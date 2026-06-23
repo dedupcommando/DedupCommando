@@ -128,7 +128,7 @@ jobs:
         run: |
           cargo install cargo-deb --locked
           ver="${GITHUB_REF_NAME#v}"
-          deb_ver="${ver//-/~}"   # 0.9.0-beta.1 -> 0.9.0~beta.1 (~ sorts below the final)
+          deb_ver="$(printf '%s' "$ver" | tr '-' '~')"   # 0.9.0-beta.1 -> 0.9.0~beta.1 (~ sorts below the final)
           cargo deb --no-build --deb-version "$deb_ver"
           mkdir -p deb && cp target/debian/*.deb deb/
       - uses: actions/upload-artifact@v7
