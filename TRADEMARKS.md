@@ -14,10 +14,10 @@ this policy limits any right that license grants you to use, modify, and redistr
 - **DedupCommando** is the name of this project and its brand. Refer to it by the full,
   single composite word — "DedupCommando", written as one word with the two capitals. Please
   don't split it ("Dedup Commando") or shorten it to "Commando".
-- The published Rust crate is **`dedupcommando`** (`cargo install dedupcommando`).
-- **`dedcom`** is only the name of the command and binary (and a redirect crate on
-  crates.io). It is a short, convenient command name — **not a brand**. Please don't use
-  "dedcom" on its own to name or market the project; the brand is always the full name
+- The installable package, command, and binary are all named **`dedcom`** (for example,
+  `apt install dedcom`). The name `dedupcommando` is also reserved as a defensive alias.
+- **`dedcom`** is a short, convenient package and command name — **not a brand**. Please don't
+  use "dedcom" on its own to name or market the project; the brand is always the full name
   **DedupCommando**.
 
 ## Using the name — what's fine

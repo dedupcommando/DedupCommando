@@ -1,8 +1,9 @@
 # 02. Installation and first run
 
 DedupCommando is distributed as a single Linux binary. The recommended path is to
-download a verified release from GitHub; `cargo install` and a Docker-based build from
-source are also supported. The runtime platform is Linux; `zfs` should be available in
+download a verified release from GitHub; a Docker-based build from source is also
+supported. (Cargo and APT package installs are planned — not yet available; see below.)
+The runtime platform is Linux; `zfs` should be available in
 `PATH`, and you typically run as **root** (to take snapshots and scan outside `$HOME`).
 
 ## Install from a GitHub Release (recommended)
@@ -21,19 +22,16 @@ public key has been published), and a SLSA build-provenance attestation. Verifyi
 download before installing is strongly recommended — see
 [Verifying Releases](../VERIFYING-RELEASES.md).
 
-## Install with cargo
+## Planned: Cargo and APT (not yet available)
 
-If you have a Rust toolchain, you can install from the crate. This builds and installs the
-`dedcom` command:
+Two convenience installs are planned but **not yet published** — don't rely on them yet:
 
-```sh
-cargo install dedupcommando
-dedcom -V
-```
+- **Cargo:** `cargo install dedcom` — once the `dedcom` crate is published to crates.io.
+- **APT:** `sudo apt install dedcom` — a signed APT repository is on the roadmap; it will serve
+  `.deb` packages built from the same release binary.
 
-The crate is named `dedupcommando`; the installed binary is `dedcom`. DedupCommando is
-**Linux-only** (it uses `libc`/`renameat2` and ZFS), so `cargo install` is supported on
-Linux only.
+Until then, use the verified GitHub Release tarball above, or build from source (below).
+DedupCommando is **Linux-only** (it uses `libc`/`renameat2` and ZFS).
 
 ## Build from source (contributors)
 

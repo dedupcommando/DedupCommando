@@ -43,13 +43,12 @@ The detailed version with screens is in [§04 Quickstart](04-quickstart.md). The
 form:
 
 ```text
-1. Install (pick one):
-     # a) Download the release binary from GitHub Releases (amd64/arm64),
-     #    verify it (see ../VERIFYING-RELEASES.md), then install:
+1. Install:
+     # Download the release binary from GitHub Releases (amd64/arm64),
+     # verify it (see ../VERIFYING-RELEASES.md), then install:
      tar xzf dedcom-<version>-<triple>.tar.gz
      sudo install -m 755 dedcom /usr/local/bin/dedcom
-     # b) Or build and install from crates.io (gives the `dedcom` command):
-     cargo install dedupcommando
+     # (Cargo and APT installs are planned — not yet available; see 02-install.md.)
 
 2. First run:
      dedcom               → notice (Space → Enter) → main screen
