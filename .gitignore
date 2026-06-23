@@ -1,0 +1,20 @@
+# Rust build output
+/target
+
+# Release bundle output
+/dist
+
+# Local runtime state (checkpoint DB, logs, locks) if ever produced in-tree
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Local deployment target — never commit
+.deploy-target
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~

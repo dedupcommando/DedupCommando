@@ -1,0 +1,51 @@
+# cargo-deny — DedupCommando dependency policy.
+#
+# Rejects any copyleft / Apache-2.0-incompatible dependency. Check: `cargo deny check licenses`.
+# The [advisories]/[bans]/[sources] sections (security/supply-chain, RUSTSEC) are configured
+# below; licenses and security are kept separate.
+
+[graph]
+# Scope — the actually-shipped binaries (amd64 + arm64 Linux). Windows/wasm crates from
+# Cargo.lock are not part of the Linux build and don't enter the license inventory.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Permissive, Apache-2.0-compatible licenses only. Any dependency outside the list is an
+# error (copyleft MPL/GPL/LGPL/… are rejected; the only one was option-ext → removed,
+# by swapping dirs for an inline XDG resolver).
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unlicense",
+]
+
+# --- security / supply-chain: advisories / bans / sources ---
+
+[advisories]
+# RUSTSEC advisory DB. Vulnerabilities always fail; unmaintained crates fail too.
+ignore = [
+    # paste 1.0.15 — RUSTSEC-2024-0436 (unmaintained, upstream archived). NOT a
+    # vulnerability and "no safe upgrade is available"; pulled in transitively only via
+    # ratatui 0.29 (build-time proc-macro). Revisit when ratatui drops paste.
+    "RUSTSEC-2024-0436",
+]
+
+[bans]
+# Transitive duplicate versions (rustix 0.38/1.1, unicode-width 0.1/0.2,
+# linux-raw-sys 0.4/0.12 — ratatui vs reflink-copy) are upstream-owned: warn, don't fail.
+multiple-versions = "warn"
+# Our Cargo.toml pins no wildcard ("*") version requirements.
+wildcards = "deny"
+
+[sources]
+# Every crate resolves from crates.io (verified). Reject any other registry / git source.
+unknown-registry = "deny"
+unknown-git = "deny"

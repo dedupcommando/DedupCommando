@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+pub mod action_review;
+pub mod applying;
+pub mod browser;
+pub mod folder_picker;
+pub mod resume;
+pub mod scan_config;
+pub mod scan_diff;
+pub mod scanning;
+pub mod summary;
+pub mod trash;

@@ -1,0 +1,23 @@
+# .gitleaks.toml — public-safe gitleaks config for DedupCommando.
+# Extends the default ruleset. Allowlists ONLY build artifacts and a single
+# documented benign match — NO private-path allowlist, so this config never trains
+# gitleaks to ignore the deployment-secret class this config must never mask.
+#
+# This config runs over the public source tree; non-shipped material is excluded by
+# construction, so there is nothing private left to allowlist away.
+title = "DedupCommando"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Build artifacts + documented benign matches"
+paths = [
+  '''^target/''',
+  '''^dist/''',
+  '''^\.git/''',
+]
+regexes = [
+  # src/pipeline/safe_open.rs — '/etc/secret' in a symlink-race comment (not a secret).
+  '''/etc/secret''',
+]

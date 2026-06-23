@@ -1,0 +1,23 @@
+# Third-Party Notices — DedupCommando
+
+DedupCommando is distributed under the Apache License 2.0 (see `LICENSE`). The
+release binaries (x86_64 / aarch64 Linux) statically link the third-party Rust
+crates listed below. Each crate's license and required notices are reproduced
+verbatim, as obligated by those licenses.
+
+This file is generated mechanically by `cargo about generate` — do not edit by
+hand. Regenerate after any dependency change.
+
+{{#each licenses}}
+--------------------------------------------------------------------------------
+
+## {{name}}
+
+Applies to the following crate(s) bundled in DedupCommando:
+{{#each used_by}}
+  * {{crate.name}} {{crate.version}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

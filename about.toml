@@ -1,0 +1,20 @@
+# cargo-about — generates THIRD-PARTY-NOTICES.
+# Run: cargo about generate about.hbs -o THIRD-PARTY-NOTICES
+#
+# Scope = the actually-shipped Linux targets (same as deny.toml). Accepted licenses = the same
+# permissive allow-list. If cargo-about encounters a license outside the list it fails, forcing a
+# deliberate decision (rather than silently shipping an unaccounted-for license).
+
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unlicense",
+]

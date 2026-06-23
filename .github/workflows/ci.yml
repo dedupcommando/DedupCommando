@@ -1,0 +1,113 @@
+# CI — DedupCommando.
+#
+# Build/test (amd64 + arm64), rustfmt --check, clippy -D warnings, cargo-deny,
+# contamination scan, secret scan, and DCO sign-off. The fmt job uses the same
+# `@stable` toolchain as build/clippy. The destructive ZFS E2E is NOT run here — it
+# needs a real ZFS host (disposable loopback-ZFS) and is run by maintainers.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: build & test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --all-targets
+      - run: cargo test --locked
+
+  fmt:
+    name: rustfmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy -D warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  contamination:
+    name: contamination scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash scripts/scan-contamination.sh
+
+  secret-scan:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run gitleaks (pinned, public-safe config)
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+          ./gitleaks detect --source . --no-git --config .gitleaks.toml --redact --verbose
+
+  dco:
+    name: DCO sign-off
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Verify Signed-off-by on PR commits
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          missing=0
+          for c in $(git rev-list "$BASE_SHA".."$HEAD_SHA"); do
+            if ! git show -s --format=%B "$c" | grep -qiE '^Signed-off-by: .+ <[^@]+@[^@]+>'; then
+              echo "::error::commit $c is missing a DCO Signed-off-by line"
+              git show -s --format='  %h %s' "$c"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Every commit must carry a DCO Signed-off-by line (use: git commit -s)."
+            exit 1
+          fi
+          echo "All PR commits carry a Signed-off-by line."

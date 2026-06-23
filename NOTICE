@@ -1,0 +1,11 @@
+DedupCommando
+Copyright 2026 Denis "DeQuzzy" Kuznetsov
+
+Licensed under the Apache License, Version 2.0 (the "License"); see the LICENSE
+file for the full text. You may not use this product except in compliance with
+the License.
+
+This product bundles third-party Rust crates, all under permissive,
+Apache-2.0-compatible licenses. Their copyright notices and the full text of
+their licenses are reproduced in the THIRD-PARTY-NOTICES file, as those licenses
+require.

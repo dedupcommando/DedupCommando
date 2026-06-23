@@ -1,0 +1,148 @@
+# Release — DedupCommando.
+#
+# Triggered by a `v*` tag. REQUIRES the owner's minisign signing secret
+# (MINISIGN_SECRET_KEY): the `guard` job fails the whole run early when it is unset, so the
+# workflow can never publish an unsigned release. Builds release binaries (amd64 + arm64),
+# packages each with the license artifacts, computes SHA-256 checksums, generates a CycloneDX
+# SBOM, signs each tarball with minisign, attaches SLSA build provenance, and publishes a
+# signed (pre-)release.
+#
+# minisign key is the owner's secret (MINISIGN_SECRET_KEY).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  guard:
+    name: require signing key
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail early if MINISIGN_SECRET_KEY is unset
+        env:
+          HAVE_SIGNING_KEY: ${{ secrets.MINISIGN_SECRET_KEY != '' }}
+        run: |
+          if [ "$HAVE_SIGNING_KEY" != "true" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is empty — refusing to build an unsigned release. Set the signing secret before pushing a v* tag."
+            exit 1
+          fi
+          echo "signing key present"
+
+  build:
+    name: build & package (${{ matrix.arch }})
+    needs: guard
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Package + checksum
+        id: pkg
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          name="dedcom-${ver}-${{ matrix.triple }}"
+          mkdir -p "dist/$name"
+          cp target/release/dedcom "dist/$name/"
+          cp LICENSE NOTICE THIRD-PARTY-NOTICES "dist/$name/"
+          tar -C dist -czf "dist/${name}.tar.gz" "$name"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "tarball=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: SBOM (CycloneDX)
+        run: |
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --format json
+          # cargo-cyclonedx names the SBOM after the package (dedupcommando), not the dedcom binary
+          cp dedupcommando.cdx.json "dist/${{ steps.pkg.outputs.name }}.cdx.json"
+
+      - name: Sign (minisign)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y minisign
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
+          # key is generated password-less (see 05 runbook); </dev/null keeps signing non-interactive
+          minisign -S -s minisign.key -m "${{ steps.pkg.outputs.tarball }}" < /dev/null
+          rm -f minisign.key
+          test -f "${{ steps.pkg.outputs.tarball }}.minisig" \
+            || { echo "::error::minisign produced no .minisig for ${{ steps.pkg.outputs.tarball }}"; exit 1; }
+
+      - name: Build provenance attestation
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ steps.pkg.outputs.tarball }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          if-no-files-found: error
+          path: |
+            dist/${{ steps.pkg.outputs.name }}.tar.gz
+            dist/${{ steps.pkg.outputs.name }}.tar.gz.sha256
+            dist/${{ steps.pkg.outputs.name }}.cdx.json
+            dist/${{ steps.pkg.outputs.name }}.tar.gz.minisig
+
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Require a signature for every tarball
+        run: |
+          missing=0
+          found=0
+          for t in dist/*.tar.gz; do
+            [ -e "$t" ] || continue
+            found=1
+            if [ ! -f "$t.minisig" ]; then
+              echo "::error::missing signature: $t.minisig"
+              missing=1
+            fi
+          done
+          if [ "$found" != 1 ]; then
+            echo "::error::no tarballs found to publish"
+            exit 1
+          fi
+          if [ "$missing" != 0 ]; then
+            echo "::error::refusing to publish an unsigned release"
+            exit 1
+          fi
+      - name: Publish signed (pre-)release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/**
+          generate_release_notes: true
+          prerelease: true
+          fail_on_unmatched_files: true
