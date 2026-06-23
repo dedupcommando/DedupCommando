@@ -9,10 +9,23 @@ repository = "https://github.com/dedupcommando/DedupCommando"
 homepage = "https://github.com/dedupcommando/DedupCommando"
 readme = "README.md"
 
-# The published crate is `dedupcommando` (brand), but the installed command stays `dedcom`.
+# Crate id stays `dedupcommando` (defensive reservation); the public package/command/binary is
+# `dedcom` (owner decision 2026-06-23). The .deb Package is `dedcom` via [package.metadata.deb].
 [[bin]]
 name = "dedcom"
 path = "src/main.rs"
+
+# Debian packaging (cargo-deb). Package name = `dedcom` (overrides the crate id) so the apt
+# package and the command match. Built/signed/published by .github/workflows/release.yml (Ф18).
+[package.metadata.deb]
+name = "dedcom"
+maintainer = "Denis \"DeQuzzy\" Kuznetsov <dedupcommando@dequzzy.io>"
+section = "utils"
+priority = "optional"
+extended-description = """
+DedupCommando is a Linux terminal UI for finding and safely deduplicating byte-for-byte \
+identical files on ZFS pools (tested on Proxmox VE): a ZFS snapshot before each destructive \
+batch, re-validation before acting, and a restorable quarantine. The installed command is `dedcom`."""
 
 [dependencies]
 ratatui = "0.29"
