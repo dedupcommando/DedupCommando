@@ -26,6 +26,8 @@ matching, or background daemon/watch indexing. Linux only.
 ## Requirements
 
 - **Linux**, kernel ≥ 3.15 (requires `renameat2`). x86_64 or aarch64.
+- **Pre-built packages need glibc ≥ 2.39** — Debian 13 (trixie), Ubuntu 24.04, or Proxmox VE 9 or newer.
+  On older systems (e.g. Proxmox VE 8 / Debian 12), build from source.
 - **ZFS strongly recommended** — snapshot safety, dataset detection and reflink depend on it. On non-ZFS
   filesystems scanning works, but applying actions has **no snapshot safety and is not recommended**.
 - `zfs` available in `PATH`; typically run as **root** (to take snapshots and scan outside `$HOME`).
@@ -33,15 +35,26 @@ matching, or background daemon/watch indexing. Linux only.
 
 ## Install
 
-Pre-built binaries are attached to each GitHub Release (amd64 and arm64). Download the tarball, **verify it**
-(see [docs/VERIFYING-RELEASES.md](docs/VERIFYING-RELEASES.md)), then install:
+**Debian / Proxmox VE — APT repository** (recommended; updates via `apt upgrade`):
+
+```sh
+sudo curl -fsSL https://dedupcommando.github.io/apt/dedcom-archive-keyring.gpg \
+  -o /usr/share/keyrings/dedcom-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/dedcom-archive-keyring.gpg] https://dedupcommando.github.io/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/dedcom.list
+sudo apt update && sudo apt install dedcom
+```
+
+**Any Linux — GitHub Release tarball** (**verify it** first, see [docs/VERIFYING-RELEASES.md](docs/VERIFYING-RELEASES.md)):
 
 ```sh
 tar xzf dedcom-<version>-<triple>.tar.gz
 sudo install -m 755 dedcom /usr/local/bin/dedcom
 ```
 
-To build from source (Docker-based, no local Rust toolchain needed), see [CONTRIBUTING.md](CONTRIBUTING.md).
+Both pre-built channels need glibc ≥ 2.39 (Debian 13 / Ubuntu 24.04 / Proxmox VE 9+). To build from source
+(Docker-based, no local Rust toolchain needed — works on older systems too), see [CONTRIBUTING.md](CONTRIBUTING.md).
+A `cargo install dedcom` is planned once the crate is published.
 
 ## Quickstart
 

@@ -1,15 +1,40 @@
 # 02. Installation and first run
 
-DedupCommando is distributed as a single Linux binary. The recommended path is to
-download a verified release from GitHub; a Docker-based build from source is also
-supported. (Cargo and APT package installs are planned — not yet available; see below.)
+DedupCommando is distributed as a single Linux binary. On Debian-family systems (including
+Proxmox VE) the easiest path is the **APT repository** (`apt install dedcom`, with automatic
+updates); a verified tarball from each GitHub Release and a Docker-based build from source are
+also supported. (A `cargo install` is still planned — not yet available; see below.)
 The runtime platform is Linux; `zfs` should be available in
 `PATH`, and you typically run as **root** (to take snapshots and scan outside `$HOME`).
 
-## Install from a GitHub Release (recommended)
+## Install from the APT repository (Debian / Proxmox VE)
 
-Pre-built binaries are attached to each GitHub Release for **amd64** and **arm64**. Download
-the tarball for your architecture, **verify it**, then install it into `PATH`:
+On Debian-family systems (including Proxmox VE) you can install `dedcom` from the project's
+signed APT repository and get updates with `apt upgrade`:
+
+```sh
+# 1. Repository signing key
+sudo curl -fsSL https://dedupcommando.github.io/apt/dedcom-archive-keyring.gpg \
+  -o /usr/share/keyrings/dedcom-archive-keyring.gpg
+# 2. Repository source (signed-by binds it to the key above)
+echo "deb [signed-by=/usr/share/keyrings/dedcom-archive-keyring.gpg] https://dedupcommando.github.io/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/dedcom.list
+# 3. Install
+sudo apt update && sudo apt install dedcom
+```
+
+`apt` then keeps `dedcom` up to date like any other package. The repository metadata is
+GPG-signed, and `signed-by` ensures `apt` trusts only packages signed with the key above.
+
+> **Requires glibc ≥ 2.39 — Debian 13 (trixie), Ubuntu 24.04, or Proxmox VE 9 or newer.** The
+> pre-built packages are compiled against glibc 2.39, so on older systems (e.g. Proxmox VE 8 /
+> Debian 12) the install refuses with an unmet `libc6` dependency — build from source (below) there.
+
+## Install from a GitHub Release (any Linux with glibc ≥ 2.39)
+
+Pre-built binaries are attached to each GitHub Release for **amd64** and **arm64** (same glibc
+requirement as the APT packages above). Download the tarball for your architecture, **verify
+it**, then install it into `PATH`:
 
 ```sh
 tar xzf dedcom-<version>-<triple>.tar.gz
@@ -22,16 +47,14 @@ public key has been published), and a SLSA build-provenance attestation. Verifyi
 download before installing is strongly recommended — see
 [Verifying Releases](../VERIFYING-RELEASES.md).
 
-## Planned: Cargo and APT (not yet available)
+## Planned: Cargo (not yet available)
 
-Two convenience installs are planned but **not yet published** — don't rely on them yet:
+One convenience install is still planned but **not yet published** — don't rely on it yet:
 
 - **Cargo:** `cargo install dedcom` — once the `dedcom` crate is published to crates.io.
-- **APT:** `sudo apt install dedcom` — a signed APT repository is on the roadmap; it will serve
-  `.deb` packages built from the same release binary.
 
-Until then, use the verified GitHub Release tarball above, or build from source (below).
-DedupCommando is **Linux-only** (it uses `libc`/`renameat2` and ZFS).
+For now, use the APT repository (Debian/Proxmox VE), the verified GitHub Release tarball, or
+build from source (below). DedupCommando is **Linux-only** (it uses `libc`/`renameat2` and ZFS).
 
 ## Build from source (contributors)
 

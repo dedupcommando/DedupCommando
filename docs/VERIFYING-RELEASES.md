@@ -51,3 +51,12 @@ gh attestation verify dedcom-<version>-<triple>.tar.gz --repo dedupcommando/Dedu
 
 The CycloneDX SBOM (`*.cdx.json`) lists the dependency tree and licenses, for auditing and supply-chain
 tooling.
+
+## APT repository
+
+If you installed `dedcom` from the [APT repository](https://dedupcommando.github.io/apt/)
+(`apt install dedcom`), `apt` verifies it for you. The repository's `Release` metadata is GPG-signed, and
+the `signed-by` option in the source list binds the repository to its published key
+(`dedcom-archive-keyring.gpg`), so `apt` installs a package only if it is signed with that key. This is a
+separate signature from the per-tarball minisign above: the APT channel is verified by the repository GPG
+key, the release tarballs by minisign.
