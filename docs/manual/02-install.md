@@ -7,6 +7,9 @@ also supported. (A `cargo install` is still planned — not yet available; see b
 The runtime platform is Linux; `zfs` should be available in
 `PATH`, and you typically run as **root** (to take snapshots and scan outside `$HOME`).
 
+> **The install commands below assume you are root** — the default on Proxmox VE, which ships
+> without `sudo`. On a non-root Debian system, run `sudo -i` first, or prefix each command with `sudo`.
+
 ## Install from the APT repository (Debian / Proxmox VE)
 
 On Debian-family systems (including Proxmox VE) you can install `dedcom` from the project's
@@ -14,13 +17,13 @@ signed APT repository and get updates with `apt upgrade`:
 
 ```sh
 # 1. Repository signing key
-sudo curl -fsSL https://dedupcommando.github.io/apt/dedcom-archive-keyring.gpg \
+curl -fsSL https://dedupcommando.github.io/apt/dedcom-archive-keyring.gpg \
   -o /usr/share/keyrings/dedcom-archive-keyring.gpg
 # 2. Repository source (signed-by binds it to the key above)
 echo "deb [signed-by=/usr/share/keyrings/dedcom-archive-keyring.gpg] https://dedupcommando.github.io/apt stable main" \
-  | sudo tee /etc/apt/sources.list.d/dedcom.list
+  | tee /etc/apt/sources.list.d/dedcom.list
 # 3. Install
-sudo apt update && sudo apt install dedcom
+apt update && apt install dedcom
 ```
 
 `apt` then keeps `dedcom` up to date like any other package. The repository metadata is
@@ -38,7 +41,7 @@ it**, then install it into `PATH`:
 
 ```sh
 tar xzf dedcom-<version>-<triple>.tar.gz
-sudo install -m 755 dedcom /usr/local/bin/dedcom
+install -m 755 dedcom /usr/local/bin/dedcom
 dedcom -V                                  # check: should print the version
 ```
 

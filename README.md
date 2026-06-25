@@ -35,21 +35,23 @@ matching, or background daemon/watch indexing. Linux only.
 
 ## Install
 
+> The commands below assume you are **root** — the default on Proxmox VE, which ships without `sudo`. On a non-root Debian login, run `sudo -i` first (or prefix each command with `sudo`).
+
 **Debian / Proxmox VE — APT repository** (recommended; updates via `apt upgrade`):
 
 ```sh
-sudo curl -fsSL https://dedupcommando.github.io/apt/dedcom-archive-keyring.gpg \
+curl -fsSL https://dedupcommando.github.io/apt/dedcom-archive-keyring.gpg \
   -o /usr/share/keyrings/dedcom-archive-keyring.gpg
 echo "deb [signed-by=/usr/share/keyrings/dedcom-archive-keyring.gpg] https://dedupcommando.github.io/apt stable main" \
-  | sudo tee /etc/apt/sources.list.d/dedcom.list
-sudo apt update && sudo apt install dedcom
+  | tee /etc/apt/sources.list.d/dedcom.list
+apt update && apt install dedcom
 ```
 
 **Any Linux — GitHub Release tarball** (**verify it** first, see [docs/VERIFYING-RELEASES.md](docs/VERIFYING-RELEASES.md)):
 
 ```sh
 tar xzf dedcom-<version>-<triple>.tar.gz
-sudo install -m 755 dedcom /usr/local/bin/dedcom
+install -m 755 dedcom /usr/local/bin/dedcom
 ```
 
 Both pre-built channels need glibc ≥ 2.39 (Debian 13 / Ubuntu 24.04 / Proxmox VE 9+). To build from source
