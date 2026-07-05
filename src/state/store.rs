@@ -157,6 +157,8 @@ impl ScanStore {
         // the state-dir), and create with 0600. O_NOFOLLOW on the final component.
         crate::paths::prepare_db_file(db_path)?;
         let conn = Connection::open(db_path)?;
+        // Refuse a DB written by a newer build before touching it (no WAL flip, no migration).
+        schema::ensure_version_supported(&conn)?;
         // busy_timeout — the background move worker holds its own connection
         // in parallel with the main one; WAL + waiting on a lock instead of a «locked» error.
         conn.execute_batch(
@@ -184,42 +186,38 @@ impl ScanStore {
 
     /// Looks for the most recent scan (to resume or view).
     pub fn find_resumable(&self) -> Result<Option<ResumeInfo>> {
-        let row = self.conn.query_row(
-            "SELECT id, created_at, status, config_json FROM scan ORDER BY id DESC LIMIT 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        );
-
-        let (scan_id, created_at, status_text, config_json) = match row {
-            Ok(values) => values,
-            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-            Err(err) => return Err(err.into()),
-        };
-
-        let status = ScanStatus::parse(&status_text)
-            .ok_or_else(|| AppError::msg(format!("unknown scan status: {status_text}")))?;
-        let config: ScanConfig = serde_json::from_str(&config_json)?;
-        let stats = self.candidate_stats(scan_id)?;
-
-        Ok(Some(ResumeInfo {
-            scan_id,
-            created_at,
-            status,
-            roots: config.roots,
-            files_total: stats.total_files,
-            files_hashed: stats.hashed_files,
-            cand_bytes_total: stats.total_bytes,
-            cand_bytes_hashed: stats.hashed_bytes,
-            files_scanned: 0,
-            reclaimable_bytes: 0,
-        }))
+        // Newest first; stream the rows and stop at the first whose status this build can parse,
+        // skipping unknown-status rows (written by a future version) with a warning — without
+        // materialising the whole scan list.
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, created_at, status, config_json FROM scan ORDER BY id DESC")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let scan_id: i64 = row.get(0)?;
+            let status_text: String = row.get(2)?;
+            let Some(status) = ScanStatus::parse(&status_text) else {
+                tracing::warn!(scan_id, status = %status_text, "skipping scan with unknown status");
+                continue;
+            };
+            let created_at: String = row.get(1)?;
+            let config_json: String = row.get(3)?;
+            let config: ScanConfig = serde_json::from_str(&config_json)?;
+            let stats = self.candidate_stats(scan_id)?;
+            return Ok(Some(ResumeInfo {
+                scan_id,
+                created_at,
+                status,
+                roots: config.roots,
+                files_total: stats.total_files,
+                files_hashed: stats.hashed_files,
+                cand_bytes_total: stats.total_bytes,
+                cand_bytes_hashed: stats.hashed_bytes,
+                files_scanned: 0,
+                reclaimable_bytes: 0,
+            }));
+        }
+        Ok(None)
     }
 
     /// Active (NOT trashed) scan sessions, newest first.
@@ -286,8 +284,10 @@ impl ScanStore {
             reclaim,
         ) in raw
         {
-            let status = ScanStatus::parse(&status_text)
-                .ok_or_else(|| AppError::msg(format!("unknown scan status: {status_text}")))?;
+            let Some(status) = ScanStatus::parse(&status_text) else {
+                tracing::warn!(scan_id, status = %status_text, "skipping scan with unknown status");
+                continue;
+            };
             let config: ScanConfig = serde_json::from_str(&config_json)?;
             let (mut files_total, mut files_hashed, mut cand_bytes_total, mut cand_bytes_hashed) = (
                 cf_total as u64,
@@ -3822,6 +3822,102 @@ mod tests {
                 );
             }
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scans_filtered_skips_unknown_status_instead_of_failing() {
+        // One row written by a future build with an unknown status must NOT hide every session.
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let good = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank/a")]))
+            .unwrap();
+        store.set_status(good, ScanStatus::Complete).unwrap();
+        let future = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank/b")]))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE scan SET status = 'from_the_future' WHERE id = ?1",
+                params![future],
+            )
+            .unwrap();
+        let scans = store.list_scans().unwrap();
+        assert_eq!(
+            scans.len(),
+            1,
+            "the unknown-status row is skipped, not fatal"
+        );
+        assert_eq!(scans[0].scan_id, good);
+    }
+
+    #[test]
+    fn find_resumable_skips_unknown_status_and_returns_next() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let older = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank/a")]))
+            .unwrap();
+        store.set_status(older, ScanStatus::Hashing).unwrap();
+        let newest = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank/b")]))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE scan SET status = 'from_the_future' WHERE id = ?1",
+                params![newest],
+            )
+            .unwrap();
+        let got = store.find_resumable().unwrap().expect("a resumable scan");
+        assert_eq!(got.scan_id, older, "the unparseable newest row is skipped");
+    }
+
+    #[test]
+    fn open_refuses_db_from_a_newer_schema() {
+        let dir = temp_state_dir("future_ver");
+        let db = dir.join("dedcom.db");
+        drop(ScanStore::open(&db).unwrap());
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.pragma_update(None, "user_version", schema::SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+        assert!(
+            ScanStore::open(&db).is_err(),
+            "a DB from a newer schema version must be refused"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn open_stamps_a_legacy_versionless_db_and_keeps_data() {
+        let dir = temp_state_dir("legacy_ver");
+        let db = dir.join("dedcom.db");
+        let scan_id = {
+            let mut store = ScanStore::open(&db).unwrap();
+            let id = store
+                .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank/a")]))
+                .unwrap();
+            store.set_status(id, ScanStatus::Complete).unwrap();
+            id
+        };
+        // Simulate a pre-versioning (v0.9) DB: clear the stamp.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.pragma_update(None, "user_version", 0i64).unwrap();
+        }
+        // Reopen with the new build: it must re-stamp and keep the scan.
+        let store = ScanStore::open(&db).unwrap();
+        let scans = store.list_scans().unwrap();
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].scan_id, scan_id);
+        drop(store);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, schema::SCHEMA_VERSION);
         std::fs::remove_dir_all(&dir).ok();
     }
 

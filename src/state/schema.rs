@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use rusqlite::Connection;
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 
 /// Checkpoint DB schema. `scan` — a single scan; `file` — the file manifest with hashes;
 /// `scan_stats` — time, environment and metrics (1:1 with `scan`); `file_mark` —
@@ -119,6 +119,24 @@ CREATE TABLE IF NOT EXISTS move_event (
 );
 ";
 
+/// Current on-disk schema version, stamped into `PRAGMA user_version`. Bump this (and add a
+/// migration step) whenever the schema changes in a way an older build cannot read. A DB from
+/// before versioning reports 0; its schema equals v1, so it is stamped on first open.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// Refuses a DB written by a newer build. Reads `PRAGMA user_version` and errors if it is above
+/// what this build knows; otherwise does nothing. Must run before any write so a future DB is
+/// left untouched.
+pub fn ensure_version_supported(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(AppError::msg(format!(
+            "dedcom.db was created by a newer version (schema v{version}; this build supports v{SCHEMA_VERSION}). Upgrade dedcom, or move the old dedcom.db aside."
+        )));
+    }
+    Ok(())
+}
+
 pub fn migrate(conn: &Connection) -> Result<()> {
     // The migration is transactional and idempotent — either it all applies,
     // or the DB stays in its previous state (no half-added columns).
@@ -159,6 +177,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS file_reuse_identity
              ON file(path, size, mtime, mtime_nsec, ctime_sec, ctime_nsec, identity_version);",
     )?;
+    // Stamp the current schema version (also upgrades a pre-versioning DB from 0).
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
 }
@@ -182,6 +202,45 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &st
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    #[test]
+    fn migrate_stamps_current_schema_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrate_twice_keeps_current_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn ensure_version_supported_refuses_future_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        assert!(ensure_version_supported(&conn).is_err());
+    }
+
+    #[test]
+    fn ensure_version_supported_allows_unversioned_and_current() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A fresh/legacy DB is at user_version 0.
+        assert!(ensure_version_supported(&conn).is_ok());
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .unwrap();
+        assert!(ensure_version_supported(&conn).is_ok());
+    }
 
     /// Migration of a production DB with the OLD `file` schema (without identity columns)
     /// is transactional and idempotent — adds columns with DEFAULT 0, preserves data,
