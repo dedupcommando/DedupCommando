@@ -546,6 +546,23 @@ pub fn on_key(app: &mut App, key: KeyEvent) {
     dispatch_key(app, key);
 }
 
+/// Keys whose handlers read `entries[cursor]` (U-1 gated set).
+fn is_entries_row_command(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::F(3..=8)
+            | KeyCode::Char(' ')
+            | KeyCode::Insert
+            | KeyCode::Enter
+            | KeyCode::Char('m' | 'M')
+    )
+}
+
+/// Views whose rows come from `entries`; group views draw groups instead (U-1).
+fn view_exposes_entries(view: PanelView) -> bool {
+    matches!(view, PanelView::Files | PanelView::DirsOnly)
+}
+
 /// Key dispatcher for the active commander screen (outside modal overlays).
 fn dispatch_key(app: &mut App, key: KeyEvent) {
     // Triage (triage v1) is armed: we await the receiver digit — intercept everything.
@@ -575,6 +592,13 @@ fn dispatch_key(app: &mut App, key: KeyEvent) {
             on_shift_fkey(app, n);
             return;
         }
+    }
+    // U-1: block row commands in views that don't display `entries`.
+    if is_entries_row_command(key.code) && !view_exposes_entries(app.commander.active_panel().view)
+    {
+        app.commander.status =
+            "Row commands need «files» or «directories» view (press v)".to_string();
+        return;
     }
     match key.code {
         KeyCode::F(1) | KeyCode::Char('?') => app.show_help = true,
@@ -1444,6 +1468,10 @@ pub(crate) fn reload_panel(app: &mut App, index: usize) {
 /// Double-click on entry of panel `index`: enters the directory under the entry
 /// (for the `..` entry — goes up a level). On a file — nothing.
 fn open_panel_entry(app: &mut App, index: usize, entry: usize) {
+    // U-1: double-click is mouse Enter; skip it where `entries` isn't shown.
+    if !view_exposes_entries(app.commander.panels[index].view) {
+        return;
+    }
     let target = match app.commander.panels[index].entries.get(entry) {
         Some(item) if item.is_dir() => item.path.clone(),
         _ => return,
@@ -2746,6 +2774,121 @@ mod keymap_tests {
             SECOND_LAYER_DISPATCH.to_vec(),
             "SECOND_LAYER and SECOND_LAYER_DISPATCH diverged — update both"
         );
+    }
+}
+
+#[cfg(test)]
+mod u1_guard_tests {
+    // U-1 matrix: row commands gated outside Files/DirsOnly; nav never gated.
+    use super::*;
+
+    const VIEWS: &[PanelView] = &[
+        PanelView::Files,
+        PanelView::DirsOnly,
+        PanelView::GroupList,
+        PanelView::GroupFiles,
+        PanelView::DuplicatesOfCursor,
+        PanelView::DirGroupList,
+        PanelView::DirGroupFiles,
+    ];
+
+    const ROW_COMMANDS: &[KeyCode] = &[
+        KeyCode::F(3),
+        KeyCode::F(4),
+        KeyCode::F(5),
+        KeyCode::F(6),
+        KeyCode::F(7),
+        KeyCode::F(8),
+        KeyCode::Char(' '),
+        KeyCode::Insert,
+        KeyCode::Char('m'),
+        KeyCode::Enter,
+    ];
+
+    const NON_ROW_COMMANDS: &[KeyCode] = &[
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::PageUp,
+        KeyCode::PageDown,
+        KeyCode::Home,
+        KeyCode::End,
+        KeyCode::Tab,
+        KeyCode::BackTab,
+        KeyCode::Char('v'),
+        KeyCode::Char('s'),
+        KeyCode::Char(','),
+        KeyCode::Char('o'),
+        KeyCode::Char('u'),
+        KeyCode::Backspace,
+        KeyCode::F(1),
+        KeyCode::F(2),
+        KeyCode::F(9),
+        KeyCode::F(11),
+    ];
+
+    // independent oracle
+    fn expected_entries_backed(view: PanelView) -> bool {
+        matches!(view, PanelView::Files | PanelView::DirsOnly)
+    }
+
+    fn blocked(view: PanelView, code: KeyCode) -> bool {
+        is_entries_row_command(code) && !view_exposes_entries(view)
+    }
+
+    #[test]
+    fn row_commands_blocked_only_outside_entries_views() {
+        for &view in VIEWS {
+            for &code in ROW_COMMANDS {
+                assert!(
+                    is_entries_row_command(code),
+                    "{code:?} must be recognised as a row command"
+                );
+                assert_eq!(
+                    blocked(view, code),
+                    !expected_entries_backed(view),
+                    "{code:?} in {view:?}: must be blocked iff the view is not files/directories"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn navigation_and_view_commands_never_blocked() {
+        for &view in VIEWS {
+            for &code in NON_ROW_COMMANDS {
+                assert!(
+                    !is_entries_row_command(code),
+                    "{code:?} must not be a row command"
+                );
+                assert!(
+                    !blocked(view, code),
+                    "{code:?} must stay enabled in {view:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn uppercase_m_is_also_gated() {
+        assert!(is_entries_row_command(KeyCode::Char('M')));
+    }
+
+    #[test]
+    fn exactly_files_and_dirsonly_expose_entries() {
+        assert!(view_exposes_entries(PanelView::Files));
+        assert!(view_exposes_entries(PanelView::DirsOnly));
+        for &view in &[
+            PanelView::GroupList,
+            PanelView::GroupFiles,
+            PanelView::DuplicatesOfCursor,
+            PanelView::DirGroupList,
+            PanelView::DirGroupFiles,
+        ] {
+            assert!(
+                !view_exposes_entries(view),
+                "{view:?} must not expose entries"
+            );
+        }
     }
 }
 
