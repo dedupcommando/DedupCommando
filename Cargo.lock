@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "dedupcommando"
-version = "0.9.0-beta.1"
+version = "0.9.0-beta.2"
 dependencies = [
  "blake3",
  "chrono",
