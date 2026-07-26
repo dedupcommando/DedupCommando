@@ -122,7 +122,11 @@ CREATE TABLE IF NOT EXISTS move_event (
 /// Current on-disk schema version, stamped into `PRAGMA user_version`. Bump this (and add a
 /// migration step) whenever the schema changes in a way an older build cannot read. A DB from
 /// before versioning reports 0; its schema equals v1, so it is stamped on first open.
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// v2 adds `scan_stats.results_materialized`. An older build would not see the marker and would
+/// fall back to «is file_group empty?», which re-derives results `--verify` had rejected — so v2
+/// is deliberately not readable by a v1 build.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Refuses a DB written by a newer build. Reads `PRAGMA user_version` and errors if it is above
 /// what this build knows; otherwise does nothing. Must run before any write so a future DB is
@@ -160,6 +164,17 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         &tx,
         "scan_stats",
         "hash_failures",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // Explicit «the results have been prepared by a writer» marker. An EMPTY file_group is a
+    // legitimate final state (no duplicates at all, or --verify rejected every group), so
+    // emptiness cannot serve as «not materialized yet». Legacy rows default to 0 and are
+    // prepared once by the operator. Additive for an existing DB, but it carries the schema to
+    // v2: a build that cannot see this column falls back to the broken emptiness test.
+    add_column_if_missing(
+        &tx,
+        "scan_stats",
+        "results_materialized",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     // Soft delete: a trash bin instead of an immediate DELETE — `trashed=1`
@@ -343,5 +358,62 @@ mod tests {
             )
             .unwrap();
         assert_eq!((files, hf), (123, 0));
+    }
+
+    /// A v1 DB (schema stamped, no `results_materialized`) migrates to v2: the column appears
+    /// with DEFAULT 0, the stamp moves to 2, and existing rows survive.
+    #[test]
+    fn migrate_v1_to_v2_adds_results_materialized_and_restamps() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // Rewind to a v1 DB: drop the v2 column (SQLite 3.35+ supports DROP COLUMN) and restamp.
+        conn.execute_batch("ALTER TABLE scan_stats DROP COLUMN results_materialized")
+            .unwrap();
+        conn.execute_batch("INSERT INTO scan_stats(scan_id, groups_found) VALUES (7, 4)")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+
+        // A v1 DB is readable by this build, and migrating brings it to v2.
+        assert!(ensure_version_supported(&conn).is_ok());
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap(); // idempotent
+
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(scan_stats)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            cols.contains(&"results_materialized".to_string()),
+            "no column results_materialized after the v1→v2 migration"
+        );
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION, "the stamp must move to v2");
+        // The legacy row survives and defaults to «not prepared».
+        let (groups, prepared): (i64, i64) = conn
+            .query_row(
+                "SELECT groups_found, results_materialized FROM scan_stats WHERE scan_id = 7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((groups, prepared), (4, 0));
+    }
+
+    #[test]
+    fn a_v2_db_is_refused_by_a_v1_build() {
+        // Guard on the bump itself: the marker is invisible to a v1 build, which would fall back
+        // to «is file_group empty?» and re-derive verify-rejected results.
+        assert_eq!(SCHEMA_VERSION, 2);
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let stamped: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stamped, 2);
     }
 }

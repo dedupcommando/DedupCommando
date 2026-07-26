@@ -576,6 +576,10 @@ impl ScanStore {
                 ])?;
             }
         }
+        // In the SAME transaction as the rows: a crash must never leave results without their
+        // marker. Written even for an empty `groups` — with --verify that means every candidate
+        // group was rejected, and the empty result is final, not re-derivable from raw hashes.
+        mark_prepared(&tx, scan_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -617,6 +621,34 @@ impl ScanStore {
              )",
             params![scan_id],
         )?;
+        // Same transaction as the rows (see record_file_results). Written even when the
+        // aggregation produced nothing: «this scan has no duplicates» is a final answer, not a
+        // reason to aggregate the manifest again on the next open.
+        mark_prepared(&tx, scan_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether a writer has already prepared this scan's results.
+    ///
+    /// An explicit marker, NOT «file_group is non-empty»: an empty result is legitimate — a scan
+    /// with no duplicates, or `--verify` rejecting every candidate group — and reading emptiness
+    /// as «not prepared» would re-aggregate the whole manifest on every open and resurrect the
+    /// groups verification threw away.
+    pub fn results_materialized(&self, scan_id: i64) -> Result<bool> {
+        let flag: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(results_materialized), 0) FROM scan_stats WHERE scan_id = ?1",
+            params![scan_id],
+            |row| row.get(0),
+        )?;
+        Ok(flag != 0)
+    }
+
+    /// Marks the results prepared in its own transaction — for the paths that only need the
+    /// marker (a legacy result that must be kept as-is rather than re-derived).
+    fn mark_results_materialized(&mut self, scan_id: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        mark_prepared(&tx, scan_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -1988,25 +2020,89 @@ impl ScanStore {
         Ok(count as u64)
     }
 
-    /// Ensures the scan's `file_group` is materialized: if there are no summaries
-    /// yet (the scan completed before materialization), computes `duplicate_groups` ONCE
-    /// and writes them, then the result is immediately dropped (does not settle in RAM).
-    /// Replaces `load_or_materialize` on the path of opening a finished scan.
+    /// Prepares a finished scan's results once, on the WRITER path — so that opening them is a
+    /// pure read and an observer never has to write.
+    ///
+    /// Keyed off the explicit `results_materialized` marker, never off `file_group` being empty:
+    /// empty is a legitimate answer. For a scan that predates the marker we must still not
+    /// re-derive a result that already exists, because `--verify` may have filtered it and raw
+    /// hashes would hand the rejected groups back. Two signals say «already finished»:
+    /// rows in `file_group`, or an authoritative `scan_stats.groups_found = 0` — the completed
+    /// scan recorded that it found nothing. Only a legacy scan with no result at all and no
+    /// recorded count is aggregated.
     pub fn ensure_materialized(&mut self, scan_id: i64) -> Result<()> {
-        let count: i64 = self.conn.query_row(
+        use rusqlite::OptionalExtension;
+        if self.results_materialized(scan_id)? {
+            return Ok(());
+        }
+        let recorded: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM file_group WHERE scan_id = ?1",
             params![scan_id],
             |row| row.get(0),
         )?;
-        if count > 0 {
-            return Ok(());
-        }
-        let mut groups = self.duplicate_groups(scan_id)?;
-        crate::model::duplicate::sort_groups_by_benefit(&mut groups);
-        if !groups.is_empty() {
-            self.record_file_results(scan_id, &groups)?;
+        // `groups_found` only counts once the scan actually recorded its outcome: `begin_scan`
+        // inserts the row with every metric at 0, so a bare zero is indistinguishable from
+        // «nothing written yet». `record_scan_result` (the single writer, at completion) fills
+        // files_scanned/bytes_hashed alongside it — non-zero there is what makes the count
+        // authoritative.
+        let stats: Option<(i64, i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT groups_found, files_scanned, bytes_hashed FROM scan_stats
+                  WHERE scan_id = ?1",
+                params![scan_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let recorded_zero_groups = matches!(
+            stats,
+            Some((0, files, bytes)) if files > 0 || bytes > 0
+        );
+        if recorded > 0 || recorded_zero_groups {
+            self.mark_results_materialized(scan_id)?;
+        } else {
+            // Result-identical to duplicate_groups + record_file_results, without the RAM peak
+            // (see materialize_file_groups_equals_record_file_results); it sets the marker.
+            self.materialize_file_groups(scan_id)?;
         }
         Ok(())
+    }
+
+    /// Ids of completed scans whose results are not prepared yet.
+    pub fn unprepared_completed_scans(&self) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id
+               FROM scan s
+               LEFT JOIN scan_stats st ON st.scan_id = s.id
+              WHERE s.status IN (?1, ?2)
+                AND COALESCE(s.trashed, 0) = 0
+                AND COALESCE(st.results_materialized, 0) = 0
+              ORDER BY s.id",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                ScanStatus::Complete.as_str(),
+                ScanStatus::CompleteWithWarnings.as_str()
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Prepares every completed scan that is still unprepared, so an observer finds ready
+    /// results instead of having to write. Writer/operator path; returns how many were prepared.
+    pub fn prepare_completed_scans(&mut self) -> Result<usize> {
+        let pending = self.unprepared_completed_scans()?;
+        let mut done = 0;
+        for scan_id in pending {
+            self.ensure_materialized(scan_id)?;
+            done += 1;
+        }
+        Ok(done)
     }
 
     /// Action-plan rows from `file` + `file_mark` — without materializing
@@ -2082,6 +2178,21 @@ impl ScanStore {
         }
         Ok(out)
     }
+}
+
+/// Sets the «results prepared» marker on an open transaction, so the marker and the rows it
+/// describes commit together. `INSERT OR IGNORE` first — a scan from before `scan_stats` existed
+/// has no row to update.
+fn mark_prepared(conn: &Connection, scan_id: i64) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO scan_stats(scan_id) VALUES (?1)",
+        params![scan_id],
+    )?;
+    conn.execute(
+        "UPDATE scan_stats SET results_materialized = 1 WHERE scan_id = ?1",
+        params![scan_id],
+    )?;
+    Ok(())
 }
 
 fn now_string() -> String {
@@ -3421,6 +3532,233 @@ mod tests {
         assert_eq!(new_sum.len(), 2);
         assert_eq!(new_sum[0].reclaim_bytes, 200);
         assert_eq!(new_sum[1].reclaim_bytes, 50);
+    }
+
+    #[test]
+    fn materialized_scan_without_duplicates_stays_empty() {
+        // Zero groups is a legitimate final answer, not «not prepared yet».
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_no_duplicates(&mut store);
+        store.materialize_file_groups(scan_id).unwrap();
+        assert!(store.results_materialized(scan_id).unwrap());
+        store.ensure_materialized(scan_id).unwrap();
+        assert!(
+            store.group_summaries(scan_id).unwrap().is_empty(),
+            "a scan with no duplicates must stay empty"
+        );
+    }
+
+    #[test]
+    fn verified_scan_with_zero_groups_is_not_resurrected() {
+        // --verify rejected every candidate group (record_file_results with an empty slice)
+        // while the raw hashes still match. Re-deriving from those hashes would hand the user
+        // back exactly the groups verification refused.
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_two_groups(&mut store);
+        store.record_file_results(scan_id, &[]).unwrap();
+        store.ensure_materialized(scan_id).unwrap();
+        assert!(
+            store.group_summaries(scan_id).unwrap().is_empty(),
+            "a read fallback must not resurrect a group rejected by verification"
+        );
+    }
+
+    #[test]
+    fn reopening_an_empty_result_does_not_recompute() {
+        // A duplicate pair added to the manifest AFTER the result was prepared must not appear
+        // — proof that opening does not re-aggregate the manifest.
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_no_duplicates(&mut store);
+        store.materialize_file_groups(scan_id).unwrap();
+        store
+            .record_files(scan_id, &[row("/x/p", 70, 7), row("/x/q", 70, 8)])
+            .unwrap();
+        let h = [7u8; 32];
+        store
+            .record_hashes(
+                scan_id,
+                &[(PathBuf::from("/x/p"), h), (PathBuf::from("/x/q"), h)],
+            )
+            .unwrap();
+        store.ensure_materialized(scan_id).unwrap();
+        assert!(
+            store.group_summaries(scan_id).unwrap().is_empty(),
+            "an already prepared result must not be recomputed"
+        );
+    }
+
+    #[test]
+    fn writer_prepares_legacy_result_once_observer_only_reads() {
+        // A scan finished before the marker existed: nothing recorded, flag unset.
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_two_groups(&mut store);
+        assert!(!store.results_materialized(scan_id).unwrap());
+        // The observer reads and sees the not-yet-prepared (empty) result — it writes nothing.
+        assert!(store.group_summaries(scan_id).unwrap().is_empty());
+        assert!(!store.results_materialized(scan_id).unwrap());
+        // The writer prepares it once.
+        store.ensure_materialized(scan_id).unwrap();
+        assert!(store.results_materialized(scan_id).unwrap());
+        let prepared = store.group_summaries(scan_id).unwrap();
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared[0].reclaim_bytes, 200);
+        // A second call changes nothing.
+        store.ensure_materialized(scan_id).unwrap();
+        assert_eq!(store.group_summaries(scan_id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn legacy_verified_empty_result_is_not_reaggregated() {
+        // The dangerous shape: a scan finished under --verify which rejected every candidate
+        // group, from before the marker existed. Raw hashes still match, file_group is empty and
+        // the marker defaults to 0 — only scan_stats.groups_found = 0 says the empty result is
+        // final. Aggregating here would hand back exactly what verification refused.
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_two_groups(&mut store);
+        store.set_status(scan_id, ScanStatus::Complete).unwrap();
+        // As the completed scan recorded it: files were scanned and hashed, and verification
+        // left zero groups behind.
+        store
+            .record_scan_result(
+                scan_id,
+                &ScanSummary {
+                    files_scanned: 6,
+                    bytes_hashed: 500,
+                    groups_found: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Migration default, as an upgraded legacy DB would have it.
+        store
+            .conn
+            .execute(
+                "UPDATE scan_stats SET results_materialized = 0 WHERE scan_id = ?1",
+                params![scan_id],
+            )
+            .unwrap();
+        store.ensure_materialized(scan_id).unwrap();
+        assert!(
+            store.group_summaries(scan_id).unwrap().is_empty(),
+            "writer preparation must not resurrect groups rejected by verification"
+        );
+        assert!(
+            store.results_materialized(scan_id).unwrap(),
+            "the empty result is now explicitly marked prepared"
+        );
+    }
+
+    #[test]
+    fn writer_prepares_every_unprepared_completed_scan() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let with_dupes = seed_two_groups(&mut store);
+        store.set_status(with_dupes, ScanStatus::Complete).unwrap();
+        let unfinished = seed_two_groups(&mut store);
+        store.set_status(unfinished, ScanStatus::Hashing).unwrap();
+        assert_eq!(
+            store.unprepared_completed_scans().unwrap(),
+            vec![with_dupes],
+            "only completed scans are prepared"
+        );
+        assert_eq!(store.prepare_completed_scans().unwrap(), 1);
+        assert!(store.results_materialized(with_dupes).unwrap());
+        assert_eq!(store.group_summaries(with_dupes).unwrap().len(), 2);
+        // Idempotent: nothing left to do on a second pass.
+        assert_eq!(store.prepare_completed_scans().unwrap(), 0);
+    }
+
+    #[test]
+    fn results_and_marker_commit_together() {
+        // The marker must never be observable without the rows it describes.
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_two_groups(&mut store);
+        store.materialize_file_groups(scan_id).unwrap();
+        assert!(store.results_materialized(scan_id).unwrap());
+        assert_eq!(store.group_summaries(scan_id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn legacy_recorded_result_is_kept_not_reaggregated() {
+        // Legacy scan WITH rows already recorded (possibly filtered by --verify): the writer
+        // marks it prepared instead of re-deriving it from raw hashes.
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_two_groups(&mut store);
+        let mut groups = store.duplicate_groups(scan_id).unwrap();
+        crate::model::duplicate::sort_groups_by_benefit(&mut groups);
+        groups.truncate(1); // verification dropped the smaller group
+        store.record_file_results(scan_id, &groups).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE scan_stats SET results_materialized = 0 WHERE scan_id = ?1",
+                params![scan_id],
+            )
+            .unwrap();
+        store.ensure_materialized(scan_id).unwrap();
+        assert_eq!(
+            store.group_summaries(scan_id).unwrap().len(),
+            1,
+            "the dropped group must not come back"
+        );
+    }
+
+    /// One scan, three files with distinct hashes — no duplicate groups.
+    fn seed_no_duplicates(store: &mut ScanStore) -> i64 {
+        let scan_id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store
+            .record_files(
+                scan_id,
+                &[row("/x/a", 10, 1), row("/x/b", 20, 2), row("/x/c", 30, 3)],
+            )
+            .unwrap();
+        store
+            .record_hashes(
+                scan_id,
+                &[
+                    (PathBuf::from("/x/a"), [1u8; 32]),
+                    (PathBuf::from("/x/b"), [2u8; 32]),
+                    (PathBuf::from("/x/c"), [3u8; 32]),
+                ],
+            )
+            .unwrap();
+        scan_id
+    }
+
+    /// Two duplicate groups (reclaim 200 and 50) plus one unique file.
+    fn seed_two_groups(store: &mut ScanStore) -> i64 {
+        let scan_id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store
+            .record_files(
+                scan_id,
+                &[
+                    row("/x/a", 100, 1),
+                    row("/x/b", 100, 2),
+                    row("/x/c", 100, 3),
+                    row("/x/d", 50, 4),
+                    row("/x/e", 50, 5),
+                    row("/x/u", 200, 6),
+                ],
+            )
+            .unwrap();
+        let (h1, h2, hu) = ([1u8; 32], [2u8; 32], [9u8; 32]);
+        store
+            .record_hashes(
+                scan_id,
+                &[
+                    (PathBuf::from("/x/a"), h1),
+                    (PathBuf::from("/x/b"), h1),
+                    (PathBuf::from("/x/c"), h1),
+                    (PathBuf::from("/x/d"), h2),
+                    (PathBuf::from("/x/e"), h2),
+                    (PathBuf::from("/x/u"), hu),
+                ],
+            )
+            .unwrap();
+        scan_id
     }
 
     #[test]
