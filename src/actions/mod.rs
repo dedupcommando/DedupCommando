@@ -85,6 +85,12 @@ impl ApplyShared {
 }
 
 /// Builds the list of planned actions from the marked files of the groups.
+///
+/// A target that is physically the SAME file as its keeper — already hardlinked, or literally
+/// the same path — is dropped. Such an action frees nothing (the content has one copy on disk
+/// either way), and for hardlink/reflink it would push the keeper's own data through the
+/// evacuate/publish cycle for no reason. Dropping a redundant *path* is a job for the file
+/// manager, not for a plan that reports freed bytes.
 pub fn plan_actions(groups: &[DuplicateGroup]) -> Vec<PlannedAction> {
     let mut plan = Vec::new();
     for group in groups {
@@ -94,6 +100,9 @@ pub fn plan_actions(groups: &[DuplicateGroup]) -> Vec<PlannedAction> {
         };
         for file in &group.files {
             if file.is_keeper {
+                continue;
+            }
+            if file.same_physical(keeper) {
                 continue;
             }
             if let Some(kind) = file.action {
@@ -730,6 +739,96 @@ mod tests {
         let from_ram = plan_actions(&groups);
         assert_eq!(from_ram.len(), 1);
         assert_eq!(from_ram[0].keeper, PathBuf::from("/x/a"));
+    }
+
+    /// A target already hardlinked to its keeper is dropped from the plan — by both builders.
+    /// Deleting it would free nothing while destroying a path; hardlink/reflink would run the
+    /// keeper's own data through evacuate/publish for nothing.
+    #[test]
+    fn a_target_physically_identical_to_the_keeper_is_dropped() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        // /x/link shares (device, inode) with the keeper /x/a — already the same physical file;
+        // /x/copy is a genuine separate copy.
+        store
+            .record_files(
+                scan_id,
+                &[
+                    mrow("/x/a", 100, 1),
+                    mrow("/x/link", 100, 1),
+                    mrow("/x/copy", 100, 2),
+                ],
+            )
+            .unwrap();
+        let h = [7u8; 32];
+        store
+            .record_hashes(
+                scan_id,
+                &[
+                    (PathBuf::from("/x/a"), h),
+                    (PathBuf::from("/x/link"), h),
+                    (PathBuf::from("/x/copy"), h),
+                ],
+            )
+            .unwrap();
+        store
+            .save_marks(
+                scan_id,
+                [
+                    mark("/x/a", true, None),
+                    mark("/x/link", false, Some(ActionKind::Delete)),
+                    mark("/x/copy", false, Some(ActionKind::Delete)),
+                ]
+                .iter(),
+            )
+            .unwrap();
+
+        let groups = store.duplicate_groups(scan_id).unwrap();
+        let from_ram = plan_actions(&groups);
+        let from_db = plan_actions_from_db(&store, scan_id).unwrap();
+        for (label, plan) in [("RAM", &from_ram), ("DB", &from_db)] {
+            assert_eq!(plan.len(), 1, "{label}: only the real copy is actionable");
+            assert_eq!(plan[0].target, PathBuf::from("/x/copy"), "{label}");
+        }
+    }
+
+    #[test]
+    fn hardlinking_onto_the_keeper_itself_is_dropped() {
+        // The same guard for hardlink, where acting would evacuate and republish the keeper's
+        // own data.
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store
+            .record_files(scan_id, &[mrow("/x/a", 100, 1), mrow("/x/link", 100, 1)])
+            .unwrap();
+        let h = [7u8; 32];
+        store
+            .record_hashes(
+                scan_id,
+                &[(PathBuf::from("/x/a"), h), (PathBuf::from("/x/link"), h)],
+            )
+            .unwrap();
+        store
+            .save_marks(
+                scan_id,
+                [
+                    mark("/x/a", true, None),
+                    mark("/x/link", false, Some(ActionKind::Hardlink)),
+                ]
+                .iter(),
+            )
+            .unwrap();
+
+        let groups = store.duplicate_groups(scan_id).unwrap();
+        assert!(plan_actions(&groups).is_empty(), "RAM plan must be empty");
+        assert!(
+            plan_actions_from_db(&store, scan_id).unwrap().is_empty(),
+            "DB plan must be empty"
+        );
     }
 
     // ---- F2: safe publication of hardlink/reflink via evacuation to quarantine ----

@@ -2167,8 +2167,10 @@ impl ScanStore {
         // preserved → the central test `plan_from_db_equals_plan_from_ram` is green.
 
         // 1. Keeper for each hash: the first by path among marked keepers with a hash.
+        // The inode comes along so a target that is already the keeper's own physical file can
+        // be dropped, exactly as `plan_actions` does.
         let mut keeper_stmt = self.conn.prepare(
-            "SELECT f.hash, f.path, f.device
+            "SELECT f.hash, f.path, f.device, f.inode
                FROM file_mark m
                JOIN file f ON f.scan_id = m.scan_id AND f.path = m.path
               WHERE m.scan_id = ?1 AND m.is_keeper = 1 AND f.hash IS NOT NULL
@@ -2179,19 +2181,20 @@ impl ScanStore {
                 row.get::<_, Vec<u8>>(0)?,
                 PathBuf::from(row.get::<_, String>(1)?),
                 row.get::<_, i64>(2)? as u64,
+                row.get::<_, i64>(3)? as u64,
             ))
         })?;
-        let mut keepers: std::collections::HashMap<Vec<u8>, (PathBuf, u64)> =
+        let mut keepers: std::collections::HashMap<Vec<u8>, (PathBuf, u64, u64)> =
             std::collections::HashMap::new();
         for row in keeper_rows {
-            let (hash, path, device) = row?;
+            let (hash, path, device, inode) = row?;
             // Queries by path → the first (minimal by path) wins.
-            keepers.entry(hash).or_insert((path, device));
+            keepers.entry(hash).or_insert((path, device, inode));
         }
 
         // 2. Targets: marked NON-keepers with an action and a known hash.
         let mut target_stmt = self.conn.prepare(
-            "SELECT f.path, f.size, f.device, f.hash, m.action
+            "SELECT f.path, f.size, f.device, f.hash, m.action, f.inode
                FROM file_mark m
                JOIN file f ON f.scan_id = m.scan_id AND f.path = m.path
               WHERE m.scan_id = ?1 AND m.is_keeper = 0 AND m.action IS NOT NULL
@@ -2205,15 +2208,20 @@ impl ScanStore {
                 row.get::<_, i64>(2)? as u64,
                 row.get::<_, Vec<u8>>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)? as u64,
             ))
         })?;
         let mut out = Vec::new();
         for row in target_rows {
-            let (target, size, target_device, hash, action) = row?;
+            let (target, size, target_device, hash, action, target_inode) = row?;
             // The group has no keeper → we do not touch the target (fail-safe, like plan_actions).
-            let Some((keeper, keeper_device)) = keepers.get(&hash) else {
+            let Some((keeper, keeper_device, keeper_inode)) = keepers.get(&hash) else {
                 continue;
             };
+            // Already the keeper's own physical file: the action would free nothing.
+            if target_device == *keeper_device && target_inode == *keeper_inode {
+                continue;
+            }
             out.push(PlannedActionRow {
                 action,
                 target,
