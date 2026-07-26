@@ -153,6 +153,11 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
         lock::Decision::Blocked => unreachable!("handled above"),
     };
 
+    // The role decided above is what makes read-only real: from here on every ScanStore::open in
+    // this process hands back a query_only connection, so an observer cannot write marks — or
+    // anything else — even through a path that forgot to ask.
+    state::set_observer_role(read_only);
+
     // Deferred auto-VACUUM: operator only, at startup (no scan running yet),
     // if config.json says it's time (default every 120 h, 0=off). In the background — a
     // VACUUM of a 5+ GB DB is noticeable; busy_timeout keeps it clear of the background
@@ -470,7 +475,9 @@ fn run_headless_scan(cli: &cli::Cli) -> Result<()> {
 /// The `--stats` mode: prints statistics for all scans (exportable data).
 fn run_stats(cli: &cli::Cli) -> Result<()> {
     let db_path = paths::checkpoint_db(cli);
-    let store = ScanStore::open(&db_path)?;
+    // Reporting only: never create a missing DB, flip WAL, migrate, or touch permissions —
+    // `--stats` may well run beside a live operator.
+    let store = ScanStore::open_read_only(&db_path)?;
 
     // DB state: file size + contents — shows where the space went and how
     // much --compact-db will return (trash purge + VACUUM).
@@ -798,10 +805,82 @@ mod purge_tests {
     }
 }
 
+/// `--stats` and `--export-csv` report on the checkpoint; they must never change it.
+#[cfg(test)]
+mod headless_readonly_tests {
+    use super::{cli, paths, run_export_csv, run_stats};
+    use crate::state::{schema, ScanStore};
+    use std::path::{Path, PathBuf};
+
+    fn temp_state_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("dedcom_hro_{tag}_{}_{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn cli_for(dir: &Path) -> cli::Cli {
+        cli::Cli {
+            state_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reporting_modes_do_not_create_a_missing_db() {
+        let dir = temp_state_dir("missing");
+        let cli = cli_for(&dir);
+        let db = paths::checkpoint_db(&cli);
+        assert!(!db.exists());
+
+        assert!(run_stats(&cli).is_err(), "--stats needs an existing DB");
+        assert!(!db.exists(), "--stats must not create dedcom.db");
+
+        let out = dir.join("export.csv");
+        assert!(run_export_csv(&cli, &out).is_err());
+        assert!(!db.exists(), "--export-csv must not create dedcom.db");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reporting_modes_refuse_an_old_schema_without_migrating_it() {
+        let dir = temp_state_dir("oldschema");
+        let cli = cli_for(&dir);
+        let db = paths::checkpoint_db(&cli);
+        drop(ScanStore::open_writable(&db).unwrap());
+        let old = schema::SCHEMA_VERSION - 1;
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.pragma_update(None, "user_version", old).unwrap();
+        }
+
+        let err = run_stats(&cli).unwrap_err().to_string();
+        assert!(
+            err.contains("older schema"),
+            "the reason must be plain, got: {err}"
+        );
+        assert!(run_export_csv(&cli, &dir.join("export.csv")).is_err());
+
+        let after: i64 = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, old, "a reporting mode must not migrate the DB");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 /// The `--export-csv` mode: exports the duplicate groups of the last scan to CSV.
 /// Works for an unfinished scan too — the already-hashed files are taken.
 fn run_export_csv(cli: &cli::Cli, out_path: &Path) -> Result<()> {
-    let store = ScanStore::open(&paths::checkpoint_db(cli))?;
+    // Export reads the checkpoint and writes only the CSV — same read-only contract as --stats.
+    let store = ScanStore::open_read_only(&paths::checkpoint_db(cli))?;
     let info = store
         .find_resumable()?
         .ok_or_else(|| AppError::msg("no saved scan"))?;

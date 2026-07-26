@@ -1073,7 +1073,7 @@ impl App {
     fn on_key_concurrency(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('r') | KeyCode::Char('R') => {
-                self.read_only = true;
+                self.set_read_only(true);
                 self.concurrency_prompt = None;
                 self.commander.status = "Observer mode: read-only".to_string();
             }
@@ -1082,24 +1082,31 @@ impl App {
                     match crate::lock::try_acquire(dir) {
                         Ok(crate::lock::Acquire::Operator(lock)) => {
                             self.instance_lock = Some(lock);
-                            self.read_only = false;
+                            self.set_read_only(false);
                             self.commander.status = "Operator role acquired".to_string();
                         }
                         _ => {
-                            self.read_only = false;
+                            self.set_read_only(false);
                             self.commander.status =
                                 "WARNING: operator by force — another instance is active"
                                     .to_string();
                         }
                     }
                 } else {
-                    self.read_only = false;
+                    self.set_read_only(false);
                 }
                 self.concurrency_prompt = None;
             }
             KeyCode::Esc => self.should_quit = true,
             _ => {}
         }
+    }
+
+    /// Switches the role. The store's process role moves with it, so the connections opened
+    /// afterwards match what the UI believes: the two must never drift apart.
+    fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+        crate::state::set_observer_role(read_only);
     }
 
     /// Gate for destructive operations in "read-only" mode. If
@@ -2247,6 +2254,11 @@ impl App {
 
     /// Marks the current file of the open group with an action (or clears it with `None`).
     fn browser_mark(&mut self, action: Option<ActionKind>) {
+        // Marks feed the operator's deletion plan, so an observer must not set them. The store
+        // would refuse the write anyway; this is the message that explains why.
+        if self.deny_if_read_only("marking files") {
+            return;
+        }
         if action == Some(ActionKind::Reflink) && !self.zfs.capabilities.reflink_safe {
             self.status =
                 "reflink unavailable — requires ZFS 2.3+ with block cloning enabled".to_string();
@@ -2283,6 +2295,9 @@ impl App {
 
     /// Makes the current file the keeper of the open group.
     fn browser_set_keeper(&mut self) {
+        if self.deny_if_read_only("choosing a keeper") {
+            return;
+        }
         let Some((_, file_index)) = self.current_group_file() else {
             return;
         };
@@ -2304,6 +2319,9 @@ impl App {
     /// Streams groups from the DB (per group — `group_files`), writes marks
     /// in batches (~500 groups/transaction), without holding the whole scan in RAM.
     fn browser_auto(&mut self) {
+        if self.deny_if_read_only("auto-select") {
+            return;
+        }
         let Some(scan_id) = self.current_scan_id else {
             return;
         };

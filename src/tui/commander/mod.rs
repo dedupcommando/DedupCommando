@@ -1933,6 +1933,10 @@ fn resolve_dir_group(app: &App, i: usize) -> Option<DirGroup> {
 
 /// Sets the mark `mark` on the file under the active panel's cursor.
 fn mark_cursor(app: &mut App, mark: Mark) {
+    // Marks are what the operator's deletion plan is built from — an observer must not set them.
+    if app.deny_if_read_only("marking files") {
+        return;
+    }
     if mark == Mark::Reflink && !app.zfs.capabilities.reflink_safe {
         app.commander.status =
             "reflink unavailable — needs ZFS 2.3+ with block cloning enabled".to_string();
@@ -1954,6 +1958,10 @@ fn mark_cursor(app: &mut App, mark: Mark) {
 /// Space: removes the mark from the entry under the cursor or sets «selected» (a file or
 /// directory — for triage; `..` is not selected).
 fn toggle_mark_cursor(app: &mut App) {
+    // Space clears an action mark or sets «selected» — the first of those is a persisted write.
+    if app.deny_if_read_only("marking files") {
+        return;
+    }
     let panel = app.commander.active_panel_mut();
     let entry = match panel.selected() {
         Some(entry) if matches!(entry.kind, EntryKind::File | EntryKind::Dir) => entry.clone(),
