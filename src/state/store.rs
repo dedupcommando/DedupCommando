@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 
 use crate::error::{AppError, Result};
 use crate::model::action::{ActionKind, MoveEvent};
@@ -144,9 +145,56 @@ pub struct ScanStore {
     conn: Connection,
 }
 
+/// Process role. `false` — operator (may write), `true` — observer.
+///
+/// Held here, next to the only place that opens the DB, on purpose. The read-only guarantee has
+/// to hold for every one of the ~25 places that open a store — including ones added later — so
+/// it cannot be a checklist at the call sites; that is exactly the failure this replaces.
+static OBSERVER_ROLE: AtomicBool = AtomicBool::new(false);
+
+/// Declares the process an observer (or an operator again). Called once from the startup role
+/// decision, and again if the user takes the operator role in the concurrency overlay.
+pub fn set_observer_role(observer: bool) {
+    OBSERVER_ROLE.store(observer, Ordering::SeqCst);
+}
+
+/// Whether this process is an observer and must not write to the DB.
+pub fn is_observer_role() -> bool {
+    OBSERVER_ROLE.load(Ordering::SeqCst)
+}
+
 impl ScanStore {
-    /// Opens (creates) the DB, enables WAL, applies the schema.
+    /// Opens the DB for the process role: an observer gets a genuinely read-only connection,
+    /// an operator the usual read-write one.
     pub fn open(db_path: &Path) -> Result<Self> {
+        if is_observer_role() {
+            return Self::open_read_only(db_path);
+        }
+        Self::open_writable(db_path)
+    }
+
+    /// Read-only connection for an observer: `SQLITE_OPEN_READ_ONLY` (which also refuses to
+    /// CREATE the file — an observer on a clean state-dir must not conjure a dedcom.db) plus
+    /// `PRAGMA query_only`, so SQLite itself rejects any write. Deliberately does none of the
+    /// operator's setup: no WAL flip, no migration, no chmod — all of them write.
+    pub fn open_read_only(db_path: &Path) -> Result<Self> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(db_path, flags).map_err(|err| {
+            AppError::msg(format!(
+                "cannot open dedcom.db read-only ({}): {err}",
+                crate::textsan::terminal(&db_path.display().to_string())
+            ))
+        })?;
+        conn.execute_batch("PRAGMA busy_timeout=5000;\nPRAGMA query_only=1;")?;
+        schema::ensure_version_supported(&conn)?;
+        // Migrating needs a writer, so an out-of-date DB is reported here rather than as a
+        // «no such column» from some query later on.
+        schema::ensure_migrated(&conn)?;
+        Ok(Self { conn })
+    }
+
+    /// Opens (creates) the DB, enables WAL, applies the schema.
+    pub fn open_writable(db_path: &Path) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
             // store::open is also called by read-only modes (--stats/--export-csv) WITHOUT the entry-point
             // establish — so we protect the chain here ourselves (no-follow, 0700, fail-closed),
@@ -4127,6 +4175,164 @@ mod tests {
         }
     }
 
+    /// Serialises everything that touches the process role or a file-backed store. The role is
+    /// process-wide by design, so a test that flips it would otherwise hand a read-only
+    /// connection to a test running in parallel.
+    static ROLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn role_guard() -> std::sync::MutexGuard<'static, ()> {
+        // A panicking test poisons the lock; that must not cascade into unrelated failures.
+        ROLE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Restores the operator role no matter how the test ends.
+    struct RoleReset;
+    impl Drop for RoleReset {
+        fn drop(&mut self) {
+            set_observer_role(false);
+        }
+    }
+
+    #[test]
+    fn read_only_open_refuses_to_create_a_missing_db() {
+        // An observer on a clean state-dir must not conjure a dedcom.db.
+        let dir = temp_state_dir("ro_missing");
+        let db = dir.join("dedcom.db");
+        assert!(ScanStore::open_read_only(&db).is_err());
+        assert!(!db.exists(), "read-only open must not create the DB file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_only_store_reads_but_rejects_writes() {
+        let _role = role_guard();
+        let dir = temp_state_dir("ro_writes");
+        let db = dir.join("dedcom.db");
+        let scan_id = {
+            let mut store = ScanStore::open_writable(&db).unwrap();
+            let id = store
+                .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank/a")]))
+                .unwrap();
+            store.set_status(id, ScanStatus::Complete).unwrap();
+            id
+        };
+        let mut observer = ScanStore::open_read_only(&db).unwrap();
+        // Reading works.
+        let scans = observer.list_scans().unwrap();
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].scan_id, scan_id);
+        // Every write is refused by SQLite itself, not by a check we remembered to write.
+        assert!(observer
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank/b")]))
+            .is_err());
+        assert!(observer.set_status(scan_id, ScanStatus::Aborted).is_err());
+        assert!(observer.trash_scan(scan_id).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn observer_role_routes_open_to_a_read_only_store() {
+        let _role = role_guard();
+        let _reset = RoleReset;
+        let dir = temp_state_dir("ro_role");
+        let db = dir.join("dedcom.db");
+        {
+            let mut store = ScanStore::open_writable(&db).unwrap();
+            store
+                .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank/a")]))
+                .unwrap();
+        }
+        // As an observer, the ordinary open() must hand back a store that cannot write.
+        set_observer_role(true);
+        assert!(is_observer_role());
+        let mut store = ScanStore::open(&db).unwrap();
+        assert_eq!(store.list_scans().unwrap().len(), 1);
+        assert!(store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank/b")]))
+            .is_err());
+        drop(store);
+        // Back as the operator, the same call writes again.
+        set_observer_role(false);
+        let mut store = ScanStore::open(&db).unwrap();
+        assert!(store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank/b")]))
+            .is_ok());
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn observer_cannot_mark_while_the_operator_holds_the_db_open() {
+        // The shape the finding is about: an observer next to a LIVE operator must not get a
+        // mark into the table the operator's deletion plan is built from.
+        let dir = temp_state_dir("ro_concurrent");
+        let db = dir.join("dedcom.db");
+        let mut operator = ScanStore::open_writable(&db).unwrap();
+        let scan_id = operator
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank/a")]))
+            .unwrap();
+        operator
+            .record_files(scan_id, &[row("/tank/a/one", 100, 1)])
+            .unwrap();
+        operator.set_status(scan_id, ScanStatus::Complete).unwrap();
+
+        // The operator's store stays open for the whole test.
+        let mut observer = ScanStore::open_read_only(&db).unwrap();
+        assert_eq!(
+            observer.list_scans().unwrap().len(),
+            1,
+            "the observer still reads"
+        );
+
+        let marked = FileEntry {
+            path: PathBuf::from("/tank/a/one"),
+            size: 100,
+            mtime: 1,
+            device: 1,
+            inode: 1,
+            is_keeper: false,
+            action: Some(ActionKind::Delete),
+        };
+        assert!(
+            observer.save_marks(scan_id, [&marked].into_iter()).is_err(),
+            "an observer must not be able to save marks"
+        );
+        let marks: i64 = operator
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_mark WHERE scan_id = ?1",
+                params![scan_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marks, 0, "file_mark must be unchanged after the attempt");
+        // The operator itself still writes.
+        assert!(operator.save_marks(scan_id, [&marked].into_iter()).is_ok());
+
+        drop(observer);
+        drop(operator);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_only_refuses_a_db_that_needs_migrating() {
+        let _role = role_guard();
+        let dir = temp_state_dir("ro_oldschema");
+        let db = dir.join("dedcom.db");
+        drop(ScanStore::open_writable(&db).unwrap());
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.pragma_update(None, "user_version", schema::SCHEMA_VERSION - 1)
+                .unwrap();
+        }
+        // Migrating needs a writer, so this is reported plainly instead of surfacing later as
+        // «no such column» from some query.
+        assert!(ScanStore::open_read_only(&db).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn temp_state_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4142,6 +4348,7 @@ mod tests {
     fn open_sets_db_and_sidecars_0600() {
         // The DB file and WAL/SHM — 0600 (contents = paths of all files in the pool).
         use std::os::unix::fs::PermissionsExt;
+        let _role = role_guard();
         let dir = temp_state_dir("mode");
         let db = dir.join("dedcom.db");
         let _store = ScanStore::open(&db).unwrap();
@@ -4213,6 +4420,7 @@ mod tests {
 
     #[test]
     fn open_refuses_db_from_a_newer_schema() {
+        let _role = role_guard();
         let dir = temp_state_dir("future_ver");
         let db = dir.join("dedcom.db");
         drop(ScanStore::open(&db).unwrap());
@@ -4230,6 +4438,7 @@ mod tests {
 
     #[test]
     fn open_stamps_a_legacy_versionless_db_and_keeps_data() {
+        let _role = role_guard();
         let dir = temp_state_dir("legacy_ver");
         let db = dir.join("dedcom.db");
         let scan_id = {
@@ -4262,6 +4471,7 @@ mod tests {
     #[test]
     fn open_rejects_symlinked_db() {
         // Opening via a symlink would write the target outside the state-dir — refused (O_NOFOLLOW).
+        let _role = role_guard();
         let dir = temp_state_dir("symlink");
         let real = dir.join("real-target.db");
         std::fs::File::create(&real).unwrap();

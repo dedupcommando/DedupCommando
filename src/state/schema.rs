@@ -141,6 +141,19 @@ pub fn ensure_version_supported(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Refuses a DB older than this build when we cannot migrate it. Migration needs a writer, and
+/// an observer holding a read-only connection would otherwise fail later, deep inside a query,
+/// with «no such column».
+pub fn ensure_migrated(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < SCHEMA_VERSION {
+        return Err(AppError::msg(format!(
+            "dedcom.db uses an older schema (v{version}; this build needs v{SCHEMA_VERSION}) and read-only mode cannot upgrade it. Start dedcom once as the operator."
+        )));
+    }
+    Ok(())
+}
+
 pub fn migrate(conn: &Connection) -> Result<()> {
     // The migration is transactional and idempotent — either it all applies,
     // or the DB stays in its previous state (no half-added columns).

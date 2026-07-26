@@ -5,4 +5,6 @@ pub mod schema;
 pub mod store;
 
 pub use host_profile::HostProfile;
-pub use store::{DedupRow, DirGroupSummary, GroupSummary, ManifestRow, ScanStore};
+pub use store::{
+    set_observer_role, DedupRow, DirGroupSummary, GroupSummary, ManifestRow, ScanStore,
+};
