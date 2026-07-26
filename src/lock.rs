@@ -49,6 +49,20 @@ pub enum Acquire {
     Busy(Option<Holder>),
 }
 
+/// What an acquire attempt established about the lock. `Busy` and `Unknown` must stay apart:
+/// «somebody holds it» is a known state we have a policy for, while «flock could not be
+/// evaluated» (ENOLCK on a network filesystem without lockd, EPERM, a read-only filesystem)
+/// tells us nothing at all — including whether an operator is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockState {
+    /// The lock is ours.
+    Held,
+    /// Another live process holds it.
+    Busy,
+    /// The lock could not be evaluated.
+    Unknown,
+}
+
 /// The behavior policy when the lock is held (`<state_dir>/config.json`,
 /// the `concurrency` field). Overridden by the `--read-only`/`--force` CLI flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -177,25 +191,41 @@ pub fn load_policy(state_dir: &Path) -> ConcurrencyPolicy {
 /// The pure role decision from the acquire outcome, the policy, and the CLI flags.
 /// `--read-only` and `--force` are the highest-priority overrides.
 pub fn decide(
-    busy: bool,
+    state: LockState,
     policy: ConcurrencyPolicy,
     cli_read_only: bool,
     cli_force: bool,
 ) -> Decision {
+    // Observing is safe whatever the lock says — an observer gets a query_only connection.
     if cli_read_only {
         return Decision::ReadOnly;
     }
-    if !busy {
-        return Decision::Operator;
-    }
-    if cli_force {
-        return Decision::Operator; // forcibly, without the lock
-    }
-    match policy {
-        ConcurrencyPolicy::Allow => Decision::Operator,
-        ConcurrencyPolicy::ReadOnly => Decision::ReadOnly,
-        ConcurrencyPolicy::Block => Decision::Blocked,
-        ConcurrencyPolicy::Ask => Decision::Ask,
+    match state {
+        LockState::Held => Decision::Operator,
+        // Fail closed. An unevaluable lock means we cannot tell whether an operator is
+        // already running, and becoming a second one is precisely what the lock exists to
+        // prevent — on a network filesystem without lockd every host would land here and all
+        // of them would start writing. Only the explicit `--force` proceeds: the `allow`
+        // policy deliberately does NOT, or a config file could quietly reinstate the very
+        // fail-open this replaces.
+        LockState::Unknown => {
+            if cli_force {
+                Decision::Operator
+            } else {
+                Decision::Blocked
+            }
+        }
+        LockState::Busy => {
+            if cli_force {
+                return Decision::Operator; // forcibly, without the lock
+            }
+            match policy {
+                ConcurrencyPolicy::Allow => Decision::Operator,
+                ConcurrencyPolicy::ReadOnly => Decision::ReadOnly,
+                ConcurrencyPolicy::Block => Decision::Blocked,
+                ConcurrencyPolicy::Ask => Decision::Ask,
+            }
+        }
     }
 }
 
@@ -204,12 +234,12 @@ pub fn decide(
 /// → proceed (holding the guard, or without it under `--force`/`Allow`); otherwise
 /// refuse.
 pub fn decide_headless(
-    busy: bool,
+    state: LockState,
     policy: ConcurrencyPolicy,
     cli_read_only: bool,
     cli_force: bool,
 ) -> Decision {
-    match decide(busy, policy, cli_read_only, cli_force) {
+    match decide(state, policy, cli_read_only, cli_force) {
         Decision::Ask => Decision::Blocked,
         other => other,
     }
@@ -253,7 +283,7 @@ mod tests {
     #[test]
     fn free_lock_becomes_operator() {
         assert_eq!(
-            decide(false, ConcurrencyPolicy::Ask, false, false),
+            decide(LockState::Held, ConcurrencyPolicy::Ask, false, false),
             Decision::Operator
         );
     }
@@ -261,7 +291,7 @@ mod tests {
     #[test]
     fn read_only_flag_forces_readonly_even_when_free() {
         assert_eq!(
-            decide(false, ConcurrencyPolicy::Ask, true, false),
+            decide(LockState::Held, ConcurrencyPolicy::Ask, true, false),
             Decision::ReadOnly
         );
     }
@@ -269,7 +299,7 @@ mod tests {
     #[test]
     fn busy_default_policy_asks() {
         assert_eq!(
-            decide(true, ConcurrencyPolicy::Ask, false, false),
+            decide(LockState::Busy, ConcurrencyPolicy::Ask, false, false),
             Decision::Ask
         );
     }
@@ -277,7 +307,7 @@ mod tests {
     #[test]
     fn busy_readonly_policy_is_readonly() {
         assert_eq!(
-            decide(true, ConcurrencyPolicy::ReadOnly, false, false),
+            decide(LockState::Busy, ConcurrencyPolicy::ReadOnly, false, false),
             Decision::ReadOnly
         );
     }
@@ -285,7 +315,7 @@ mod tests {
     #[test]
     fn busy_block_policy_blocks() {
         assert_eq!(
-            decide(true, ConcurrencyPolicy::Block, false, false),
+            decide(LockState::Busy, ConcurrencyPolicy::Block, false, false),
             Decision::Blocked
         );
     }
@@ -293,7 +323,7 @@ mod tests {
     #[test]
     fn busy_allow_policy_is_operator() {
         assert_eq!(
-            decide(true, ConcurrencyPolicy::Allow, false, false),
+            decide(LockState::Busy, ConcurrencyPolicy::Allow, false, false),
             Decision::Operator
         );
     }
@@ -301,8 +331,43 @@ mod tests {
     #[test]
     fn busy_force_flag_overrides_to_operator() {
         assert_eq!(
-            decide(true, ConcurrencyPolicy::Block, false, true),
+            decide(LockState::Busy, ConcurrencyPolicy::Block, false, true),
             Decision::Operator
+        );
+    }
+
+    #[test]
+    fn unevaluable_lock_blocks_under_every_policy() {
+        // The NFS-without-lockd case: we cannot tell whether an operator is running, so we do
+        // not become one. Previously this path silently returned Operator.
+        for policy in [
+            ConcurrencyPolicy::Ask,
+            ConcurrencyPolicy::ReadOnly,
+            ConcurrencyPolicy::Block,
+            ConcurrencyPolicy::Allow,
+        ] {
+            assert_eq!(
+                decide(LockState::Unknown, policy, false, false),
+                Decision::Blocked,
+                "an unevaluable lock must fail closed under {policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unevaluable_lock_yields_only_to_the_force_flag() {
+        assert_eq!(
+            decide(LockState::Unknown, ConcurrencyPolicy::Ask, false, true),
+            Decision::Operator
+        );
+    }
+
+    #[test]
+    fn unevaluable_lock_still_allows_observing() {
+        // An observer writes nothing, so it is safe even with no working lock.
+        assert_eq!(
+            decide(LockState::Unknown, ConcurrencyPolicy::Ask, true, false),
+            Decision::ReadOnly
         );
     }
 
@@ -324,7 +389,7 @@ mod tests {
         // No UI to ask with — `ask` with the lock held = block, not a silent
         // entry (otherwise headless would proceed without confirmation).
         assert_eq!(
-            decide_headless(true, ConcurrencyPolicy::Ask, false, false),
+            decide_headless(LockState::Busy, ConcurrencyPolicy::Ask, false, false),
             Decision::Blocked
         );
     }
@@ -334,16 +399,30 @@ mod tests {
         // Everything except Ask passes through as in `decide`: free → operator;
         // force when held → operator; read-only → readonly.
         assert_eq!(
-            decide_headless(false, ConcurrencyPolicy::Ask, false, false),
+            decide_headless(LockState::Held, ConcurrencyPolicy::Ask, false, false),
             Decision::Operator
         );
         assert_eq!(
-            decide_headless(true, ConcurrencyPolicy::Block, false, true),
+            decide_headless(LockState::Busy, ConcurrencyPolicy::Block, false, true),
             Decision::Operator
         );
         assert_eq!(
-            decide_headless(true, ConcurrencyPolicy::ReadOnly, false, false),
+            decide_headless(LockState::Busy, ConcurrencyPolicy::ReadOnly, false, false),
             Decision::ReadOnly
+        );
+    }
+
+    #[test]
+    fn headless_unevaluable_lock_blocks_the_write() {
+        // The destructive headless modes (--scan / --compact-db / --purge-quarantine) used to
+        // proceed with no lock at all when flock could not be evaluated.
+        assert_eq!(
+            decide_headless(LockState::Unknown, ConcurrencyPolicy::Allow, false, false),
+            Decision::Blocked
+        );
+        assert_eq!(
+            decide_headless(LockState::Unknown, ConcurrencyPolicy::Ask, false, true),
+            Decision::Operator
         );
     }
 }

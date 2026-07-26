@@ -122,17 +122,29 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
 
     // Single-instance lock: acquiring the advisory flock = the OPERATOR role;
     // held by another live instance → the role is decided by the policy + CLI flags.
-    let (busy, holder, mut lock_to_hold) = match lock::try_acquire(&state_dir) {
-        Ok(lock::Acquire::Operator(guard)) => (false, None, Some(guard)),
-        Ok(lock::Acquire::Busy(h)) => (true, h, None),
+    let (lock_state, holder, mut lock_to_hold) = match lock::try_acquire(&state_dir) {
+        Ok(lock::Acquire::Operator(guard)) => (lock::LockState::Held, None, Some(guard)),
+        Ok(lock::Acquire::Busy(h)) => (lock::LockState::Busy, h, None),
         Err(err) => {
-            tracing::warn!("single-instance lock unavailable ({err}); continuing as operator");
-            (false, None, None)
+            // NOT «continue as operator»: we have no idea whether one is already running.
+            tracing::warn!("single-instance lock could not be evaluated: {err}");
+            (lock::LockState::Unknown, None, None)
         }
     };
     let policy = lock::load_policy(&state_dir);
-    let decision = lock::decide(busy, policy, cli.read_only, cli.force);
+    let decision = lock::decide(lock_state, policy, cli.read_only, cli.force);
     if matches!(decision, lock::Decision::Blocked) {
+        if lock_state == lock::LockState::Unknown {
+            eprintln!(
+                "dedcom: cannot verify the single-instance lock in {}.\n\
+                 Refusing to start as the operator: two operators on one state can apply\n\
+                 destructive plans at the same time. A network filesystem without lockd cannot\n\
+                 provide the lock — put the state directory on local storage (--state-dir),\n\
+                 run with --read-only to observe, or with --force to proceed anyway.",
+                textsan::terminal(&state_dir.display().to_string())
+            );
+            return Ok(());
+        }
         let who = holder
             .map(|h| format!(" (PID {}, since {})", h.pid, h.since))
             .unwrap_or_default();
@@ -329,25 +341,34 @@ fn wants_commander(cli: &cli::Cli) -> bool {
 
 /// Acquires the single-instance lock for headless modes that WRITE to the DB/FS
 /// (`--scan`/`--compact-db`/`--purge-quarantine`), so there is no concurrent write
-/// (including with a running TUI operator). `Ok(Some(guard))` — hold until the end of the
-/// operation; `Ok(None)` — `--force`/the `allow` policy / flock unavailable. Held and without
-/// `--force` (or `--read-only` given) → `Err` (exit 1). No UI — the `ask` policy collapses to
-/// `block`. Read-only modes (`--stats`, `--export-csv`) do not write and do not take the lock.
+/// (including with a running TUI operator). `Ok(Some(guard))` — the lock is ours, hold it until
+/// the end of the operation; `Ok(None)` — proceeding deliberately without one, which now means
+/// only `--force`, or the `allow` policy against a *known* holder. Everything else is an `Err`
+/// (exit 1): a holder without `--force`, `--read-only`, and a lock that could not be evaluated
+/// at all. No UI — the `ask` policy collapses to `block`. Read-only modes (`--stats`,
+/// `--export-csv`) do not write and do not take the lock.
 fn acquire_write_lock(cli: &cli::Cli) -> Result<Option<lock::InstanceLock>> {
     let state_dir = paths::state_dir(cli);
     // Write mode: state-dir 0700 + a check of the whole chain, fail-closed.
     paths::establish_state_dir(&state_dir)?;
-    let (busy, holder, guard) = match lock::try_acquire(&state_dir) {
-        Ok(lock::Acquire::Operator(g)) => (false, None, Some(g)),
-        Ok(lock::Acquire::Busy(h)) => (true, h, None),
+    let (lock_state, holder, guard) = match lock::try_acquire(&state_dir) {
+        Ok(lock::Acquire::Operator(g)) => (lock::LockState::Held, None, Some(g)),
+        Ok(lock::Acquire::Busy(h)) => (lock::LockState::Busy, h, None),
         Err(err) => {
-            tracing::warn!("single-instance lock unavailable ({err}); continuing without it");
-            return Ok(None);
+            // Used to return Ok(None) — the write then proceeded with no lock whatsoever.
+            tracing::warn!("single-instance lock could not be evaluated: {err}");
+            (lock::LockState::Unknown, None, None)
         }
     };
     let policy = lock::load_policy(&state_dir);
-    match lock::decide_headless(busy, policy, cli.read_only, cli.force) {
+    match lock::decide_headless(lock_state, policy, cli.read_only, cli.force) {
         lock::Decision::Operator => Ok(guard),
+        _ if lock_state == lock::LockState::Unknown => Err(AppError::msg(format!(
+            "write cancelled: cannot verify the single-instance lock in {} — \
+             put the state directory on local storage (a network filesystem without lockd \
+             cannot provide the lock), or retry with --force",
+            textsan::terminal(&state_dir.display().to_string())
+        ))),
         _ => {
             let who = holder
                 .map(|h| format!(" (PID {}, since {})", h.pid, h.since))
@@ -802,6 +823,81 @@ mod purge_tests {
         );
         assert!(report.errors.is_empty());
         std::fs::remove_dir_all(&base).ok();
+    }
+}
+
+/// The headless write path itself, not just the pure decision: this is where an unevaluable
+/// lock used to turn into `Ok(None)` and let the write proceed unlocked.
+#[cfg(test)]
+mod acquire_write_lock_tests {
+    use super::{acquire_write_lock, cli};
+    use std::path::{Path, PathBuf};
+
+    fn temp_state_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("dedcom_awl_{tag}_{}_{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn cli_for(dir: &Path, force: bool) -> cli::Cli {
+        cli::Cli {
+            state_dir: Some(dir.to_path_buf()),
+            force,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unevaluable_lock_refuses_the_write_even_with_allow_policy() {
+        let dir = temp_state_dir("unevaluable");
+        // A directory where the lock file belongs: opening it read-write fails with EISDIR, so
+        // try_acquire returns Err — the same shape as ENOLCK on a filesystem without lockd.
+        std::fs::create_dir_all(dir.join("dedcom.lock")).unwrap();
+        // The most permissive policy there is must not buy a way past it.
+        std::fs::write(dir.join("config.json"), br#"{"concurrency":"allow"}"#).unwrap();
+
+        // `match` rather than expect_err: the Ok side holds a lock guard, which is not Debug.
+        let err = match acquire_write_lock(&cli_for(&dir, false)) {
+            Ok(_) => panic!("an unevaluable lock must refuse the write"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains(&dir.display().to_string()),
+            "the message must name the state directory, got: {err}"
+        );
+        assert!(
+            err.contains("--force"),
+            "the message must offer --force, got: {err}"
+        );
+
+        // --force is the one documented way through, and it holds no guard.
+        let forced = match acquire_write_lock(&cli_for(&dir, true)) {
+            Ok(guard) => guard,
+            Err(err) => panic!("--force must proceed, got: {err}"),
+        };
+        assert!(
+            forced.is_none(),
+            "there is no lock to hold when flock cannot be evaluated"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_free_lock_is_acquired_and_held() {
+        let dir = temp_state_dir("free");
+        let guard = match acquire_write_lock(&cli_for(&dir, false)) {
+            Ok(guard) => guard,
+            Err(err) => panic!("a free lock must be acquired, got: {err}"),
+        };
+        assert!(guard.is_some(), "the guard must be held for the write");
+        drop(guard);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
