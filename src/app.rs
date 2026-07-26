@@ -616,11 +616,19 @@ impl App {
                     Err(err) => format!("Failed to purge scan: {err}"),
                 };
             }
-            AppEvent::ResultsLoaded(scan_id, summaries, summary) => {
+            AppEvent::ResultsLoaded(scan_id, summaries, summary, prepared) => {
                 // Opened a completed scan as a LIST of results. Browser is
                 // a wizard screen, so we switch mode (relevant for entry from F2).
                 self.mode = AppMode::Wizard;
                 self.show_results(scan_id, summaries, summary);
+                if !prepared {
+                    // An observer cannot prepare results, and an empty list here would read as
+                    // «no duplicates found» — say plainly that nothing has been prepared yet.
+                    self.status = "Results of this scan are not prepared yet — open it as the \
+                                   operator (without --read-only) to prepare them"
+                        .to_string();
+                    self.commander.status = self.status.clone();
+                }
             }
             AppEvent::CommanderResumeProbe {
                 roots,
@@ -1584,19 +1592,28 @@ impl App {
         self.opening_started = Some(std::time::Instant::now());
         let db_path = self.db_path.clone();
         let events = self.events.clone();
+        let read_only = self.read_only;
         std::thread::spawn(move || {
-            let (summaries, summary) = match ScanStore::open(&db_path) {
+            let (summaries, summary, prepared) = match ScanStore::open(&db_path) {
                 Ok(mut store) => {
-                    // Materialize file_group once, if it doesn't exist yet (scan completed
-                    // previously), then read the lightweight summaries — without groups in RAM.
-                    let _ = store.ensure_materialized(scan_id);
+                    // Preparing the results is a WRITE, so only the operator does it, once per
+                    // scan. Reading them is then a pure read — an observer never writes and never
+                    // re-aggregates the manifest.
+                    if !read_only {
+                        if let Err(err) = store.ensure_materialized(scan_id) {
+                            tracing::warn!(scan_id, %err, "preparing the finished scan failed");
+                        }
+                    }
+                    let prepared = store.results_materialized(scan_id).unwrap_or(false);
                     let summaries = store.group_summaries(scan_id).unwrap_or_default();
                     let summary = store.scan_summary(scan_id).unwrap_or_default();
-                    (summaries, summary)
+                    (summaries, summary, prepared)
                 }
-                Err(_) => (Vec::new(), ScanSummary::default()),
+                Err(_) => (Vec::new(), ScanSummary::default(), false),
             };
-            let _ = events.send(AppEvent::ResultsLoaded(scan_id, summaries, summary));
+            let _ = events.send(AppEvent::ResultsLoaded(
+                scan_id, summaries, summary, prepared,
+            ));
         });
     }
 

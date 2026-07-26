@@ -166,6 +166,20 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
         });
     }
 
+    // Results are prepared by the WRITER: the operator brings every completed scan that predates
+    // the marker up to date at startup, so an observer only ever reads. In the background —
+    // aggregating an old multi-million-row manifest is not instant.
+    if !read_only {
+        let db_path = db_path.clone();
+        std::thread::spawn(move || {
+            match ScanStore::open(&db_path).and_then(|mut store| store.prepare_completed_scans()) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("prepared results of {n} completed scan(s)"),
+                Err(err) => tracing::warn!("preparing completed scans failed: {err}"),
+            }
+        });
+    }
+
     let commander = wants_commander(cli);
 
     let (tx, rx) = tui::event::channel();

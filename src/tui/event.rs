@@ -51,9 +51,11 @@ pub enum AppEvent {
     /// multi-index DELETE by `file` ran in the background so as not to hang the UI.
     SessionDeleted(std::result::Result<i64, String>),
     /// A finished scan's ready result, loaded in the background: opening
-    /// without rescanning. `(scan_id, group summaries, scan summary)`. Carries
-    /// lightweight `GroupSummary`, not all `DuplicateGroup` (RAM paging).
-    ResultsLoaded(i64, Vec<GroupSummary>, ScanSummary),
+    /// without rescanning. `(scan_id, group summaries, scan summary, results prepared)`. Carries
+    /// lightweight `GroupSummary`, not all `DuplicateGroup` (RAM paging). The last flag is false
+    /// when the writer has not prepared this scan yet — the empty list then means «unknown», not
+    /// «no duplicates», and must not be shown as a result.
+    ResultsLoaded(i64, Vec<GroupSummary>, ScanSummary, bool),
     /// Background session probe for F2: unfinished + the last Complete of the same
     /// roots — F2 gives an instant response, while the heavy `list_scans` runs in the background.
     CommanderResumeProbe {
