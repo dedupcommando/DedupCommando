@@ -21,6 +21,7 @@ mod model;
 mod paths;
 mod pipeline;
 mod scan;
+mod signals;
 mod state;
 mod sysmon;
 mod textsan;
@@ -28,8 +29,6 @@ mod tui;
 mod zfs;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 use std::time::Duration;
 
 use ratatui::crossterm::event::KeyCode;
@@ -85,6 +84,11 @@ fn main() {
     let _log_guards = logging::init(&paths::log_file(&cli), &paths::bench_file(&cli));
     tracing::info!("dedcom v{} starting", version());
 
+    // Signal handlers are installed per mode, NOT here: a mode that catches a signal without
+    // checking the cancel flag would simply swallow it and become unkillable by SIGTERM.
+    // `--compact-db` and `--purge-quarantine` have no cancellation of their own, so they keep
+    // the default disposition and die promptly, as before.
+
     // Headless modes that write to the DB/FS hold the single-instance lock for the duration:
     // otherwise a write race with a second process or with a running TUI operator.
     // Read-only modes (--stats/--export-csv) do not take the lock. The guard (_lock) lives
@@ -112,6 +116,9 @@ fn main() {
 
 /// Interactive mode: the TUI with a background scan worker.
 fn run_tui(cli: &cli::Cli) -> Result<()> {
+    // The event loop checks for an arrived signal every iteration and turns it into the same
+    // cancellation Esc uses, so catching them here does not swallow them.
+    signals::install();
     let db_path = paths::checkpoint_db(cli);
     let state_dir = paths::state_dir(cli);
     // The state directory may not exist on the first run — we create it ahead at 0700
@@ -314,6 +321,11 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
     );
 
     while !app.should_quit {
+        // A signal arrived: arm the same cancellation Esc uses and leave once the current action
+        // is done. A second signal means the operator has stopped waiting.
+        if signals::requested() {
+            app.request_shutdown(signals::count() > 1);
+        }
         app.tick = app.tick.wrapping_add(1);
         // Resource sampling before the frame — self-throttles by interval.
         app.resource.sample();
@@ -413,7 +425,11 @@ fn run_headless_scan(cli: &cli::Cli) -> Result<()> {
         }
     };
 
-    let cancel = Arc::new(AtomicBool::new(false));
+    // The scan checks the flag at phase and chunk boundaries, so it is safe to catch signals
+    // here. Watch the signal flag itself: this used to be a freshly created flag that nothing
+    // ever armed, so Ctrl+C could not stop a headless scan.
+    signals::install();
+    let cancel = signals::shutdown_flag();
     // Hashing progress now arrives frequently (by bytes); we print a line only when the file
     // count changes — otherwise the output is overwhelmed.
     let mut last_hashed_files = u64::MAX;
@@ -444,7 +460,7 @@ fn run_headless_scan(cli: &cli::Cli) -> Result<()> {
         &config,
         resume,
         cli.verify,
-        &cancel,
+        cancel,
         print_progress,
     )?;
 

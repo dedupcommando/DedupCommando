@@ -363,6 +363,9 @@ pub struct App {
     /// Sessions in trash — list for the restore/purge screen.
     pub trashed: Vec<ResumeInfo>,
     pub trash_cursor: usize,
+    /// Background `purge_scan` jobs in flight. They have no cancel flag, so a shutdown signal
+    /// waits for them rather than abandoning a half-finished multi-index DELETE.
+    pub purge_pending: usize,
     /// An action awaiting confirmation in a modal dialog.
     pub confirm: Option<ConfirmAction>,
     /// A completed scan's result is being loaded in the background (E2E feedback) — `Some(start)`
@@ -495,6 +498,7 @@ impl App {
             resource: crate::sysmon::ResourceMonitor::new(),
             trashed: Vec::new(),
             trash_cursor: 0,
+            purge_pending: 0,
             confirm: None,
             opening_started: None,
             results_from_sessions: false,
@@ -602,7 +606,12 @@ impl App {
                 crate::tui::commander::fetch_panel_dedup(self, target);
             }
             AppEvent::CommanderMoveDone(outcome) => {
+                // Records the MoveRecord and the Undo entry, and clears `move_pending`.
                 crate::tui::commander::apply_move_outcome(self, *outcome);
+                // We were only staying alive to let this land (see `request_shutdown`).
+                if crate::signals::requested() {
+                    self.request_shutdown(false);
+                }
             }
             AppEvent::SessionsReady(list) => {
                 self.sessions = list;
@@ -611,10 +620,15 @@ impl App {
                 self.session_cursor = 0;
             }
             AppEvent::SessionDeleted(result) => {
+                self.purge_pending = self.purge_pending.saturating_sub(1);
                 self.status = match result {
                     Ok(_) => "Session purged from trash".to_string(),
                     Err(err) => format!("Failed to purge scan: {err}"),
                 };
+                // We were only staying alive to let this land (see `request_shutdown`).
+                if crate::signals::requested() {
+                    self.request_shutdown(false);
+                }
             }
             AppEvent::ResultsLoaded(scan_id, summaries, summary, prepared) => {
                 // Opened a completed scan as a LIST of results. Browser is
@@ -884,6 +898,11 @@ impl App {
 
     fn on_finished(&mut self, result: std::result::Result<ScanOutcome, String>) {
         self.scan = None;
+        // We were only staying alive to let this finish — but other background work may still
+        // be in flight, so re-ask rather than quitting outright.
+        if crate::signals::requested() {
+            self.request_shutdown(false);
+        }
         // Fresh scan/resume: the result is not from viewing the session list — Esc → ScanConfig/commander.
         self.results_from_sessions = false;
         let completed_scan = match &result {
@@ -949,6 +968,11 @@ impl App {
     fn on_apply_finished(&mut self, result: std::result::Result<BatchResult, String>) {
         self.apply = None;
         self.review.confirming = false;
+        // The batch has reported, so its outcome is recorded; other background work may still
+        // need to land, so re-ask rather than quitting outright.
+        if crate::signals::requested() {
+            self.request_shutdown(false);
+        }
         let from_commander = self.commander.return_to_commander;
         match result {
             Ok(batch) => {
@@ -1107,6 +1131,39 @@ impl App {
     fn set_read_only(&mut self, read_only: bool) {
         self.read_only = read_only;
         crate::state::set_observer_role(read_only);
+    }
+
+    /// A shutdown signal arrived (SIGHUP from a dropped SSH session, SIGTERM, SIGINT).
+    ///
+    /// Arms the same cancellation Esc uses — finish the current action, then stop — instead of
+    /// dying between a quarantine evacuation and its publish. With nothing in flight we leave
+    /// straight away; while a scan or a batch is running we wait for it, so its result is
+    /// reported and the Undo journal is written. `forced` (a second signal) stops waiting.
+    ///
+    /// Called from the event loop on every iteration, so it must stay idempotent.
+    pub fn request_shutdown(&mut self, forced: bool) {
+        if let Some(handle) = &self.scan {
+            handle.cancel();
+        }
+        if let Some(handle) = &self.apply {
+            handle.cancel();
+        }
+        // A background move must reach `CommanderMoveDone` so `apply_move_outcome` records the
+        // MoveRecord and the Undo entry; a background purge must reach `SessionDeleted`. Neither
+        // has a cancel flag to arm — the only safe thing is to let it finish.
+        let busy = self.scan.is_some()
+            || self.apply.is_some()
+            || self.commander.move_pending > 0
+            || self.purge_pending > 0;
+        if forced || !busy {
+            self.should_quit = true;
+            return;
+        }
+        let waiting = "Signal received — finishing the current action, then exiting…";
+        if self.status != waiting {
+            self.status = waiting.to_string();
+            self.commander.status = waiting.to_string();
+        }
     }
 
     /// Gate for destructive operations in "read-only" mode. If
@@ -1749,6 +1806,9 @@ impl App {
         self.status = "Purging from trash in the background…".to_string();
         let db_path = self.db_path.clone();
         let events = self.events.clone();
+        // Counted so a shutdown signal waits for the multi-index DELETE to finish and for its
+        // result to be handled, rather than leaving it half-done.
+        self.purge_pending += 1;
         std::thread::spawn(move || {
             let result = ScanStore::open(&db_path)
                 .and_then(|mut store| store.purge_scan(scan_id))
@@ -2711,4 +2771,106 @@ fn list_subdirs(dir: &Path) -> Vec<PathBuf> {
     }
     dirs.sort();
     dirs
+}
+
+/// A shutdown signal must not abandon background work that has no cancel flag: a move batch
+/// still has to reach `CommanderMoveDone` so its MoveRecord and Undo entry are written, and a
+/// purge still has to reach `SessionDeleted`.
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use crossbeam_channel::Receiver;
+
+    fn test_app() -> (App, Receiver<AppEvent>) {
+        let (tx, rx) = crate::tui::event::channel();
+        let zfs = ZfsEnvironment {
+            pools: Vec::new(),
+            capabilities: crate::model::dataset::ZfsCapabilities::default(),
+            warnings: Vec::new(),
+        };
+        let app = App::new(
+            zfs,
+            HostProfile::default(),
+            PathBuf::from("/nonexistent/dedcom.db"),
+            tx,
+            Vec::new(),
+            false,
+            RevalidationMode::default(),
+            Vec::new(),
+            true,
+            crate::lock::Startup {
+                lock: None,
+                read_only: false,
+                prompt: None,
+            },
+            false,
+        );
+        (app, rx)
+    }
+
+    #[test]
+    fn the_first_signal_waits_for_a_background_move() {
+        let (mut app, _rx) = test_app();
+        app.commander.move_pending = 1;
+        app.request_shutdown(false);
+        assert!(
+            !app.should_quit,
+            "must wait for CommanderMoveDone so the Undo entry is written"
+        );
+        // The move landed and `apply_move_outcome` cleared the counter.
+        app.commander.move_pending = 0;
+        app.request_shutdown(false);
+        assert!(app.should_quit, "nothing left in flight — leave");
+    }
+
+    #[test]
+    fn the_first_signal_waits_for_a_background_purge() {
+        let (mut app, _rx) = test_app();
+        app.purge_pending = 1;
+        app.request_shutdown(false);
+        assert!(
+            !app.should_quit,
+            "must wait for the purge and its SessionDeleted"
+        );
+        app.purge_pending = 0;
+        app.request_shutdown(false);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn handling_session_deleted_releases_the_wait() {
+        // The real path: the event clears the counter, so the pending shutdown can proceed.
+        let (mut app, _rx) = test_app();
+        app.purge_pending = 1;
+        app.request_shutdown(false);
+        assert!(!app.should_quit);
+        app.handle_event(AppEvent::SessionDeleted(Ok(1)));
+        assert_eq!(app.purge_pending, 0, "the counter is released by the event");
+    }
+
+    #[test]
+    fn a_second_signal_stops_waiting_for_either_kind_of_work() {
+        let (mut app, _rx) = test_app();
+        app.commander.move_pending = 1;
+        app.request_shutdown(true);
+        assert!(
+            app.should_quit,
+            "a forced shutdown does not wait for a move"
+        );
+
+        let (mut app, _rx) = test_app();
+        app.purge_pending = 1;
+        app.request_shutdown(true);
+        assert!(
+            app.should_quit,
+            "a forced shutdown does not wait for a purge"
+        );
+    }
+
+    #[test]
+    fn with_nothing_in_flight_the_first_signal_leaves_at_once() {
+        let (mut app, _rx) = test_app();
+        app.request_shutdown(false);
+        assert!(app.should_quit);
+    }
 }

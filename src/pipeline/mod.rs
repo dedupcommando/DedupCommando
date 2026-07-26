@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -47,7 +46,9 @@ pub fn run_scan(
     config: &ScanConfig,
     resume: Option<i64>,
     verify: bool,
-    cancel: &Arc<AtomicBool>,
+    // `&AtomicBool`, not `&Arc<…>`: the flag is only ever read here, and the process-wide signal
+    // flag is a plain static. An `Arc<AtomicBool>` caller still passes `&cancel` unchanged.
+    cancel: &AtomicBool,
     mut on_progress: impl FnMut(ScanProgress),
 ) -> Result<ScanOutcome> {
     let segment_start = Instant::now();
@@ -113,7 +114,7 @@ fn run_phases(
     config: &ScanConfig,
     is_resume: bool,
     verify: bool,
-    cancel: &Arc<AtomicBool>,
+    cancel: &AtomicBool,
     on_progress: &mut impl FnMut(ScanProgress),
 ) -> Result<ScanOutcome> {
     // Effective config: on resume we read it from the DB (we need not only
@@ -627,6 +628,7 @@ fn hex32(bytes: &[u8; 32]) -> String {
 #[cfg(test)]
 mod hash_failures_tests {
     use super::*;
+    use std::sync::Arc;
 
     /// A unique temporary directory (as in pipeline::hash::tests) — without the tempfile crate.
     fn unique_temp_dir(tag: &str) -> PathBuf {
