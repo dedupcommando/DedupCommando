@@ -254,6 +254,10 @@ not inside one). After Esc:
   halfway, otherwise a file could be left half-evacuated. Only after the current
   action finishes is the cancellation flag checked.
 - The UI shows the Summary marked "cancelled"; the partial result is correct.
+- The marks of the actions that were never reached **stay** — in the panels and in
+  the saved plan on disk alike, so the remaining work survives even a restart. Press
+  F11 again to execute what is left. What the batch did reach loses its mark in both
+  places, so a re-run never repeats it.
 
 ### …apply the wrong thing (the whole batch)
 

@@ -70,6 +70,12 @@ pub struct BatchResult {
     pub snapshots: Vec<String>,
     pub quarantine_dirs: Vec<PathBuf>,
     pub bytes_planned: u64,
+    /// How many actions the batch set out to apply. With `cancelled` it is the other half of
+    /// «applied N of M» — `outcomes` only ever holds the ones that were reached.
+    pub planned: usize,
+    /// The operator stopped the batch (Esc, or a shutdown signal) before it ran out of actions.
+    /// A partial result is not a finished one, and the untouched marks must survive it.
+    pub cancelled: bool,
 }
 
 impl BatchResult {
