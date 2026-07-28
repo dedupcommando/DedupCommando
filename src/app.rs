@@ -27,6 +27,11 @@ use crate::tui::commander::state::{CommanderState, LoadTarget};
 use crate::tui::event::AppEvent;
 use crate::zfs::ZfsEnvironment;
 
+/// Shown when the batch is over but its marks could not be settled in the DB: the plan on disk
+/// still lists what was just applied, and executing it again would act on stale marks.
+pub const MARKS_NOT_SETTLED: &str =
+    "WARNING: the saved marks were not updated — the plan on disk still lists what was applied";
+
 /// Page size for incremental loading of files in the
 /// open group — `group_files_page` loads exactly this many at a time. When the
 /// cursor scrolls toward the end of the window, `maybe_load_more_files` loads
@@ -324,6 +329,10 @@ pub struct App {
     pub browser: BrowserState,
     pub review: ReviewState,
     pub summary_result: Option<BatchResult>,
+    /// The last batch ended with its marks unsettled in the DB — the plan on disk still lists
+    /// what was applied. Explicit state, not a status string: every screen that reports the batch
+    /// has to keep saying so, and a status line is overwritten by the next thing that happens.
+    pub marks_unsettled: bool,
     pub status: String,
     pub scan: Option<ScanHandle>,
     /// Control of background application; `Some` while application is running.
@@ -479,6 +488,7 @@ impl App {
             browser: BrowserState::default(),
             review: ReviewState::default(),
             summary_result: None,
+            marks_unsettled: false,
             status: String::new(),
             scan: None,
             apply: None,
@@ -962,6 +972,54 @@ impl App {
         self.applying.bytes_done = progress.bytes_done;
     }
 
+    /// Settles the persisted marks with what the batch did. `false` — the DB could not be
+    /// updated, so the caller must keep the marks in RAM and say so instead of implying the plan
+    /// on disk has changed.
+    fn reconcile_persisted_marks(
+        &self,
+        scan_id: Option<i64>,
+        attempted: &[PathBuf],
+        cancelled: bool,
+    ) -> bool {
+        // No scan behind the marks (a commander batch without loaded dedup data) — nothing was
+        // ever persisted, so there is nothing to settle.
+        let Some(scan_id) = scan_id else {
+            return true;
+        };
+        let result = ScanStore::open(&self.db_path)
+            .and_then(|mut store| store.reconcile_marks_after_batch(scan_id, attempted, cancelled));
+        if let Err(err) = result {
+            tracing::warn!("failed to settle action marks after the batch: {err}");
+            return false;
+        }
+        true
+    }
+
+    /// Drops the marks in RAM that the DB has just lost — the panels of the commander, or the
+    /// group open in the wizard's browser, which is written back wholesale by the next mark and
+    /// would otherwise resurrect what the batch already applied.
+    fn forget_settled_marks(&mut self, attempted: &[PathBuf], cancelled: bool, commander: bool) {
+        let spent = |path: &Path| !cancelled || attempted.iter().any(|target| target == path);
+        if commander {
+            for panel in &mut self.commander.panels {
+                if cancelled {
+                    for target in attempted {
+                        panel.marks.remove(target);
+                    }
+                } else {
+                    panel.marks.clear();
+                }
+            }
+        } else if let Some(open) = self.browser.open_group.as_mut() {
+            for file in &mut open.files {
+                if spent(&file.path) {
+                    file.is_keeper = false;
+                    file.action = None;
+                }
+            }
+        }
+    }
+
     /// Result of background application: summary + Summary screen. For commander —
     /// re-read the panels (marks cleared, directories changed), as it was synchronously.
     /// On error — return to the original screen with a message.
@@ -976,18 +1034,48 @@ impl App {
         let from_commander = self.commander.return_to_commander;
         match result {
             Ok(batch) => {
+                // A cancelled batch is not a finished one: only what was actually attempted loses
+                // its mark, so the marking work for the rest of the plan survives.
+                let cancelled = batch.cancelled;
+                let attempted: Vec<PathBuf> = batch
+                    .outcomes
+                    .iter()
+                    .map(|outcome| outcome.target.clone())
+                    .collect();
+                // The marks also live in SQLite, and the wizard builds its plan straight from
+                // there — settling only the copy in RAM would bring the applied actions back on
+                // the next restart. The marks of the origin that made them are what we settle.
+                let scan_id = if from_commander {
+                    self.commander.dedup_scan_id
+                } else {
+                    self.current_scan_id
+                };
+                let settled = self.reconcile_persisted_marks(scan_id, &attempted, cancelled);
+                if settled {
+                    self.forget_settled_marks(&attempted, cancelled, from_commander);
+                }
                 self.summary_result = Some(batch);
-                self.status.clear();
+                // Never claim the marks were dealt with when the DB refused: the marks in RAM are
+                // left alone too, so both halves still say the same thing.
+                self.marks_unsettled = !settled;
+                self.status = if settled {
+                    String::new()
+                } else {
+                    MARKS_NOT_SETTLED.to_string()
+                };
                 self.screen = Screen::Summary;
                 if from_commander {
                     let affected = std::mem::take(&mut self.apply_affected);
                     crate::tui::commander::invalidate_dir_sizes(self, &affected);
                     let count = self.commander.panels.len();
                     for index in 0..count {
-                        self.commander.panels[index].marks.clear();
                         crate::tui::commander::reload_panel(self, index);
                     }
+                    if !settled {
+                        self.commander.status = MARKS_NOT_SETTLED.to_string();
+                    }
                 }
+                self.refresh_marked_count();
             }
             Err(err) => {
                 self.apply_affected.clear();
@@ -1974,7 +2062,22 @@ impl App {
             KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
             KeyCode::Esc => {
                 self.screen = Screen::ScanConfig;
-                self.status = "Actions applied. Start a new scan for fresh data.".to_string();
+                // «Applied» would be a lie after a cancelled batch — the marks that were never
+                // reached are still there, waiting to be executed again.
+                let cancelled = self
+                    .summary_result
+                    .as_ref()
+                    .map(|result| result.cancelled)
+                    .unwrap_or(false);
+                // Unsettled marks outrank both lines: the plan on disk still holds what was
+                // applied, and this screen is where the operator would start the next one.
+                self.status = if self.marks_unsettled {
+                    MARKS_NOT_SETTLED.to_string()
+                } else if cancelled {
+                    "Application cancelled. The marks that were not reached are kept.".to_string()
+                } else {
+                    "Actions applied. Start a new scan for fresh data.".to_string()
+                };
             }
             _ => {}
         }
@@ -2489,6 +2592,8 @@ impl App {
             .flat_map(|pool| pool.datasets.iter().cloned())
             .collect();
         self.apply_affected = plan.iter().map(|action| action.target.clone()).collect();
+        // The warning belongs to the batch that raised it, not to the session.
+        self.marks_unsettled = false;
         self.applying = ApplyingState {
             total: plan.len(),
             bytes_total: actions::verify_bytes_total(&plan, self.reval_mode),
@@ -2798,7 +2903,11 @@ mod shutdown_tests {
     use super::*;
     use crossbeam_channel::Receiver;
 
-    fn test_app() -> (App, Receiver<AppEvent>) {
+    pub(super) fn test_app() -> (App, Receiver<AppEvent>) {
+        test_app_with_db(PathBuf::from("/nonexistent/dedcom.db"))
+    }
+
+    pub(super) fn test_app_with_db(db_path: PathBuf) -> (App, Receiver<AppEvent>) {
         let (tx, rx) = crate::tui::event::channel();
         let zfs = ZfsEnvironment {
             pools: Vec::new(),
@@ -2808,7 +2917,7 @@ mod shutdown_tests {
         let app = App::new(
             zfs,
             HostProfile::default(),
-            PathBuf::from("/nonexistent/dedcom.db"),
+            db_path,
             tx,
             Vec::new(),
             false,
@@ -2936,5 +3045,282 @@ mod shutdown_tests {
         let (mut app, _rx) = test_app();
         app.request_shutdown(false);
         assert!(app.should_quit);
+    }
+}
+
+/// Esc during a batch stops it at an action boundary, so most of the plan may never be attempted.
+/// Treating that as a completed run threw the marks for the rest of the work away.
+#[cfg(test)]
+mod cancel_tests {
+    use super::shutdown_tests::{test_app, test_app_with_db};
+    use super::*;
+    use crate::model::action::ActionOutcome;
+    use crate::tui::commander::state::Mark;
+    use crossbeam_channel::Receiver;
+
+    /// An app over a real DB seeded with keeper `/x/a` and targets `/x/b`, `/x/c`. `commander`
+    /// picks which origin owns the marks — the two UIs keep their scan id in different fields,
+    /// and both persist through the same `file_mark` table.
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("dedcom_marks_{tag}_{}_{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn app_over_seeded_db(tag: &str, commander: bool) -> (PathBuf, App, Receiver<AppEvent>, i64) {
+        let dir = temp_dir(tag);
+        let db_path = dir.join("dedcom.db");
+        let scan_id = crate::state::store::seed_marked_group(&db_path);
+
+        let (mut app, rx) = test_app_with_db(db_path);
+        if commander {
+            app.commander.dedup_scan_id = Some(scan_id);
+            app.commander.return_to_commander = true;
+        } else {
+            app.current_scan_id = Some(scan_id);
+        }
+        (dir, app, rx, scan_id)
+    }
+
+    fn plan_targets(db_path: &Path, scan_id: i64) -> Vec<PathBuf> {
+        let store = ScanStore::open(db_path).unwrap();
+        store
+            .planned_action_rows(scan_id)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.target)
+            .collect()
+    }
+
+    fn finished(outcomes: Vec<ActionOutcome>, planned: usize, cancelled: bool) -> AppEvent {
+        AppEvent::ApplyFinished(Ok(BatchResult {
+            outcomes,
+            planned,
+            cancelled,
+            ..Default::default()
+        }))
+    }
+
+    /// The marks are in SQLite too, and the wizard rebuilds its plan straight from there. A
+    /// cancelled batch must leave exactly the untouched remainder behind — not the whole plan
+    /// (the applied action would run again) and not an empty one (the work would be lost).
+    #[test]
+    fn a_cancelled_batch_settles_the_persisted_marks_of_the_wizard() {
+        let _role = crate::state::store::role_guard();
+        let (dir, mut app, _rx, scan_id) = app_over_seeded_db("wizard_cancel", false);
+        let db_path = app.db_path.clone();
+
+        app.handle_event(finished(vec![applied(Path::new("/x/b"))], 2, true));
+
+        assert_eq!(
+            plan_targets(&db_path, scan_id),
+            vec![PathBuf::from("/x/c")],
+            "the plan on disk holds only what the batch never reached"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same table, other origin: the commander keeps its scan id in `dedup_scan_id`, and its
+    /// batches were leaving the persisted marks untouched just as the wizard's did.
+    #[test]
+    fn a_cancelled_batch_settles_the_persisted_marks_of_the_commander() {
+        let _role = crate::state::store::role_guard();
+        let (dir, mut app, _rx, scan_id) = app_over_seeded_db("commander_cancel", true);
+        let db_path = app.db_path.clone();
+        app.commander.panels[0]
+            .marks
+            .insert(PathBuf::from("/x/b"), Mark::Delete);
+        app.commander.panels[0]
+            .marks
+            .insert(PathBuf::from("/x/c"), Mark::Delete);
+
+        app.handle_event(finished(vec![applied(Path::new("/x/b"))], 2, true));
+
+        assert_eq!(
+            plan_targets(&db_path, scan_id),
+            vec![PathBuf::from("/x/c")],
+            "the plan on disk holds only what the batch never reached"
+        );
+        let marks = &app.commander.panels[0].marks;
+        assert!(!marks.contains_key(&PathBuf::from("/x/b")));
+        assert!(marks.contains_key(&PathBuf::from("/x/c")), "RAM agrees");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A batch that ran to the end spends the whole plan: nothing may be rebuilt from the marks
+    /// it left behind, or a restart would apply the same actions again.
+    #[test]
+    fn a_finished_batch_leaves_no_persisted_plan_behind() {
+        let _role = crate::state::store::role_guard();
+        let (dir, mut app, _rx, scan_id) = app_over_seeded_db("wizard_finished", false);
+        let db_path = app.db_path.clone();
+
+        app.handle_event(finished(
+            vec![applied(Path::new("/x/b")), applied(Path::new("/x/c"))],
+            2,
+            false,
+        ));
+
+        assert!(
+            plan_targets(&db_path, scan_id).is_empty(),
+            "an applied plan must not survive in the DB"
+        );
+        assert!(app.status.is_empty(), "no warning when the DB was settled");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The DB is the durable half. If it cannot be updated we must not imply it was: the marks in
+    /// RAM stay as they are and the operator is told the plan on disk is still the old one.
+    #[test]
+    fn an_unsettled_db_warns_and_keeps_the_marks() {
+        let _role = crate::state::store::role_guard();
+        let dir = temp_dir("unsettled");
+        // The DB cannot be opened: its parent is a regular file, which is ENOTDIR for anyone,
+        // root included — the same effect on the marks as a refused write.
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        let target = PathBuf::from("/x/b");
+        let (mut app, _rx) = test_app_with_db(blocker.join("dedcom.db"));
+        app.commander.dedup_scan_id = Some(1);
+        app.commander.return_to_commander = true;
+        app.commander.panels[0]
+            .marks
+            .insert(target.clone(), Mark::Delete);
+
+        app.handle_event(finished(vec![applied(&target)], 1, false));
+
+        assert!(
+            app.commander.panels[0].marks.contains_key(&target),
+            "the marks stay while the DB still holds them"
+        );
+        assert!(
+            app.status.contains("WARNING"),
+            "the operator must be told: {}",
+            app.status
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The wizard leaves the Summary through `Esc`, and that handler used to overwrite the
+    /// warning with "Actions applied…" — a false success over a plan that still lists what was
+    /// just applied. The screen the operator lands on is where the next batch starts.
+    #[test]
+    fn the_wizard_carries_the_unsettled_warning_out_of_the_summary() {
+        let _role = crate::state::store::role_guard();
+        let dir = temp_dir("unsettled_wizard");
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        let (mut app, _rx) = test_app_with_db(blocker.join("dedcom.db"));
+        app.show_disclaimer = false;
+        app.mode = AppMode::Wizard;
+        app.current_scan_id = Some(1);
+
+        app.handle_event(finished(vec![applied(Path::new("/x/b"))], 1, false));
+        assert!(app.marks_unsettled, "the DB refused, so nothing is settled");
+        assert!(matches!(app.screen, Screen::Summary));
+
+        app.handle_event(AppEvent::Key(KeyEvent::from(KeyCode::Esc)));
+        assert!(matches!(app.screen, Screen::ScanConfig));
+        assert!(
+            app.marks_unsettled,
+            "leaving the screen does not settle anything"
+        );
+        assert!(
+            app.status.contains("WARNING"),
+            "the warning must survive the exit: {}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("Actions applied"),
+            "and must not be replaced by a success line: {}",
+            app.status
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn applied(target: &Path) -> ActionOutcome {
+        ActionOutcome {
+            kind: ActionKind::Delete,
+            target: target.to_path_buf(),
+            bytes: 10,
+            result: Ok(()),
+        }
+    }
+
+    fn marked_app(first: &Path, second: &Path) -> App {
+        let (mut app, _rx) = test_app();
+        app.commander.return_to_commander = true;
+        let marks = &mut app.commander.panels[0].marks;
+        marks.insert(first.to_path_buf(), Mark::Delete);
+        marks.insert(second.to_path_buf(), Mark::Delete);
+        app
+    }
+
+    #[test]
+    fn a_cancelled_batch_keeps_the_marks_it_never_reached() {
+        let done = PathBuf::from("/nonexistent/a.bin");
+        let never_reached = PathBuf::from("/nonexistent/b.bin");
+        let mut app = marked_app(&done, &never_reached);
+
+        app.handle_event(AppEvent::ApplyFinished(Ok(BatchResult {
+            outcomes: vec![applied(&done)],
+            planned: 2,
+            cancelled: true,
+            ..Default::default()
+        })));
+
+        let marks = &app.commander.panels[0].marks;
+        assert!(
+            !marks.contains_key(&done),
+            "the action that ran must lose its mark"
+        );
+        assert!(
+            marks.contains_key(&never_reached),
+            "the action that was never attempted must keep its mark"
+        );
+    }
+
+    #[test]
+    fn a_batch_that_ran_to_the_end_still_clears_the_marks() {
+        let first = PathBuf::from("/nonexistent/a.bin");
+        let second = PathBuf::from("/nonexistent/b.bin");
+        let mut app = marked_app(&first, &second);
+
+        app.handle_event(AppEvent::ApplyFinished(Ok(BatchResult {
+            outcomes: vec![applied(&first), applied(&second)],
+            planned: 2,
+            cancelled: false,
+            ..Default::default()
+        })));
+
+        assert!(
+            app.commander.panels[0].marks.is_empty(),
+            "a finished batch clears everything, keepers included"
+        );
+    }
+
+    #[test]
+    fn leaving_the_summary_of_a_cancelled_batch_does_not_say_applied() {
+        let (mut app, _rx) = test_app();
+        app.show_disclaimer = false;
+        app.mode = AppMode::Wizard;
+        app.screen = Screen::Summary;
+        app.summary_result = Some(BatchResult {
+            planned: 2,
+            cancelled: true,
+            ..Default::default()
+        });
+
+        app.handle_event(AppEvent::Key(KeyEvent::from(KeyCode::Esc)));
+        assert!(
+            app.status.contains("cancelled"),
+            "the operator must not read a stopped batch as a finished one: {}",
+            app.status
+        );
     }
 }

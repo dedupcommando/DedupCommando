@@ -212,8 +212,12 @@ pub fn apply_batch(
     // Per-batch cache of re-checked files (Hybrid): the keeper is hashed once per
     // batch, the repeat check is a re-stat by `FileIdentity` (we don't re-read).
     let mut verified: HashMap<PathBuf, FileIdentity> = HashMap::new();
+    let mut cancelled = false;
     for (index, action) in actions.iter().enumerate() {
         if shared.is_cancelled() {
+            // The rest of the batch was never attempted. Reported as such, so the caller does not
+            // read a partial run as a finished one and throw the remaining marks away.
+            cancelled = true;
             break;
         }
         shared.index.store(index, Ordering::Relaxed);
@@ -235,6 +239,8 @@ pub fn apply_batch(
         snapshots: snapshots_made,
         quarantine_dirs,
         bytes_planned: actions.iter().map(|action| action.size).sum(),
+        planned: actions.len(),
+        cancelled,
     })
 }
 
@@ -565,6 +571,45 @@ mod tests {
             size,
             expected_hash: hash.to_string(),
         }
+    }
+
+    /// Esc mid-batch must not come back looking like a completed run: the caller decides from
+    /// `cancelled` whether the marks of the untouched rest of the plan may be thrown away.
+    #[test]
+    fn a_cancelled_batch_says_so_and_counts_the_whole_plan() {
+        let first = PathBuf::from("/nonexistent/a.bin");
+        let second = PathBuf::from("/nonexistent/b.bin");
+        let keeper = PathBuf::from("/nonexistent/keep.bin");
+        let plan = vec![
+            planned(&first, &keeper, 10, "aa"),
+            planned(&second, &keeper, 20, "aa"),
+        ];
+        let shared = ApplyShared::default();
+        // Cancelled before the first action: the flag is read at the action boundary, so nothing
+        // is attempted and nothing on disk is touched.
+        shared.cancel.store(true, Ordering::Relaxed);
+
+        let batch = apply_batch(&plan, &[], false, &shared, RevalidationMode::Hybrid).unwrap();
+        assert!(batch.cancelled, "a stopped batch is not a finished one");
+        assert!(batch.outcomes.is_empty(), "nothing was attempted");
+        assert_eq!(batch.planned, 2, "«applied 0 of 2» needs the whole plan");
+        assert_eq!(batch.bytes_planned, 30);
+    }
+
+    /// The same plan left alone runs to the end. A failing action is still an attempted one —
+    /// only a real cancellation sets the flag.
+    #[test]
+    fn a_batch_that_ran_out_of_actions_is_not_cancelled() {
+        let target = PathBuf::from("/nonexistent/a.bin");
+        let keeper = PathBuf::from("/nonexistent/keep.bin");
+        let plan = vec![planned(&target, &keeper, 10, "aa")];
+        let shared = ApplyShared::default();
+
+        let batch = apply_batch(&plan, &[], false, &shared, RevalidationMode::Hybrid).unwrap();
+        assert!(!batch.cancelled);
+        assert_eq!(batch.outcomes.len(), 1, "the missing file was attempted");
+        assert_eq!(batch.failed(), 1, "and refused by revalidation");
+        assert_eq!(batch.planned, 1);
     }
 
     #[test]

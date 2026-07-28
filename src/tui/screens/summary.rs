@@ -28,6 +28,20 @@ pub fn render(frame: &mut Frame, app: &App) {
         ),
     ];
 
+    // A cancelled batch must not read as a finished one — the header above counts only what was
+    // reached, and the rest of the plan is still marked and waiting.
+    if result.cancelled {
+        lines.push(Line::from(
+            format!(
+                "  CANCELLED: {} of {} actions were reached — the marks of the rest are kept",
+                result.outcomes.len(),
+                result.planned,
+            )
+            .bold()
+            .yellow(),
+        ));
+    }
+
     for outcome in &result.outcomes {
         if let Err(message) = &outcome.result {
             lines.push(
@@ -73,6 +87,17 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
     if !result.quarantine_dirs.is_empty() {
         lines.push(Line::from("    dedcom --purge-quarantine"));
+    }
+
+    // The batch is over, but the marks may not be: a durable-state warning belongs where the
+    // operator is looking, not only in the log.
+    if app.marks_unsettled {
+        lines.push(Line::from(""));
+        lines.push(
+            Line::from(format!("  {}", crate::app::MARKS_NOT_SETTLED))
+                .red()
+                .bold(),
+        );
     }
 
     lines.push(Line::from(""));

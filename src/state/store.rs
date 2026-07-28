@@ -163,6 +163,79 @@ pub fn is_observer_role() -> bool {
     OBSERVER_ROLE.load(Ordering::SeqCst)
 }
 
+/// Serialises everything that touches the process role or a file-backed store. The role is
+/// process-wide by design, so a test that flips it would otherwise hand a read-only connection to
+/// a test running in parallel. Lives here rather than in the test module because the callers that
+/// open a store go well beyond this file.
+#[cfg(test)]
+pub(crate) fn role_guard() -> std::sync::MutexGuard<'static, ()> {
+    static ROLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A panicking test poisons the lock; that must not cascade into unrelated failures.
+    ROLE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Seeds `db` with one duplicate group — keeper `/x/a`, targets `/x/b` and `/x/c`, all marked —
+/// and returns the scan id. Shared with the app-level tests: marks outlive the process, so
+/// settling them after a batch has to be checked against a real file rather than a map in RAM.
+#[cfg(test)]
+pub(crate) fn seed_marked_group(db: &Path) -> i64 {
+    use crate::model::action::ActionKind;
+    use crate::model::duplicate::FileEntry;
+
+    let mut store = ScanStore::open_writable(db).unwrap();
+    let scan_id = store
+        .begin_scan(&crate::model::scan::ScanConfig::new(vec![PathBuf::from(
+            "/x",
+        )]))
+        .unwrap();
+    let file = |path: &str, inode: u64| ManifestRow {
+        path: PathBuf::from(path),
+        size: 10,
+        inode,
+        device: 1,
+        ..Default::default()
+    };
+    store
+        .record_files(
+            scan_id,
+            &[file("/x/a", 1), file("/x/b", 2), file("/x/c", 3)],
+        )
+        .unwrap();
+    store
+        .record_hashes(
+            scan_id,
+            &[
+                (PathBuf::from("/x/a"), [7u8; 32]),
+                (PathBuf::from("/x/b"), [7u8; 32]),
+                (PathBuf::from("/x/c"), [7u8; 32]),
+            ],
+        )
+        .unwrap();
+    let mark = |path: &str, keeper: bool, action: Option<ActionKind>| FileEntry {
+        path: PathBuf::from(path),
+        size: 10,
+        mtime: 0,
+        device: 1,
+        inode: 0,
+        is_keeper: keeper,
+        action,
+    };
+    store
+        .save_marks(
+            scan_id,
+            [
+                mark("/x/a", true, None),
+                mark("/x/b", false, Some(ActionKind::Delete)),
+                mark("/x/c", false, Some(ActionKind::Delete)),
+            ]
+            .iter(),
+        )
+        .unwrap();
+    scan_id
+}
+
 impl ScanStore {
     /// Opens the DB for the process role: an observer gets a genuinely read-only connection,
     /// an operator the usual read-write one.
@@ -1229,6 +1302,31 @@ impl ScanStore {
                     ])?;
                 }
             }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Settles the persisted marks with what a batch of actions actually did — the durable half
+    /// of what each UI does with its own copy. `attempted` are the targets the batch reached.
+    /// A cancelled batch clears only those, so everything it never got to stays marked and a
+    /// re-run applies exactly the remainder; a batch that ran to the end spends the whole plan,
+    /// keepers included. One transaction: the plan is settled as a whole or not at all.
+    pub fn reconcile_marks_after_batch(
+        &mut self,
+        scan_id: i64,
+        attempted: &[PathBuf],
+        cancelled: bool,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        if cancelled {
+            let mut clear = tx.prepare("DELETE FROM file_mark WHERE scan_id = ?1 AND path = ?2")?;
+            for target in attempted {
+                clear.execute(params![scan_id, &*target.to_string_lossy()])?;
+            }
+            drop(clear);
+        } else {
+            tx.execute("DELETE FROM file_mark WHERE scan_id = ?1", params![scan_id])?;
         }
         tx.commit()?;
         Ok(())
@@ -4183,18 +4281,6 @@ mod tests {
         }
     }
 
-    /// Serialises everything that touches the process role or a file-backed store. The role is
-    /// process-wide by design, so a test that flips it would otherwise hand a read-only
-    /// connection to a test running in parallel.
-    static ROLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn role_guard() -> std::sync::MutexGuard<'static, ()> {
-        // A panicking test poisons the lock; that must not cascade into unrelated failures.
-        ROLE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
     /// Restores the operator role no matter how the test ends.
     struct RoleReset;
     impl Drop for RoleReset {
@@ -4699,5 +4785,74 @@ mod tests {
         assert_eq!(rows.len(), 1, "only group A with keeper+action");
         assert_eq!(rows[0].target, PathBuf::from("/a2"));
         assert_eq!(rows[0].keeper, PathBuf::from("/a1"));
+    }
+
+    /// A real DB on disk with one group: keeper `/x/a`, targets `/x/b` and `/x/c`. Marks outlive
+    /// the process, so the post-batch reconciliation has to be checked against the file, not
+    /// against a map in RAM.
+    fn store_on_disk_with_marked_group(tag: &str) -> (PathBuf, ScanStore, i64) {
+        let dir = temp_state_dir(tag);
+        let db = dir.join("dedcom.db");
+        let id = seed_marked_group(&db);
+        (dir, ScanStore::open_writable(&db).unwrap(), id)
+    }
+
+    fn marked_paths(store: &ScanStore, scan_id: i64) -> Vec<String> {
+        let mut stmt = store
+            .conn
+            .prepare("SELECT path FROM file_mark WHERE scan_id = ?1 ORDER BY path")
+            .unwrap();
+        let rows = stmt
+            .query_map(params![scan_id], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    }
+
+    #[test]
+    fn reconciling_a_cancelled_batch_leaves_the_rest_of_the_plan_marked() {
+        let (dir, mut store, id) = store_on_disk_with_marked_group("marks_cancelled");
+        // The batch reached /x/b and was stopped before /x/c.
+        store
+            .reconcile_marks_after_batch(id, &[PathBuf::from("/x/b")], true)
+            .unwrap();
+
+        assert_eq!(
+            marked_paths(&store, id),
+            vec!["/x/a".to_string(), "/x/c".to_string()],
+            "the attempted target is gone; the keeper the rest of the plan needs stays"
+        );
+        let plan = crate::actions::plan_actions_from_db(&store, id).unwrap();
+        assert_eq!(
+            plan.len(),
+            1,
+            "a fresh plan holds only what was not reached"
+        );
+        assert_eq!(plan[0].target, PathBuf::from("/x/c"));
+        assert_eq!(plan[0].keeper, PathBuf::from("/x/a"));
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reconciling_a_finished_batch_leaves_no_plan_to_rebuild() {
+        let (dir, mut store, id) = store_on_disk_with_marked_group("marks_finished");
+        store
+            .reconcile_marks_after_batch(id, &[PathBuf::from("/x/b"), PathBuf::from("/x/c")], false)
+            .unwrap();
+
+        assert!(
+            marked_paths(&store, id).is_empty(),
+            "a spent plan leaves nothing marked, keepers included"
+        );
+        assert!(
+            crate::actions::plan_actions_from_db(&store, id)
+                .unwrap()
+                .is_empty(),
+            "the applied actions must not come back after a restart"
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
