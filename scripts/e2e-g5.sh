@@ -120,6 +120,30 @@ operator() {
 
 scan() { rm -rf "$STATE"; "$DEDCOM" --state-dir "$STATE" --scan "$1" --no-resume; }
 inode() { stat -c '%i' -- "$1"; }
+
+# xattr helpers (D-1): setfattr/getfattr come from the `attr` package and are not everywhere,
+# python3 is. Returning non-zero means "could not do it" — the caller fails the scenario.
+xattr_set() {  # path name value
+    if command -v setfattr >/dev/null 2>&1; then
+        setfattr -n "$2" -v "$3" -- "$1"
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import os,sys; os.setxattr(sys.argv[1], sys.argv[2], sys.argv[3].encode())' \
+                "$1" "$2" "$3"
+    else
+        return 127
+    fi
+}
+xattr_get() {  # path name -> value on stdout, empty if absent
+    if command -v getfattr >/dev/null 2>&1; then
+        getfattr --only-values -n "$2" -- "$1" 2>/dev/null || true
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import os,sys
+try: sys.stdout.write(os.getxattr(sys.argv[1], sys.argv[2]).decode())
+except OSError: pass' "$1" "$2"
+    else
+        return 127
+    fi
+}
 quarantined() { find "/$POOL" -path '*/.dedcom-quarantine/*' -name "$1" 2>/dev/null | grep -q .; }
 
 # 0 if the latest scan row is observably in-progress (walking/hashing); needs python3.
@@ -154,15 +178,23 @@ Expected: dup.bin becomes a hardlink to keeper.bin; original dup.bin → quarant
 }
 
 scenario_reflink() {
-    banner "reflink — separate inode, shared blocks, within one pool"
+    banner "reflink — separate inode, shared blocks, and the target's own metadata (D-1)"
     local d="$G5ROOT/reflink"; rm -rf "$d"; mkdir -p "$d"
     head -c 512K /dev/urandom > "$d/keeper.bin"; cp "$d/keeper.bin" "$d/dup.bin"
+    # D-1: the clone is a NEW inode, so it must come back with dup.bin's owner/mode/xattr —
+    # not the keeper's, and not root's. Make all three differ, or the check proves nothing.
+    chmod 0644 "$d/keeper.bin"
+    chmod 0600 "$d/dup.bin"
+    chown 12345:12345 "$d/dup.bin" || { fail "cannot chown dup.bin — D-1 cannot be checked"; return; }
+    xattr_set "$d/dup.bin" user.dedcom_e2e "target-metadata" \
+        || { fail "cannot set user.dedcom_e2e on dup.bin (install 'attr' or python3; ensure the dataset stores xattrs)"; return; }
     local i_keep; i_keep="$(inode "$d/keeper.bin")"
-    info "fixture: keeper.bin, dup.bin (identical); keeper inode=$i_keep"
+    info "fixture: keeper.bin 0644 root:root, dup.bin 0600 12345:12345 + user.dedcom_e2e; keeper inode=$i_keep"
     scan "$d"
     operator "Group: keeper.bin + dup.bin.
 Mark keeper.bin = Keeper (F7), dup.bin = Reflink (F6), then F11.
-Expected: dup.bin keeps a SEPARATE inode but shares blocks with keeper (ZFS block_cloning)."
+Expected: dup.bin keeps a SEPARATE inode but shares blocks with keeper (ZFS block_cloning),
+and keeps its own 0600 / 12345:12345 / user.dedcom_e2e."
     banner "verify reflink"
     [ -f "$d/dup.bin" ] || { fail "dup.bin missing after apply"; return; }
     local i_dup; i_dup="$(inode "$d/dup.bin")"
@@ -172,6 +204,17 @@ Expected: dup.bin keeps a SEPARATE inode but shares blocks with keeper (ZFS bloc
     info "block sharing: confirm via 'zpool get bcloneused $POOL' or 'filefrag -v' (shared extents)"
     quarantined "dup.bin" && ok "original dup.bin evacuated to quarantine" \
                           || info "note: original dup.bin not seen in quarantine — verify manually"
+    # D-1 proper: on the filesystem the feature exists for.
+    local mode owner xa
+    mode="$(stat -c '%a' -- "$d/dup.bin")"
+    owner="$(stat -c '%u:%g' -- "$d/dup.bin")"
+    xa="$(xattr_get "$d/dup.bin" user.dedcom_e2e)"
+    [ "$mode" = "600" ] && ok "mode preserved (0600)" \
+                        || fail "mode is 0$mode, expected 0600 — D-1 regression (clone published with the umask's mode)"
+    [ "$owner" = "12345:12345" ] && ok "owner preserved (12345:12345)" \
+                                 || fail "owner is $owner, expected 12345:12345 — D-1 regression (clone published as the running user)"
+    [ "$xa" = "target-metadata" ] && ok "xattr user.dedcom_e2e preserved" \
+                                  || fail "user.dedcom_e2e is '$xa', expected 'target-metadata' — D-1 regression (xattrs/ACL lost)"
 }
 
 scenario_delete_restore() {

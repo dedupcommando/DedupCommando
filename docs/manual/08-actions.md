@@ -90,6 +90,7 @@ After apply:
 | Limitation | Details |
 |---|---|
 | Only within a **single dataset** | If the target and keeper are in different datasets — the error `cross-dataset hardlink is impossible — files are in different datasets`. A ZFS dataset is a separate filesystem, and a hardlink between filesystems is impossible in principle. |
+| The target takes on the keeper's metadata | After the action the path IS the keeper's inode, so its owner, permissions, ACL and xattrs are the keeper's. The target's own are not merged — they stay only on the original in quarantine, and `--purge-quarantine` removes them for good. If the two files must keep different metadata, choose reflink. |
 | Metadata is merged | A change of permissions/owner through any path is seen by all — it is **one** inode entry. |
 | A write through one path = a write for all | That is exactly what a hardlink means, but if different copies are expected to diverge, choose reflink or do NOT deduplicate them. |
 | Backup software may count N paths of one inode as one file | Depends on the software (`rsync` understands this, as does GNU `cp -a`; some count each name separately). |
@@ -113,7 +114,10 @@ After apply:
 
 - The target AND the keeper share **BLOCKS** at the pool level (ZFS `block_cloning`),
   but have **different inodes**.
-- Metadata is independent (owner/permissions/xattr may differ).
+- Metadata is independent (owner/permissions/xattr may differ) and is **kept**: the
+  clone is a new inode, so `dedcom` writes the replaced file's owner, mode, ACL,
+  extended attributes and timestamps onto it before publishing it. Without that step
+  the file would come back owned by whoever ran the tool, with the umask's mode.
 - Changing the content through any path = copy-on-write of a new block; the other
   files stay as they were.
 
@@ -124,6 +128,7 @@ After apply:
 | ZFS ≥ 2.3 with `block_cloning` enabled | `zpool get all <pool> \| grep block_cloning`; the scan configuration header shows on which pools it is active. If the host does not qualify, the action is cancelled with `reflink is unavailable on this host — needs ZFS 2.3+ with block cloning enabled`. |
 | The target and keeper in the **same pool** | Between datasets of the SAME pool it is fine; between different pools — the error `reflink is impossible — files are in different ZFS pools`. |
 | `reflink_safe` is determined at startup | If `dedcom` did not establish at startup that `block_cloning` is safe for the pool, the action is cancelled (this is the same `reflink is unavailable …` refusal above). |
+| The metadata has to be carryable | The replaced file's owner/mode/ACL/xattr are written onto the clone before it is published. If that cannot be done — no privilege to hand the file back to its owner, a filesystem that refuses an attribute — the action is cancelled with `cannot carry over the …` and the file is left untouched. Publishing a clone with the wrong owner would be the worse outcome. |
 
 **When to choose Reflink (over Hardlink):**
 

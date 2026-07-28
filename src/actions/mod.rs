@@ -16,6 +16,7 @@ use crate::zfs::snapshots;
 pub mod apply_worker;
 pub mod delete;
 pub mod hardlink;
+pub mod meta;
 pub mod move_dir;
 pub mod move_file;
 pub mod quarantine;
