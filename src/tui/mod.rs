@@ -96,7 +96,34 @@ pub fn install_panic_hook() {
             LeaveAlternateScreen
         );
         original(info);
+        // A panic in a background thread leaves the process running, so the main loop has to be
+        // told that the screen it draws on is gone. Last of all, so that by the time the loop
+        // reacts the terminal is restored and the message is already printed.
+        crate::panics::mark_tui_dead();
     }));
+}
+
+#[cfg(test)]
+mod panic_hook_tests {
+    /// A worker panic must reach the main loop: the hook restores the terminal for the panic
+    /// message, and a loop that keeps drawing writes straight over it.
+    #[test]
+    fn a_background_panic_marks_the_tui_dead() {
+        let _lock = crate::panics::test_lock();
+        let original = std::panic::take_hook();
+        super::install_panic_hook();
+        crate::panics::clear_tui_dead();
+
+        let thread = std::thread::spawn(|| panic!("boom in a background thread"));
+        assert!(thread.join().is_err(), "the thread must have panicked");
+        assert!(
+            crate::panics::tui_dead(),
+            "the main loop must learn the terminal is gone"
+        );
+
+        std::panic::set_hook(original);
+        crate::panics::clear_tui_dead();
+    }
 }
 
 /// Render dispatcher by current screen; on top — the help overlay.

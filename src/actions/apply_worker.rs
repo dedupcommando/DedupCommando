@@ -11,8 +11,10 @@ use std::time::Duration;
 
 use crossbeam_channel::Sender;
 
-use crate::model::action::{PlannedAction, RevalidationMode};
+use crate::error::Result;
+use crate::model::action::{BatchResult, PlannedAction, RevalidationMode};
 use crate::model::dataset::Dataset;
+use crate::panics;
 use crate::tui::event::AppEvent;
 
 use super::{apply_batch, ApplyPhase, ApplyShared};
@@ -38,6 +40,17 @@ pub fn spawn(
     mode: RevalidationMode,
     events: Sender<AppEvent>,
 ) -> ApplyHandle {
+    spawn_job(events, move |shared| {
+        apply_batch(&plan, &datasets, reflink_safe, shared, mode)
+    })
+}
+
+/// The worker itself: poller, panic containment, terminal event. `spawn` hands it the real batch;
+/// the tests hand it a job that panics, which is the only way in to the containment.
+fn spawn_job<F>(events: Sender<AppEvent>, job: F) -> ApplyHandle
+where
+    F: FnOnce(&ApplyShared) -> Result<BatchResult> + Send + 'static,
+{
     let shared = Arc::new(ApplyShared::default());
 
     // Poller: ~6 progress snapshots per second, until the phase is Done. A separate thread —
@@ -54,11 +67,11 @@ pub fn spawn(
         thread::sleep(Duration::from_millis(150));
     });
 
-    // Worker thread: applies the batch and sends the result.
+    // Worker thread: applies the batch and sends the result. A panic used to unwind it alone —
+    // no ApplyFinished, and the Applying screen has no other way out.
     let work_shared = shared.clone();
     thread::spawn(move || {
-        let result = apply_batch(&plan, &datasets, reflink_safe, &work_shared, mode)
-            .map_err(|err| err.to_string());
+        let result = panics::guard("the apply worker", || job(&work_shared));
         // We guarantee the Done phase even if apply_batch exited with an error BEFORE it
         // (for example, a snapshot failure) — otherwise the poller would spin forever.
         work_shared.set_phase(ApplyPhase::Done);
@@ -120,5 +133,35 @@ mod tests {
             }
         }
         assert!(saw_done, "the poller must reach the Done phase");
+    }
+
+    /// A panicking batch must still report. Without containment the thread unwinds without
+    /// `ApplyFinished`, the poller spins on a phase that never becomes Done, and the Applying
+    /// screen — which has no exit key of its own — waits for that event forever.
+    #[test]
+    fn a_panicking_batch_still_reports_finished() {
+        let _lock = crate::panics::test_lock();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let _handle = spawn_job(tx, |_shared| panic!("boom in the batch"));
+
+        let mut finished: Option<std::result::Result<BatchResult, String>> = None;
+        let mut saw_done = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && (finished.is_none() || !saw_done) {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(AppEvent::ApplyFinished(result)) => finished = Some(result),
+                Ok(AppEvent::ApplyProgress(p)) if p.phase == ApplyPhase::Done => saw_done = true,
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        let err = finished
+            .expect("ApplyFinished must arrive even when the batch panics")
+            .expect_err("a panic is an error, not a result");
+        assert!(
+            err.contains("boom in the batch"),
+            "the screen must show what happened: {err}"
+        );
+        assert!(saw_done, "the poller must reach Done and stop");
     }
 }

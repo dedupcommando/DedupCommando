@@ -18,6 +18,7 @@ mod lock;
 mod logging;
 mod maint;
 mod model;
+mod panics;
 mod paths;
 mod pipeline;
 mod scan;
@@ -119,6 +120,9 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
     // The event loop checks for an arrived signal every iteration and turns it into the same
     // cancellation Esc uses, so catching them here does not swallow them.
     signals::install();
+    // Before the first background thread is started, so none of them can panic outside the hook's
+    // reach and leave the splash drawing over the message.
+    tui::install_panic_hook();
     let db_path = paths::checkpoint_db(cli);
     let state_dir = paths::state_dir(cli);
     // The state directory may not exist on the first run — we create it ahead at 0700
@@ -209,10 +213,14 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
     let (tx, rx) = tui::event::channel();
     let presets = model::preset::load_all(&paths::presets_file(cli));
 
-    tui::install_panic_hook();
     let mut guard = tui::TerminalGuard::enter()?;
     // Splash on screen immediately — even before the keyboard-support request.
     let mut tick: u64 = 0;
+    // A startup thread (auto-VACUUM, preparing results) may already have panicked: the hook has
+    // restored the terminal, so the splash must not paint over the message either.
+    if panics::tui_dead() {
+        return Err(panic_shutdown_error());
+    }
     guard
         .terminal()
         .draw(|frame| tui::render_splash(frame, tick))?;
@@ -245,6 +253,9 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
     }
 
     let (zfs, host, sessions) = loop {
+        if panics::tui_dead() {
+            return Err(panic_shutdown_error());
+        }
         tick = tick.wrapping_add(1);
         guard
             .terminal()
@@ -320,18 +331,32 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
         cli.merkle_dirs,
     );
 
+    let mut panicked = false;
     while !app.should_quit {
         // A signal arrived: arm the same cancellation Esc uses and leave once the current action
         // is done. A second signal means the operator has stopped waiting.
         if signals::requested() {
             app.request_shutdown(signals::count() > 1);
         }
+        // A thread panicked. The hook has already given the terminal back to the shell and printed
+        // the message, so another frame would only scribble over it. We leave the same way a signal
+        // does — the batch in flight still has its snapshot and quarantine to finish into, and
+        // keys still work if the operator would rather quit now.
+        if panics::tui_dead() {
+            if !panicked {
+                panicked = true;
+                eprintln!("dedcom: a background thread panicked — finishing the current action, then exiting");
+            }
+            app.request_shutdown(false);
+        }
         app.tick = app.tick.wrapping_add(1);
         // Resource sampling before the frame — self-throttles by interval.
         app.resource.sample();
-        guard
-            .terminal()
-            .draw(|frame| tui::render(frame, &mut app))?;
+        if !panicked {
+            guard
+                .terminal()
+                .draw(|frame| tui::render(frame, &mut app))?;
+        }
 
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(event) => app.handle_event(event),
@@ -340,8 +365,41 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
         }
     }
 
+    if panicked {
+        return Err(panic_shutdown_error());
+    }
     tracing::info!("normal shutdown");
     Ok(())
+}
+
+/// A panic in a background thread has already restored the terminal and printed its message, so
+/// nothing may be drawn afterwards — and the process must not pretend it exited cleanly.
+fn panic_shutdown_error() -> AppError {
+    AppError::msg("a background thread panicked — see the message above")
+}
+
+#[cfg(test)]
+mod startup_order_tests {
+    /// The hook is what tells the loop the screen is gone, so a thread started before it is
+    /// installed can panic outside its reach — auto-VACUUM and the results preparation both start
+    /// long before the terminal is entered. Only source order can hold this, hence the guard.
+    #[test]
+    fn the_panic_hook_is_installed_before_the_first_background_thread() {
+        let after_run_tui = include_str!("main.rs")
+            .split_once("fn run_tui")
+            .expect("run_tui must exist")
+            .1;
+        let hook = after_run_tui
+            .find("install_panic_hook()")
+            .expect("run_tui must install the panic hook");
+        let spawn = after_run_tui
+            .find("thread::spawn")
+            .expect("run_tui must start background threads");
+        assert!(
+            hook < spawn,
+            "the panic hook must be installed before the first background thread"
+        );
+    }
 }
 
 /// DedupCommando IS the multi-pane commando, so it is open by default. `--classic` takes you

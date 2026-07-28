@@ -2145,20 +2145,44 @@ fn ensure_move_worker(app: &mut App) {
     let (tx, rx) = crossbeam_channel::unbounded::<state::MoveRequest>();
     let db_path = app.db_path.clone();
     let events = app.events.clone();
+    spawn_move_worker(events, rx, move |request| {
+        move_batch::run_batch(
+            &db_path,
+            &request.sources,
+            &request.dest_dir,
+            request.scan_id,
+        )
+    });
+    app.commander.move_worker = Some(tx);
+}
+
+/// The worker loop itself: one request at a time, each one contained. `ensure_move_worker` gives
+/// it the real batch; the tests give it a job that panics. A panic must neither swallow the
+/// request — only `CommanderMoveDone` releases `move_pending` and writes the Undo entry — nor take
+/// the worker down, or every later move would vanish silently.
+fn spawn_move_worker<F>(
+    events: crossbeam_channel::Sender<AppEvent>,
+    requests: crossbeam_channel::Receiver<state::MoveRequest>,
+    job: F,
+) where
+    F: Fn(&state::MoveRequest) -> move_batch::MoveBatchOutcome + Send + 'static,
+{
     std::thread::spawn(move || {
-        while let Ok(request) = rx.recv() {
-            let mut outcome = move_batch::run_batch(
-                &db_path,
-                &request.sources,
-                &request.dest_dir,
-                request.scan_id,
-            );
+        while let Ok(request) = requests.recv() {
+            let mut outcome = match crate::panics::guard_value("the move worker", || job(&request))
+            {
+                Ok(outcome) => outcome,
+                Err(err) => move_batch::MoveBatchOutcome {
+                    failed: request.sources.len(),
+                    error: Some(err),
+                    ..Default::default()
+                },
+            };
             outcome.reload = request.reload;
             outcome.label = request.label;
             let _ = events.send(AppEvent::CommanderMoveDone(Box::new(outcome)));
         }
     });
-    app.commander.move_worker = Some(tx);
 }
 
 /// Applies the background move batch's result to the UI: Undo log,
@@ -2189,7 +2213,10 @@ pub(crate) fn apply_move_outcome(app: &mut App, outcome: move_batch::MoveBatchOu
     } else {
         String::new()
     };
-    app.commander.status = if outcome.failed == 0 {
+    app.commander.status = if let Some(err) = &outcome.error {
+        // The batch never returned, so there is no per-item breakdown to show.
+        format!("→ {}: move failed — {err}", outcome.label)
+    } else if outcome.failed == 0 {
         format!("→ {}: moved {moved}{dup_note}", outcome.label)
     } else {
         // The reasons (including a refused cross-dataset move with the rsync hint,
@@ -2541,6 +2568,69 @@ fn run_source_snapshots(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod move_worker_tests {
+    use super::*;
+
+    fn request(label: &str) -> state::MoveRequest {
+        state::MoveRequest {
+            sources: vec![PathBuf::from("/nonexistent/a.bin")],
+            dest_dir: PathBuf::from("/nonexistent/dest"),
+            scan_id: None,
+            reload: Vec::new(),
+            label: label.to_string(),
+        }
+    }
+
+    /// A panicking batch must still come back as `CommanderMoveDone`: that event is the only thing
+    /// that releases `move_pending` and tells the operator the move did not happen. And the worker
+    /// has to survive it — it is a single long-lived thread, so its death would silently swallow
+    /// every later move.
+    #[test]
+    fn a_panicking_move_reports_and_the_worker_survives() {
+        let _lock = crate::panics::test_lock();
+        let (events_tx, events_rx) = crossbeam_channel::unbounded();
+        let (requests_tx, requests_rx) = crossbeam_channel::unbounded();
+        spawn_move_worker(events_tx, requests_rx, |request| {
+            if request.label == "first" {
+                panic!("boom in the move");
+            }
+            move_batch::MoveBatchOutcome::default()
+        });
+
+        requests_tx.send(request("first")).unwrap();
+        let outcome = recv_move_done(&events_rx);
+        assert_eq!(outcome.label, "first");
+        let err = outcome
+            .error
+            .expect("a panicking batch must report an error");
+        assert!(
+            err.contains("boom in the move"),
+            "the status must show what happened: {err}"
+        );
+        assert_eq!(outcome.failed, 1, "nothing of the request was moved");
+
+        requests_tx.send(request("second")).unwrap();
+        let outcome = recv_move_done(&events_rx);
+        assert_eq!(outcome.label, "second", "the worker must still be alive");
+        assert!(outcome.error.is_none());
+    }
+
+    fn recv_move_done(
+        events: &crossbeam_channel::Receiver<AppEvent>,
+    ) -> move_batch::MoveBatchOutcome {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match events.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(AppEvent::CommanderMoveDone(outcome)) => return *outcome,
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        panic!("CommanderMoveDone must arrive");
+    }
 }
 
 #[cfg(test)]

@@ -609,7 +609,7 @@ impl App {
                 // Records the MoveRecord and the Undo entry, and clears `move_pending`.
                 crate::tui::commander::apply_move_outcome(self, *outcome);
                 // We were only staying alive to let this land (see `request_shutdown`).
-                if crate::signals::requested() {
+                if shutdown_pending() {
                     self.request_shutdown(false);
                 }
             }
@@ -626,7 +626,7 @@ impl App {
                     Err(err) => format!("Failed to purge scan: {err}"),
                 };
                 // We were only staying alive to let this land (see `request_shutdown`).
-                if crate::signals::requested() {
+                if shutdown_pending() {
                     self.request_shutdown(false);
                 }
             }
@@ -900,7 +900,7 @@ impl App {
         self.scan = None;
         // We were only staying alive to let this finish — but other background work may still
         // be in flight, so re-ask rather than quitting outright.
-        if crate::signals::requested() {
+        if shutdown_pending() {
             self.request_shutdown(false);
         }
         // Fresh scan/resume: the result is not from viewing the session list — Esc → ScanConfig/commander.
@@ -970,7 +970,7 @@ impl App {
         self.review.confirming = false;
         // The batch has reported, so its outcome is recorded; other background work may still
         // need to land, so re-ask rather than quitting outright.
-        if crate::signals::requested() {
+        if shutdown_pending() {
             self.request_shutdown(false);
         }
         let from_commander = self.commander.return_to_commander;
@@ -1809,12 +1809,10 @@ impl App {
         // Counted so a shutdown signal waits for the multi-index DELETE to finish and for its
         // result to be handled, rather than leaving it half-done.
         self.purge_pending += 1;
-        std::thread::spawn(move || {
-            let result = ScanStore::open(&db_path)
+        spawn_purge_job(events, move || {
+            ScanStore::open(&db_path)
                 .and_then(|mut store| store.purge_scan(scan_id))
                 .map(|()| scan_id)
-                .map_err(|err| err.to_string());
-            let _ = events.send(AppEvent::SessionDeleted(result));
         });
     }
 
@@ -2773,6 +2771,25 @@ fn list_subdirs(dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// A shutdown is already under way when a signal arrived or a panic took the screen away. The
+/// completion handlers ask again, so the last piece of background work releases the wait.
+fn shutdown_pending() -> bool {
+    crate::signals::requested() || crate::panics::tui_dead()
+}
+
+/// Runs the purge in the background so a multi-index DELETE does not hang the UI. Split out so a
+/// test can hand it a job that panics: `purge_pending` is released only by `SessionDeleted`, so
+/// that event has to arrive even then.
+fn spawn_purge_job<F>(events: crossbeam_channel::Sender<AppEvent>, job: F)
+where
+    F: FnOnce() -> crate::error::Result<i64> + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let result = crate::panics::guard("the purge worker", job);
+        let _ = events.send(AppEvent::SessionDeleted(result));
+    });
+}
+
 /// A shutdown signal must not abandon background work that has no cancel flag: a move batch
 /// still has to reach `CommanderMoveDone` so its MoveRecord and Undo entry are written, and a
 /// purge still has to reach `SessionDeleted`.
@@ -2846,6 +2863,53 @@ mod shutdown_tests {
         assert!(!app.should_quit);
         app.handle_event(AppEvent::SessionDeleted(Ok(1)));
         assert_eq!(app.purge_pending, 0, "the counter is released by the event");
+    }
+
+    /// A panicking purge must still report. `purge_pending` is released only by `SessionDeleted`,
+    /// so without the event a shutdown waits for work that is already over.
+    #[test]
+    fn a_panicking_purge_still_reports_and_releases_the_wait() {
+        let _lock = crate::panics::test_lock();
+        let (mut app, rx) = test_app();
+        app.purge_pending = 1;
+        spawn_purge_job(app.events.clone(), || panic!("boom in the purge"));
+
+        let event = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("SessionDeleted must arrive even when the purge panics");
+        match &event {
+            AppEvent::SessionDeleted(Err(err)) => assert!(
+                err.contains("boom in the purge"),
+                "the status must show what happened: {err}"
+            ),
+            _ => panic!("a panicking purge must report an error, not a success"),
+        }
+        app.handle_event(event);
+        assert_eq!(app.purge_pending, 0, "the counter is released by the event");
+        assert!(app.status.contains("boom in the purge"), "{}", app.status);
+    }
+
+    /// The shutdown that a panic starts has to finish by itself. The operator has already lost the
+    /// screen; making them send a second signal because a worker died is the bug A-4 is about.
+    #[test]
+    fn a_panic_shutdown_ends_without_a_second_signal() {
+        let _lock = crate::panics::test_lock();
+        crate::panics::clear_tui_dead();
+        let (mut app, _rx) = test_app();
+        app.commander.move_pending = 1;
+        // The hook fired while the move was still running; this is what the main loop then does.
+        crate::panics::mark_tui_dead();
+        app.request_shutdown(false);
+        assert!(!app.should_quit, "the move still has to land");
+
+        let outcome = crate::tui::commander::move_batch::MoveBatchOutcome {
+            error: Some("the move worker panicked: boom".to_string()),
+            ..Default::default()
+        };
+        app.handle_event(AppEvent::CommanderMoveDone(Box::new(outcome)));
+        assert_eq!(app.commander.move_pending, 0, "the event released the wait");
+        assert!(app.should_quit, "no second signal should be needed");
+        crate::panics::clear_tui_dead();
     }
 
     #[test]
