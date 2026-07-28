@@ -31,6 +31,9 @@ pub struct MoveBatchOutcome {
     pub reload: Vec<(LoadTarget, Option<PathBuf>)>,
     /// Label for the status line (e.g. «receiver 2» / «panel 2»).
     pub label: String,
+    /// The batch died instead of returning — a panic in the worker. Nothing was reported item by
+    /// item, so this is all the operator gets besides the log.
+    pub error: Option<String>,
 }
 
 /// Moves the batch `sources` into the directory `dest_dir`. Files are dedup-aware,
