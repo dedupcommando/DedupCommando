@@ -2898,41 +2898,44 @@ where
 /// A shutdown signal must not abandon background work that has no cancel flag: a move batch
 /// still has to reach `CommanderMoveDone` so its MoveRecord and Undo entry are written, and a
 /// purge still has to reach `SessionDeleted`.
+/// An `App` in commander mode over a database that is not there. Lives outside the test modules
+/// because the commander's own tests need the same one.
+#[cfg(test)]
+pub(crate) fn test_app() -> (App, crossbeam_channel::Receiver<AppEvent>) {
+    test_app_with_db(PathBuf::from("/nonexistent/dedcom.db"))
+}
+
+#[cfg(test)]
+pub(crate) fn test_app_with_db(db_path: PathBuf) -> (App, crossbeam_channel::Receiver<AppEvent>) {
+    let (tx, rx) = crate::tui::event::channel();
+    let zfs = ZfsEnvironment {
+        pools: Vec::new(),
+        capabilities: crate::model::dataset::ZfsCapabilities::default(),
+        warnings: Vec::new(),
+    };
+    let app = App::new(
+        zfs,
+        HostProfile::default(),
+        db_path,
+        tx,
+        Vec::new(),
+        false,
+        RevalidationMode::default(),
+        Vec::new(),
+        true,
+        crate::lock::Startup {
+            lock: None,
+            read_only: false,
+            prompt: None,
+        },
+        false,
+    );
+    (app, rx)
+}
+
 #[cfg(test)]
 mod shutdown_tests {
     use super::*;
-    use crossbeam_channel::Receiver;
-
-    pub(super) fn test_app() -> (App, Receiver<AppEvent>) {
-        test_app_with_db(PathBuf::from("/nonexistent/dedcom.db"))
-    }
-
-    pub(super) fn test_app_with_db(db_path: PathBuf) -> (App, Receiver<AppEvent>) {
-        let (tx, rx) = crate::tui::event::channel();
-        let zfs = ZfsEnvironment {
-            pools: Vec::new(),
-            capabilities: crate::model::dataset::ZfsCapabilities::default(),
-            warnings: Vec::new(),
-        };
-        let app = App::new(
-            zfs,
-            HostProfile::default(),
-            db_path,
-            tx,
-            Vec::new(),
-            false,
-            RevalidationMode::default(),
-            Vec::new(),
-            true,
-            crate::lock::Startup {
-                lock: None,
-                read_only: false,
-                prompt: None,
-            },
-            false,
-        );
-        (app, rx)
-    }
 
     #[test]
     fn the_first_signal_waits_for_a_background_move() {
@@ -3052,7 +3055,6 @@ mod shutdown_tests {
 /// Treating that as a completed run threw the marks for the rest of the work away.
 #[cfg(test)]
 mod cancel_tests {
-    use super::shutdown_tests::{test_app, test_app_with_db};
     use super::*;
     use crate::model::action::ActionOutcome;
     use crate::tui::commander::state::Mark;

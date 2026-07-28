@@ -304,7 +304,7 @@ This is what is drawn on the footer. With no modifiers:
 | **F8**    | Mark as Delete                                                         |
 | **F9**    | Menu (overlay)                                                         |
 | **F10**   | Exit                                                                   |
-| **F11**   | Apply the marked actions (the confirmation overlay)                   |
+| **F11** or **x** | Apply the marked actions (the confirmation overlay). Also in the F9 menu — most terminals eat F11 |
 | **F12**   | Sessions and scan results (the ResumeScan overlay + the session list) |
 
 ## F-keys — second layer
@@ -334,23 +334,30 @@ The prefix is cleared:
 - by pressing `` ` `` again (toggle);
 - by an F-key (the second layer handles it and clears).
 
-## The F9 menu (13 items)
+The same prefix followed by the **digit row** reaches the FIRST layer, for terminals
+that keep an F-key for themselves (F10 = menu, F11 = fullscreen in most of them):
+`` ` `` `1`…`9` = F1…F9, `` ` `` `0` = F10, `` ` `` `-` = F11, `` ` `` `=` = F12.
+Execute also has the letter alias **x**. See
+[§13 Troubleshooting](13-troubleshooting.md#f11-does-nothing--the-terminal-window-just-goes-fullscreen).
+
+## The F9 menu (14 items)
 
 ```text
 ┌─ Menu — F9 ────────────────────────────────────────────────────────────┐
 │  1. Scan the active panel's directory                                  │
 │  2. Configure and start a scan…                                        │
 │  3. Sessions and scan results…                                         │
-│  4. Clear all marks of the active panel                                │
-│  5. Reload scan data                                                   │
-│  6. Change panel mode (v)                                              │
-│  7. Synchronize panels (Shift+F1)                                      │
-│  8. Compare panels (Shift+F2)                                          │
-│  9. Add a panel (Shift+F3)                                             │
-│  10. Remove a panel (Shift+F4)                                         │
-│  11. Change panel root (Shift+F5)                                      │
-│  12. Recompute directory size (Shift+F6)                              │
-│  13. Keyboard help                                                     │
+│  4. Execute marked actions (F11 or x)                                  │
+│  5. Clear all marks of the active panel                                │
+│  6. Reload scan data                                                   │
+│  7. Change panel mode (v)                                              │
+│  8. Synchronize panels (Shift+F1)                                      │
+│  9. Compare panels (Shift+F2)                                          │
+│  10. Add a panel (Shift+F3)                                            │
+│  11. Remove a panel (Shift+F4)                                         │
+│  12. Change panel root (Shift+F5)                                      │
+│  13. Recompute directory size (Shift+F6)                              │
+│  14. Keyboard help                                                     │
 │                                                                         │
 │  ↑↓ select  Enter apply  Esc cancel                                    │
 └────────────────────────────────────────────────────────────────────────┘

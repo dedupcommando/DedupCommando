@@ -558,6 +558,20 @@ fn is_entries_row_command(code: KeyCode) -> bool {
     )
 }
 
+/// The prefix key followed by the digit row reaches a FIRST-layer F-key: 1-9 → F1-F9, 0 → F10,
+/// `-` → F11, `=` → F12, in the order the keys sit above the letters. Terminals swallow F10
+/// (menu) and F11 (fullscreen) before the application ever sees them, and Execute lived on F11
+/// alone.
+fn first_layer_key(code: KeyCode) -> Option<u8> {
+    match code {
+        KeyCode::Char(digit @ '1'..='9') => Some(digit as u8 - b'0'),
+        KeyCode::Char('0') => Some(10),
+        KeyCode::Char('-') => Some(11),
+        KeyCode::Char('=') => Some(12),
+        _ => None,
+    }
+}
+
 /// Views whose rows come from `entries`; group views draw groups instead (U-1).
 fn view_exposes_entries(view: PanelView) -> bool {
     matches!(view, PanelView::Files | PanelView::DirsOnly)
@@ -585,11 +599,17 @@ fn dispatch_key(app: &mut App, key: KeyEvent) {
         app.commander.second_layer = !app.commander.second_layer;
         return;
     }
-    // Layer 2 is armed: an F-key runs a layer-2 command, anything else disarms the layer.
+    // Layer 2 is armed: an F-key runs a layer-2 command; a digit runs the FIRST-layer command of
+    // that number, because F10/F11 are exactly the keys GUI terminals keep for themselves.
+    // Anything else disarms the layer and goes on to be handled normally.
     if app.commander.second_layer {
         app.commander.second_layer = false;
         if let KeyCode::F(n) = key.code {
             on_shift_fkey(app, n);
+            return;
+        }
+        if let Some(n) = first_layer_key(key.code) {
+            dispatch_key(app, KeyEvent::new(KeyCode::F(n), KeyModifiers::NONE));
             return;
         }
     }
@@ -612,7 +632,9 @@ fn dispatch_key(app: &mut App, key: KeyEvent) {
         KeyCode::F(6) => mark_cursor(app, Mark::Reflink),
         KeyCode::F(7) => mark_cursor(app, Mark::Keeper),
         KeyCode::F(8) => mark_cursor(app, Mark::Delete),
-        KeyCode::F(11) => actions::prepare_execution(app),
+        // `x` is the way in that no terminal can take away: F11 is fullscreen in GNOME Terminal,
+        // Konsole, Windows Terminal and xfce4-terminal, and it used to be the only one.
+        KeyCode::F(11) | KeyCode::Char('x') | KeyCode::Char('X') => actions::prepare_execution(app),
         KeyCode::Char(' ') => toggle_mark_cursor(app),
         KeyCode::Char('s') | KeyCode::Char('S') => cycle_sort(app),
         KeyCode::Char('v') | KeyCode::Char('V') => cycle_view(app),
@@ -1051,6 +1073,7 @@ enum MenuAction {
     ScanActivePanel,
     WizardScanConfig,
     WizardResume,
+    Execute,
     ClearMarks,
     ReloadDedup,
     CycleView,
@@ -1061,13 +1084,14 @@ enum MenuAction {
 }
 
 /// Items of the F9 dropdown menu.
-const MENU: [(&str, MenuAction); 13] = [
+const MENU: [(&str, MenuAction); 14] = [
     (
         "Scan the active panel's directory",
         MenuAction::ScanActivePanel,
     ),
     ("Configure and start a scan…", MenuAction::WizardScanConfig),
     ("Sessions and scan results…", MenuAction::WizardResume),
+    ("Execute marked actions (F11 or x)", MenuAction::Execute),
     (
         "Clear all marks of the active panel",
         MenuAction::ClearMarks,
@@ -1253,6 +1277,7 @@ fn run_menu_action(app: &mut App, action: MenuAction) {
         MenuAction::ScanActivePanel => scan_active_panel(app),
         MenuAction::WizardScanConfig => app.open_wizard(Screen::ScanConfig),
         MenuAction::WizardResume => app.open_wizard(Screen::Resume),
+        MenuAction::Execute => actions::prepare_execution(app),
         MenuAction::ClearMarks => {
             app.commander.active_panel_mut().marks.clear();
             app.commander.status = "Active panel marks cleared".to_string();
@@ -2796,6 +2821,11 @@ pub fn render_help(frame: &mut Frame, app: &App) {
         Line::from("    F5 Hardlink F6 Reflink  F7 Keeper   F8 Delete"),
         Line::from("    F9 Menu     F10 Exit    F11 Execute  F12 Sessions"),
         Line::from(""),
+        Line::from("  When the terminal eats an F-key".bold()),
+        Line::from("    x           Execute marked actions (same as F11)"),
+        Line::from("    ` then 1-9  F1-F9;  ` 0 → F10,  ` - → F11,  ` = → F12"),
+        Line::from("    F9 menu     Execute is available there too"),
+        Line::from(""),
         Line::from("  Second layer of F-keys".bold()),
         Line::from("    `           prefix: layer 2 for a single F-key press"),
     ];
@@ -2872,6 +2902,107 @@ mod keymap_tests {
             SECOND_LAYER_DISPATCH.to_vec(),
             "SECOND_LAYER and SECOND_LAYER_DISPATCH diverged — update both"
         );
+    }
+}
+
+/// F11 was the only way into Execute, and GNOME Terminal, Konsole, Windows Terminal and
+/// xfce4-terminal all keep it for themselves — the operator marked files and had nothing to press.
+#[cfg(test)]
+mod u2_execute_reachability_tests {
+    use super::*;
+
+    /// `prepare_execution` ran and found nothing marked. Any other outcome (empty status, an
+    /// overlay) means the key never reached it.
+    const NOTHING_MARKED: &str = "No marked files (F5/F6/F7/F8)";
+
+    fn commander_app() -> App {
+        let (app, _rx) = crate::app::test_app();
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        dispatch_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn the_letter_alias_reaches_execute() {
+        for code in [KeyCode::Char('x'), KeyCode::Char('X')] {
+            let mut app = commander_app();
+            press(&mut app, code);
+            assert_eq!(app.commander.status, NOTHING_MARKED, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn the_prefix_and_a_digit_reach_the_first_layer() {
+        // ` then `-` is F11 — the whole point: Execute without pressing F11.
+        let mut app = commander_app();
+        press(&mut app, KeyCode::Char('`'));
+        press(&mut app, KeyCode::Char('-'));
+        assert_eq!(app.commander.status, NOTHING_MARKED);
+        assert!(
+            !app.commander.second_layer,
+            "the layer disarms after the key"
+        );
+
+        // ` then `0` is F10 — quit, and it proves the mapping is not Execute-specific.
+        let mut app = commander_app();
+        press(&mut app, KeyCode::Char('`'));
+        press(&mut app, KeyCode::Char('0'));
+        assert!(app.should_quit);
+
+        // A plain digit without the prefix is not a command.
+        let mut app = commander_app();
+        press(&mut app, KeyCode::Char('0'));
+        assert!(!app.should_quit);
+        assert!(app.commander.status.is_empty());
+    }
+
+    #[test]
+    fn the_prefix_still_reaches_the_second_layer() {
+        // The digits must not have taken the F-key meaning away: ` then F12 is Shift+F12.
+        let mut app = commander_app();
+        press(&mut app, KeyCode::Char('`'));
+        press(&mut app, KeyCode::F(12));
+        assert!(app.commander.board_active, "` F12 opens the Triage Board");
+    }
+
+    #[test]
+    fn the_menu_offers_execute() {
+        let index = MENU
+            .iter()
+            .position(|(_, action)| matches!(action, MenuAction::Execute))
+            .expect("the F9 menu must offer Execute");
+        assert!(
+            MENU[index].0.contains("Execute"),
+            "the label says what it does: {}",
+            MENU[index].0
+        );
+
+        let mut app = commander_app();
+        run_menu_action(&mut app, MENU[index].1);
+        assert_eq!(app.commander.status, NOTHING_MARKED);
+    }
+
+    #[test]
+    fn every_first_layer_key_is_reachable_by_a_digit() {
+        let expected: Vec<(KeyCode, u8)> = (1..=9)
+            .map(|n| {
+                (
+                    KeyCode::Char(char::from_digit(u32::from(n), 10).unwrap()),
+                    n,
+                )
+            })
+            .chain([
+                (KeyCode::Char('0'), 10),
+                (KeyCode::Char('-'), 11),
+                (KeyCode::Char('='), 12),
+            ])
+            .collect();
+        for (code, fkey) in expected {
+            assert_eq!(first_layer_key(code), Some(fkey), "{code:?}");
+        }
+        assert_eq!(first_layer_key(KeyCode::Char('q')), None);
     }
 }
 

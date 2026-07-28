@@ -222,6 +222,24 @@ or --read-only given — terminate that process or retry with --force
 
 ## TUI
 
+### F11 does nothing — the terminal window just goes fullscreen
+
+**Cause:** F11 is the fullscreen shortcut in GNOME Terminal, Konsole, Windows
+Terminal and xfce4-terminal, and F10 opens their menu. The terminal consumes the
+key; `dedcom` never receives it. Nothing is wrong with the marks.
+
+**Fix:** any of these does the same thing as F11:
+
+```text
+x              # execute the marked actions
+` then -       # the prefix key, then the digit-row key of F11
+F9 → "Execute marked actions (F11 or x)"
+```
+
+The prefix works for the whole first layer: `` ` `` then `1`…`9` = F1…F9,
+`` ` `` `0` = F10, `` ` `` `-` = F11, `` ` `` `=` = F12. A click on the footer cell
+also runs the command, but that needs mouse reporting (in tmux: `set -g mouse on`).
+
 ### Shift+F works in a local terminal but not in the Proxmox web shell
 
 **Cause:** xterm.js (the Proxmox web console) does not pass the Shift modifier with

@@ -71,16 +71,17 @@ Press **F9**:
 │  1. Scan the active panel's directory                                  │
 │  2. Configure and start a scan…                     ◀ select          │
 │  3. Sessions and scan results…                                        │
-│  4. Clear all marks of the active panel                               │
-│  5. Reload scan data                                                  │
-│  6. Change panel mode (v)                                             │
-│  7. Synchronize panels (Shift+F1)                                     │
-│  8. Compare panels (Shift+F2)                                         │
-│  9. Add a panel (Shift+F3)                                            │
-│  10. Remove a panel (Shift+F4)                                        │
-│  11. Change panel root (Shift+F5)                                     │
-│  12. Recompute directory size (Shift+F6)                              │
-│  13. Keyboard help                                                    │
+│  4. Execute marked actions (F11 or x)                                 │
+│  5. Clear all marks of the active panel                               │
+│  6. Reload scan data                                                  │
+│  7. Change panel mode (v)                                             │
+│  8. Synchronize panels (Shift+F1)                                     │
+│  9. Compare panels (Shift+F2)                                         │
+│  10. Add a panel (Shift+F3)                                           │
+│  11. Remove a panel (Shift+F4)                                        │
+│  12. Change panel root (Shift+F5)                                     │
+│  13. Recompute directory size (Shift+F6)                              │
+│  14. Keyboard help                                                    │
 │                                                                         │
 │  ↑↓ select  Enter apply  Esc cancel                                   │
 └────────────────────────────────────────────────────────────────────────┘
