@@ -51,9 +51,9 @@ Overlay title ` Concurrent launch `.
 | **F6**  | Ref     | Mark Reflink                                      |
 | **F7**  | Keep    | Mark Keeper                                       |
 | **F8**  | Del     | Mark Delete                                       |
-| **F9**  | Menu    | Menu (overlay with 13 items)                      |
+| **F9**  | Menu    | Menu (overlay with 14 items)                      |
 | **F10** | Exit    | Exit                                              |
-| **F11** | Exec    | Apply the marked actions (Confirm overlay)        |
+| **F11** | Exec    | Apply the marked actions (Confirm overlay); also **x**, or the F9 menu |
 | **F12** | Sessions| Sessions list and scan results (wizard Resume)    |
 
 ### Second F-key layer (`Shift+F<N>` or `` ` `` then `F<N>`)
@@ -74,6 +74,22 @@ Activating the second layer:
 - `Shift+F<N>` directly (if the terminal transmits it).
 - `` ` `` (backtick) — arms layer 2 for the single next F key press
   (for Proxmox's xterm.js).
+
+### When the terminal keeps an F-key for itself
+
+F10 (menu) and F11 (fullscreen) are intercepted by most desktop terminals, so the
+application never sees them. Two ways in that no terminal can take away:
+
+| Key                  | What it does                                    |
+|----------------------|-------------------------------------------------|
+| **x**                | Apply the marked actions — the same as F11      |
+| `` ` `` then **1**…**9** | F1…F9                                       |
+| `` ` `` then **0**   | F10 (exit)                                      |
+| `` ` `` then **-**   | F11 (execute)                                   |
+| `` ` `` then **=**   | F12 (sessions)                                  |
+
+Execute is also available from the F9 menu; see
+[§13 Troubleshooting](13-troubleshooting.md#f11-does-nothing--the-terminal-window-just-goes-fullscreen).
 
 ### Letters and symbols in Commando
 
@@ -107,13 +123,13 @@ Activating the second layer:
 
 #### Menu (F9)
 
-Overlay title ` Menu — F9 `. The 13 items: 1 `Scan the active panel's
+Overlay title ` Menu — F9 `. The 14 items: 1 `Scan the active panel's
 directory` · 2 `Configure and start a scan…` · 3 `Sessions and scan results…` ·
-4 `Clear all marks of the active panel` · 5 `Reload scan data` · 6 `Change
-panel mode (v)` · 7 `Synchronize panels (Shift+F1)` · 8 `Compare panels
-(Shift+F2)` · 9 `Add a panel (Shift+F3)` · 10 `Remove a panel (Shift+F4)` ·
-11 `Change panel root (Shift+F5)` · 12 `Recompute directory size (Shift+F6)` ·
-13 `Keyboard help`.
+4 `Execute marked actions (F11 or x)` · 5 `Clear all marks of the active panel` ·
+6 `Reload scan data` · 7 `Change panel mode (v)` · 8 `Synchronize panels
+(Shift+F1)` · 9 `Compare panels (Shift+F2)` · 10 `Add a panel (Shift+F3)` ·
+11 `Remove a panel (Shift+F4)` · 12 `Change panel root (Shift+F5)` ·
+13 `Recompute directory size (Shift+F6)` · 14 `Keyboard help`.
 
 | Key          | Action                            |
 |--------------|-----------------------------------|
