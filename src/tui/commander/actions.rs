@@ -8,7 +8,7 @@ use crate::model::dataset::Dataset;
 use crate::model::duplicate::{hex_encode, DuplicateGroup, FileEntry};
 use crate::state::ScanStore;
 
-use super::state::{ConfirmTab, Mark, Overlay};
+use super::state::{ConfirmTab, Mark, Overlay, PlanDigest};
 
 /// F11: collects marks from all panels, builds a plan, opens the confirmation.
 pub fn prepare_execution(app: &mut App) {
@@ -45,6 +45,7 @@ pub fn prepare_execution(app: &mut App) {
         &datasets,
         crate::zfs::trusted_zfs_bin(),
     );
+    app.commander.confirm_digest = PlanDigest::of(&plan);
     app.commander.pending_actions = plan;
     app.commander.overlay = Overlay::Confirm {
         files: count,
@@ -135,4 +136,124 @@ fn build_groups(app: &App, files: Vec<FileEntry>) -> (Vec<DuplicateGroup>, usize
         })
         .collect();
     (groups, no_hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::test_app_with_db;
+    use crate::model::action::ActionKind;
+    use crate::state::store::{role_guard, ManifestRow};
+    use std::path::{Path, PathBuf};
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("dedcom_u4a_{tag}_{}_{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Real files on disk (`collect_marked` stats them) whose paths carry one shared hash in
+    /// the DB (`build_groups` looks each one up) — the minimum for F11 to build a plan.
+    fn seed(dir: &Path, names: &[&str]) -> (PathBuf, i64) {
+        let db_path = dir.join("dedcom.db");
+        let mut store = ScanStore::open_writable(&db_path).unwrap();
+        let scan_id = store
+            .begin_scan(&crate::model::scan::ScanConfig::new(
+                vec![dir.to_path_buf()],
+            ))
+            .unwrap();
+        let mut rows = Vec::new();
+        let mut hashes = Vec::new();
+        for name in names {
+            let path = dir.join(name);
+            std::fs::write(&path, b"identical content").unwrap();
+            rows.push(ManifestRow {
+                path: path.clone(),
+                size: 17,
+                ..Default::default()
+            });
+            hashes.push((path, [7u8; 32]));
+        }
+        store.record_files(scan_id, &rows).unwrap();
+        store.record_hashes(scan_id, &hashes).unwrap();
+        (db_path, scan_id)
+    }
+
+    /// The review's failure scenario: F8 landed where F7 was meant, so the batch deletes the
+    /// two files the operator wanted to keep. «Actions: 2» reads as expected — the digest is
+    /// what makes the mistake visible before Y.
+    #[test]
+    fn the_confirmation_digest_names_a_mis_marked_batch() {
+        let _role = role_guard();
+        let dir = temp_dir("mismarked");
+        let (db_path, scan_id) = seed(&dir, &["keeper.bin", "dup1.bin", "dup2.bin"]);
+
+        let (mut app, _rx) = test_app_with_db(db_path);
+        app.commander.dedup_scan_id = Some(scan_id);
+        let marks = &mut app.commander.panels[0].marks;
+        marks.insert(dir.join("keeper.bin"), Mark::Keeper);
+        marks.insert(dir.join("dup1.bin"), Mark::Delete);
+        marks.insert(dir.join("dup2.bin"), Mark::Delete);
+
+        prepare_execution(&mut app);
+
+        assert!(
+            matches!(app.commander.overlay, Overlay::Confirm { files: 2, .. }),
+            "the plan is two deletions: {:?}",
+            app.commander.overlay
+        );
+        let digest = &app.commander.confirm_digest;
+        assert_eq!(
+            digest.counts,
+            vec![(ActionKind::Delete, 2)],
+            "the confirmation must be able to say «delete 2»"
+        );
+        let named: Vec<&PathBuf> = digest.samples.iter().map(|(_, path)| path).collect();
+        assert!(
+            named.contains(&&dir.join("dup1.bin")) && named.contains(&&dir.join("dup2.bin")),
+            "both targets are named: {named:?}"
+        );
+        assert_eq!(digest.hidden, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A stale digest is worse than none: the overlay would describe the previous plan.
+    #[test]
+    fn a_second_plan_replaces_the_first_digest() {
+        let _role = role_guard();
+        let dir = temp_dir("replace");
+        let (db_path, scan_id) = seed(&dir, &["keeper.bin", "dup1.bin", "dup2.bin"]);
+
+        let (mut app, _rx) = test_app_with_db(db_path);
+        app.commander.dedup_scan_id = Some(scan_id);
+        {
+            let marks = &mut app.commander.panels[0].marks;
+            marks.insert(dir.join("keeper.bin"), Mark::Keeper);
+            marks.insert(dir.join("dup1.bin"), Mark::Delete);
+            marks.insert(dir.join("dup2.bin"), Mark::Delete);
+        }
+        prepare_execution(&mut app);
+        assert_eq!(app.commander.confirm_digest.counts.len(), 1);
+
+        // The operator backs out and re-marks one file as a hardlink instead.
+        cancel_execution(&mut app);
+        {
+            let marks = &mut app.commander.panels[0].marks;
+            marks.remove(&dir.join("dup2.bin"));
+            marks.insert(dir.join("dup1.bin"), Mark::Hardlink);
+        }
+        prepare_execution(&mut app);
+
+        assert_eq!(
+            app.commander.confirm_digest.counts,
+            vec![(ActionKind::Hardlink, 1)],
+            "the digest describes the plan on screen now, not the one that was cancelled"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -383,13 +383,29 @@ Besides the menu there are three more modal overlays:
 │   Summary     Commands                                                 │
 │                                                                         │
 │   Actions to be executed: 9                                            │
+│   By type: delete 2 · hardlink 7                                       │
 │   Approximately freed: 232.0 MiB                                       │
+│                                                                         │
+│   DELETE    /tank/junk/duplicate.bin                                   │
+│   DELETE    /tank/junk/duplicate-2.bin                                 │
+│   HARDLINK  /tank/dup/IMG_4421.HEIC                                    │
+│   HARDLINK  …/old-copy/IMG_4421.HEIC                                   │
+│   HARDLINK  /tank/dup/IMG_4422.HEIC                                    │
+│   … and 4 more                                                          │
 │                                                                         │
 │   A ZFS snapshot for rollback is created before changes.               │
 │                                                                         │
 │   [Tab] tab  [S] save .sh  [Y] execute  [N]/[Esc] cancel               │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+Summary reports the plan by composition, not just by total: the **By type** line
+and up to five quoted targets. "Actions: 3" reads the same whether F7 or F8
+landed on the copy, so the kinds and the paths are what catch a mis-marked
+batch before **Y**. Long paths are elided from the left so the file name stays.
+A short terminal gives things up in order — first the quoted paths, then the
+spacing, then the snapshot note, then the size — so that the count, the
+composition, the `… and N more` and the `[Y]/[N]` hint are always on screen.
 
 | Key     | Action                                                               |
 |---------|----------------------------------------------------------------------|
