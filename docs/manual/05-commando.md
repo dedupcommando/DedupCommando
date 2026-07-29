@@ -433,12 +433,18 @@ that it can be read to the end. The overlay title carries the position as
 | **Home** / **End** | First / last window of the script                         |
 | **Tab** | Switch the tab: `Summary` ↔ `Commands` (the full shell script)       |
 | **S**   | Save the plan as a `.sh` (audit trail; manual execution is possible) |
-| **Y** or **Enter** | Execute — start applying                                  |
+| **Y**   | Execute — start applying                                             |
+| **Enter** | Nothing. Applying is destructive, so it costs a deliberate **Y**   |
 | **N** / **Esc** | Cancel                                                       |
 
 `S` always writes the whole script, whatever part of it is on screen. On a
 window too small for both hint lines the scrolling hint goes first — the
 `[Y]/[N]` line stays.
+
+**Enter does not execute.** It used to be a synonym for **Y**, which made the
+one irreversible step in the tool reachable by the key people press to dismiss a
+dialog they have not read. Enter is now ignored here: the confirmation stays
+open and the plan is untouched.
 
 ### F3 file info (Overlay::FileInfo)
 
