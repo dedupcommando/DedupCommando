@@ -451,6 +451,51 @@ pub enum ConfirmTab {
     Commands,
 }
 
+/// Scroll position of the Commands tab of the F11 confirmation.
+///
+/// The tab used to print the first screenful and a «… N more lines» note, so the audit view
+/// could not be audited past its first screen — the script of a large plan runs to thousands
+/// of lines. `total` is counted once when the plan is prepared, because the overlay redraws
+/// every frame and only the visible window should be formatted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConfirmScroll {
+    /// Index of the first script line shown.
+    pub offset: usize,
+    /// Script lines in total.
+    pub total: usize,
+    /// Body rows the last frame measured; `0` until the first frame.
+    pub rows: u16,
+}
+
+impl ConfirmScroll {
+    /// Largest first-line index that still fills the window. Scrolling past it would only
+    /// add blank rows under the last line.
+    pub fn max_offset(&self) -> usize {
+        self.total.saturating_sub(self.rows as usize)
+    }
+
+    /// Moves the window by `delta` lines, clamped to the script.
+    pub fn scroll_by(&mut self, delta: i32) {
+        let next = i64::from(delta).saturating_add(self.offset as i64);
+        self.offset = next.clamp(0, self.max_offset() as i64) as usize;
+    }
+
+    /// Pulls the window back inside the script — a resize can grow it under an offset that
+    /// was valid for the smaller one.
+    pub fn clamp(&mut self) {
+        self.offset = self.offset.min(self.max_offset());
+    }
+
+    /// 1-based inclusive range of the visible window; `None` when there is nothing to show.
+    pub fn visible_range(&self) -> Option<(usize, usize)> {
+        if self.total == 0 || self.rows == 0 {
+            return None;
+        }
+        let first = self.offset.min(self.max_offset());
+        Some((first + 1, (first + self.rows as usize).min(self.total)))
+    }
+}
+
 /// Modal overlay on top of the commander panels.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Overlay {
@@ -725,6 +770,8 @@ pub struct CommanderState {
     pub confirm_script: String,
     /// Composition of the current F11 plan — shown on the "Summary" tab.
     pub confirm_digest: PlanDigest,
+    /// Where the "Commands" tab is scrolled to within `confirm_script`.
+    pub confirm_scroll: ConfirmScroll,
     /// Triage (triage v1): a move awaiting a receiver (the source is fixed).
     pub triage: Option<TriagePending>,
     /// Triage move journal for Undo (`u`); newest at the end.
@@ -792,6 +839,7 @@ impl CommanderState {
             pending_actions: Vec::new(),
             confirm_script: String::new(),
             confirm_digest: PlanDigest::default(),
+            confirm_scroll: ConfirmScroll::default(),
             triage: None,
             move_log: Vec::new(),
             snapshotted: HashSet::new(),

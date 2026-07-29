@@ -407,12 +407,38 @@ A short terminal gives things up in order — first the quoted paths, then the
 spacing, then the snapshot note, then the size — so that the count, the
 composition, the `… and N more` and the `[Y]/[N]` hint are always on screen.
 
+The **Commands** tab shows the plan's shell script and scrolls: the script of a
+large plan runs to thousands of lines, and the whole point of an audit view is
+that it can be read to the end. The overlay title carries the position as
+`lines X-Y of N`, or `no script lines` when there is nothing to show.
+
+```text
+┌─ Confirmation — F11 · lines 18-34 of 217 ───────────────────────────────┐
+│   Summary     Commands                                                  │
+│                                                                         │
+│  mkdir -p '/tank/ds_a/.dedcom-quarantine/20260729-113540/dup'           │
+│  mv -n -- '/tank/dup/copy1.bin' '/tank/ds_a/.dedcom-quarantine/…'       │
+│  cp --reflink=always -- '/tank/dup/orig.bin' '/tank/dup/copy1.bin'      │
+│   …                                                                     │
+│                                                                         │
+│   ↑↓ · PgUp/PgDn · Home/End — scroll                                    │
+│   [Tab] tab  [S] save .sh (whole script)  [Y] execute  [N]/[Esc] cancel │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
 | Key     | Action                                                               |
 |---------|----------------------------------------------------------------------|
+| **↑** / **↓** | Scroll the script one line (Commands tab)                      |
+| **PgUp** / **PgDn** | Scroll a screenful, one line of overlap                  |
+| **Home** / **End** | First / last window of the script                         |
 | **Tab** | Switch the tab: `Summary` ↔ `Commands` (the full shell script)       |
 | **S**   | Save the plan as a `.sh` (audit trail; manual execution is possible) |
 | **Y** or **Enter** | Execute — start applying                                  |
 | **N** / **Esc** | Cancel                                                       |
+
+`S` always writes the whole script, whatever part of it is on screen. On a
+window too small for both hint lines the scrolling hint goes first — the
+`[Y]/[N]` line stays.
 
 ### F3 file info (Overlay::FileInfo)
 
