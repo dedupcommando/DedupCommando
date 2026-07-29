@@ -1208,7 +1208,9 @@ fn on_key_confirm(app: &mut App, key: KeyEvent) {
         _ => return,
     };
     match key.code {
-        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => actions::confirm_execution(app),
+        // Y only. Enter is the key people press to dismiss a dialog they have not read, and
+        // this dialog starts a destructive batch — it must cost a deliberate keystroke.
+        KeyCode::Char('y') | KeyCode::Char('Y') => actions::confirm_execution(app),
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => actions::cancel_execution(app),
         // Switching the Summary/Commands tab and saving the script.
         KeyCode::Tab => toggle_confirm_tab(app),
@@ -3108,6 +3110,154 @@ mod u4b_commands_scroll_tests {
         );
         let written = std::fs::read_to_string(saved[0].path()).unwrap();
         assert_eq!(written, whole, "the .sh must not be cut down to the window");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// U-4c: Enter used to mean Y. The one irreversible step in the tool was reachable by the key
+/// people press to get a dialog off the screen.
+#[cfg(test)]
+mod u4c_enter_is_not_execute_tests {
+    use super::state::ConfirmScroll;
+    use super::*;
+    use crate::model::action::{ActionKind, PlannedAction};
+    use std::path::PathBuf;
+
+    /// An app with the F11 confirmation open over a two-action plan.
+    fn confirming(tab: ConfirmTab) -> App {
+        let (mut app, _rx) = crate::app::test_app();
+        app.commander.pending_actions = ["/x/dup1.bin", "/x/dup2.bin"]
+            .iter()
+            .map(|target| PlannedAction {
+                kind: ActionKind::Delete,
+                target: PathBuf::from(target),
+                keeper: PathBuf::from("/x/keeper.bin"),
+                target_device: 1,
+                keeper_device: 1,
+                size: 1024,
+                expected_hash: String::new(),
+            })
+            .collect();
+        app.commander.confirm_script = "echo one\necho two".to_string();
+        app.commander.confirm_scroll = ConfirmScroll {
+            offset: 0,
+            total: 2,
+            rows: 1,
+        };
+        app.commander.overlay = Overlay::Confirm {
+            files: 2,
+            reclaim: 2048,
+            tab,
+        };
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        on_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// The point of U-4c. Enter must leave the operator exactly where they were.
+    #[test]
+    fn enter_does_not_execute_on_either_tab() {
+        for tab in [ConfirmTab::Summary, ConfirmTab::Commands] {
+            let mut app = confirming(tab);
+
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Enter);
+
+            assert!(
+                matches!(app.commander.overlay, Overlay::Confirm { .. }),
+                "{tab:?}: the confirmation must stay open"
+            );
+            assert_eq!(
+                app.commander.pending_actions.len(),
+                2,
+                "{tab:?}: the plan must be untouched"
+            );
+            assert!(app.apply.is_none(), "{tab:?}: no batch may have started");
+            assert_eq!(
+                app.screen,
+                Screen::ScanConfig,
+                "{tab:?}: the wizard must not have been entered"
+            );
+        }
+    }
+
+    /// Y is still the way through — and it hands over the exact plan that was pending.
+    #[test]
+    fn y_still_executes_the_pending_plan() {
+        for code in [KeyCode::Char('y'), KeyCode::Char('Y')] {
+            let mut app = confirming(ConfirmTab::Summary);
+
+            press(&mut app, code);
+
+            // The handover is synchronous; the batch itself has its own tests.
+            assert!(matches!(app.commander.overlay, Overlay::None), "{code:?}");
+            assert!(
+                app.commander.pending_actions.is_empty(),
+                "{code:?}: the plan was taken"
+            );
+            assert_eq!(app.applying.total, 2, "{code:?}: both actions handed over");
+            assert_eq!(app.screen, Screen::Applying, "{code:?}");
+            assert!(app.apply.is_some(), "{code:?}: the worker was started");
+        }
+    }
+
+    #[test]
+    fn n_and_esc_still_cancel() {
+        for code in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
+            let mut app = confirming(ConfirmTab::Commands);
+
+            press(&mut app, code);
+
+            assert!(matches!(app.commander.overlay, Overlay::None), "{code:?}");
+            assert!(app.commander.pending_actions.is_empty(), "{code:?}");
+            assert!(app.apply.is_none(), "{code:?}: cancelling starts nothing");
+        }
+    }
+
+    /// Dropping Enter must not disturb the keys U-4a and U-4b put on this overlay.
+    #[test]
+    fn tab_scroll_and_save_still_work() {
+        let mut app = confirming(ConfirmTab::Summary);
+
+        press(&mut app, KeyCode::Tab);
+        assert!(matches!(
+            app.commander.overlay,
+            Overlay::Confirm {
+                tab: ConfirmTab::Commands,
+                ..
+            }
+        ));
+
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.commander.confirm_scroll.offset, 1, "Commands scrolls");
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.commander.confirm_scroll.offset, 0);
+
+        // `S` writes next to the checkpoint DB — point it somewhere disposable so the test
+        // asserts a real save instead of an error string.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("dedcom_u4c_save_{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.db_path = dir.join("dedcom.db");
+
+        press(&mut app, KeyCode::Char('s'));
+
+        assert!(
+            app.commander.status.starts_with("Script saved"),
+            "S still reaches save: {}",
+            app.commander.status
+        );
+        let saved = std::fs::read_dir(dir.join("plans")).unwrap().count();
+        assert_eq!(saved, 1, "the script was written");
+        assert!(
+            matches!(app.commander.overlay, Overlay::Confirm { .. }),
+            "and none of this closed the confirmation"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

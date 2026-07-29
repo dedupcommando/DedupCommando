@@ -64,7 +64,7 @@ form:
      (or F8 to delete (Del), or F6 for reflink (Ref) — see §08)
 
 5. Apply:
-     F11 → confirmation → Enter → wait for the Summary
+     F11 → confirmation → Y → wait for the Summary
 
 6. Rollback, if something is wrong:
      zfs rollback tank@dedcom-<ts>    # the snapshot is taken automatically

@@ -152,7 +152,8 @@ line is added above it and the save reads `[S] save .sh (whole script)`.
 | **Home** / **End** | First / last window of the script                  |
 | **Tab**      | Switch the tab (Summary ↔ Commands)                      |
 | **S**        | Save the plan as `.sh` — always the whole script          |
-| **Y** or **Enter** | Execute                                            |
+| **Y**        | Execute                                                   |
+| **Enter**    | Ignored — executing is deliberate, and only **Y** does it |
 | **N** / **Esc** | Cancel                                                |
 
 #### FileInfo (F3)
