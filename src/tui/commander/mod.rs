@@ -126,7 +126,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             files,
             reclaim,
             tab,
-        } => overlay::render_confirm(frame, files, reclaim, tab, &app.commander.confirm_script),
+        } => overlay::render_confirm(
+            frame,
+            files,
+            reclaim,
+            tab,
+            &app.commander.confirm_script,
+            &app.commander.confirm_digest,
+        ),
         Overlay::FileInfo => overlay::render_info(frame, &app.commander.info_lines),
         Overlay::ResumeScan => {
             let root = app

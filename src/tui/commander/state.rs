@@ -473,6 +473,56 @@ pub enum Overlay {
     ResumeScan,
 }
 
+/// What an F11 confirmation is about to run, worked out once when the overlay opens.
+/// «Actions: 3» alone reads as expected to someone who did mean three actions but marked
+/// the wrong side of a group, so the confirmation has to say which kinds and on which
+/// paths. `Overlay` is `Copy`, and the plan can hold thousands of actions the overlay
+/// would otherwise recount on every frame — hence a precomputed digest next to
+/// `confirm_script`, not fields on the variant.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanDigest {
+    /// Counts of the kinds actually present, in a fixed order — `delete 2 · hardlink 7`.
+    pub counts: Vec<(ActionKind, usize)>,
+    /// The opening actions, in plan order: enough to recognise a mis-marked batch.
+    pub samples: Vec<(ActionKind, PathBuf)>,
+    /// Actions beyond `samples`.
+    pub hidden: usize,
+}
+
+impl PlanDigest {
+    /// How many actions the digest quotes by path.
+    pub const SAMPLES: usize = 5;
+
+    pub fn of(plan: &[PlannedAction]) -> Self {
+        let (mut delete, mut hardlink, mut reflink) = (0usize, 0usize, 0usize);
+        for action in plan {
+            match action.kind {
+                ActionKind::Delete => delete += 1,
+                ActionKind::Hardlink => hardlink += 1,
+                ActionKind::Reflink => reflink += 1,
+            }
+        }
+        let counts = [
+            (ActionKind::Delete, delete),
+            (ActionKind::Hardlink, hardlink),
+            (ActionKind::Reflink, reflink),
+        ]
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .collect();
+        let samples: Vec<(ActionKind, PathBuf)> = plan
+            .iter()
+            .take(Self::SAMPLES)
+            .map(|action| (action.kind, action.target.clone()))
+            .collect();
+        Self {
+            counts,
+            hidden: plan.len() - samples.len(),
+            samples,
+        }
+    }
+}
+
 /// Comparison mode of neighbouring panels.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CompareMode {
@@ -673,6 +723,8 @@ pub struct CommanderState {
     /// Shell-script preview of the current F11 plan — shown
     /// on the "Commands" tab and saved with `S`.
     pub confirm_script: String,
+    /// Composition of the current F11 plan — shown on the "Summary" tab.
+    pub confirm_digest: PlanDigest,
     /// Triage (triage v1): a move awaiting a receiver (the source is fixed).
     pub triage: Option<TriagePending>,
     /// Triage move journal for Undo (`u`); newest at the end.
@@ -739,6 +791,7 @@ impl CommanderState {
             compare_mode: CompareMode::Off,
             pending_actions: Vec::new(),
             confirm_script: String::new(),
+            confirm_digest: PlanDigest::default(),
             triage: None,
             move_log: Vec::new(),
             snapshotted: HashSet::new(),
@@ -878,5 +931,68 @@ mod tests {
         let state = CommanderState::new(&[PathBuf::from("/tank")]);
         assert!(state.scan_coverage_cache.is_empty());
         assert!(state.dedup_scan_id.is_none());
+    }
+}
+
+/// U-4a: «Actions: 3» is what a batch that marked the wrong side of a group looks like too,
+/// so the confirmation has to be able to say which kinds and on which paths.
+#[cfg(test)]
+mod plan_digest_tests {
+    use super::*;
+
+    fn action(kind: ActionKind, target: &str) -> PlannedAction {
+        PlannedAction {
+            kind,
+            target: PathBuf::from(target),
+            keeper: PathBuf::from("/x/keeper.bin"),
+            target_device: 1,
+            keeper_device: 1,
+            size: 1024,
+            expected_hash: String::new(),
+        }
+    }
+
+    #[test]
+    fn counts_only_the_kinds_actually_planned() {
+        let plan = vec![
+            action(ActionKind::Hardlink, "/x/a"),
+            action(ActionKind::Delete, "/x/b"),
+            action(ActionKind::Hardlink, "/x/c"),
+        ];
+        assert_eq!(
+            PlanDigest::of(&plan).counts,
+            vec![(ActionKind::Delete, 1), (ActionKind::Hardlink, 2)],
+            "no reflink is planned, so it must not be reported as «reflink 0»"
+        );
+    }
+
+    #[test]
+    fn quotes_the_opening_actions_and_counts_the_rest() {
+        let plan: Vec<PlannedAction> = (0..8)
+            .map(|index| action(ActionKind::Delete, &format!("/x/f{index}")))
+            .collect();
+        let digest = PlanDigest::of(&plan);
+        assert_eq!(digest.samples.len(), PlanDigest::SAMPLES);
+        assert_eq!(digest.samples[0].1, PathBuf::from("/x/f0"));
+        assert_eq!(digest.hidden, 3, "8 planned, 5 quoted");
+    }
+
+    #[test]
+    fn a_plan_short_enough_is_quoted_whole() {
+        let plan = vec![
+            action(ActionKind::Delete, "/x/a"),
+            action(ActionKind::Reflink, "/x/b"),
+        ];
+        let digest = PlanDigest::of(&plan);
+        assert_eq!(digest.samples.len(), 2);
+        assert_eq!(digest.hidden, 0);
+    }
+
+    #[test]
+    fn an_empty_plan_digests_to_nothing() {
+        let digest = PlanDigest::of(&[]);
+        assert!(digest.counts.is_empty());
+        assert!(digest.samples.is_empty());
+        assert_eq!(digest.hidden, 0);
     }
 }

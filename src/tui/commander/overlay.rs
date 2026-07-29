@@ -9,7 +9,8 @@ use ratatui::{
     Frame,
 };
 
-use super::state::ConfirmTab;
+use super::panel::ellipsize_left;
+use super::state::{ConfirmTab, PlanDigest};
 use crate::model::scan::ResumeInfo;
 use crate::tui::{centered, human_bytes};
 
@@ -51,6 +52,7 @@ pub fn render_confirm(
     reclaim: u64,
     tab: ConfirmTab,
     script: &str,
+    digest: &PlanDigest,
 ) {
     let tabs = Line::from(vec![
         Span::raw("  "),
@@ -60,18 +62,18 @@ pub fn render_confirm(
     ]);
     let hint = Line::from("  [Tab] tab  [S] save .sh  [Y] execute  [N]/[Esc] cancel");
 
-    let (area, body): (Rect, Vec<Line>) = match tab {
+    let (area, body, gaps): (Rect, Vec<Line>, bool) = match tab {
         ConfirmTab::Summary => {
-            let body = vec![
-                Line::from(""),
-                Line::from(format!("  Actions to be executed: {files}")),
-                Line::from(format!("  Approximately freed: {}", human_bytes(reclaim))),
-                Line::from(""),
-                Line::from("  A ZFS snapshot for rollback is created before changes."),
-            ];
-            // tabs + empty + body + empty + hint + border(2).
-            let height = body.len() as u16 + 6;
-            (centered(frame.area(), 66, height), body)
+            // Borders, the tab strip and the key hint are never given up: a confirmation
+            // whose [Y]/[N] line has fallen off the bottom is worse than one that says
+            // less. The two blank separators go first, then the body sheds itself.
+            let avail = frame.area().height as usize;
+            let gaps = avail >= SUMMARY_FIXED + 2 + SUMMARY_MIN_BODY;
+            let chrome = SUMMARY_FIXED + if gaps { 2 } else { 0 };
+            let lines = summary_lines(files, reclaim, digest, avail.saturating_sub(chrome));
+            let height = (lines.len() + chrome) as u16;
+            let body: Vec<Line> = lines.into_iter().map(Line::from).collect();
+            (centered(frame.area(), SUMMARY_WIDTH, height), body, gaps)
         }
         ConfirmTab::Commands => {
             let avail = frame.area();
@@ -98,14 +100,19 @@ pub fn render_confirm(
                     .map(|l| Line::from(format!(" {l}")))
                     .collect()
             };
-            (centered(avail, width, height), body)
+            (centered(avail, width, height), body, true)
         }
     };
 
     frame.render_widget(Clear, area);
-    let mut content = vec![tabs, Line::from("")];
+    let mut content = vec![tabs];
+    if gaps {
+        content.push(Line::from(""));
+    }
     content.extend(body);
-    content.push(Line::from(""));
+    if gaps {
+        content.push(Line::from(""));
+    }
     content.push(hint);
     frame.render_widget(
         Paragraph::new(Text::from(content)).block(
@@ -115,6 +122,120 @@ pub fn render_confirm(
         ),
         area,
     );
+}
+
+/// Box width of the Summary tab.
+const SUMMARY_WIDTH: u16 = 66;
+
+/// Rows the Summary box never gives up: two borders, the tab strip and the key hint.
+const SUMMARY_FIXED: usize = 4;
+
+/// Body rows that survive every shrink — the count, the composition, and the admission of
+/// what is not being shown. Below this the blank separators are dropped first.
+const SUMMARY_MIN_BODY: usize = 3;
+
+/// Width left for a path once `  ` + the padded action label have been printed.
+const SUMMARY_PATH: usize = SUMMARY_WIDTH as usize - 2 - 12;
+
+/// What the Summary body has given up so far, in the order it is given up.
+#[derive(Debug, Clone, Copy)]
+struct Shed {
+    /// Quoted target paths still shown.
+    samples: usize,
+    /// Blank separators still shown.
+    spacing: bool,
+    /// The snapshot reassurance still shown.
+    note: bool,
+    /// The reclaim estimate still shown.
+    size: bool,
+}
+
+impl Shed {
+    fn new(samples: usize) -> Self {
+        Self {
+            samples,
+            spacing: true,
+            note: true,
+            size: true,
+        }
+    }
+
+    /// Gives up the next least-needed thing; `false` when only the essentials are left.
+    fn shrink(&mut self) -> bool {
+        if self.samples > 0 {
+            self.samples -= 1;
+        } else if self.spacing {
+            self.spacing = false;
+        } else if self.note {
+            self.note = false;
+        } else if self.size {
+            self.size = false;
+        } else {
+            return false;
+        }
+        true
+    }
+}
+
+/// Text of the Summary tab, shrunk to `max_rows`. Pure, so what the operator is told can be
+/// asserted without a terminal.
+///
+/// The [Y]/[N] hint is not part of this body and is never shed — the operator has to be able
+/// to read their way out of a confirmation they did not mean to open. What goes, in order:
+/// the quoted paths, then the blank spacing, then the snapshot note, then the size estimate.
+/// The count, the `By type` composition and «… and N more» are what remain.
+fn summary_lines(files: usize, reclaim: u64, digest: &PlanDigest, max_rows: usize) -> Vec<String> {
+    let mut shed = Shed::new(digest.samples.len());
+    let mut lines = compose(files, reclaim, digest, shed);
+    while lines.len() > max_rows && shed.shrink() {
+        lines = compose(files, reclaim, digest, shed);
+    }
+    // Below the essentials there is nothing left to trade; cut rather than push the hint off.
+    lines.truncate(max_rows);
+    lines
+}
+
+/// The Summary body at one particular level of shedding.
+fn compose(files: usize, reclaim: u64, digest: &PlanDigest, shed: Shed) -> Vec<String> {
+    let mut lines = vec![format!("  Actions to be executed: {files}")];
+    if !digest.counts.is_empty() {
+        let by_kind: Vec<String> = digest
+            .counts
+            .iter()
+            .map(|(kind, count)| format!("{} {count}", kind.label().to_lowercase()))
+            .collect();
+        lines.push(format!("  By type: {}", by_kind.join(" · ")));
+    }
+    if shed.size {
+        lines.push(format!("  Approximately freed: {}", human_bytes(reclaim)));
+    }
+
+    let shown = digest.samples.len().min(shed.samples);
+    if shown > 0 {
+        if shed.spacing {
+            lines.push(String::new());
+        }
+        for (kind, target) in digest.samples.iter().take(shown) {
+            lines.push(format!(
+                "  {:9} {}",
+                kind.label(),
+                ellipsize_left(&target.display().to_string(), SUMMARY_PATH),
+            ));
+        }
+    }
+    // Everything the plan holds that this screen is not showing by name.
+    let unnamed = digest.hidden + (digest.samples.len() - shown);
+    if unnamed > 0 {
+        lines.push(format!("  … and {unnamed} more"));
+    }
+
+    if shed.note {
+        if shed.spacing {
+            lines.push(String::new());
+        }
+        lines.push("  A ZFS snapshot for rollback is created before changes.".to_string());
+    }
+    lines
 }
 
 /// Tab-label span of the confirmation overlay; the active one is inverted.
@@ -278,4 +399,220 @@ pub fn render_info(frame: &mut Frame, lines: &[String]) {
         ),
         area,
     );
+}
+
+#[cfg(test)]
+mod confirm_summary_tests {
+    use super::*;
+    use crate::model::action::{ActionKind, PlannedAction};
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::path::PathBuf;
+
+    fn digest_of(actions: &[(ActionKind, &str)]) -> PlanDigest {
+        let plan: Vec<PlannedAction> = actions
+            .iter()
+            .map(|(kind, target)| PlannedAction {
+                kind: *kind,
+                target: PathBuf::from(target),
+                keeper: PathBuf::from("/tank/keeper.bin"),
+                target_device: 1,
+                keeper_device: 1,
+                size: 1024,
+                expected_hash: String::new(),
+            })
+            .collect();
+        PlanDigest::of(&plan)
+    }
+
+    /// The Summary body with room to spare — what a normal terminal shows.
+    fn joined(digest: &PlanDigest, rows: usize) -> String {
+        summary_lines(digest.samples.len() + digest.hidden, 1024, digest, rows).join("\n")
+    }
+
+    /// Everything actually painted by `render_confirm` on a `width`x`height` terminal.
+    fn drawn(digest: &PlanDigest, width: u16, height: u16) -> String {
+        let files = digest.samples.len() + digest.hidden;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render_confirm(frame, files, 1024, ConfirmTab::Summary, "", digest))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn long_plan(count: usize) -> PlanDigest {
+        let paths: Vec<String> = (0..count).map(|i| format!("/tank/f{i}.bin")).collect();
+        let actions: Vec<(ActionKind, &str)> = paths
+            .iter()
+            .map(|path| (ActionKind::Delete, path.as_str()))
+            .collect();
+        digest_of(&actions)
+    }
+
+    /// What the operator is shown on a normal terminal, and the whole point of U-4a: the
+    /// batch is described by kind and by path, not by a bare total.
+    #[test]
+    fn the_summary_names_the_kinds_and_the_paths() {
+        let digest = digest_of(&[
+            (ActionKind::Delete, "/tank/photos/IMG_4421.HEIC"),
+            (ActionKind::Hardlink, "/tank/dup/a.bin"),
+            (ActionKind::Hardlink, "/tank/dup/b.bin"),
+        ]);
+        let text = joined(&digest, 20);
+
+        assert!(
+            text.contains("By type: delete 1 · hardlink 2"),
+            "the composition has to be spelled out:\n{text}"
+        );
+        assert!(
+            text.contains("DELETE") && text.contains("IMG_4421.HEIC"),
+            "the deletion the operator did not mean must be named:\n{text}"
+        );
+        assert!(!text.contains("more"), "a 3-action plan is quoted whole");
+    }
+
+    /// A plan longer than the quota says so, instead of quietly showing five of five hundred.
+    #[test]
+    fn a_long_plan_admits_what_it_is_not_showing() {
+        let text = joined(&long_plan(12), 20);
+
+        assert!(text.contains("By type: delete 12"));
+        assert!(text.contains("/tank/f0.bin") && text.contains("/tank/f4.bin"));
+        assert!(!text.contains("/tank/f5.bin"), "only five are quoted");
+        assert!(text.contains("… and 7 more"), "{text}");
+    }
+
+    /// The box is 66 wide, so a deep path has to lose its head — the file name is the part
+    /// that identifies it.
+    #[test]
+    fn a_deep_path_keeps_its_tail() {
+        let digest = digest_of(&[(
+            ActionKind::Delete,
+            "/tank/backups/2019/january/photos/family/holiday/IMG_4421_original_copy.HEIC",
+        )]);
+        let text = joined(&digest, 20);
+
+        assert!(
+            text.contains("IMG_4421_original_copy.HEIC"),
+            "the name identifies the file:\n{text}"
+        );
+        assert!(text.contains('…'), "and the head is elided:\n{text}");
+        for line in text.lines() {
+            assert!(
+                line.chars().count() <= SUMMARY_WIDTH as usize - 2,
+                "line overflows the box: {line}"
+            );
+        }
+    }
+
+    /// The order the body gives things up in as the budget tightens: quoted paths, then the
+    /// blank spacing, then the snapshot note, then the size — never the count, the
+    /// composition, or the admission of what is not shown.
+    #[test]
+    fn the_body_sheds_paths_before_prose() {
+        let digest = long_plan(12);
+
+        let roomy = joined(&digest, 20);
+        assert!(roomy.contains("/tank/f0.bin") && roomy.contains("A ZFS snapshot"));
+
+        let tight = joined(&digest, 5);
+        assert!(!tight.contains("/tank/f0.bin"), "paths go first:\n{tight}");
+        assert!(
+            tight.contains("A ZFS snapshot"),
+            "prose outlives them:\n{tight}"
+        );
+
+        let tighter = joined(&digest, 4);
+        assert!(
+            !tighter.contains("A ZFS snapshot"),
+            "then the note:\n{tighter}"
+        );
+        assert!(tighter.contains("Approximately freed"));
+
+        let essentials = joined(&digest, 3);
+        assert_eq!(
+            essentials, "  Actions to be executed: 12\n  By type: delete 12\n  … and 12 more",
+            "what is left is what the operator cannot decide without"
+        );
+    }
+
+    /// The defect this amend fixes: the body alone was fitted to the terminal, but
+    /// `render_confirm` then wrapped it in chrome that pushed the key hint off an 80x10
+    /// screen. The operator could see a destructive batch and not the way to refuse it.
+    #[test]
+    fn a_ten_row_terminal_still_shows_the_way_out() {
+        let screen = drawn(&long_plan(12), 80, 10);
+
+        assert!(
+            screen.contains("[Y] execute") && screen.contains("[N]/[Esc] cancel"),
+            "the decision hint must survive:\n{screen}"
+        );
+        assert!(screen.contains("Actions to be executed: 12"), "{screen}");
+        assert!(screen.contains("By type: delete 12"), "{screen}");
+        assert!(
+            screen.contains("… and 12 more"),
+            "nothing is quoted, and the screen owns up to it:\n{screen}"
+        );
+        assert!(
+            !screen.contains("DELETE "),
+            "no room for quoted paths here:\n{screen}"
+        );
+    }
+
+    /// Below what the essentials need there is nothing left to trade, and the hint is still
+    /// the last line standing.
+    #[test]
+    fn the_hint_outlives_every_other_line() {
+        for height in 6..=16u16 {
+            let screen = drawn(&long_plan(12), 80, height);
+            assert!(
+                screen.contains("[Y] execute"),
+                "height {height} lost the hint:\n{screen}"
+            );
+            assert!(
+                screen.contains("Actions to be executed: 12"),
+                "height {height} lost the count:\n{screen}"
+            );
+        }
+    }
+
+    /// The composition has to survive the trip to the screen, not just the string builder.
+    #[test]
+    fn the_overlay_draws_the_composition() {
+        let digest = digest_of(&[
+            (ActionKind::Delete, "/tank/photos/IMG_4421.HEIC"),
+            (ActionKind::Hardlink, "/tank/dup/a.bin"),
+        ]);
+        let (width, height) = (100u16, 30u16);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render_confirm(frame, 2, 1024, ConfirmTab::Summary, "", &digest))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let screen: String = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            screen.contains("By type: delete 1 · hardlink 1"),
+            "{screen}"
+        );
+        assert!(screen.contains("IMG_4421.HEIC"), "{screen}");
+        assert!(
+            screen.contains("[Y] execute"),
+            "the hint stays visible:\n{screen}"
+        );
+    }
 }

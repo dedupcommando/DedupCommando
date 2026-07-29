@@ -272,13 +272,29 @@ overlay with two tabs — **Summary** and **Commands**:
 │   Summary     Commands                                                 │
 │                                                                         │
 │   Actions to be executed: 9                                            │
+│   By type: delete 2 · hardlink 7                                       │
 │   Approximately freed: 232.0 MiB                                       │
+│                                                                         │
+│   DELETE    /tank/junk/duplicate.bin                                   │
+│   DELETE    /tank/junk/duplicate-2.bin                                 │
+│   HARDLINK  /tank/dup/IMG_4421.HEIC                                    │
+│   HARDLINK  …/old-copy/IMG_4421.HEIC                                   │
+│   HARDLINK  /tank/dup/IMG_4422.HEIC                                    │
+│   … and 4 more                                                          │
 │                                                                         │
 │   A ZFS snapshot for rollback is created before changes.               │
 │                                                                         │
 │   [Tab] tab  [S] save .sh  [Y] execute  [N]/[Esc] cancel               │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+The composition matters more than the total: "Actions: 3" looks exactly the same
+whether you marked the three copies or the three originals. The **By type** line
+and the first few paths are there so a batch that marked the wrong side of a
+group is recognisable before **Y**. Deep paths lose their head, not their name.
+On a short terminal the box gives up the quoted paths first, then the spacing
+and the explanatory lines — the count, the composition, the `… and N more` and
+the `[Y]/[N]` hint stay visible down to a 10-row window.
 
 | Key             | Action                                                        |
 |-----------------|---------------------------------------------------------------|
