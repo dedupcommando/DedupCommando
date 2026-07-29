@@ -139,13 +139,19 @@ directory` · 2 `Configure and start a scan…` · 3 `Sessions and scan results�
 
 #### Confirm (F11)
 
-Overlay title ` Confirmation — F11 `; tabs `Summary` / `Commands`. Footer hint:
-`[Tab] tab  [S] save .sh  [Y] execute  [N]/[Esc] cancel`.
+Overlay title ` Confirmation — F11 `; on the Commands tab it carries the scroll
+position, ` Confirmation — F11 · lines X-Y of N ` (or `· no script lines`). Tabs
+`Summary` / `Commands`. Footer hint on Summary:
+`[Tab] tab  [S] save .sh  [Y] execute  [N]/[Esc] cancel`; on Commands a scroll
+line is added above it and the save reads `[S] save .sh (whole script)`.
 
 | Key          | Action                                                    |
 |--------------|-----------------------------------------------------------|
+| **↑** / **↓**| Scroll one script line (Commands tab only)               |
+| **PgUp** / **PgDn** | Scroll a screenful (Commands tab only)             |
+| **Home** / **End** | First / last window of the script                  |
 | **Tab**      | Switch the tab (Summary ↔ Commands)                      |
-| **S**        | Save the plan as `.sh`                                    |
+| **S**        | Save the plan as `.sh` — always the whole script          |
 | **Y** or **Enter** | Execute                                            |
 | **N** / **Esc** | Cancel                                                |
 

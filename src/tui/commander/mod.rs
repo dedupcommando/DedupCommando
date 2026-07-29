@@ -133,6 +133,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             tab,
             &app.commander.confirm_script,
             &app.commander.confirm_digest,
+            &mut app.commander.confirm_scroll,
         ),
         Overlay::FileInfo => overlay::render_info(frame, &app.commander.info_lines),
         Overlay::ResumeScan => {
@@ -1202,12 +1203,33 @@ fn reset_resume_overlay(app: &mut App) {
 
 /// Input in the F11 confirmation overlay.
 fn on_key_confirm(app: &mut App, key: KeyEvent) {
+    let tab = match app.commander.overlay {
+        Overlay::Confirm { tab, .. } => tab,
+        _ => return,
+    };
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => actions::confirm_execution(app),
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => actions::cancel_execution(app),
         // Switching the Summary/Commands tab and saving the script.
         KeyCode::Tab => toggle_confirm_tab(app),
         KeyCode::Char('s') | KeyCode::Char('S') => save_confirm_script(app),
+        // Movement belongs to the Commands tab; Summary has nothing to scroll.
+        _ if matches!(tab, ConfirmTab::Commands) => scroll_confirm_commands(app, key.code),
+        _ => {}
+    }
+}
+
+/// Scrolling the Commands tab of the F11 confirmation.
+fn scroll_confirm_commands(app: &mut App, code: KeyCode) {
+    let scroll = &mut app.commander.confirm_scroll;
+    let page = crate::tui::screens::browser::page_step(scroll.rows, 1);
+    match code {
+        KeyCode::Up => scroll.scroll_by(-1),
+        KeyCode::Down => scroll.scroll_by(1),
+        KeyCode::PageUp => scroll.scroll_by(-page),
+        KeyCode::PageDown => scroll.scroll_by(page),
+        KeyCode::Home => scroll.offset = 0,
+        KeyCode::End => scroll.offset = scroll.max_offset(),
         _ => {}
     }
 }
@@ -2909,6 +2931,184 @@ mod keymap_tests {
             SECOND_LAYER_DISPATCH.to_vec(),
             "SECOND_LAYER and SECOND_LAYER_DISPATCH diverged — update both"
         );
+    }
+}
+
+/// U-4b: the Commands tab printed the first screenful and a «… N more lines» note, so the
+/// audit view of a plan could not be audited past its first screen.
+#[cfg(test)]
+mod u4b_commands_scroll_tests {
+    use super::state::ConfirmScroll;
+    use super::*;
+
+    /// An app with the F11 confirmation open on `tab` over a script of `lines` lines, as the
+    /// first frame would leave it: `rows` measured, window at the top.
+    fn confirming(tab: ConfirmTab, lines: usize, rows: u16) -> App {
+        let (mut app, _rx) = crate::app::test_app();
+        app.commander.confirm_script = (1..=lines)
+            .map(|n| format!("echo line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.commander.confirm_scroll = ConfirmScroll {
+            offset: 0,
+            total: lines,
+            rows,
+        };
+        app.commander.overlay = Overlay::Confirm {
+            files: 1,
+            reclaim: 1024,
+            tab,
+        };
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        on_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn the_commands_tab_scrolls_line_page_and_end() {
+        let mut app = confirming(ConfirmTab::Commands, 100, 10);
+
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.commander.confirm_scroll.offset, 2);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.commander.confirm_scroll.offset, 1);
+
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(
+            app.commander.confirm_scroll.offset, 10,
+            "a page is the window minus one line of overlap"
+        );
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(app.commander.confirm_scroll.offset, 1);
+
+        press(&mut app, KeyCode::End);
+        assert_eq!(
+            app.commander.confirm_scroll.offset, 90,
+            "End parks the last line at the bottom of the window, not past it"
+        );
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.commander.confirm_scroll.offset, 0);
+    }
+
+    #[test]
+    fn the_window_never_leaves_the_script() {
+        let mut app = confirming(ConfirmTab::Commands, 100, 10);
+        for _ in 0..40 {
+            press(&mut app, KeyCode::PageDown);
+        }
+        assert_eq!(app.commander.confirm_scroll.offset, 90);
+        for _ in 0..40 {
+            press(&mut app, KeyCode::PageUp);
+        }
+        assert_eq!(app.commander.confirm_scroll.offset, 0);
+    }
+
+    /// A script that fits has nothing to scroll — the window must not drift off its only page.
+    #[test]
+    fn a_script_shorter_than_the_window_does_not_move() {
+        for lines in [0usize, 1, 5] {
+            let mut app = confirming(ConfirmTab::Commands, lines, 10);
+            for code in [KeyCode::Down, KeyCode::PageDown, KeyCode::End] {
+                press(&mut app, code);
+                assert_eq!(
+                    app.commander.confirm_scroll.offset, 0,
+                    "{lines} lines, {code:?}"
+                );
+            }
+        }
+    }
+
+    /// Summary has nothing to scroll, and movement must not leak into it.
+    #[test]
+    fn the_summary_tab_ignores_movement() {
+        let mut app = confirming(ConfirmTab::Summary, 100, 10);
+        for code in [
+            KeyCode::Down,
+            KeyCode::PageDown,
+            KeyCode::End,
+            KeyCode::Up,
+            KeyCode::Home,
+        ] {
+            press(&mut app, code);
+            assert_eq!(app.commander.confirm_scroll.offset, 0, "{code:?}");
+        }
+    }
+
+    /// The modal owns the keyboard: movement must not reach the panels underneath, and the
+    /// decision keys must keep working from the Commands tab.
+    #[test]
+    fn the_modal_intercepts_movement_and_still_answers() {
+        let mut app = confirming(ConfirmTab::Commands, 100, 10);
+        let cursor = app.commander.panels[0].list.selected();
+
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::End);
+
+        assert_eq!(
+            app.commander.panels[0].list.selected(),
+            cursor,
+            "the panel cursor must not move while a confirmation is open"
+        );
+        assert!(matches!(
+            app.commander.overlay,
+            Overlay::Confirm {
+                tab: ConfirmTab::Commands,
+                ..
+            }
+        ));
+
+        press(&mut app, KeyCode::Tab);
+        assert!(
+            matches!(
+                app.commander.overlay,
+                Overlay::Confirm {
+                    tab: ConfirmTab::Summary,
+                    ..
+                }
+            ),
+            "Tab still switches tabs"
+        );
+
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            matches!(app.commander.overlay, Overlay::None),
+            "Esc still cancels"
+        );
+    }
+
+    /// `S` writes the plan, not the part of it that happens to be on screen.
+    #[test]
+    fn saving_writes_the_whole_script_after_scrolling() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("dedcom_u4b_save_{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = confirming(ConfirmTab::Commands, 100, 10);
+        app.db_path = dir.join("dedcom.db");
+        let whole = app.commander.confirm_script.clone();
+
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Char('s'));
+
+        let saved: Vec<_> = std::fs::read_dir(dir.join("plans"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(
+            saved.len(),
+            1,
+            "one script written: {}",
+            app.commander.status
+        );
+        let written = std::fs::read_to_string(saved[0].path()).unwrap();
+        assert_eq!(written, whole, "the .sh must not be cut down to the window");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

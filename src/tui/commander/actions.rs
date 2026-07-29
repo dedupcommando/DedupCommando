@@ -8,7 +8,7 @@ use crate::model::dataset::Dataset;
 use crate::model::duplicate::{hex_encode, DuplicateGroup, FileEntry};
 use crate::state::ScanStore;
 
-use super::state::{ConfirmTab, Mark, Overlay, PlanDigest};
+use super::state::{ConfirmScroll, ConfirmTab, Mark, Overlay, PlanDigest};
 
 /// F11: collects marks from all panels, builds a plan, opens the confirmation.
 pub fn prepare_execution(app: &mut App) {
@@ -40,11 +40,19 @@ pub fn prepare_execution(app: &mut App) {
         .iter()
         .flat_map(|pool| pool.datasets.iter().cloned())
         .collect();
-    app.commander.confirm_script = crate::actions::script_preview::render_script(
+    let script = crate::actions::script_preview::render_script(
         &plan,
         &datasets,
         crate::zfs::trusted_zfs_bin(),
     );
+    // A fresh confirmation always opens at the top of its own script — a leftover offset
+    // from a previous plan would point into a script that no longer exists.
+    app.commander.confirm_scroll = ConfirmScroll {
+        offset: 0,
+        total: script.lines().count(),
+        rows: 0,
+    };
+    app.commander.confirm_script = script;
     app.commander.confirm_digest = PlanDigest::of(&plan);
     app.commander.pending_actions = plan;
     app.commander.overlay = Overlay::Confirm {

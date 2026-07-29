@@ -10,7 +10,7 @@ use ratatui::{
 };
 
 use super::panel::ellipsize_left;
-use super::state::{ConfirmTab, PlanDigest};
+use super::state::{ConfirmScroll, ConfirmTab, PlanDigest};
 use crate::model::scan::ResumeInfo;
 use crate::tui::{centered, human_bytes};
 
@@ -53,6 +53,7 @@ pub fn render_confirm(
     tab: ConfirmTab,
     script: &str,
     digest: &PlanDigest,
+    scroll: &mut ConfirmScroll,
 ) {
     let tabs = Line::from(vec![
         Span::raw("  "),
@@ -60,47 +61,67 @@ pub fn render_confirm(
         Span::raw("  "),
         tab_span("Commands", matches!(tab, ConfirmTab::Commands)),
     ]);
-    let hint = Line::from("  [Tab] tab  [S] save .sh  [Y] execute  [N]/[Esc] cancel");
 
-    let (area, body, gaps): (Rect, Vec<Line>, bool) = match tab {
+    let (area, body, gaps, hint, title): (Rect, Vec<Line>, bool, Vec<Line>, String) = match tab {
         ConfirmTab::Summary => {
+            let hint = vec![Line::from(SUMMARY_HINT)];
             // Borders, the tab strip and the key hint are never given up: a confirmation
             // whose [Y]/[N] line has fallen off the bottom is worse than one that says
             // less. The two blank separators go first, then the body sheds itself.
             let avail = frame.area().height as usize;
-            let gaps = avail >= SUMMARY_FIXED + 2 + SUMMARY_MIN_BODY;
-            let chrome = SUMMARY_FIXED + if gaps { 2 } else { 0 };
+            let fixed = CHROME_FIXED + hint.len();
+            let gaps = avail >= fixed + 2 + SUMMARY_MIN_BODY;
+            let chrome = fixed + if gaps { 2 } else { 0 };
             let lines = summary_lines(files, reclaim, digest, avail.saturating_sub(chrome));
             let height = (lines.len() + chrome) as u16;
             let body: Vec<Line> = lines.into_iter().map(Line::from).collect();
-            (centered(frame.area(), SUMMARY_WIDTH, height), body, gaps)
+            (
+                centered(frame.area(), SUMMARY_WIDTH, height),
+                body,
+                gaps,
+                hint,
+                CONFIRM_TITLE.to_string(),
+            )
         }
         ConfirmTab::Commands => {
             let avail = frame.area();
             let width = avail.width.saturating_sub(4).clamp(40, 110);
-            let height = avail.height.saturating_sub(4).clamp(10, 44);
-            // Visible script rows: height − border(2) − tabs − 2 empties − hint.
-            let body_rows = height.saturating_sub(6) as usize;
-            let all: Vec<&str> = script.lines().collect();
-            let body = if all.len() > body_rows && body_rows > 0 {
-                let shown = body_rows - 1;
-                let mut lines: Vec<Line> = all
-                    .iter()
-                    .take(shown)
-                    .map(|l| Line::from(format!(" {l}")))
-                    .collect();
-                lines.push(Line::from(format!(
-                    " … {} more lines — save with [S]",
-                    all.len() - shown
-                )));
-                lines
-            } else {
-                all.iter()
-                    .take(body_rows)
-                    .map(|l| Line::from(format!(" {l}")))
-                    .collect()
+            // The box never exceeds the terminal — the old floor of 10 rows is what let the
+            // key hint fall off a small window. Above the cap the script simply scrolls.
+            let box_rows = avail.height.min(COMMANDS_MAX_ROWS);
+            // The scrolling hint is the first thing to give up; the decision hint is not.
+            let mut hint = vec![Line::from(COMMANDS_SCROLL_HINT), Line::from(COMMANDS_HINT)];
+            while hint.len() > 1 && box_rows < (CHROME_FIXED + hint.len()) as u16 {
+                hint.remove(0);
+            }
+            let fixed = (CHROME_FIXED + hint.len()) as u16;
+            let gaps = box_rows >= fixed + 3;
+            let chrome = fixed + if gaps { 2 } else { 0 };
+            let body_rows = box_rows.saturating_sub(chrome);
+
+            scroll.rows = body_rows;
+            scroll.clamp();
+            // Only the visible window is formatted: the script of a large plan is thousands
+            // of lines and this overlay redraws on every frame.
+            let body: Vec<Line> = script
+                .lines()
+                .skip(scroll.offset)
+                .take(body_rows as usize)
+                .map(|line| Line::from(format!(" {line}")))
+                .collect();
+            let title = match scroll.visible_range() {
+                Some((first, last)) => {
+                    format!("{CONFIRM_TITLE}· lines {first}-{last} of {} ", scroll.total)
+                }
+                None => format!("{CONFIRM_TITLE}· no script lines "),
             };
-            (centered(avail, width, height), body, true)
+            (
+                centered(avail, width, chrome + body_rows),
+                body,
+                gaps,
+                hint,
+                title,
+            )
         }
     };
 
@@ -113,13 +134,10 @@ pub fn render_confirm(
     if gaps {
         content.push(Line::from(""));
     }
-    content.push(hint);
+    content.extend(hint);
     frame.render_widget(
-        Paragraph::new(Text::from(content)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Confirmation — F11 "),
-        ),
+        Paragraph::new(Text::from(content))
+            .block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
 }
@@ -127,8 +145,23 @@ pub fn render_confirm(
 /// Box width of the Summary tab.
 const SUMMARY_WIDTH: u16 = 66;
 
-/// Rows the Summary box never gives up: two borders, the tab strip and the key hint.
-const SUMMARY_FIXED: usize = 4;
+/// Overlay title; both tabs share the stem, Commands appends its line range.
+const CONFIRM_TITLE: &str = " Confirmation — F11 ";
+
+/// Rows every confirmation box spends before any hint line: two borders and the tab strip.
+const CHROME_FIXED: usize = 3;
+
+/// Key hint of the Summary tab.
+const SUMMARY_HINT: &str = "  [Tab] tab  [S] save .sh  [Y] execute  [N]/[Esc] cancel";
+
+/// Key hints of the Commands tab. The scrolling line is dropped before the decision line on a
+/// window too small for both — the operator must always be able to read their way out.
+const COMMANDS_SCROLL_HINT: &str = "  ↑↓ · PgUp/PgDn · Home/End — scroll";
+const COMMANDS_HINT: &str =
+    "  [Tab] tab  [S] save .sh (whole script)  [Y] execute  [N]/[Esc] cancel";
+
+/// The Commands box stops growing here; beyond it the script scrolls.
+const COMMANDS_MAX_ROWS: u16 = 44;
 
 /// Body rows that survive every shrink — the count, the composition, and the admission of
 /// what is not being shown. Below this the blank separators are dropped first.
@@ -433,8 +466,19 @@ mod confirm_summary_tests {
     fn drawn(digest: &PlanDigest, width: u16, height: u16) -> String {
         let files = digest.samples.len() + digest.hidden;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut scroll = ConfirmScroll::default();
         terminal
-            .draw(|frame| render_confirm(frame, files, 1024, ConfirmTab::Summary, "", digest))
+            .draw(|frame| {
+                render_confirm(
+                    frame,
+                    files,
+                    1024,
+                    ConfirmTab::Summary,
+                    "",
+                    digest,
+                    &mut scroll,
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..height)
@@ -566,6 +610,152 @@ mod confirm_summary_tests {
         );
     }
 
+    /// A script long enough that the tail starts off-screen, one command per line.
+    fn script(lines: usize) -> String {
+        (1..=lines)
+            .map(|n| format!("echo line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The Commands tab as actually painted, with the scroll state the frame leaves behind.
+    fn drawn_commands(text: &str, scroll: &mut ConfirmScroll, width: u16, height: u16) -> String {
+        let digest = PlanDigest::default();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_confirm(frame, 1, 1024, ConfirmTab::Commands, text, &digest, scroll)
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn commands_scroll(total: usize) -> ConfirmScroll {
+        ConfirmScroll {
+            offset: 0,
+            total,
+            rows: 0,
+        }
+    }
+
+    /// The defect U-4b names: the tab printed the head of the script and a note about the
+    /// rest, so the tail of a plan could never be read on screen.
+    #[test]
+    fn the_commands_tail_can_be_scrolled_into_view() {
+        let text = script(60);
+        let mut scroll = commands_scroll(60);
+
+        let first = drawn_commands(&text, &mut scroll, 100, 24);
+        assert!(first.contains("echo line1 "), "the head is shown:\n{first}");
+        assert!(
+            !first.contains("echo line60"),
+            "the fixture only means something if the tail starts off-screen:\n{first}"
+        );
+        assert!(
+            first.contains("lines 1-"),
+            "the range says where we are:\n{first}"
+        );
+        assert!(first.contains("of 60"), "{first}");
+
+        scroll.offset = scroll.max_offset();
+        let last = drawn_commands(&text, &mut scroll, 100, 24);
+        assert!(
+            last.contains("echo line60"),
+            "the last line must be reachable and rendered:\n{last}"
+        );
+        assert!(
+            last.contains("lines 44-60 of 60"),
+            "and the range must say so:\n{last}"
+        );
+
+        scroll.offset = 0;
+        let home = drawn_commands(&text, &mut scroll, 100, 24);
+        assert!(home.contains("echo line1 ") && !home.contains("echo line60"));
+        assert!(home.contains("lines 1-17 of 60"), "{home}");
+    }
+
+    /// A page moves by the window minus one line of overlap, the same step the browser uses.
+    #[test]
+    fn a_page_moves_the_rendered_range_consistently() {
+        let text = script(60);
+        let mut scroll = commands_scroll(60);
+        drawn_commands(&text, &mut scroll, 100, 24);
+        assert_eq!(scroll.rows, 17, "17 body rows on a 24-row terminal");
+
+        scroll.scroll_by(crate::tui::screens::browser::page_step(scroll.rows, 1));
+        let paged = drawn_commands(&text, &mut scroll, 100, 24);
+        assert!(paged.contains("lines 17-33 of 60"), "{paged}");
+        assert!(paged.contains("echo line17") && paged.contains("echo line33"));
+    }
+
+    /// A resize grows the window under an offset that was valid for the smaller one; the
+    /// window has to come back inside the script instead of trailing blank rows.
+    #[test]
+    fn growing_the_terminal_pulls_the_window_back_inside() {
+        let text = script(30);
+        let mut scroll = commands_scroll(30);
+        drawn_commands(&text, &mut scroll, 100, 12);
+        scroll.offset = scroll.max_offset();
+        let small = drawn_commands(&text, &mut scroll, 100, 12);
+        assert!(small.contains("echo line30"), "{small}");
+
+        let big = drawn_commands(&text, &mut scroll, 100, 40);
+        assert!(
+            big.contains("echo line30") && big.contains("echo line1 "),
+            "the whole script fits now, so the window must sit at the top:\n{big}"
+        );
+        assert_eq!(scroll.offset, 0, "clamped back to the only page");
+        assert!(big.contains("lines 1-30 of 30"), "{big}");
+    }
+
+    /// Nothing to show must still render, and say so, rather than print `lines 1-0 of 0`.
+    #[test]
+    fn an_empty_or_single_line_script_renders_safely() {
+        let mut empty = commands_scroll(0);
+        let screen = drawn_commands("", &mut empty, 100, 24);
+        assert!(screen.contains("no script lines"), "{screen}");
+        assert!(screen.contains("[Y] execute"), "{screen}");
+
+        let mut one = commands_scroll(1);
+        let screen = drawn_commands("echo only", &mut one, 100, 24);
+        assert!(screen.contains("echo only"), "{screen}");
+        assert!(screen.contains("lines 1-1 of 1"), "{screen}");
+    }
+
+    /// The Commands tab inherits U-4a's rule: whatever the terminal size, the operator can
+    /// still read how to refuse, and the tail stays reachable.
+    #[test]
+    fn a_small_terminal_keeps_the_decision_hint() {
+        let text = script(60);
+        for height in 6..=20u16 {
+            let mut scroll = commands_scroll(60);
+            let screen = drawn_commands(&text, &mut scroll, 100, height);
+            assert!(
+                screen.contains("[Y] execute") && screen.contains("[N]/[Esc] cancel"),
+                "height {height} lost the decision hint:\n{screen}"
+            );
+
+            scroll.offset = scroll.max_offset();
+            let tail = drawn_commands(&text, &mut scroll, 100, height);
+            assert!(
+                tail.contains("echo line60"),
+                "height {height} cannot reach the last line:\n{tail}"
+            );
+            assert!(
+                tail.contains("[Y] execute"),
+                "height {height} lost the hint at the tail:\n{tail}"
+            );
+        }
+    }
+
     /// Below what the essentials need there is nothing left to trade, and the hint is still
     /// the last line standing.
     #[test]
@@ -590,20 +780,7 @@ mod confirm_summary_tests {
             (ActionKind::Delete, "/tank/photos/IMG_4421.HEIC"),
             (ActionKind::Hardlink, "/tank/dup/a.bin"),
         ]);
-        let (width, height) = (100u16, 30u16);
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| render_confirm(frame, 2, 1024, ConfirmTab::Summary, "", &digest))
-            .unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let screen: String = (0..height)
-            .map(|y| {
-                (0..width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let screen = drawn(&digest, 100, 30);
 
         assert!(
             screen.contains("By type: delete 1 · hardlink 1"),
