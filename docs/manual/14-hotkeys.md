@@ -277,11 +277,13 @@ suffix `-> DELETE` / `-> HARDLINK` / `-> REFLINK`.
 
 ### ActionReview
 
-Footer: ` [Y] execute · [Esc] back to review `.
+Footer: ` ↑↓/PgUp/PgDn/Home/End scroll · [Y] execute · [Esc] back to browser `.
 
 | Key          | Action                                                     |
 |--------------|------------------------------------------------------------|
 | **↑** / **↓**| Scroll                                                     |
+| **PgUp** / **PgDn** | Scroll a screenful                                  |
+| **Home** / **End** | First / last action of the plan                      |
 | **Y**        | Go to the final confirmation (modal)                       |
 | **Esc**      | Back to Browser                                            |
 | **q** / **Q**| Exit                                                       |

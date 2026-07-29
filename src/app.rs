@@ -286,6 +286,13 @@ impl BrowserState {
 pub struct ReviewState {
     pub actions: Vec<PlannedAction>,
     pub confirming: bool,
+    /// Cursor and scroll offset of the action list. The plan can hold every
+    /// duplicate of a scan, so without this the rows past the first screen
+    /// were unreachable — the operator confirmed a batch they could not read.
+    pub list: ListState,
+    /// Height of the list window from the last frame — for PageUp/PageDown.
+    /// `0` until the first frame; `page_step` falls back to 20.
+    pub visible_rows: u16,
 }
 
 /// State of the startup disclaimer/consent gate.
@@ -2046,9 +2053,24 @@ impl App {
             }
             return;
         }
+        let len = self.review.actions.len();
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
             KeyCode::Char('y') | KeyCode::Char('Y') => self.review.confirming = true,
+            KeyCode::Up => step(&mut self.review.list, len, -1),
+            KeyCode::Down => step(&mut self.review.list, len, 1),
+            KeyCode::PageUp => step(
+                &mut self.review.list,
+                len,
+                page_step(self.review.visible_rows, -1),
+            ),
+            KeyCode::PageDown => step(
+                &mut self.review.list,
+                len,
+                page_step(self.review.visible_rows, 1),
+            ),
+            KeyCode::Home => step(&mut self.review.list, len, i32::MIN / 2),
+            KeyCode::End => step(&mut self.review.list, len, i32::MAX / 2),
             KeyCode::Esc => {
                 self.screen = Screen::Browser;
                 self.status.clear();
@@ -2561,9 +2583,13 @@ impl App {
             self.status = "No marked actions — mark files: d delete, h hardlink".to_string();
             return;
         }
+        let mut list = ListState::default();
+        list.select(Some(0));
         self.review = ReviewState {
             actions: plan,
             confirming: false,
+            list,
+            visible_rows: 0,
         };
         self.status.clear();
         self.screen = Screen::ActionReview;
@@ -2931,6 +2957,23 @@ pub(crate) fn test_app_with_db(db_path: PathBuf) -> (App, crossbeam_channel::Rec
         false,
     );
     (app, rx)
+}
+
+/// `count` planned deletions, distinguishable by path. Module level because the
+/// ActionReview screen's own render test plans the same batch.
+#[cfg(test)]
+pub(crate) fn test_plan(count: usize) -> Vec<PlannedAction> {
+    (0..count)
+        .map(|index| PlannedAction {
+            kind: ActionKind::Delete,
+            target: PathBuf::from(format!("/x/dup{index}.bin")),
+            keeper: PathBuf::from("/x/keeper.bin"),
+            target_device: 1,
+            keeper_device: 1,
+            size: 1024,
+            expected_hash: String::new(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -3324,5 +3367,143 @@ mod cancel_tests {
             "the operator must not read a stopped batch as a finished one: {}",
             app.status
         );
+    }
+}
+
+/// U-3: the action review lists the whole plan, so it has to scroll. The keys go in through
+/// `handle_event` — the screen used to swallow them one level below, in `on_key_action_review`.
+#[cfg(test)]
+mod action_review_scroll_tests {
+    use super::*;
+
+    /// An app sitting on ActionReview over a plan of `count` actions, as
+    /// `open_action_review` leaves it. `rows` is what the last frame measured.
+    fn review_app(count: usize, rows: u16) -> (App, crossbeam_channel::Receiver<AppEvent>) {
+        let (mut app, rx) = test_app();
+        app.show_disclaimer = false;
+        app.mode = AppMode::Wizard;
+        app.screen = Screen::ActionReview;
+        let mut list = ListState::default();
+        list.select(Some(0));
+        app.review = ReviewState {
+            actions: test_plan(count),
+            confirming: false,
+            list,
+            visible_rows: rows,
+        };
+        (app, rx)
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_event(AppEvent::Key(KeyEvent::from(code)));
+    }
+
+    #[test]
+    fn arrows_move_the_cursor() {
+        let (mut app, _rx) = review_app(50, 12);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.review.list.selected(), Some(2));
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.review.list.selected(), Some(1));
+    }
+
+    #[test]
+    fn end_reaches_an_action_below_the_first_screen() {
+        let (mut app, _rx) = review_app(50, 12);
+        press(&mut app, KeyCode::End);
+        assert_eq!(
+            app.review.list.selected(),
+            Some(49),
+            "the last action of the plan must be reachable — 12 rows fit on screen, 50 are planned"
+        );
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.review.list.selected(), Some(0));
+    }
+
+    #[test]
+    fn page_keys_step_by_the_rendered_window() {
+        let (mut app, _rx) = review_app(50, 12);
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(
+            app.review.list.selected(),
+            Some(11),
+            "a page is the window minus one row of overlap"
+        );
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(app.review.list.selected(), Some(0));
+    }
+
+    #[test]
+    fn the_cursor_stays_inside_the_plan() {
+        let (mut app, _rx) = review_app(3, 12);
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Down);
+        }
+        assert_eq!(app.review.list.selected(), Some(2));
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Up);
+        }
+        assert_eq!(app.review.list.selected(), Some(0));
+    }
+
+    /// Scrolling must not become another way to start the batch: the confirmation modal
+    /// still owns the keys while it is open.
+    #[test]
+    fn the_confirmation_modal_ignores_scrolling() {
+        let (mut app, _rx) = review_app(50, 12);
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.review.confirming);
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.review.list.selected(), Some(0));
+        assert!(app.review.confirming, "only Y/N/Esc answer the modal");
+    }
+
+    /// The plan is confirmed from wherever the operator scrolled to — Y is not tied to the
+    /// first row, and asking the question is not yet starting the batch.
+    #[test]
+    fn confirmation_opens_from_a_scrolled_cursor() {
+        let (mut app, _rx) = review_app(50, 12);
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.review.list.selected(), Some(49));
+
+        press(&mut app, KeyCode::Char('y'));
+
+        assert!(app.review.confirming, "Y must open the modal from any row");
+        assert_eq!(
+            app.review.list.selected(),
+            Some(49),
+            "opening the modal does not move the cursor"
+        );
+        assert_eq!(app.screen, Screen::ActionReview);
+        assert!(app.apply.is_none(), "the question alone starts nothing");
+    }
+
+    /// Answering "no" leaves everything as it was, scroll position included, so the operator
+    /// resumes reading the plan where they stopped.
+    #[test]
+    fn declining_the_confirmation_starts_nothing_and_keeps_the_position() {
+        for answer in [KeyCode::Char('n'), KeyCode::Esc] {
+            let (mut app, _rx) = review_app(50, 12);
+            press(&mut app, KeyCode::PageDown);
+            let position = app.review.list.selected();
+            press(&mut app, KeyCode::Char('y'));
+            assert!(app.review.confirming);
+
+            press(&mut app, answer);
+
+            assert!(!app.review.confirming, "{answer:?} closes the modal");
+            assert_eq!(
+                app.review.list.selected(),
+                position,
+                "{answer:?} leaves the cursor where it was"
+            );
+            assert_eq!(
+                app.screen,
+                Screen::ActionReview,
+                "{answer:?} must not start the batch"
+            );
+            assert!(app.apply.is_none(), "{answer:?} spawned an apply worker");
+        }
     }
 }

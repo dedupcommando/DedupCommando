@@ -236,24 +236,28 @@ From the Browser, the **r** key opens the list of **planned** actions — what
 exactly will happen on apply:
 
 ```text
-┌ Action review — dry-run, nothing executed yet ─────────────────────────┐
-│ HARDLINK   /tank/dup/IMG_4421.HEIC                       (3.6 MiB)      │
-│ HARDLINK   /tank/old-copy/IMG_4421.HEIC                  (3.6 MiB)      │
-│ DELETE     /tank/junk/duplicate.bin                      (1.8 MiB)      │
-│ REFLINK    /tank/vm/disk.img                             (80.0 MiB)     │
-│ ...                                                                      │
+┌ Action review — dry-run, nothing executed yet · 1 of 9 ─────────────────┐
+│ ▶ HARDLINK   /tank/dup/IMG_4421.HEIC                     (3.6 MiB)      │
+│   HARDLINK   /tank/old-copy/IMG_4421.HEIC                (3.6 MiB)      │
+│   DELETE     /tank/junk/duplicate.bin                    (1.8 MiB)      │
+│   REFLINK    /tank/vm/disk.img                           (80.0 MiB)     │
+│   ...                                                                    │
 ├─────────────────────────────────────────────────────────────────────────┤
 │ Operations: 9 · potential to free: 232.0 MiB                           │
 │ Before applying, ZFS snapshots of the affected datasets will be created. │
-│ [Y] execute · [Esc] back to review                                     │
+│ ↑↓/PgUp/PgDn/Home/End scroll · [Y] execute · [Esc] back to browser     │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-Each row is `{KIND:9}  {path}   ({bytes})`.
+Each row is `{KIND:9}  {path}   ({bytes})`. The row under the cursor carries the
+`▶ ` marker and is drawn in reverse video; long plans scroll — the list follows
+the cursor, and the title counts where in the plan it stands (`N of M`).
 
 | Key         | Action                                                              |
 |-------------|---------------------------------------------------------------------|
 | **↑** / **↓**| Scroll the list                                                    |
+| **PgUp** / **PgDn** | Scroll a screenful                                          |
+| **Home** / **End** | First / last action of the plan                              |
 | **Y**       | Go to the final confirmation (modal "are you sure?")               |
 | **Esc**     | Return to the Browser                                               |
 
