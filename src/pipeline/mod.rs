@@ -54,17 +54,25 @@ pub fn run_scan(
 ) -> Result<ScanOutcome> {
     let segment_start = Instant::now();
 
+    // Fail-closed root set, on every invocation and before anything is written. A root set where one
+    // tree is reachable twice has no honest result to report, so it never becomes a scan at all.
+    // Resume is not an exemption: an unfinished scan from a build without this check can carry
+    // overlapping roots, and an alias can appear after the scan was created. The walk's alias guard
+    // is not a substitute — it accepts the same pathname twice by design, and nested roots collapse
+    // to identical manifest pathnames.
+    roots::ensure_disjoint(&config.roots)?;
+
     // `scan_id` is fixed before the phases — so the statistics can be written
     // on any exit path, including cancellation.
     let scan_id = match resume {
-        Some(id) => id,
-        None => {
-            // Before anything is written: a root set where one tree is reachable twice has no honest
-            // result to report, so it never becomes a scan at all. A resume keeps the roots it was
-            // created with, and its walk is covered by the alias guard inside `walk`.
-            roots::ensure_disjoint(&config.roots)?;
-            store.begin_scan(config)?
+        Some(id) => {
+            // A resume walks and hashes the roots stored with the scan, whatever the caller happened
+            // to pass, so those are the ones that have to be disjoint. Checked before the first
+            // resume-side write.
+            roots::ensure_disjoint(&store.load_config(id)?.roots)?;
+            id
         }
+        None => store.begin_scan(config)?,
     };
     store.ensure_scan_stats(scan_id)?;
 
@@ -737,6 +745,120 @@ mod hash_failures_tests {
             ),
             ScanOutcome::Cancelled => panic!("expected Completed"),
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Resume is not an exemption. An unfinished scan whose stored roots overlap — what a build
+    /// without the preflight could leave behind — must be refused before any resume-side write, and
+    /// nothing about it may be published.
+    #[test]
+    fn a_resumed_scan_with_conflicting_roots_is_refused() {
+        let dir = unique_temp_dir("resume_roots");
+        let inner = dir.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("a.bin"), b"identical duplicate content").unwrap();
+        std::fs::write(dir.join("b.bin"), b"identical duplicate content").unwrap();
+
+        // Seeded through the store, exactly as an older build would have: `begin_scan` directly, so
+        // the fresh-scan preflight never ran, then a resumable status.
+        let mut cfg = ScanConfig::new(vec![dir.clone(), inner.clone()]);
+        cfg.min_size = 0;
+        cfg.exclude_globs = Vec::new();
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store.begin_scan(&cfg).unwrap();
+        store.set_status(id, ScanStatus::Hashing).unwrap();
+        assert!(
+            store.scan_status(id).unwrap().is_resumable(),
+            "the seeded scan must look resumable"
+        );
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let text = match run_scan(&mut store, &cfg, Some(id), false, &cancel, |_| {}) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("a resume must not bypass the root preflight"),
+        };
+        assert!(
+            text.contains("nested roots"),
+            "the class must be named: {text}"
+        );
+        assert!(
+            text.contains(&inner.display().to_string()),
+            "both roots must be named: {text}"
+        );
+
+        let counts = store.db_counts().unwrap();
+        assert_eq!(counts.scans, 1, "no new scan was created");
+        assert_eq!(counts.file_rows, 0, "no manifest row was written");
+        assert_eq!(
+            store.scan_status(id).unwrap(),
+            ScanStatus::Hashing,
+            "the status is untouched — certainly not completed"
+        );
+        assert!(
+            !store.results_materialized(id).unwrap(),
+            "no result was published"
+        );
+        assert!(
+            store.group_summaries(id).unwrap().is_empty(),
+            "and no group summary"
+        );
+        // `add_elapsed` is the last resume-side write of `run_scan`; 0 proves it never ran (and an
+        // absent stats row is the same answer).
+        assert_eq!(
+            store.elapsed_seconds(id).unwrap_or(0.0),
+            0.0,
+            "no time was accumulated for the refused resume"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The stored roots are the ones a resume actually walks, so they are the ones that must be
+    /// disjoint — even when the caller hands in a perfectly clean set. Without this, a TUI resume that
+    /// passes its own config would slip past the check that the supplied set happens to satisfy.
+    #[test]
+    fn a_resume_is_validated_against_the_roots_stored_with_the_scan() {
+        let dir = unique_temp_dir("resume_stored_roots");
+        let inner = dir.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("a.bin"), b"identical duplicate content").unwrap();
+
+        let mut stored = ScanConfig::new(vec![dir.clone(), inner.clone()]);
+        stored.min_size = 0;
+        stored.exclude_globs = Vec::new();
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store.begin_scan(&stored).unwrap();
+        store.set_status(id, ScanStatus::Hashing).unwrap();
+
+        // What the caller passes is disjoint on its own — only the stored set conflicts.
+        let mut supplied = ScanConfig::new(vec![dir.clone()]);
+        supplied.min_size = 0;
+        supplied.exclude_globs = Vec::new();
+        assert!(
+            roots::ensure_disjoint(&supplied.roots).is_ok(),
+            "the supplied set must be innocent, or the test proves nothing"
+        );
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let text = match run_scan(&mut store, &supplied, Some(id), false, &cancel, |_| {}) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("the stored roots must be validated on resume"),
+        };
+        assert!(
+            text.contains("nested roots"),
+            "the class must be named: {text}"
+        );
+        assert_eq!(
+            store.db_counts().unwrap().file_rows,
+            0,
+            "no manifest row was written"
+        );
+        assert_eq!(
+            store.scan_status(id).unwrap(),
+            ScanStatus::Hashing,
+            "the status is untouched"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
