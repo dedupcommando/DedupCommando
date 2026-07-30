@@ -302,6 +302,62 @@ fn propagate_sql() -> String {
     )
 }
 
+/// The cross-scan reuse key: the SAME pathname carrying the SAME full temporal identity in a
+/// different scan, with an fd-verified digest. `device`/`inode` are deliberately absent — ZFS
+/// changes both after an import or reboot, and a key that included them would re-read the pool
+/// every time. `cur` is the current row, `prev` the candidate source.
+const CROSS_SCAN_SOURCE: &str = "prev.path = cur.path AND prev.size = cur.size
+                   AND prev.mtime = cur.mtime AND prev.mtime_nsec = cur.mtime_nsec
+                   AND prev.ctime_sec = cur.ctime_sec AND prev.ctime_nsec = cur.ctime_nsec
+                   AND prev.identity_version = 1 AND prev.hash IS NOT NULL
+                   AND prev.scan_id <> cur.scan_id";
+
+/// Inherits a past digest for every still-null pathname that has one. `MIN` rather than `LIMIT 1`:
+/// a deterministic aggregate, and legitimate only after the caller's preflight has proved in the
+/// same transaction that every eligible source carries one and the same digest.
+fn inherit_sql() -> String {
+    format!(
+        "UPDATE file AS cur
+            SET hash = (SELECT MIN(prev.hash) FROM file AS prev WHERE {CROSS_SCAN_SOURCE}),
+                identity_version = 1
+          WHERE cur.scan_id = ?1 AND cur.hash IS NULL
+            AND EXISTS (SELECT 1 FROM file AS prev WHERE {CROSS_SCAN_SOURCE})"
+    )
+}
+
+/// Current-scan physical objects for which the checkpoint offers more than one distinct digest.
+///
+/// The evidence is the union of two things, per object: the digests this scan already trusts, and
+/// every trusted past digest offered to any of the object's still-null pathnames. `UNION` (not
+/// `UNION ALL`) collapses repeats, so several past rows carrying the same digest are agreement.
+/// This catches both shapes of the defect — two past scans disagreeing about one pathname, and two
+/// aliases of one object each matching a different past digest.
+fn conflicting_inheritance_objects(conn: &Connection, scan_id: i64) -> Result<u64> {
+    let object_columns = "cur.device AS device, cur.inode AS inode, cur.size AS size,
+                          cur.mtime AS mtime, cur.mtime_nsec AS mtime_nsec,
+                          cur.ctime_sec AS ctime_sec, cur.ctime_nsec AS ctime_nsec";
+    let count: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM (
+                 SELECT 1 FROM (
+                     SELECT {object_columns}, cur.hash AS hash
+                       FROM file AS cur
+                      WHERE cur.scan_id = ?1 AND cur.hash IS NOT NULL
+                        AND cur.identity_version = 1
+                     UNION
+                     SELECT {object_columns}, prev.hash AS hash
+                       FROM file AS cur JOIN file AS prev ON {CROSS_SCAN_SOURCE}
+                      WHERE cur.scan_id = ?1 AND cur.hash IS NULL
+                 )
+                 GROUP BY {OBJECT_KEY}
+                HAVING COUNT(DISTINCT hash) > 1)"
+        ),
+        params![scan_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as u64)
+}
+
 /// Objects whose aliases hold more than one distinct trusted digest. Only `identity_version = 1`
 /// rows count: a legacy or move-path digest is never a propagation source, so disagreeing with one
 /// is not a conflict.
@@ -1762,33 +1818,27 @@ impl ScanStore {
     /// `identity_version=1` (fd-verified); `dev/inode` are NOT in the key (ZFS changes them).
     /// The inherited row also becomes `version=1` — the chain survives cleanup of
     /// old scans. Returns the number inherited. Index `file_reuse_identity`.
+    /// Refuses first, then inherits — both in one transaction, so a refusal leaves every current
+    /// hash and `identity_version` exactly as it was and the attempt is safely retryable.
+    ///
+    /// The old query answered a disagreement with `LIMIT 1`, i.e. by row order, and the
+    /// current-scan check that runs afterwards could not notice: by then only the chosen digest
+    /// existed. The preflight therefore weighs the complete evidence per current physical object —
+    /// digests this scan already trusts, plus every trusted past digest offered to any of the
+    /// object's still-null pathnames — and more than one distinct digest among them is an
+    /// unanswerable question, not a value to pick.
     pub fn inherit_hashes(&mut self, scan_id: i64) -> Result<u64> {
-        let updated = self.conn.execute(
-            "UPDATE file
-                SET hash = (
-                        SELECT prev.hash FROM file AS prev
-                         WHERE prev.path = file.path AND prev.size = file.size
-                           AND prev.mtime = file.mtime AND prev.mtime_nsec = file.mtime_nsec
-                           AND prev.ctime_sec = file.ctime_sec
-                           AND prev.ctime_nsec = file.ctime_nsec
-                           AND prev.identity_version = 1 AND prev.hash IS NOT NULL
-                           AND prev.scan_id <> file.scan_id
-                         LIMIT 1
-                    ),
-                    identity_version = 1
-              WHERE scan_id = ?1
-                AND hash IS NULL
-                AND EXISTS (
-                        SELECT 1 FROM file AS prev
-                         WHERE prev.path = file.path AND prev.size = file.size
-                           AND prev.mtime = file.mtime AND prev.mtime_nsec = file.mtime_nsec
-                           AND prev.ctime_sec = file.ctime_sec
-                           AND prev.ctime_nsec = file.ctime_nsec
-                           AND prev.identity_version = 1 AND prev.hash IS NOT NULL
-                           AND prev.scan_id <> file.scan_id
-                    )",
-            params![scan_id],
-        )?;
+        let tx = self.conn.transaction()?;
+        let conflicts = conflicting_inheritance_objects(&tx, scan_id)?;
+        if conflicts > 0 {
+            return Err(AppError::msg(format!(
+                "the checkpoint offers more than one hash for {conflicts} physical object(s) of this scan. Reusing either would be a guess; rescan without hash reuse, or move the old dedcom.db aside."
+            )));
+        }
+        // Safe only because the same transaction just proved every eligible source agrees: with one
+        // distinct digest, a deterministic aggregate and «any of them» are the same value.
+        let updated = tx.execute(&inherit_sql(), params![scan_id])?;
+        tx.commit()?;
         Ok(updated as u64)
     }
 
@@ -6077,9 +6127,21 @@ mod tests {
         assert_eq!(hash_of(&store, now, "/x/a"), None, "and it stays unhashed");
     }
 
-    /// Two aliases of one allocation that inherited different digests cannot both be right.
-    /// Choosing by row order would be answering a data-safety question at random, so the scan
-    /// refuses — and propagates nothing at all.
+    fn identity_version_of(store: &ScanStore, scan_id: i64, path: &str) -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT identity_version FROM file WHERE scan_id = ?1 AND path = ?2",
+                params![scan_id, path],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Two aliases of one allocation whose past digests disagree cannot both be right. The refusal
+    /// has to come *before* anything is written: choosing by row order would be answering a
+    /// data-safety question at random, and inheriting one of them first would leave the scan
+    /// half-poisoned even though the answer is unknowable.
     #[test]
     fn conflicting_inherited_digests_refuse_instead_of_picking_one() {
         let mut store = ScanStore::open_in_memory().unwrap();
@@ -6099,20 +6161,136 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(store.inherit_hashes(now).unwrap(), 2, "both names inherit");
 
         let err = store
-            .propagate_inherited_hashes(now)
+            .inherit_hashes(now)
             .expect_err("disagreeing digests for one allocation must refuse");
         assert!(
-            err.to_string().contains("more than one inherited hash"),
+            err.to_string().contains("more than one"),
+            "the message must name the cause: {err}"
+        );
+
+        // No winner, and no partial state: nothing was written at all.
+        for path in ["/x/a", "/x/b", "/x/c"] {
+            assert_eq!(
+                hash_of(&store, now, path),
+                None,
+                "{path} must stay unhashed"
+            );
+            assert_eq!(
+                identity_version_of(&store, now, path),
+                0,
+                "{path} untouched"
+            );
+        }
+        // The independent current-scan defence still refuses too, on a scan left exactly as it was.
+        assert_eq!(store.propagate_inherited_hashes(now).unwrap(), 0);
+    }
+
+    /// Two past scans offering different digests for the *same* current pathname. The old
+    /// correlated `LIMIT 1` answered this by row order, and the later current-object check could
+    /// not notice, because by then only the chosen digest existed.
+    #[test]
+    fn two_past_scans_disagreeing_about_one_pathname_refuse_inheritance() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        past_scan(&mut store, &[alias_row("/x/a", 2, 11)], [1u8; 32]);
+        past_scan(&mut store, &[alias_row("/x/a", 2, 11)], [2u8; 32]);
+
+        let now = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store
+            .record_files(
+                now,
+                &[alias_row("/x/a", 2, 11), alias_row("/x/other", 3, 11)],
+            )
+            .unwrap();
+
+        let err = store
+            .inherit_hashes(now)
+            .expect_err("two past digests for one pathname must refuse");
+        assert!(
+            err.to_string().contains("more than one"),
             "the message must name the cause: {err}"
         );
         assert_eq!(
-            hash_of(&store, now, "/x/c"),
+            hash_of(&store, now, "/x/a"),
             None,
-            "and no alias was filled from either of them"
+            "no arbitrary winner was written"
         );
+        assert_eq!(identity_version_of(&store, now, "/x/a"), 0);
+    }
+
+    /// A digest already trusted on the current object is evidence too. A twin whose past source
+    /// disagrees with it must refuse, leaving the trusted digest exactly where it was.
+    #[test]
+    fn a_past_digest_disagreeing_with_the_current_object_refuses() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        past_scan(&mut store, &[alias_row("/x/b", 2, 11)], [1u8; 32]);
+
+        let now = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store
+            .record_files(now, &[alias_row("/x/a", 2, 11), alias_row("/x/b", 2, 11)])
+            .unwrap();
+        // /x/a is already fd-verified in this scan, with a different digest.
+        store
+            .record_hashes_verified(now, &[(alias_row("/x/a", 2, 11), [7u8; 32])])
+            .unwrap();
+        // Propagation gave the alias the trusted digest; put it back to null so the past source is
+        // the only thing offering /x/b a value.
+        store
+            .conn
+            .execute(
+                "UPDATE file SET hash = NULL, identity_version = 0
+                  WHERE scan_id = ?1 AND path = '/x/b'",
+                params![now],
+            )
+            .unwrap();
+
+        let err = store
+            .inherit_hashes(now)
+            .expect_err("a past digest contradicting the current object must refuse");
+        assert!(err.to_string().contains("more than one"), "{err}");
+        assert_eq!(
+            hash_of(&store, now, "/x/a"),
+            Some(hex_encode(&[7u8; 32])),
+            "the digest this scan verified is preserved"
+        );
+        assert_eq!(
+            hash_of(&store, now, "/x/b"),
+            None,
+            "and the twin stays null"
+        );
+    }
+
+    /// Several past scans carrying the SAME digest are agreement, not a conflict.
+    #[test]
+    fn repeated_past_rows_with_one_digest_are_agreement() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let hash = [1u8; 32];
+        past_scan(&mut store, &[alias_row("/x/a", 2, 11)], hash);
+        past_scan(&mut store, &[alias_row("/x/a", 2, 11)], hash);
+        past_scan(&mut store, &[alias_row("/x/a", 2, 11)], hash);
+
+        let now = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store
+            .record_files(
+                now,
+                &[alias_row("/x/a", 2, 11), alias_row("/x/other", 3, 11)],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.inherit_hashes(now).unwrap(),
+            1,
+            "exactly one current row inherits"
+        );
+        assert_eq!(hash_of(&store, now, "/x/a"), Some(hex_encode(&hash)));
+        assert_eq!(identity_version_of(&store, now, "/x/a"), 1);
     }
 
     /// A representative whose manifest identity no longer matches what was opened commits nothing
