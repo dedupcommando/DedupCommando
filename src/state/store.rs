@@ -11,7 +11,7 @@ use crate::model::duplicate::{
     build_dir_signatures_streaming, hex_encode, signature_of, DirGroup, DirSigAlgo, DuplicateGroup,
     FileEntry,
 };
-use crate::model::reclaim::{DestructivePlanVerdict, ReclaimState};
+use crate::model::reclaim::{DestructivePlanVerdict, LinkCount, ReclaimState};
 use crate::model::scan::{
     ResumeInfo, ScanConfig, ScanEnvironment, ScanStatsRow, ScanStatus, ScanSummary,
 };
@@ -650,6 +650,9 @@ impl ScanStore {
             )?;
             for file in files {
                 let path = file.path.to_string_lossy();
+                // Checked: a count the signed column cannot hold is refused here, so the manifest
+                // can never acquire the negative value the reader would have to call corrupt.
+                let nlink = LinkCount::from_u64(file.nlink).to_i64()?;
                 stmt.execute(params![
                     scan_id,
                     &*path,
@@ -660,7 +663,7 @@ impl ScanStore {
                     file.ctime_nsec,
                     file.device as i64,
                     file.inode as i64,
-                    file.nlink as i64,
+                    nlink,
                 ])?;
             }
         }
@@ -783,17 +786,24 @@ impl ScanStore {
         ReclaimState::from_i64(raw)
     }
 
-    /// Whether every manifest row of the scan carries a real link count. One `nlink = 0` is enough
-    /// to make the scan unsafe to plan against — that row's allocation may have links nobody
-    /// counted — and a manifest migrated from v2 is entirely in that state. Stops at the first
-    /// such row, so a fully known manifest is the only case that reads all of them.
+    /// Whether every manifest row of the scan carries a real link count. One unrecorded count is
+    /// enough to make the scan unsafe to plan against — that row's allocation may have links
+    /// nobody counted — and a manifest migrated from v2 is entirely in that state.
+    ///
+    /// The worst row decides, so the query asks for the smallest non-positive count there is:
+    /// `NULL` means every row holds a real count (or the scan has no rows at all), `0` is the
+    /// ordinary legacy case, and anything negative cannot come from `st_nlink` and is refused
+    /// rather than believed.
     pub fn scan_link_counts_known(&self, scan_id: i64) -> Result<bool> {
-        let unknown: i64 = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM file WHERE scan_id = ?1 AND nlink = 0)",
+        let worst: Option<i64> = self.conn.query_row(
+            "SELECT MIN(nlink) FROM file WHERE scan_id = ?1 AND nlink <= 0",
             params![scan_id],
             |row| row.get(0),
         )?;
-        Ok(unknown == 0)
+        match worst {
+            None => Ok(true),
+            Some(raw) => Ok(LinkCount::from_i64(raw)?.is_known()),
+        }
     }
 
     /// Whether this scan's results may be turned into a destructive plan. Answers only — `R2D`
@@ -856,8 +866,11 @@ impl ScanStore {
                    GROUP BY size HAVING COUNT(*) >= 2
                )",
         )?;
+        // The link count travels beside the row rather than inside it: decoding it is checked and
+        // can fail, which a rusqlite row mapper cannot report. The field below is a placeholder
+        // the loop replaces before anything reads it.
         let rows = stmt.query_map(params![scan_id], |row| {
-            Ok(ManifestRow {
+            let file = ManifestRow {
                 path: PathBuf::from(row.get::<_, String>(0)?),
                 size: row.get::<_, i64>(1)? as u64,
                 mtime: row.get::<_, i64>(2)?,
@@ -866,13 +879,16 @@ impl ScanStore {
                 ctime_nsec: row.get::<_, i64>(5)?,
                 device: row.get::<_, i64>(6)? as u64,
                 inode: row.get::<_, i64>(7)? as u64,
-                nlink: row.get::<_, i64>(8)? as u64,
-            })
+                nlink: 0,
+            };
+            Ok((file, row.get::<_, i64>(8)?))
         })?;
 
         let mut files = Vec::new();
         for row in rows {
-            files.push(row?);
+            let (mut file, nlink) = row?;
+            file.nlink = LinkCount::from_i64(nlink)?.to_u64();
+            files.push(file);
         }
         Ok(files)
     }
@@ -5132,5 +5148,157 @@ mod tests {
             "the message must name the cause: {err}"
         );
         assert!(store.destructive_plan_verdict(id).is_err());
+    }
+
+    /// Seeds a completed-looking scan and returns its id. `file.nlink` is a signed SQLite
+    /// `INTEGER` with no domain constraint, so a damaged or externally modified DB can hold a
+    /// value `st_nlink` could never produce; these tests write one deliberately.
+    fn store_with_seeded_manifest(rows: &[(&str, i64, i64)]) -> (ScanStore, i64) {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank")]))
+            .unwrap();
+        for (index, (path, size, nlink)) in rows.iter().enumerate() {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO file(scan_id, path, size, mtime, device, inode, nlink)
+                     VALUES (?1, ?2, ?3, 42, 10, ?4, ?5)",
+                    params![id, path, size, index as i64 + 1, nlink],
+                )
+                .unwrap();
+        }
+        (store, id)
+    }
+
+    /// A negative persisted link count is corruption, not a large real count. Planning must refuse
+    /// with an explicit error — and here the trust state is deliberately set to `Exact`, so the
+    /// link-count check is the only thing standing between this scan and `Allowed`.
+    #[test]
+    fn a_corrupt_negative_link_count_refuses_destructive_planning() {
+        let (store, id) = store_with_seeded_manifest(&[("/tank/a", 100, -1)]);
+        store
+            .conn
+            .execute(
+                "UPDATE scan_stats SET reclaim_state = ?2 WHERE scan_id = ?1",
+                params![id, ReclaimState::Exact.as_i64()],
+            )
+            .unwrap();
+
+        let err = store
+            .scan_link_counts_known(id)
+            .expect_err("a negative link count must not read as known");
+        assert!(
+            err.to_string().contains("corrupt link count"),
+            "the message must name the cause: {err}"
+        );
+
+        match store.destructive_plan_verdict(id) {
+            Err(err) => assert!(
+                err.to_string().contains("corrupt link count"),
+                "the verdict must refuse for the same reason: {err}"
+            ),
+            Ok(verdict) => panic!("corruption must never produce a verdict, got {verdict:?}"),
+        }
+    }
+
+    /// The same value read back through the manifest: an unchecked `as u64` would turn `-1` into
+    /// `u64::MAX` and hand a hashing candidate a link count larger than the filesystem could ever
+    /// report. Reading must fail instead.
+    #[test]
+    fn a_corrupt_negative_link_count_refuses_candidate_reading() {
+        // Two rows of one size, so both are hashing candidates.
+        let (store, id) = store_with_seeded_manifest(&[("/tank/a", 100, -1), ("/tank/b", 100, 1)]);
+
+        match store.candidate_files(id) {
+            Err(err) => assert!(
+                err.to_string().contains("corrupt link count"),
+                "the message must name the cause: {err}"
+            ),
+            Ok(rows) => panic!(
+                "a corrupt row must not be readable, got {:?}",
+                rows.iter().map(|row| row.nlink).collect::<Vec<_>>()
+            ),
+        }
+    }
+
+    /// The accepted domain, at its edges: `0` stays the ordinary legacy unknown, `1` and a larger
+    /// real count round-trip untouched, and the scan only counts as known once no row is left at
+    /// `0`.
+    #[test]
+    fn link_count_boundaries_round_trip_through_the_manifest() {
+        let (store, id) = store_with_seeded_manifest(&[
+            ("/tank/a", 100, 0),
+            ("/tank/b", 100, 1),
+            ("/tank/c", 100, 4),
+        ]);
+
+        let mut read: Vec<(String, u64)> = store
+            .candidate_files(id)
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.path.to_string_lossy().into_owned(), row.nlink))
+            .collect();
+        read.sort();
+        assert_eq!(
+            read,
+            vec![
+                ("/tank/a".to_string(), 0),
+                ("/tank/b".to_string(), 1),
+                ("/tank/c".to_string(), 4),
+            ],
+            "0 stays unknown, real counts survive unchanged"
+        );
+
+        assert!(
+            !store.scan_link_counts_known(id).unwrap(),
+            "one legacy row is enough to make the scan unknown"
+        );
+        assert_eq!(
+            store.destructive_plan_verdict(id).unwrap(),
+            DestructivePlanVerdict::RescanRequired,
+            "a 0 is the ordinary legacy refusal, not an error"
+        );
+
+        store
+            .conn
+            .execute("DELETE FROM file WHERE path = '/tank/a'", [])
+            .unwrap();
+        assert!(
+            store.scan_link_counts_known(id).unwrap(),
+            "with every row at 1 or more the counts are known"
+        );
+    }
+
+    /// The write side of the same invariant: a count SQLite's signed column cannot hold must be
+    /// refused before the insert, not wrapped into a negative the reader would then call corrupt.
+    #[test]
+    fn a_link_count_too_large_for_the_column_is_refused_before_it_is_written() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank")]))
+            .unwrap();
+        let row = ManifestRow {
+            path: PathBuf::from("/tank/a"),
+            size: 100,
+            device: 1,
+            inode: 2,
+            nlink: u64::MAX,
+            ..Default::default()
+        };
+
+        assert!(
+            store.record_files(id, &[row]).is_err(),
+            "a count that does not fit the column must not be written"
+        );
+        let negative: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file WHERE scan_id = ?1 AND nlink < 0",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(negative, 0, "nothing negative reached the manifest");
     }
 }

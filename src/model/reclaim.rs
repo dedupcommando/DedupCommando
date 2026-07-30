@@ -60,6 +60,68 @@ impl ReclaimState {
     }
 }
 
+/// A link count as persisted in `file.nlink`.
+///
+/// The column is SQLite's signed `INTEGER` and carries no domain constraint, so a damaged or
+/// externally modified DB can hold a value `st_nlink` could never produce. This type is the one
+/// gate between that column and the rest of the program: the accepted domain is exactly `0` for a
+/// row whose count was never recorded and `>= 1` for a real count. Anything negative is corruption
+/// and is refused — never reinterpreted as a large positive number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkCount {
+    /// Never recorded — a legacy pre-v3 row.
+    Unknown,
+    /// The real `st_nlink` the walk observed; always `>= 1`.
+    Known(u64),
+}
+
+impl LinkCount {
+    /// Decodes a value read from `file.nlink`.
+    pub fn from_i64(raw: i64) -> Result<Self> {
+        match raw {
+            0 => Ok(Self::Unknown),
+            count if count > 0 => Ok(Self::Known(count as u64)),
+            negative => Err(AppError::msg(format!(
+                "dedcom.db holds a corrupt link count ({negative}); a link count is never negative. Rescan, or move the old dedcom.db aside."
+            ))),
+        }
+    }
+
+    /// Reads the manifest convention, where `0` stands for a count that was never recorded.
+    pub const fn from_u64(value: u64) -> Self {
+        match value {
+            0 => Self::Unknown,
+            count => Self::Known(count),
+        }
+    }
+
+    /// Encodes for storage. A count too large for the signed column is refused here rather than
+    /// wrapped into the negative a reader would then have to call corrupt.
+    pub fn to_i64(self) -> Result<i64> {
+        match self {
+            Self::Unknown => Ok(0),
+            Self::Known(count) => i64::try_from(count).map_err(|_| {
+                AppError::msg(format!(
+                    "link count {count} does not fit dedcom.db's integer column"
+                ))
+            }),
+        }
+    }
+
+    /// The manifest convention again: the real count, or `0` when it was never recorded.
+    pub const fn to_u64(self) -> u64 {
+        match self {
+            Self::Unknown => 0,
+            Self::Known(count) => count,
+        }
+    }
+
+    /// Whether this row's allocation has a link count anyone can reason about.
+    pub const fn is_known(self) -> bool {
+        matches!(self, Self::Known(_))
+    }
+}
+
 /// Whether a scan's results may be turned into a destructive plan.
 ///
 /// A pre-v3 scan stays fully browseable, but its link counts were never recorded, so nothing can
@@ -122,6 +184,46 @@ mod tests {
         assert!(!ReclaimState::Unknown.is_trusted());
         assert!(ReclaimState::Exact.is_trusted());
         assert!(ReclaimState::UpperBound.is_trusted());
+    }
+
+    #[test]
+    fn a_link_count_round_trips_across_the_accepted_domain() {
+        assert_eq!(LinkCount::from_i64(0).unwrap(), LinkCount::Unknown);
+        assert_eq!(LinkCount::from_i64(1).unwrap(), LinkCount::Known(1));
+        assert_eq!(
+            LinkCount::from_i64(i64::MAX).unwrap(),
+            LinkCount::Known(i64::MAX as u64)
+        );
+        for count in [LinkCount::Unknown, LinkCount::Known(1), LinkCount::Known(9)] {
+            assert_eq!(LinkCount::from_i64(count.to_i64().unwrap()).unwrap(), count);
+            assert_eq!(LinkCount::from_u64(count.to_u64()), count);
+        }
+        assert!(!LinkCount::Unknown.is_known());
+        assert!(LinkCount::Known(1).is_known());
+    }
+
+    /// The defect this type exists for: an unchecked cast would turn `-1` into `u64::MAX` and hand
+    /// the program a link count no filesystem could report.
+    #[test]
+    fn a_negative_link_count_is_corruption_not_a_large_count() {
+        for raw in [-1, -42, i64::MIN] {
+            let err = LinkCount::from_i64(raw).expect_err("a negative count must not decode");
+            assert!(
+                err.to_string().contains("corrupt link count"),
+                "the message must name the cause: {err}"
+            );
+        }
+    }
+
+    /// The write side: a count the signed column cannot hold is refused rather than wrapped.
+    #[test]
+    fn a_link_count_too_large_for_the_column_is_refused() {
+        assert!(LinkCount::Known(u64::MAX).to_i64().is_err());
+        assert_eq!(
+            LinkCount::Known(i64::MAX as u64).to_i64().unwrap(),
+            i64::MAX,
+            "the largest storable count still encodes"
+        );
     }
 
     /// Both inputs must hold: an unknown state, or a manifest with unrecorded link counts, refuses
