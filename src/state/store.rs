@@ -1278,9 +1278,11 @@ impl ScanStore {
     }
 
     /// Spreads digests that cross-scan inheritance just produced across the aliases of each
-    /// object, before any candidate is chosen. This is what makes a renamed alias free: one
+    /// object, before any candidate is chosen. This is what makes a newly visible alias free: one
     /// surviving pathname inherits, every other pathname of the same allocation receives the
-    /// digest, and the object needs zero content reads.
+    /// digest, and the object needs zero content reads. A pathname that was actually renamed is a
+    /// different case — the rename moved the inode's ctime, so nothing of that object inherits at
+    /// all and it is read once.
     ///
     /// Refuses first if any object carries more than one distinct trusted digest — two aliases
     /// that inherited from different past scans cannot both be right, and picking by row order
@@ -6167,51 +6169,63 @@ mod tests {
             .map(|h| hex_encode(&h))
     }
 
-    /// R7a. One alias kept its name and inherits from the past scan; the renamed one cannot — no
-    /// past row has that path — and receives the digest through current-scan physical identity.
-    /// The object is left with nothing to read.
+    /// R7a — the zero-read case, in the shape a filesystem can actually produce: a hardlink
+    /// pathname that already existed but lay outside the previous scan's roots, so it has no past
+    /// manifest row of its own. Nothing on disk changed between the two scans, so the inode's
+    /// ctime is untouched and the pathname that *was* in scope still matches its past row exactly.
+    ///
+    /// It inherits by path, the newly visible pathname is filled by current-object propagation,
+    /// and the allocation is left with nothing to read.
+    ///
+    /// A rename cannot stand in for this: `rename(2)` updates the inode's ctime, which is
+    /// `an_object_whose_ctime_moved_is_read_exactly_once` below.
     #[test]
-    fn a_renamed_alias_is_filled_from_its_surviving_twin_without_a_read() {
+    fn a_newly_visible_alias_is_filled_from_its_surviving_twin_without_a_read() {
         let mut store = ScanStore::open_in_memory().unwrap();
         let hash = [9u8; 32];
-        past_scan(
-            &mut store,
-            &[alias_row("/x/a", 2, 11), alias_row("/x/b", 2, 11)],
-            hash,
-        );
+        // The past scan saw only /x/a. /x/b was already a link to the same inode, but outside that
+        // scan's roots, so the checkpoint has no row for it.
+        past_scan(&mut store, &[alias_row("/x/a", 2, 11)], hash);
 
-        // The new scan sees the same allocation under one old name and one new one.
+        // The current scan's roots now cover both pathnames of that same, untouched allocation —
+        // same device, inode and full temporal identity as the past row.
         let now = store
             .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
             .unwrap();
         store
-            .record_files(now, &[alias_row("/x/a", 2, 11), alias_row("/x/b2", 2, 11)])
+            .record_files(now, &[alias_row("/x/a", 2, 11), alias_row("/x/b", 2, 11)])
             .unwrap();
 
         assert_eq!(
             store.inherit_hashes(now).unwrap(),
             1,
-            "only /x/a can inherit"
+            "only /x/a has a past row to inherit from"
         );
         assert_eq!(
             store.propagate_inherited_hashes(now).unwrap(),
             1,
-            "/x/b2 is filled from it"
+            "and /x/b is filled from it, unread"
         );
 
         let expected = Some(hex_encode(&hash));
         assert_eq!(hash_of(&store, now, "/x/a"), expected);
-        assert_eq!(hash_of(&store, now, "/x/b2"), expected);
+        assert_eq!(hash_of(&store, now, "/x/b"), expected);
         assert!(
             store.candidate_objects(now).unwrap().is_empty(),
             "nothing is left to read"
         );
     }
 
-    /// R7a′. When no pathname can inherit, the allocation is read — exactly once, through a single
-    /// representative, however many names point at it.
+    /// R7a-prime — an actual name mutation. `rename(2)`, `link(2)` and `unlink(2)` all update the
+    /// inode's ctime, so once a twin is renamed the whole allocation carries a temporal identity
+    /// the past manifest does not have — including the pathname that kept its own name and was
+    /// never touched. Nothing inherits, and the allocation is read exactly once, through one
+    /// deterministic representative, however many names point at it.
+    ///
+    /// This is the case a rename really produces; the zero-read one is
+    /// `a_newly_visible_alias_is_filled_from_its_surviving_twin_without_a_read` above.
     #[test]
-    fn an_object_no_pathname_can_inherit_is_read_exactly_once() {
+    fn an_object_whose_ctime_moved_is_read_exactly_once() {
         let mut store = ScanStore::open_in_memory().unwrap();
         past_scan(
             &mut store,
@@ -6219,8 +6233,9 @@ mod tests {
             [9u8; 32],
         );
 
-        // Both names changed, and a second allocation of the same size exists so the size is
-        // eligible at all.
+        // `/x/b` was renamed to `/x/b2`. That moved the inode's ctime from 11 to 77, so BOTH
+        // pathnames of the object now fail the cross-scan match — `/x/a` included. A second
+        // allocation of the same size keeps the size eligible at all.
         let now = store
             .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
             .unwrap();
@@ -6228,15 +6243,23 @@ mod tests {
             .record_files(
                 now,
                 &[
-                    alias_row("/x/a2", 2, 11),
-                    alias_row("/x/b2", 2, 11),
+                    alias_row("/x/a", 2, 77),
+                    alias_row("/x/b2", 2, 77),
                     alias_row("/x/other", 3, 11),
                 ],
             )
             .unwrap();
 
-        assert_eq!(store.inherit_hashes(now).unwrap(), 0, "no path matches");
-        assert_eq!(store.propagate_inherited_hashes(now).unwrap(), 0);
+        assert_eq!(
+            store.inherit_hashes(now).unwrap(),
+            0,
+            "the ctime moved, so not even the surviving pathname matches"
+        );
+        assert_eq!(
+            store.propagate_inherited_hashes(now).unwrap(),
+            0,
+            "and there is no trusted digest to spread"
+        );
         let candidates = store.candidate_objects(now).unwrap();
         assert_eq!(candidates.len(), 2, "two allocations, two representatives");
         let mut representatives: Vec<String> = candidates
@@ -6246,8 +6269,8 @@ mod tests {
         representatives.sort();
         assert_eq!(
             representatives,
-            vec!["/x/a2".to_string(), "/x/other".to_string()],
-            "the representative is the first pathname of its object, deterministically"
+            vec!["/x/a".to_string(), "/x/other".to_string()],
+            "one representative for the mutated object, one for the control, both deterministic"
         );
     }
 
