@@ -302,6 +302,34 @@ fn propagate_sql() -> String {
     )
 }
 
+/// The four candidate totals off ONE object relation and ONE eligibility relation.
+///
+/// `objects` collapses the manifest to one row per scan-local temporal physical object, carrying
+/// how many pathnames it has and how many of them already hold a digest. `eligible` then counts
+/// those objects per size. Everything the phase reports is a `SUM` over the join of the two, so the
+/// expensive grouping happens once rather than once per reported number.
+///
+/// `MATERIALIZED` is explicit: `objects` is referenced twice, and without it SQLite is free to
+/// inline the definition into both references, which is precisely the repetition being removed.
+fn candidate_stats_sql() -> String {
+    format!(
+        "WITH objects AS MATERIALIZED (
+             SELECT {OBJECT_KEY}, COUNT(*) AS paths, COUNT(hash) AS hashed_paths
+               FROM file WHERE scan_id = ?1
+              GROUP BY {OBJECT_KEY}
+         ),
+         eligible AS (
+             SELECT size FROM objects GROUP BY size HAVING COUNT(*) >= 2
+         )
+         SELECT
+             COALESCE(SUM(objects.paths), 0),
+             COALESCE(SUM(objects.size), 0),
+             COALESCE(SUM(objects.hashed_paths), 0),
+             COALESCE(SUM(CASE WHEN objects.hashed_paths > 0 THEN objects.size ELSE 0 END), 0)
+           FROM objects JOIN eligible ON eligible.size = objects.size"
+    )
+}
+
 /// The cross-scan reuse key: the SAME pathname carrying the SAME full temporal identity in a
 /// different scan, with an fd-verified digest. `device`/`inode` are deliberately absent — ZFS
 /// changes both after an import or reboot, and a key that included them would re-read the pool
@@ -1123,34 +1151,24 @@ impl ScanStore {
     /// completion is what the file counter tracks. Bytes count **distinct physical objects once**,
     /// because that is what will be read from disk; charging an allocation once per alias would
     /// inflate the total, the rate and the ETA by exactly the duplication the scan is looking for.
+    ///
+    /// All four totals come off ONE object relation and ONE eligibility relation. Written as four
+    /// separate subqueries — the shape this replaces — each carried its own copy of the complete
+    /// eligible-size aggregation, so the scan-local object grouping ran four times per call, and
+    /// the phase calls this at least at start and at final reconciliation. `MATERIALIZED` is
+    /// explicit because `objects` is referenced twice and SQLite would otherwise be free to inline
+    /// it, reintroducing exactly the duplication this removes.
     pub fn candidate_stats(&self, scan_id: i64) -> Result<CandidateStats> {
-        let eligible = eligible_sizes_sql();
-        let stats = self.conn.query_row(
-            &format!(
-                "SELECT
-                     (SELECT COUNT(*) FROM file
-                       WHERE scan_id = ?1 AND size IN ({eligible})),
-                     (SELECT COALESCE(SUM(size), 0) FROM (
-                          SELECT size FROM file
-                           WHERE scan_id = ?1 AND size IN ({eligible})
-                           GROUP BY {OBJECT_KEY})),
-                     (SELECT COUNT(*) FROM file
-                       WHERE scan_id = ?1 AND size IN ({eligible}) AND hash IS NOT NULL),
-                     (SELECT COALESCE(SUM(size), 0) FROM (
-                          SELECT size FROM file
-                           WHERE scan_id = ?1 AND size IN ({eligible}) AND hash IS NOT NULL
-                           GROUP BY {OBJECT_KEY}))"
-            ),
-            params![scan_id],
-            |row| {
+        let stats = self
+            .conn
+            .query_row(&candidate_stats_sql(), params![scan_id], |row| {
                 Ok(CandidateStats {
                     total_files: row.get::<_, i64>(0)? as u64,
                     total_bytes: row.get::<_, i64>(1)? as u64,
                     hashed_files: row.get::<_, i64>(2)? as u64,
                     hashed_bytes: row.get::<_, i64>(3)? as u64,
                 })
-            },
-        )?;
+            })?;
         Ok(stats)
     }
 
@@ -5697,6 +5715,143 @@ mod tests {
             store.destructive_plan_verdict(id).is_err(),
             "and planning must never proceed"
         );
+    }
+
+    // ---- C3c: candidate statistics -------------------------------------------------------------
+
+    fn sized_row(path: &str, inode: u64, size: u64) -> ManifestRow {
+        ManifestRow {
+            size,
+            ..alias_row(path, inode, 11)
+        }
+    }
+
+    fn stats_of(rows: &[ManifestRow]) -> (ScanStore, i64, CandidateStats) {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store.record_files(id, rows).unwrap();
+        let stats = store.candidate_stats(id).unwrap();
+        (store, id, stats)
+    }
+
+    #[test]
+    fn an_empty_manifest_has_no_candidate_statistics() {
+        let (_store, _id, stats) = stats_of(&[]);
+        assert_eq!(
+            (
+                stats.total_files,
+                stats.total_bytes,
+                stats.hashed_files,
+                stats.hashed_bytes
+            ),
+            (0, 0, 0, 0)
+        );
+    }
+
+    /// Neither a size only one object has, nor a size several *names of one object* share, is
+    /// something to hash. Both must be absent from every total.
+    #[test]
+    fn unique_sizes_and_alias_only_sizes_are_excluded_from_every_total() {
+        let (_store, _id, stats) = stats_of(&[
+            // One object under three names: one allocation, nothing to compare it with.
+            sized_row("/x/a1", 2, 100),
+            sized_row("/x/a2", 2, 100),
+            sized_row("/x/a3", 2, 100),
+            // A size nobody else has.
+            sized_row("/x/lonely", 3, 999),
+        ]);
+        assert_eq!(
+            (
+                stats.total_files,
+                stats.total_bytes,
+                stats.hashed_files,
+                stats.hashed_bytes
+            ),
+            (0, 0, 0, 0),
+            "aliases alone do not make a size eligible"
+        );
+    }
+
+    #[test]
+    fn two_independent_objects_of_one_size_are_two_paths_and_two_object_sizes() {
+        let (_store, _id, stats) =
+            stats_of(&[sized_row("/x/a", 2, 100), sized_row("/x/b", 3, 100)]);
+        assert_eq!((stats.total_files, stats.total_bytes), (2, 200));
+        assert_eq!((stats.hashed_files, stats.hashed_bytes), (0, 0));
+    }
+
+    /// The two dimensions, side by side: every pathname is counted, every allocation once.
+    #[test]
+    fn aliases_count_as_paths_while_bytes_count_allocations() {
+        let (_store, _id, stats) = stats_of(&[
+            sized_row("/x/a1", 2, 100),
+            sized_row("/x/a2", 2, 100),
+            sized_row("/x/a3", 2, 100),
+            sized_row("/x/b", 3, 100),
+        ]);
+        assert_eq!(stats.total_files, 4, "four pathnames must end up hashed");
+        assert_eq!(stats.total_bytes, 200, "over two allocations");
+    }
+
+    /// A partially hashed object: only the pathnames that actually carry a digest advance the file
+    /// counter, while its allocation enters the byte counter once — it was read once.
+    #[test]
+    fn a_partially_hashed_object_charges_its_bytes_once() {
+        let (store, id, before) = stats_of(&[
+            sized_row("/x/a1", 2, 100),
+            sized_row("/x/a2", 2, 100),
+            sized_row("/x/b", 3, 100),
+        ]);
+        assert_eq!((before.total_files, before.total_bytes), (3, 200));
+
+        // Only one of the two aliases is given a digest, directly, without propagation.
+        store
+            .conn
+            .execute(
+                "UPDATE file SET hash = X'AA' WHERE scan_id = ?1 AND path = '/x/a1'",
+                params![id],
+            )
+            .unwrap();
+
+        let stats = store.candidate_stats(id).unwrap();
+        assert_eq!(stats.hashed_files, 1, "one pathname carries a digest");
+        assert_eq!(
+            stats.hashed_bytes, 100,
+            "and its allocation is charged once, not once per alias"
+        );
+    }
+
+    /// On a clean completion both dimensions reach their totals — pathnames because propagation
+    /// fills the aliases, bytes because every allocation was read.
+    #[test]
+    fn a_clean_completion_reaches_both_totals() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store
+            .record_files(
+                id,
+                &[
+                    sized_row("/x/a1", 2, 100),
+                    sized_row("/x/a2", 2, 100),
+                    sized_row("/x/b", 3, 100),
+                ],
+            )
+            .unwrap();
+        let total = store.candidate_stats(id).unwrap();
+
+        for representative in store.candidate_objects(id).unwrap() {
+            store
+                .record_hashes_verified(id, &[(representative, [3u8; 32])])
+                .unwrap();
+        }
+
+        let done = store.candidate_stats(id).unwrap();
+        assert_eq!(done.hashed_files, total.total_files, "every pathname");
+        assert_eq!(done.hashed_bytes, total.total_bytes, "every allocation");
     }
 
     // ---- C3a: the grouped link-count boundary --------------------------------------------------
