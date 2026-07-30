@@ -15,6 +15,7 @@ use crate::state::{ManifestRow, ScanStore};
 
 pub mod governor;
 pub mod hash;
+pub mod roots;
 mod safe_open;
 pub mod verify;
 pub mod walk;
@@ -57,7 +58,13 @@ pub fn run_scan(
     // on any exit path, including cancellation.
     let scan_id = match resume {
         Some(id) => id,
-        None => store.begin_scan(config)?,
+        None => {
+            // Before anything is written: a root set where one tree is reachable twice has no honest
+            // result to report, so it never becomes a scan at all. A resume keeps the roots it was
+            // created with, and its walk is covered by the alias guard inside `walk`.
+            roots::ensure_disjoint(&config.roots)?;
+            store.begin_scan(config)?
+        }
     };
     store.ensure_scan_stats(scan_id)?;
 
@@ -675,6 +682,61 @@ mod hash_failures_tests {
             ScanStatus::Complete,
             "status Complete without warnings"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A root set where one tree is reachable twice is refused before anything is written: no scan
+    /// row, no manifest, no result. The same tree scanned by one root still completes normally.
+    #[test]
+    fn conflicting_roots_are_refused_before_a_scan_row_exists() {
+        let dir = unique_temp_dir("nested_roots");
+        let inner = dir.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("a.bin"), b"identical duplicate content").unwrap();
+        std::fs::write(dir.join("b.bin"), b"identical duplicate content").unwrap();
+
+        let mut cfg = ScanConfig::new(vec![dir.clone(), inner.clone()]);
+        cfg.min_size = 0;
+        cfg.exclude_globs = Vec::new();
+
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        // Not `expect_err`: `ScanOutcome` has no `Debug`, and adding one is not this commit's job.
+        let text = match run_scan(&mut store, &cfg, None, false, &cancel, |_| {}) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("nested roots must not start a scan"),
+        };
+        assert!(
+            text.contains("nested roots"),
+            "the class must be named: {text}"
+        );
+        assert!(
+            text.contains(&inner.display().to_string()),
+            "both roots must be named: {text}"
+        );
+
+        let counts = store.db_counts().unwrap();
+        assert_eq!(counts.scans, 0, "begin_scan was never reached");
+        assert_eq!(counts.file_rows, 0, "and no manifest row was written");
+        assert!(
+            store.list_scans().unwrap().is_empty(),
+            "no session to resume"
+        );
+
+        // Control: one root over the same tree scans to completion.
+        let mut ok = ScanConfig::new(vec![dir.clone()]);
+        ok.min_size = 0;
+        ok.exclude_globs = Vec::new();
+        let outcome = run_scan(&mut store, &ok, None, false, &cancel, |_| {})
+            .expect("a disjoint root set still scans");
+        match outcome {
+            ScanOutcome::Completed(results) => assert_eq!(
+                results.summary.groups_found, 1,
+                "the two identical files are still found"
+            ),
+            ScanOutcome::Cancelled => panic!("expected Completed"),
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

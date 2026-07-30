@@ -66,6 +66,11 @@ pub fn walk(
     let mut files: Vec<WalkedFile> = Vec::new();
     let mut entries: u64 = 0;
     let mut skipped_non_utf8: u64 = 0;
+    // Directories seen so far, by physical identity. An alias inside a selected root (a bind mount,
+    // or a directory symlink while following links) is only visible here, and it aborts the scan —
+    // see `roots::DirAliasGuard`. Bounded by the number of directories, which is small next to the
+    // file vector this walk already holds.
+    let mut dirs = super::roots::DirAliasGuard::default();
     for result in builder.build() {
         if entries % 1024 == 0 {
             if cancel.load(Ordering::Relaxed) {
@@ -89,6 +94,14 @@ pub fn walk(
         };
         match entry.file_type() {
             Some(file_type) if file_type.is_file() => {}
+            // A directory: the only place an alias inside a root can be caught. Its metadata is the
+            // one extra `stat` this guard costs, and only for directories.
+            Some(file_type) if file_type.is_dir() => {
+                if let Ok(meta) = entry.metadata() {
+                    dirs.note(entry.path(), meta.dev(), meta.ino())?;
+                }
+                continue;
+            }
             _ => continue,
         }
         let meta = match entry.metadata() {
@@ -166,6 +179,48 @@ mod tests {
         dir.push(format!("dedcom_walk_{tag}_{}_{nanos}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The walk-time half of the root guard: a directory symlink pointing at a sibling directory
+    /// makes one tree visible under two pathnames as soon as links are followed. No privileges
+    /// needed, so the bind-mount E2E is not the only coverage of this branch.
+    #[test]
+    fn a_followed_directory_alias_aborts_the_walk() {
+        let root = temp_dir("dir_alias");
+        let real = root.join("real");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("f.bin"), b"data").unwrap();
+        std::os::unix::fs::symlink(&real, root.join("alias")).unwrap();
+
+        let mut config = ScanConfig::new(vec![root.clone()]);
+        config.min_size = 0;
+        config.exclude_globs.clear();
+        config.follow_symlinks = true;
+
+        let cancel = AtomicBool::new(false);
+        // Not `expect_err`: that needs `Debug` on the success type, and `WalkedFile` has none.
+        let text = match walk(&config, &cancel, |_, _, _| {}) {
+            Err(err) => err.to_string(),
+            Ok((files, _)) => panic!("the alias must abort the walk, got {} files", files.len()),
+        };
+        assert!(
+            text.contains("same directory"),
+            "the class must be named: {text}"
+        );
+        assert!(
+            text.contains("alias") && text.contains("real"),
+            "both pathnames must be named: {text}"
+        );
+
+        // Control: without following links the symlink is not a directory, and the same tree walks
+        // exactly as it did before this guard existed.
+        config.follow_symlinks = false;
+        let (files, skipped) =
+            walk(&config, &cancel, |_, _, _| {}).expect("no alias when links are not followed");
+        assert_eq!(files.len(), 1, "exactly the one real file");
+        assert_eq!(skipped, 0);
+
+        fs::remove_dir_all(&root).ok();
     }
 
     /// Non-UTF8 guard: a file with a non-UTF8 name is skipped and counted,
