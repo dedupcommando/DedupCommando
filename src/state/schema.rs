@@ -151,17 +151,30 @@ CREATE TABLE IF NOT EXISTS move_event (
 /// migration; the escape is the one the refusal message already names — move `dedcom.db` aside.
 pub const SCHEMA_VERSION: i64 = 3;
 
+/// The version refusal itself, parameterized by the maximum schema a *reading build* supports.
+///
+/// Being a parameter rather than a constant is what makes the downgrade guarantee testable: a build
+/// that only knows an older schema differs from this one, for this purpose, in exactly that number.
+/// Passing it is therefore a real execution of the same comparison an older build would make —
+/// unlike comparing two constants, which proves nothing about the code.
+///
+/// Reads only. A refusal must leave the DB exactly as it was, which is what lets a DB from a future
+/// build survive being opened by this one.
+fn ensure_version_at_most(conn: &Connection, supported: i64) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > supported {
+        return Err(AppError::msg(format!(
+            "dedcom.db was created by a newer version (schema v{version}; this build supports v{supported}). Upgrade dedcom, or move the old dedcom.db aside."
+        )));
+    }
+    Ok(())
+}
+
 /// Refuses a DB written by a newer build. Reads `PRAGMA user_version` and errors if it is above
 /// what this build knows; otherwise does nothing. Must run before any write so a future DB is
 /// left untouched.
 pub fn ensure_version_supported(conn: &Connection) -> Result<()> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > SCHEMA_VERSION {
-        return Err(AppError::msg(format!(
-            "dedcom.db was created by a newer version (schema v{version}; this build supports v{SCHEMA_VERSION}). Upgrade dedcom, or move the old dedcom.db aside."
-        )));
-    }
-    Ok(())
+    ensure_version_at_most(conn, SCHEMA_VERSION)
 }
 
 /// Refuses a DB older than this build when we cannot migrate it. Migration needs a writer, and
@@ -311,6 +324,30 @@ mod tests {
         .unwrap()
         .filter_map(|r| r.ok())
         .collect()
+    }
+
+    /// Manifest, marks, group summary and scan statistics as text — the representative data a
+    /// «this check wrote nothing» assertion compares across a refused open.
+    fn representative_data(conn: &Connection) -> Vec<String> {
+        let mut rows = Vec::new();
+        for sql in [
+            "SELECT 'file|' || path || '|' || size || '|' || nlink || '|'
+                    || COALESCE(hex(hash), '') FROM file ORDER BY path",
+            "SELECT 'mark|' || path || '|' || is_keeper || '|' || COALESCE(action, '')
+               FROM file_mark ORDER BY path",
+            "SELECT 'group|' || rank || '|' || hash || '|' || file_count || '|' || size || '|'
+                    || reclaim || '|' || object_count || '|' || reclaim_state
+               FROM file_group ORDER BY rank",
+            "SELECT 'stats|' || scan_id || '|' || files_scanned || '|' || bytes_hashed || '|'
+                    || groups_found || '|' || reclaimable_bytes || '|' || results_materialized
+                    || '|' || reclaim_state
+               FROM scan_stats ORDER BY scan_id",
+        ] {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let mapped = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.extend(mapped.filter_map(|r| r.ok()));
+        }
+        rows
     }
 
     /// A genuinely v2-shaped DB: the current schema with every v3 addition taken away again and
@@ -732,6 +769,10 @@ mod tests {
 
     /// A DB from a future build is refused and left exactly as it was — no migration, no stamp
     /// rewrite, nothing an older build could damage.
+    ///
+    /// Goes through the production entry point `ensure_version_supported`, which is
+    /// `ensure_version_at_most(conn, SCHEMA_VERSION)` — the same comparison the v2-aware test below
+    /// drives with a different maximum. One implementation, both directions.
     #[test]
     fn a_v4_db_is_refused_without_writing_to_it() {
         let conn = v2_shaped_db();
@@ -747,19 +788,57 @@ mod tests {
         assert_eq!(schema_fingerprint(&conn), before, "nothing was migrated");
     }
 
-    /// The other direction: a build that only knows v2 must refuse a v3 DB rather than
-    /// re-materialize `file_group` with the pathname formula and re-inflate reclaim. Replays that
-    /// build's own check against the version this one stamps.
+    /// The other direction, executed rather than asserted: a build that only knows v2 must refuse a
+    /// v3 DB rather than re-materialize `file_group` with the pathname formula and re-inflate
+    /// reclaim.
+    ///
+    /// For this purpose a v2 build differs from this one in exactly one number — the maximum schema
+    /// it supports — so calling the same comparison production calls, with that maximum, *is* what
+    /// a v2 build does to a v3 DB. The refusal must name both versions, and it must not write:
+    /// version, schema and data are compared across it.
     #[test]
     fn a_v2_aware_build_refuses_a_v3_db() {
-        const V2_SCHEMA_VERSION: i64 = 2;
-        let conn = Connection::open_in_memory().unwrap();
+        // A real v3 DB with real results, produced by the actual migration.
+        let conn = v2_shaped_db();
+        seed_completed_scan(&conn);
         migrate(&conn).unwrap();
+        assert_eq!(user_version(&conn), 3, "the subject really is a v3 DB");
 
+        let version_before = user_version(&conn);
+        let schema_before = schema_fingerprint(&conn);
+        let data_before = representative_data(&conn);
         assert!(
-            user_version(&conn) > V2_SCHEMA_VERSION,
-            "a v2 build's `ensure_version_supported` refuses exactly this"
+            !data_before.is_empty(),
+            "the unchanged-data assertion must have something to compare"
         );
-        assert_eq!(SCHEMA_VERSION, 3);
+
+        // This build's own maximum accepts it; that is the control.
+        assert!(ensure_version_supported(&conn).is_ok());
+
+        // A build whose maximum is v2 refuses it.
+        let err = ensure_version_at_most(&conn, 2)
+            .expect_err("a v2-aware build must refuse a v3 database");
+        let text = err.to_string();
+        assert!(
+            text.contains("schema v3"),
+            "the database's own version must be named: {text}"
+        );
+        assert!(
+            text.contains("supports v2"),
+            "and the maximum the refusing build supports: {text}"
+        );
+
+        // The refused check performed no migration and no write of any kind.
+        assert_eq!(
+            user_version(&conn),
+            version_before,
+            "a refusal must not restamp"
+        );
+        assert_eq!(schema_fingerprint(&conn), schema_before, "nor migrate");
+        assert_eq!(
+            representative_data(&conn),
+            data_before,
+            "nor touch the data"
+        );
     }
 }
