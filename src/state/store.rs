@@ -11,6 +11,7 @@ use crate::model::duplicate::{
     build_dir_signatures_streaming, hex_encode, signature_of, DirGroup, DirSigAlgo, DuplicateGroup,
     FileEntry,
 };
+use crate::model::reclaim::{DestructivePlanVerdict, ReclaimState};
 use crate::model::scan::{
     ResumeInfo, ScanConfig, ScanEnvironment, ScanStatsRow, ScanStatus, ScanSummary,
 };
@@ -32,6 +33,10 @@ pub struct ManifestRow {
     pub ctime_nsec: i64,
     pub device: u64,
     pub inode: u64,
+    /// `st_nlink` observed by the walk; `0` = unknown (a legacy pre-v3 row, since a real link
+    /// count is at least 1). How many of those links this scan actually saw is a separate
+    /// question, answered by the manifest rows sharing `(device, inode)`.
+    pub nlink: u64,
 }
 
 /// Statistics on hashing candidates — for progress and resume.
@@ -640,8 +645,8 @@ impl ScanStore {
             let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO file
                      (scan_id, path, size, mtime, mtime_nsec, ctime_sec, ctime_nsec,
-                      device, inode, hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+                      device, inode, nlink, hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
             )?;
             for file in files {
                 let path = file.path.to_string_lossy();
@@ -655,6 +660,7 @@ impl ScanStore {
                     file.ctime_nsec,
                     file.device as i64,
                     file.inode as i64,
+                    file.nlink as i64,
                 ])?;
             }
         }
@@ -765,6 +771,42 @@ impl ScanStore {
         Ok(flag != 0)
     }
 
+    /// How far this scan's persisted reclaim total can be trusted. A legacy result and one this
+    /// build has not computed yet both read as `Unknown`; an integer no build knows is an error,
+    /// not a guess.
+    pub fn scan_reclaim_state(&self, scan_id: i64) -> Result<ReclaimState> {
+        let raw: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(reclaim_state), 0) FROM scan_stats WHERE scan_id = ?1",
+            params![scan_id],
+            |row| row.get(0),
+        )?;
+        ReclaimState::from_i64(raw)
+    }
+
+    /// Whether every manifest row of the scan carries a real link count. One `nlink = 0` is enough
+    /// to make the scan unsafe to plan against — that row's allocation may have links nobody
+    /// counted — and a manifest migrated from v2 is entirely in that state. Stops at the first
+    /// such row, so a fully known manifest is the only case that reads all of them.
+    pub fn scan_link_counts_known(&self, scan_id: i64) -> Result<bool> {
+        let unknown: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM file WHERE scan_id = ?1 AND nlink = 0)",
+            params![scan_id],
+            |row| row.get(0),
+        )?;
+        Ok(unknown == 0)
+    }
+
+    /// Whether this scan's results may be turned into a destructive plan. Answers only — `R2D`
+    /// owns wiring it into action construction and the confirmation screens, so nothing calls it
+    /// outside tests yet and today's behaviour is unchanged.
+    #[allow(dead_code)]
+    pub fn destructive_plan_verdict(&self, scan_id: i64) -> Result<DestructivePlanVerdict> {
+        Ok(DestructivePlanVerdict::of(
+            self.scan_reclaim_state(scan_id)?,
+            self.scan_link_counts_known(scan_id)?,
+        ))
+    }
+
     /// Marks the results prepared in its own transaction — for the paths that only need the
     /// marker (a legacy result that must be kept as-is rather than re-derived).
     fn mark_results_materialized(&mut self, scan_id: i64) -> Result<()> {
@@ -803,7 +845,11 @@ impl ScanStore {
     /// Files awaiting hashing: hash IS NULL and the size occurs ≥ 2 times.
     pub fn candidate_files(&self, scan_id: i64) -> Result<Vec<ManifestRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, size, mtime, mtime_nsec, ctime_sec, ctime_nsec, device, inode FROM file
+            // `nlink` is read back with the row it belongs to — the selection itself is
+            // unchanged (same WHERE, same rows), so that a `ManifestRow` in flight never carries
+            // a fabricated 0 for a link count the manifest actually knows.
+            "SELECT path, size, mtime, mtime_nsec, ctime_sec, ctime_nsec, device, inode, nlink
+             FROM file
              WHERE scan_id = ?1 AND hash IS NULL
                AND size IN (
                    SELECT size FROM file WHERE scan_id = ?1
@@ -820,6 +866,7 @@ impl ScanStore {
                 ctime_nsec: row.get::<_, i64>(5)?,
                 device: row.get::<_, i64>(6)? as u64,
                 inode: row.get::<_, i64>(7)? as u64,
+                nlink: row.get::<_, i64>(8)? as u64,
             })
         })?;
 
@@ -2443,6 +2490,7 @@ mod tests {
             ctime_nsec: 11,
             device: 1,
             inode: 2,
+            nlink: 1,
         };
         let b = ManifestRow {
             path: PathBuf::from("/x/b"),
@@ -2654,6 +2702,7 @@ mod tests {
             ctime_nsec: 200,
             device: 1,
             inode: 1,
+            nlink: 1,
         };
         store.record_files(a, std::slice::from_ref(&src)).unwrap();
         store
@@ -4854,5 +4903,234 @@ mod tests {
 
         drop(store);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A fresh v3 scan of the hardlink forest persists the real `st_nlink` of every pathname it
+    /// walks — the four aliases of the shared inode, the twin whose second link lies outside the
+    /// scan, and the plain control — while the manifest still holds exactly one row per pathname.
+    /// The expectation is read back from the filesystem, so it cannot drift from the fixture.
+    #[test]
+    fn a_fresh_scan_persists_real_link_counts() {
+        let forest = crate::testfixtures::HardlinkForest::build("nlink_v3");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(false);
+        match crate::pipeline::run_scan(
+            &mut store,
+            &forest.scan_config(),
+            None,
+            false,
+            &cancel,
+            |_| {},
+        ) {
+            Ok(crate::pipeline::ScanOutcome::Completed(_)) => {}
+            Ok(crate::pipeline::ScanOutcome::Cancelled) => {
+                panic!("the scan must not cancel itself")
+            }
+            Err(err) => panic!("scan the forest: {err}"),
+        }
+
+        let mut stmt = store
+            .conn
+            .prepare("SELECT path, nlink FROM file ORDER BY path")
+            .unwrap();
+        let persisted: Vec<(String, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+
+        let mut walked: Vec<PathBuf> = std::fs::read_dir(&forest.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        walked.sort();
+        let expected: Vec<(String, i64)> = walked
+            .iter()
+            .map(|path| {
+                (
+                    path.to_string_lossy().into_owned(),
+                    forest.nlink_of(path) as i64,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            persisted, expected,
+            "one row per pathname, each with its real link count"
+        );
+        // Named explicitly so the numbers the fixture exists for are visible in the test itself.
+        assert_eq!(
+            forest.nlink_of(&forest.aliases[0]),
+            4,
+            "the shared inode has four links, all inside the root"
+        );
+        assert_eq!(
+            forest.nlink_of(&forest.twin_b),
+            2,
+            "twin_b has two links, one of them outside the scan"
+        );
+        assert_eq!(forest.nlink_of(&forest.twin_a), 1, "twin_a is a lone link");
+    }
+
+    /// Rewinds an open DB to the v2 shape: drops what v3 added and restamps. Migration needs a
+    /// writer, so this is how a test produces the DB an observer must refuse.
+    fn rewind_to_v2(conn: &Connection) {
+        conn.execute_batch(
+            "DROP INDEX file_scan_identity;
+             DROP INDEX file_hash_identity;
+             ALTER TABLE file       DROP COLUMN nlink;
+             ALTER TABLE file_group DROP COLUMN object_count;
+             ALTER TABLE file_group DROP COLUMN reclaim_state;
+             ALTER TABLE scan_stats DROP COLUMN reclaim_state;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 2i64).unwrap();
+    }
+
+    /// An observer holds a genuinely read-only connection and cannot migrate. Opening a v2 DB has
+    /// to fail immediately, naming the reason — not later, deep inside a query, as «no such
+    /// column» — and the DB must be left exactly as it was for the operator to upgrade.
+    #[test]
+    fn an_observer_refuses_a_v2_db_without_migrating_it() {
+        let dir = temp_state_dir("readonly_v2");
+        let db = dir.join("dedcom.db");
+        {
+            let store = ScanStore::open_writable(&db).unwrap();
+            rewind_to_v2(&store.conn);
+        }
+
+        // Not `expect_err`: that needs `Debug` on the success type, and `ScanStore` has none.
+        let text = match ScanStore::open_read_only(&db) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("a v2 DB must be refused on a read-only connection"),
+        };
+        assert!(
+            text.contains("older schema") && text.contains("read-only"),
+            "the message must explain the refusal: {text}"
+        );
+
+        // Untouched: still v2, and still without the v3 column.
+        let conn = Connection::open(&db).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2, "the observer must not have migrated anything");
+        assert!(
+            conn.prepare("SELECT nlink FROM file").is_err(),
+            "nothing wrote the v3 column either"
+        );
+
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A migrated pre-v3 scan stays browseable but must never reach a destructive plan: its link
+    /// counts were never recorded, so no build can tell an alias from an independent copy in it.
+    #[test]
+    fn a_migrated_scan_without_link_counts_refuses_destructive_planning() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank")]))
+            .unwrap();
+        // Exactly what the v2→v3 migration leaves behind: rows with no link count.
+        store
+            .conn
+            .execute_batch(&format!(
+                "INSERT INTO file(scan_id, path, size, mtime, device, inode, hash)
+                     VALUES ({id}, '/tank/a', 100, 42, 10, 5, X'AABB'),
+                            ({id}, '/tank/b', 100, 42, 10, 5, X'AABB');"
+            ))
+            .unwrap();
+
+        assert_eq!(store.scan_reclaim_state(id).unwrap(), ReclaimState::Unknown);
+        assert!(
+            !store.scan_link_counts_known(id).unwrap(),
+            "a migrated manifest has no link counts"
+        );
+        assert_eq!(
+            store.destructive_plan_verdict(id).unwrap(),
+            DestructivePlanVerdict::RescanRequired
+        );
+    }
+
+    /// The other side of the gate. A fresh v3 scan does record every link count — but the trust
+    /// state itself is still unknown, because computing it belongs to `R2C`; the verdict stays
+    /// closed until something establishes it, and then opens.
+    #[test]
+    fn a_fresh_scan_knows_its_link_counts_and_the_gate_opens_on_a_trusted_state() {
+        let forest = crate::testfixtures::HardlinkForest::build("verdict_v3");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(false);
+        match crate::pipeline::run_scan(
+            &mut store,
+            &forest.scan_config(),
+            None,
+            false,
+            &cancel,
+            |_| {},
+        ) {
+            Ok(crate::pipeline::ScanOutcome::Completed(_)) => {}
+            Ok(crate::pipeline::ScanOutcome::Cancelled) => {
+                panic!("the scan must not cancel itself")
+            }
+            Err(err) => panic!("scan the forest: {err}"),
+        }
+        let id = store.latest_scan_id().unwrap().expect("the scan exists");
+
+        assert!(
+            store.scan_link_counts_known(id).unwrap(),
+            "every walked row carries a real link count"
+        );
+        assert_eq!(
+            store.scan_reclaim_state(id).unwrap(),
+            ReclaimState::Unknown,
+            "R2A records link counts; R2C is what establishes trust"
+        );
+        assert_eq!(
+            store.destructive_plan_verdict(id).unwrap(),
+            DestructivePlanVerdict::RescanRequired,
+            "fail closed while the state is unknown"
+        );
+
+        // Once a trusted state is persisted, the same scan is plannable — the gate is a gate, not
+        // a permanent refusal.
+        store
+            .conn
+            .execute(
+                "UPDATE scan_stats SET reclaim_state = ?2 WHERE scan_id = ?1",
+                params![id, ReclaimState::Exact.as_i64()],
+            )
+            .unwrap();
+        assert_eq!(store.scan_reclaim_state(id).unwrap(), ReclaimState::Exact);
+        assert_eq!(
+            store.destructive_plan_verdict(id).unwrap(),
+            DestructivePlanVerdict::Allowed
+        );
+    }
+
+    /// A reclaim state this build does not recognise is an error, not a silent «unknown» — a
+    /// number written by something else must not be interpreted at all.
+    #[test]
+    fn an_unrecognised_persisted_reclaim_state_is_refused() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank")]))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE scan_stats SET reclaim_state = 7 WHERE scan_id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let err = store
+            .scan_reclaim_state(id)
+            .expect_err("7 is not a reclaim state");
+        assert!(
+            err.to_string().contains("unknown reclaim state"),
+            "the message must name the cause: {err}"
+        );
+        assert!(store.destructive_plan_verdict(id).is_err());
     }
 }

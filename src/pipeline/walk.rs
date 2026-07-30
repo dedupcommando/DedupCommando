@@ -20,6 +20,9 @@ pub struct WalkedFile {
     pub ctime_nsec: i64,
     pub device: u64,
     pub inode: u64,
+    /// `st_nlink` — how many pathnames the inode has in total, including any this scan never
+    /// sees. Comes from the metadata already fetched below; costs no extra syscall.
+    pub nlink: u64,
 }
 
 /// Walks all roots from `config` and returns the matching files plus the number of files
@@ -152,6 +155,7 @@ pub fn walk(
             ctime_nsec: meta.ctime_nsec(),
             device: meta.dev(),
             inode: meta.ino(),
+            nlink: meta.nlink(),
         });
     }
 

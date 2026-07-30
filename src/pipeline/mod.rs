@@ -375,6 +375,7 @@ fn walk_phase(
             ctime_nsec: file.ctime_nsec,
             device: file.device,
             inode: file.inode,
+            nlink: file.nlink,
         })
         .collect();
 
