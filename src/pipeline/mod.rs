@@ -435,8 +435,17 @@ fn hash_phase(
     on_progress(ScanProgress::Phase(ScanPhase::Hashing));
     let mut bench = crate::bench::start("hash_phase");
 
+    // Immediately after inheritance and before any candidate is chosen: give every alias of an
+    // object the digest one of its pathnames inherited. An object whose aliases are all filled in
+    // this way is no longer a candidate and costs zero reads. Refuses if two aliases inherited
+    // different digests — see `propagate_inherited_hashes`.
+    let propagated = store.propagate_inherited_hashes(scan_id)?;
+    if propagated > 0 {
+        tracing::info!("hash reuse: {propagated} aliases filled from an inherited digest");
+    }
+
     let stats = store.candidate_stats(scan_id)?;
-    let mut candidates = store.candidate_files(scan_id)?;
+    let mut candidates = store.candidate_objects(scan_id)?;
     // Inode order: we read candidates by (device, inode), not in directory-walk
     // order — this clusters disk accesses and cuts the seek storm on HDD (the
     // bottleneck per upstream's measurement on 2×HDD: −21% on a cold scan). On SSD/NVMe harmless
@@ -464,6 +473,10 @@ fn hash_phase(
     // error / identity-mismatch) — for the "Failed to hash: N" line on the scan screen.
     // The authoritative total is computed at the finish by reconciling candidate_stats.
     let mut hash_failures_seen: u64 = 0;
+    // Content reads this phase performs: one attempt per candidate object. The bench entry count
+    // must mean reads, so it cannot be the path-row total — propagated aliases are exactly the
+    // reads that did NOT happen.
+    let mut objects_read: u64 = 0;
 
     on_progress(ScanProgress::Hashing {
         files_done,
@@ -582,10 +595,10 @@ fn hash_phase(
         // Checkpoint: the batch of fd-verified hashes is committed by a conditional
         // UPDATE by identity. The uncommitted ones (identity race) — to the log, not to success.
         let persisted = store.record_hashes_verified(scan_id, &hashed)?;
-        if (persisted.files as usize) < hashed.len() {
+        if (persisted.representatives as usize) < hashed.len() {
             tracing::warn!(
                 "checkpoint: {} of {} hashes not committed (identity changed)",
-                hashed.len() as u64 - persisted.files,
+                hashed.len() as u64 - persisted.representatives,
                 hashed.len()
             );
         }
@@ -595,7 +608,11 @@ fn hash_phase(
         // batch candidates (error/identity) we accumulate into the failure counter for the scan screen.
         files_done += persisted.files;
         bytes_done += persisted.bytes;
-        hash_failures_seen += chunk_total - persisted.files;
+        objects_read += chunk_total;
+        // Against the REPRESENTATIVES, never against `files`: one representative can complete
+        // several pathnames, so `files` may exceed the batch size and the subtraction would
+        // underflow. A failure is a candidate object whose representative did not commit.
+        hash_failures_seen += chunk_total - persisted.representatives;
         // Candidate progress in the DB — DB-accurate (persisted delta), for an honest
         // % in the session list.
         let _ = store.update_candidate_progress(
@@ -627,7 +644,7 @@ fn hash_phase(
         tracing::info!("hash progress: {files_done}/{files_total} files");
     }
 
-    bench.set_entries(files_total);
+    bench.set_entries(objects_read);
     Ok(true)
 }
 

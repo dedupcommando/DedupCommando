@@ -54,8 +54,15 @@ pub struct CandidateStats {
 /// `candidate_stats` on every chunk (on /tank that would be tens of thousands of heavy GROUP BYs).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PersistedHashes {
+    /// Path rows that gained a digest: the committed representatives plus every alias the same
+    /// checkpoint propagated to. Pathname completion advances by this.
     pub files: u64,
+    /// Bytes actually read — the size of each committed representative, so one allocation counts
+    /// once however many pathnames point at it. Aliases add nothing here.
     pub bytes: u64,
+    /// Representatives whose conditional update committed. Always `<=` the batch size, which is
+    /// what the hash-failure counter subtracts from; `files` can exceed the batch and must not.
+    pub representatives: u64,
 }
 
 /// Summary of the checkpoint DB's contents — for `--stats`.
@@ -149,6 +156,12 @@ pub struct PlannedActionRow {
 /// Checkpoint store: a SQLite DB with the scan state and the file manifest.
 pub struct ScanStore {
     conn: Connection,
+    /// Test-only: how many set-based digest-propagation statements this store has issued. The
+    /// hashing phase must spend one per batch, never one per alias, and a counter on the store
+    /// itself proves that without a dependency, rusqlite tracing, or a timing measurement. Per
+    /// instance rather than global, so parallel tests cannot pollute each other.
+    #[cfg(test)]
+    propagations: std::cell::Cell<u64>,
 }
 
 /// Process role. `false` — operator (may write), `true` — observer.
@@ -242,7 +255,93 @@ pub(crate) fn seed_marked_group(db: &Path) -> i64 {
     scan_id
 }
 
+/// The scan-local temporal physical identity of a manifest row — the columns that decide whether
+/// two pathnames are the same allocation *right now*. Bare `(device, inode)` is deliberately not
+/// enough: an inode number is reused after a delete, and a same-second in-place edit would
+/// otherwise look unchanged. Used as a `GROUP BY` list and as a join key; nothing here is ever
+/// concatenated into a text key.
+const OBJECT_KEY: &str = "device, inode, size, mtime, mtime_nsec, ctime_sec, ctime_nsec";
+
+/// Sizes worth hashing: a size qualifies only when at least TWO DISTINCT physical objects share
+/// it. Counting path rows instead is the P-1 defect — four aliases of one allocation are one copy,
+/// not four, and reading them looks like four duplicates that would free three files.
+///
+/// The inner `GROUP BY` collapses the aliases of one object into a single row; the outer one
+/// counts those objects per size.
+fn eligible_sizes_sql() -> String {
+    format!(
+        "SELECT size FROM (
+             SELECT size FROM file WHERE scan_id = ?1 GROUP BY {OBJECT_KEY}
+         ) GROUP BY size HAVING COUNT(*) >= 2"
+    )
+}
+
+/// Propagates a trusted digest to every hash-null pathname of the same current-scan object.
+///
+/// Set-based on purpose: one statement per checkpoint, not one per alias. The source must be
+/// `identity_version = 1` — only an fd-verified or inherited-from-fd-verified digest — and the
+/// target must match the source's complete temporal identity, so linking, unlinking or replacing
+/// any alias changes the inode ctime and disqualifies the whole stale object. `hash IS NULL`
+/// guarantees no existing digest is ever overwritten.
+///
+/// `LIMIT 1` is only safe because `conflicting_digest_objects` has already refused any object
+/// carrying more than one distinct trusted digest, so there is nothing to choose between.
+fn propagate_sql() -> String {
+    let matches_source = "src.scan_id = file.scan_id
+                  AND src.device = file.device AND src.inode = file.inode
+                  AND src.size = file.size AND src.mtime = file.mtime
+                  AND src.mtime_nsec = file.mtime_nsec
+                  AND src.ctime_sec = file.ctime_sec AND src.ctime_nsec = file.ctime_nsec
+                  AND src.identity_version = 1 AND src.hash IS NOT NULL";
+    format!(
+        "UPDATE file
+            SET hash = (SELECT src.hash FROM file AS src WHERE {matches_source} LIMIT 1),
+                identity_version = 1
+          WHERE scan_id = ?1 AND hash IS NULL
+            AND EXISTS (SELECT 1 FROM file AS src WHERE {matches_source})"
+    )
+}
+
+/// Objects whose aliases hold more than one distinct trusted digest. Only `identity_version = 1`
+/// rows count: a legacy or move-path digest is never a propagation source, so disagreeing with one
+/// is not a conflict.
+fn conflicting_digest_objects(conn: &Connection, scan_id: i64) -> Result<u64> {
+    let count: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM (
+                 SELECT 1 FROM file
+                  WHERE scan_id = ?1 AND hash IS NOT NULL AND identity_version = 1
+                  GROUP BY {OBJECT_KEY}
+                 HAVING COUNT(DISTINCT hash) > 1)"
+        ),
+        params![scan_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as u64)
+}
+
+/// Runs the one set-based propagation statement on an open transaction and returns the rows it
+/// filled in. One statement per call — never a loop over aliases.
+fn propagate_trusted_digests(tx: &Connection, scan_id: i64) -> Result<u64> {
+    let updated = tx.execute(&propagate_sql(), params![scan_id])?;
+    Ok(updated as u64)
+}
+
 impl ScanStore {
+    fn new(conn: Connection) -> Self {
+        Self {
+            conn,
+            #[cfg(test)]
+            propagations: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Test-only: set-based propagation statements issued so far (see the field).
+    #[cfg(test)]
+    pub fn propagation_statements(&self) -> u64 {
+        self.propagations.get()
+    }
+
     /// Opens the DB for the process role: an observer gets a genuinely read-only connection,
     /// an operator the usual read-write one.
     pub fn open(db_path: &Path) -> Result<Self> {
@@ -269,7 +368,7 @@ impl ScanStore {
         // Migrating needs a writer, so an out-of-date DB is reported here rather than as a
         // «no such column» from some query later on.
         schema::ensure_migrated(&conn)?;
-        Ok(Self { conn })
+        Ok(Self::new(conn))
     }
 
     /// Opens (creates) the DB, enables WAL, applies the schema.
@@ -295,7 +394,7 @@ impl ScanStore {
         // 0600 on the DB file and WAL/SHM (created by enabling WAL above): the contents — the paths of all
         // pool files — are for the owner only (errors are propagated, not best-effort).
         crate::paths::enforce_db_perms_0600(db_path)?;
-        Ok(Self { conn })
+        Ok(Self::new(conn))
     }
 
     /// Opens an in-memory DB — for unit tests.
@@ -303,7 +402,7 @@ impl ScanStore {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         schema::migrate(&conn)?;
-        Ok(Self { conn })
+        Ok(Self::new(conn))
     }
 
     /// Path of the DB file — to derive the state_dir for reading config.json.
@@ -865,20 +964,25 @@ impl ScanStore {
         Ok(())
     }
 
-    /// Files awaiting hashing: hash IS NULL and the size occurs ≥ 2 times.
-    pub fn candidate_files(&self, scan_id: i64) -> Result<Vec<ManifestRow>> {
-        let mut stmt = self.conn.prepare(
-            // `nlink` is read back with the row it belongs to — the selection itself is
-            // unchanged (same WHERE, same rows), so that a `ManifestRow` in flight never carries
-            // a fabricated 0 for a link count the manifest actually knows.
-            "SELECT path, size, mtime, mtime_nsec, ctime_sec, ctime_nsec, device, inode, nlink
+    /// One representative pathname per physical object still awaiting a digest.
+    ///
+    /// This is the hash-once contract: the content of an allocation is read once, not once per
+    /// pathname pointing at it. Every path row stays in the manifest — nothing is collapsed there —
+    /// but only the representative is handed to the hashing phase, and the digest reaches its
+    /// aliases by propagation (`propagate_trusted_digests`) rather than by reading them again.
+    ///
+    /// The representative is `MIN(path)` within the object, so it is deterministic across runs and
+    /// across a resume. Aliases share `nlink` by construction, so `MIN` over the group returns
+    /// their common value; it is still decoded through the checked gate.
+    pub fn candidate_objects(&self, scan_id: i64) -> Result<Vec<ManifestRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT MIN(path), size, mtime, mtime_nsec, ctime_sec, ctime_nsec, device, inode,
+                    MIN(nlink)
              FROM file
-             WHERE scan_id = ?1 AND hash IS NULL
-               AND size IN (
-                   SELECT size FROM file WHERE scan_id = ?1
-                   GROUP BY size HAVING COUNT(*) >= 2
-               )",
-        )?;
+             WHERE scan_id = ?1 AND hash IS NULL AND size IN ({})
+             GROUP BY {OBJECT_KEY}",
+            eligible_sizes_sql()
+        ))?;
         // The link count travels beside the row rather than inside it, as a raw `Value`: decoding
         // it is checked, rejects a non-integer storage class, and can fail — which a rusqlite row
         // mapper cannot report. The field below is a placeholder the loop replaces before anything
@@ -907,20 +1011,30 @@ impl ScanStore {
         Ok(files)
     }
 
-    /// Statistics on hashing candidates.
+    /// Statistics on hashing candidates, in the two dimensions the phase actually has.
+    ///
+    /// Files count **path rows** — every pathname still has to end up with a digest, so pathname
+    /// completion is what the file counter tracks. Bytes count **distinct physical objects once**,
+    /// because that is what will be read from disk; charging an allocation once per alias would
+    /// inflate the total, the rate and the ETA by exactly the duplication the scan is looking for.
     pub fn candidate_stats(&self, scan_id: i64) -> Result<CandidateStats> {
+        let eligible = eligible_sizes_sql();
         let stats = self.conn.query_row(
-            "SELECT
-                 COUNT(*),
-                 COALESCE(SUM(size), 0),
-                 COUNT(hash),
-                 COALESCE(SUM(CASE WHEN hash IS NOT NULL THEN size ELSE 0 END), 0)
-             FROM file
-             WHERE scan_id = ?1
-               AND size IN (
-                   SELECT size FROM file WHERE scan_id = ?1
-                   GROUP BY size HAVING COUNT(*) >= 2
-               )",
+            &format!(
+                "SELECT
+                     (SELECT COUNT(*) FROM file
+                       WHERE scan_id = ?1 AND size IN ({eligible})),
+                     (SELECT COALESCE(SUM(size), 0) FROM (
+                          SELECT size FROM file
+                           WHERE scan_id = ?1 AND size IN ({eligible})
+                           GROUP BY {OBJECT_KEY})),
+                     (SELECT COUNT(*) FROM file
+                       WHERE scan_id = ?1 AND size IN ({eligible}) AND hash IS NOT NULL),
+                     (SELECT COALESCE(SUM(size), 0) FROM (
+                          SELECT size FROM file
+                           WHERE scan_id = ?1 AND size IN ({eligible}) AND hash IS NOT NULL
+                           GROUP BY {OBJECT_KEY}))"
+            ),
             params![scan_id],
             |row| {
                 Ok(CandidateStats {
@@ -992,6 +1106,10 @@ impl ScanStore {
         scan_id: i64,
         rows: &[(ManifestRow, [u8; 32])],
     ) -> Result<PersistedHashes> {
+        // Borrowed before the transaction takes `conn`: disjoint fields, so the counter stays
+        // reachable while the transaction is open.
+        #[cfg(test)]
+        let counter = &self.propagations;
         let tx = self.conn.transaction()?;
         let mut persisted = PersistedHashes::default();
         {
@@ -1018,13 +1136,46 @@ impl ScanStore {
                 ])?;
                 // PK (scan_id,path) → updated ∈ {0,1}. We accumulate bytes only for committed ones.
                 if updated > 0 {
+                    persisted.representatives += updated as u64;
                     persisted.files += updated as u64;
                     persisted.bytes += row.size;
                 }
             }
         }
+        // In the SAME transaction as the representatives: a crash must never leave an object
+        // trusted while its unchanged aliases sit unpropagated, which a later run would then read
+        // again. A representative that did not commit leaves no trusted source, so it propagates
+        // nothing — the identity check above is the only gate needed.
+        #[cfg(test)]
+        counter.set(counter.get() + 1);
+        persisted.files += propagate_trusted_digests(&tx, scan_id)?;
         tx.commit()?;
         Ok(persisted)
+    }
+
+    /// Spreads digests that cross-scan inheritance just produced across the aliases of each
+    /// object, before any candidate is chosen. This is what makes a renamed alias free: one
+    /// surviving pathname inherits, every other pathname of the same allocation receives the
+    /// digest, and the object needs zero content reads.
+    ///
+    /// Refuses first if any object carries more than one distinct trusted digest — two aliases
+    /// that inherited from different past scans cannot both be right, and picking by row order
+    /// would be choosing a random answer to a data-safety question.
+    pub fn propagate_inherited_hashes(&mut self, scan_id: i64) -> Result<u64> {
+        #[cfg(test)]
+        let counter = &self.propagations;
+        let tx = self.conn.transaction()?;
+        let conflicts = conflicting_digest_objects(&tx, scan_id)?;
+        if conflicts > 0 {
+            return Err(AppError::msg(format!(
+                "{conflicts} physical object(s) in this scan carry more than one inherited hash. The checkpoint disagrees with itself; rescan without hash reuse, or move the old dedcom.db aside."
+            )));
+        }
+        #[cfg(test)]
+        counter.set(counter.get() + 1);
+        let propagated = propagate_trusted_digests(&tx, scan_id)?;
+        tx.commit()?;
+        Ok(propagated)
     }
 
     /// DISABLED. The former key `(device,inode,size,mtime)` is unsafe —
@@ -2501,7 +2652,7 @@ mod tests {
         store.record_files(scan_id, &files).unwrap();
 
         // /unique has a unique size -> not a candidate for hashing.
-        let candidates = store.candidate_files(scan_id).unwrap();
+        let candidates = store.candidate_objects(scan_id).unwrap();
         assert_eq!(candidates.len(), 3);
 
         // /a and /b — same hash; /c — different.
@@ -2543,8 +2694,12 @@ mod tests {
             inode: 2,
             nlink: 1,
         };
+        // Its own inode: two independent objects of one size, which is what this test is about.
+        // (An actual alias of `/x/a` would now receive the digest by propagation — that contract
+        // has its own tests.)
         let b = ManifestRow {
             path: PathBuf::from("/x/b"),
+            inode: 3,
             ..a.clone()
         };
         store.record_files(id, &[a.clone(), b.clone()]).unwrap();
@@ -2553,6 +2708,7 @@ mod tests {
         // Matching identity → committed: 1 row, its size (persisted delta).
         let p = store.record_hashes_verified(id, &[(a, h)]).unwrap();
         assert_eq!((p.files, p.bytes), (1, 100), "1 row committed, 100 bytes");
+        assert_eq!(p.representatives, 1, "and it was the representative itself");
         // Non-matching identity (different mtime_nsec) → 0/0, hash not committed.
         let b_wrong = ManifestRow {
             mtime_nsec: 999,
@@ -2823,7 +2979,7 @@ mod tests {
             .unwrap();
 
         // On resume the only remaining candidate is the unhashed /b.
-        let candidates = store.candidate_files(scan_id).unwrap();
+        let candidates = store.candidate_objects(scan_id).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].path, PathBuf::from("/b"));
     }
@@ -2872,7 +3028,7 @@ mod tests {
             .unwrap();
         store.set_status(b, ScanStatus::Hashing).unwrap();
         // Before inheritance both are candidates (size 100 twice, hash NULL).
-        assert_eq!(store.candidate_files(b).unwrap().len(), 2);
+        assert_eq!(store.candidate_objects(b).unwrap().len(), 2);
         // Inheritance (as `run_phases` does before `hash_phase` on resume).
         assert_eq!(
             store.inherit_hashes(b).unwrap(),
@@ -2881,8 +3037,8 @@ mod tests {
         );
         // Now there is nothing to read from disk.
         assert!(
-            store.candidate_files(b).unwrap().is_empty(),
-            "after inherit candidate_files is empty → 0 disk reads"
+            store.candidate_objects(b).unwrap().is_empty(),
+            "after inherit candidate_objects is empty → 0 disk reads"
         );
     }
 
@@ -5245,7 +5401,7 @@ mod tests {
         // Two rows of one size, so both are hashing candidates.
         let (store, id) = store_with_seeded_manifest(&[("/tank/a", 100, -1), ("/tank/b", 100, 1)]);
 
-        match store.candidate_files(id) {
+        match store.candidate_objects(id) {
             Err(err) => assert!(
                 err.to_string().contains("corrupt link count"),
                 "the message must name the cause: {err}"
@@ -5269,7 +5425,7 @@ mod tests {
         ]);
 
         let mut read: Vec<(String, u64)> = store
-            .candidate_files(id)
+            .candidate_objects(id)
             .unwrap()
             .into_iter()
             .map(|row| (row.path.to_string_lossy().into_owned(), row.nlink))
@@ -5411,7 +5567,7 @@ mod tests {
                 Ok(verdict) => panic!("{literal} must never produce a verdict, got {verdict:?}"),
             }
 
-            match store.candidate_files(id) {
+            match store.candidate_objects(id) {
                 Err(err) => assert!(
                     err.to_string().contains(&format!("stored as {class}")),
                     "reading must refuse for the same named reason: {err}"
@@ -5440,6 +5596,474 @@ mod tests {
         assert!(
             store.destructive_plan_verdict(id).is_err(),
             "and planning must never proceed"
+        );
+    }
+
+    // ---- R2B: hash once, preserve every pathname ----------------------------------------------
+
+    /// Runs a real scan of `root` and returns the store, the scan id and the reads it performed.
+    fn scan_counting_reads(root: &Path) -> (ScanStore, i64, usize) {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let mut config = ScanConfig::new(vec![root.to_path_buf()]);
+        config.min_size = 0;
+        config.exclude_globs = Vec::new();
+        let cancel = AtomicBool::new(false);
+
+        let log = crate::testfixtures::ReadLog::start();
+        match crate::pipeline::run_scan(&mut store, &config, None, false, &cancel, |_| {}) {
+            Ok(crate::pipeline::ScanOutcome::Completed(_)) => {}
+            Ok(crate::pipeline::ScanOutcome::Cancelled) => {
+                panic!("the scan must not cancel itself")
+            }
+            Err(err) => panic!("scan {}: {err}", root.display()),
+        }
+        let reads = log.count_under(root);
+        drop(log);
+
+        let id = store.latest_scan_id().unwrap().expect("the scan exists");
+        (store, id, reads)
+    }
+
+    /// Every manifest pathname with its digest, as hex; `None` where no digest was recorded.
+    fn digests(store: &ScanStore, scan_id: i64) -> Vec<(String, Option<String>)> {
+        let mut stmt = store
+            .conn
+            .prepare("SELECT path, hash FROM file WHERE scan_id = ?1 ORDER BY path")
+            .unwrap();
+        let rows = stmt
+            .query_map(params![scan_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?.map(|h| hex_encode(&h)),
+                ))
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = temp_state_dir(tag).join("root");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The forest end to end: three reads for three allocations, every one of the seven pathnames
+    /// still in the manifest, and all six duplicate-content pathnames carrying the same digest —
+    /// the four aliases got theirs by propagation, having never been opened.
+    #[test]
+    fn every_alias_receives_the_digest_its_object_was_read_for() {
+        let forest = crate::testfixtures::HardlinkForest::build("r2b_forest");
+        let (store, id, reads) = scan_counting_reads(&forest.root);
+
+        assert_eq!(reads, 3, "one read per allocation");
+        let recorded = digests(&store, id);
+        assert_eq!(recorded.len(), 7, "seven pathnames, seven manifest rows");
+
+        let by_path: std::collections::HashMap<&str, &Option<String>> = recorded
+            .iter()
+            .map(|(path, hash)| (path.as_str(), hash))
+            .collect();
+        let duplicate = forest.duplicate_pathnames();
+        let first = by_path[duplicate[0].to_string_lossy().as_ref()]
+            .clone()
+            .expect("the first duplicate pathname has a digest");
+        for path in &duplicate {
+            assert_eq!(
+                by_path[path.to_string_lossy().as_ref()].as_ref(),
+                Some(&first),
+                "{} must carry the group's digest",
+                path.display()
+            );
+        }
+        assert!(
+            by_path[forest.unique.to_string_lossy().as_ref()].is_none(),
+            "the unique-size file is not a candidate and stays unhashed"
+        );
+
+        // The link outside the scan root is not, and must not become, a manifest row.
+        assert!(
+            !recorded
+                .iter()
+                .any(|(path, _)| path == &forest.external.to_string_lossy()),
+            "the unobserved link must not appear in the manifest"
+        );
+
+        // One propagation statement for the inheritance pass plus one per hashing batch — never
+        // one per alias.
+        assert_eq!(
+            store.propagation_statements(),
+            2,
+            "set-based propagation: one inheritance pass + one batch"
+        );
+    }
+
+    /// An alias-only set is one allocation under several names. There is nothing to compare it
+    /// with, so nothing is read — and every pathname still keeps its row.
+    #[test]
+    fn an_alias_only_set_is_read_zero_times() {
+        let root = scratch("r2b_alias_only");
+        let first = root.join("a.bin");
+        std::fs::write(&first, vec![7u8; 4096]).unwrap();
+        for name in ["b.bin", "c.bin"] {
+            std::fs::hard_link(&first, root.join(name)).unwrap();
+        }
+
+        let (store, id, reads) = scan_counting_reads(&root);
+        assert_eq!(reads, 0, "one allocation is not a duplicate of itself");
+        assert!(
+            store.candidate_objects(id).unwrap().is_empty(),
+            "and it is not a candidate"
+        );
+        let recorded = digests(&store, id);
+        assert_eq!(recorded.len(), 3, "all three pathnames keep their rows");
+        assert!(
+            recorded.iter().all(|(_, hash)| hash.is_none()),
+            "nothing was hashed, so nothing carries a digest"
+        );
+        assert!(
+            store.duplicate_groups(id).unwrap().is_empty(),
+            "and no duplicate-content group is formed"
+        );
+
+        std::fs::remove_dir_all(root.parent().unwrap()).ok();
+    }
+
+    /// The control that must not move: two byte-identical files on two inodes are read twice and
+    /// still form an ordinary group.
+    #[test]
+    fn two_independent_identical_files_are_still_read_twice() {
+        let root = scratch("r2b_control");
+        for name in ["a.bin", "b.bin"] {
+            std::fs::write(root.join(name), vec![7u8; 4096]).unwrap();
+        }
+
+        let (store, id, reads) = scan_counting_reads(&root);
+        assert_eq!(reads, 2, "two allocations, two reads");
+        let groups = store.duplicate_groups(id).unwrap();
+        assert_eq!(groups.len(), 1, "the ordinary group is still found");
+        assert_eq!(groups[0].files.len(), 2);
+
+        std::fs::remove_dir_all(root.parent().unwrap()).ok();
+    }
+
+    /// A manifest row on object `(device 1, inode)` with an explicit temporal identity, so a test
+    /// can state exactly which pathnames are the same allocation and which are not.
+    fn alias_row(path: &str, inode: u64, ctime_nsec: i64) -> ManifestRow {
+        ManifestRow {
+            path: PathBuf::from(path),
+            size: 100,
+            mtime: 5,
+            mtime_nsec: 7,
+            ctime_sec: 9,
+            ctime_nsec,
+            device: 1,
+            inode,
+            nlink: 2,
+        }
+    }
+
+    /// A finished past scan holding a trusted (fd-verified) digest for every given row.
+    fn past_scan(store: &mut ScanStore, rows: &[ManifestRow], hash: [u8; 32]) -> i64 {
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store.record_files(id, rows).unwrap();
+        let pairs: Vec<(ManifestRow, [u8; 32])> =
+            rows.iter().map(|row| (row.clone(), hash)).collect();
+        store.record_hashes_verified(id, &pairs).unwrap();
+        id
+    }
+
+    fn hash_of(store: &ScanStore, scan_id: i64, path: &str) -> Option<String> {
+        store
+            .conn
+            .query_row(
+                "SELECT hash FROM file WHERE scan_id = ?1 AND path = ?2",
+                params![scan_id, path],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .unwrap()
+            .map(|h| hex_encode(&h))
+    }
+
+    /// R7a. One alias kept its name and inherits from the past scan; the renamed one cannot — no
+    /// past row has that path — and receives the digest through current-scan physical identity.
+    /// The object is left with nothing to read.
+    #[test]
+    fn a_renamed_alias_is_filled_from_its_surviving_twin_without_a_read() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let hash = [9u8; 32];
+        past_scan(
+            &mut store,
+            &[alias_row("/x/a", 2, 11), alias_row("/x/b", 2, 11)],
+            hash,
+        );
+
+        // The new scan sees the same allocation under one old name and one new one.
+        let now = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store
+            .record_files(now, &[alias_row("/x/a", 2, 11), alias_row("/x/b2", 2, 11)])
+            .unwrap();
+
+        assert_eq!(
+            store.inherit_hashes(now).unwrap(),
+            1,
+            "only /x/a can inherit"
+        );
+        assert_eq!(
+            store.propagate_inherited_hashes(now).unwrap(),
+            1,
+            "/x/b2 is filled from it"
+        );
+
+        let expected = Some(hex_encode(&hash));
+        assert_eq!(hash_of(&store, now, "/x/a"), expected);
+        assert_eq!(hash_of(&store, now, "/x/b2"), expected);
+        assert!(
+            store.candidate_objects(now).unwrap().is_empty(),
+            "nothing is left to read"
+        );
+    }
+
+    /// R7a′. When no pathname can inherit, the allocation is read — exactly once, through a single
+    /// representative, however many names point at it.
+    #[test]
+    fn an_object_no_pathname_can_inherit_is_read_exactly_once() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        past_scan(
+            &mut store,
+            &[alias_row("/x/a", 2, 11), alias_row("/x/b", 2, 11)],
+            [9u8; 32],
+        );
+
+        // Both names changed, and a second allocation of the same size exists so the size is
+        // eligible at all.
+        let now = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store
+            .record_files(
+                now,
+                &[
+                    alias_row("/x/a2", 2, 11),
+                    alias_row("/x/b2", 2, 11),
+                    alias_row("/x/other", 3, 11),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(store.inherit_hashes(now).unwrap(), 0, "no path matches");
+        assert_eq!(store.propagate_inherited_hashes(now).unwrap(), 0);
+        let candidates = store.candidate_objects(now).unwrap();
+        assert_eq!(candidates.len(), 2, "two allocations, two representatives");
+        let mut representatives: Vec<String> = candidates
+            .iter()
+            .map(|row| row.path.to_string_lossy().into_owned())
+            .collect();
+        representatives.sort();
+        assert_eq!(
+            representatives,
+            vec!["/x/a2".to_string(), "/x/other".to_string()],
+            "the representative is the first pathname of its object, deterministically"
+        );
+    }
+
+    /// A pathname whose content was replaced by something else of the same size must not receive a
+    /// digest — not by inheritance, whose key includes the full temporal identity, and not by
+    /// propagation, which is a different allocation.
+    #[test]
+    fn a_same_size_replacement_receives_no_digest() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        past_scan(&mut store, &[alias_row("/x/a", 2, 11)], [9u8; 32]);
+
+        let now = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store
+            .record_files(
+                now,
+                &[
+                    // Same path and size, new content: a different ctime, and a different inode.
+                    alias_row("/x/a", 4, 77),
+                    alias_row("/x/other", 3, 11),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.inherit_hashes(now).unwrap(),
+            0,
+            "the identity differs"
+        );
+        assert_eq!(store.propagate_inherited_hashes(now).unwrap(), 0);
+        assert_eq!(hash_of(&store, now, "/x/a"), None, "and it stays unhashed");
+    }
+
+    /// Two aliases of one allocation that inherited different digests cannot both be right.
+    /// Choosing by row order would be answering a data-safety question at random, so the scan
+    /// refuses — and propagates nothing at all.
+    #[test]
+    fn conflicting_inherited_digests_refuse_instead_of_picking_one() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        past_scan(&mut store, &[alias_row("/x/a", 2, 11)], [1u8; 32]);
+        past_scan(&mut store, &[alias_row("/x/b", 2, 11)], [2u8; 32]);
+
+        let now = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store
+            .record_files(
+                now,
+                &[
+                    alias_row("/x/a", 2, 11),
+                    alias_row("/x/b", 2, 11),
+                    alias_row("/x/c", 2, 11),
+                ],
+            )
+            .unwrap();
+        assert_eq!(store.inherit_hashes(now).unwrap(), 2, "both names inherit");
+
+        let err = store
+            .propagate_inherited_hashes(now)
+            .expect_err("disagreeing digests for one allocation must refuse");
+        assert!(
+            err.to_string().contains("more than one inherited hash"),
+            "the message must name the cause: {err}"
+        );
+        assert_eq!(
+            hash_of(&store, now, "/x/c"),
+            None,
+            "and no alias was filled from either of them"
+        );
+    }
+
+    /// A representative whose manifest identity no longer matches what was opened commits nothing
+    /// — and therefore propagates nothing to its aliases either.
+    #[test]
+    fn a_representative_that_lost_its_identity_propagates_to_no_alias() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store
+            .record_files(
+                id,
+                &[
+                    alias_row("/x/a", 2, 11),
+                    alias_row("/x/b", 2, 11),
+                    alias_row("/x/other", 3, 11),
+                ],
+            )
+            .unwrap();
+
+        // What the hashing phase saw no longer matches the manifest row.
+        let stale = ManifestRow {
+            ctime_nsec: 999,
+            ..alias_row("/x/a", 2, 11)
+        };
+        let persisted = store
+            .record_hashes_verified(id, &[(stale, [5u8; 32])])
+            .unwrap();
+        assert_eq!(
+            persisted,
+            PersistedHashes::default(),
+            "nothing committed, nothing propagated, no bytes claimed"
+        );
+        assert_eq!(hash_of(&store, id, "/x/a"), None);
+        assert_eq!(hash_of(&store, id, "/x/b"), None);
+    }
+
+    /// After a cancellation the committed objects stay committed, and a resume re-selects only
+    /// what is genuinely left — each remaining allocation exactly once.
+    #[test]
+    fn a_resume_reads_every_remaining_object_at_most_once() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store
+            .record_files(
+                id,
+                &[
+                    alias_row("/x/a", 2, 11),
+                    alias_row("/x/b", 2, 11),
+                    alias_row("/x/c", 3, 11),
+                    alias_row("/x/d", 4, 11),
+                ],
+            )
+            .unwrap();
+
+        // One batch got through before the cancellation.
+        let first = store.candidate_objects(id).unwrap();
+        assert_eq!(first.len(), 3, "three allocations, three representatives");
+        let done = first[0].clone();
+        let persisted = store
+            .record_hashes_verified(id, &[(done.clone(), [8u8; 32])])
+            .unwrap();
+        assert_eq!(persisted.representatives, 1);
+        assert_eq!(persisted.bytes, 100, "one allocation, charged once");
+
+        // Resume: the finished allocation is gone from the candidates, the rest appear once each.
+        let resumed = store.candidate_objects(id).unwrap();
+        let objects: Vec<u64> = resumed.iter().map(|row| row.inode).collect();
+        assert_eq!(objects.len(), 2, "only the unfinished allocations");
+        assert!(
+            !objects.contains(&done.inode),
+            "a committed object is not read again"
+        );
+        let mut unique = objects.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), objects.len(), "and each appears exactly once");
+    }
+
+    /// Progress counts pathnames in one dimension and allocations in the other: an alias completes
+    /// a pathname without claiming a byte that was never read.
+    #[test]
+    fn propagated_aliases_advance_pathnames_without_inflating_bytes() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store
+            .record_files(
+                id,
+                &[
+                    alias_row("/x/a", 2, 11),
+                    alias_row("/x/b", 2, 11),
+                    alias_row("/x/c", 2, 11),
+                    alias_row("/x/other", 3, 11),
+                ],
+            )
+            .unwrap();
+
+        let stats = store.candidate_stats(id).unwrap();
+        assert_eq!(stats.total_files, 4, "four pathnames must end up hashed");
+        assert_eq!(
+            stats.total_bytes, 200,
+            "but only two allocations will be read"
+        );
+
+        let before = store.propagation_statements();
+        let persisted = store
+            .record_hashes_verified(id, &[(alias_row("/x/a", 2, 11), [8u8; 32])])
+            .unwrap();
+        assert_eq!(persisted.representatives, 1, "one representative committed");
+        assert_eq!(persisted.files, 3, "and it completed three pathnames");
+        assert_eq!(persisted.bytes, 100, "having read one allocation once");
+        assert_eq!(
+            store.propagation_statements() - before,
+            1,
+            "one statement for the batch, not one per alias"
+        );
+
+        let after = store.candidate_stats(id).unwrap();
+        assert_eq!(after.hashed_files, 3);
+        assert_eq!(
+            after.hashed_bytes, 100,
+            "bytes follow allocations, not names"
         );
     }
 

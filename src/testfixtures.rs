@@ -496,12 +496,14 @@ mod tests {
         assert_eq!(log.count_of(&forest.twin_a), 0, "twin_a was not hashed");
     }
 
-    /// Baseline through the real scan, recorded so the next commit's change is visible: today the
-    /// hashing phase reads **one file per pathname** — six reads over three allocations, the shared
-    /// inode read four times. `R2B / C3` turns this into three reads, one per physical object, and
-    /// owns the update of these numbers.
+    /// The hash-once contract through a real scan: the hashing phase reads **one file per physical
+    /// object** — three reads over the forest's three allocations, where it used to make six, one
+    /// per duplicate pathname, reading the shared inode four times.
+    ///
+    /// Every pathname is still in the manifest; only the *reading* collapsed. That the aliases all
+    /// end up carrying the digest is asserted next to the manifest itself, in the store tests.
     #[test]
-    fn scan_reads_one_file_per_pathname_today() {
+    fn scan_reads_one_file_per_physical_object() {
         let forest = HardlinkForest::build("baseline");
         let mut store = crate::state::ScanStore::open_in_memory().expect("in-memory store");
         let cancel = std::sync::atomic::AtomicBool::new(false);
@@ -523,25 +525,33 @@ mod tests {
             .map(|alias| log.count_of(alias))
             .collect();
         let unique_reads = log.count_of(&forest.unique);
+        let twin_reads = log.count_of(&forest.twin_a) + log.count_of(&forest.twin_b);
         drop(log);
 
         match outcome {
             crate::pipeline::ScanOutcome::Completed(_) => {}
             crate::pipeline::ScanOutcome::Cancelled => panic!("the scan must not cancel itself"),
         }
+        assert_eq!(forest.duplicate_objects(), 3, "three allocations");
         assert_eq!(
-            reads,
-            forest.duplicate_pathnames().len(),
-            "today every duplicate pathname is read: {reads} reads"
+            reads, 3,
+            "one read per allocation, not per pathname: {reads} reads"
         );
         assert_eq!(
-            per_alias,
-            vec![1, 1, 1, 1],
-            "the same allocation is read once per alias"
+            per_alias.iter().sum::<usize>(),
+            1,
+            "the four aliases of one allocation are read exactly once between them: {per_alias:?}"
         );
-        assert_eq!(forest.duplicate_objects(), 3, "over three allocations");
+        assert_eq!(twin_reads, 2, "and each independent object is read once");
         // A size nobody shares is not a candidate, so the unique file is never read.
         assert_eq!(unique_reads, 0, "the unique file must not be hashed");
+        // Reading collapsed; the manifest did not.
+        let scan_id = store.latest_scan_id().unwrap().expect("the scan exists");
+        assert_eq!(
+            store.manifest_count(scan_id).unwrap(),
+            7,
+            "every walked pathname keeps its row"
+        );
     }
 
     #[test]
