@@ -320,6 +320,46 @@ fn conflicting_digest_objects(conn: &Connection, scan_id: i64) -> Result<u64> {
     Ok(count as u64)
 }
 
+/// What one physical object's aliases collectively say about their link count.
+///
+/// Grouping is a place a corrupt cell can hide. `MIN(nlink)` over `(integer 1, text 'oops')`
+/// returns the integer, because SQLite sorts numbers below text — the aggregate would quietly
+/// elect the one valid alias and the C2a/C2a1 gate would never see the broken one. So the group is
+/// judged as a whole, before any value is trusted: which storage classes it contains, and whether
+/// its rows agree.
+struct GroupedLinkCount {
+    /// `MIN(nlink)`. Meaningful only once the class and agreement checks have passed.
+    value: Value,
+    /// `COUNT(DISTINCT nlink)` — more than one means the aliases disagree.
+    distinct: i64,
+    /// `MIN(typeof(nlink))` and `MAX(typeof(nlink))`. Equal iff the group holds a single storage
+    /// class; unlike `MIN(nlink)`, `typeof` of a NULL cell is the ordinary string `'null'`, so a
+    /// NULL cannot slip past by being skipped the way aggregates skip it.
+    min_class: String,
+    max_class: String,
+}
+
+impl GroupedLinkCount {
+    fn decode(&self, representative: &Path) -> Result<LinkCount> {
+        let named = crate::textsan::terminal(&representative.display().to_string());
+        if self.min_class != self.max_class {
+            return Err(AppError::msg(format!(
+                "dedcom.db holds link counts of two different types ({} and {}) for the one allocation behind {named}. Rescan, or move the old dedcom.db aside.",
+                self.min_class, self.max_class
+            )));
+        }
+        if self.distinct > 1 {
+            return Err(AppError::msg(format!(
+                "dedcom.db holds {} different link counts for the one allocation behind {named}; its pathnames are the same inode and cannot disagree. Rescan, or move the old dedcom.db aside.",
+                self.distinct
+            )));
+        }
+        // One storage class, one value: the shared checked decoder now sees exactly what every
+        // alias of this object holds — including a non-integer class the whole group shares.
+        link_count_from_sql(&self.value)
+    }
+}
+
 /// Runs the one set-based propagation statement on an open transaction and returns the rows it
 /// filled in. One statement per call — never a loop over aliases.
 fn propagate_trusted_digests(tx: &Connection, scan_id: i64) -> Result<u64> {
@@ -975,18 +1015,22 @@ impl ScanStore {
     /// across a resume. Aliases share `nlink` by construction, so `MIN` over the group returns
     /// their common value; it is still decoded through the checked gate.
     pub fn candidate_objects(&self, scan_id: i64) -> Result<Vec<ManifestRow>> {
+        // The link count comes back as evidence about the WHOLE group, not as one aggregated
+        // value: `MIN` alone would let a valid alias vouch for a corrupt one (see
+        // `grouped_link_count`). The two `typeof` extremes reveal every storage class present, and
+        // the distinct count reveals aliases that disagree.
         let mut stmt = self.conn.prepare(&format!(
             "SELECT MIN(path), size, mtime, mtime_nsec, ctime_sec, ctime_nsec, device, inode,
-                    MIN(nlink)
+                    MIN(nlink), COUNT(DISTINCT nlink),
+                    MIN(typeof(nlink)), MAX(typeof(nlink))
              FROM file
              WHERE scan_id = ?1 AND hash IS NULL AND size IN ({})
              GROUP BY {OBJECT_KEY}",
             eligible_sizes_sql()
         ))?;
-        // The link count travels beside the row rather than inside it, as a raw `Value`: decoding
-        // it is checked, rejects a non-integer storage class, and can fail — which a rusqlite row
-        // mapper cannot report. The field below is a placeholder the loop replaces before anything
-        // reads it.
+        // The link-count evidence travels beside the row rather than inside it: validating it is
+        // checked and can fail, which a rusqlite row mapper cannot report. The field below is a
+        // placeholder the loop replaces before anything reads it.
         let rows = stmt.query_map(params![scan_id], |row| {
             let file = ManifestRow {
                 path: PathBuf::from(row.get::<_, String>(0)?),
@@ -999,13 +1043,19 @@ impl ScanStore {
                 inode: row.get::<_, i64>(7)? as u64,
                 nlink: 0,
             };
-            Ok((file, row.get::<_, Value>(8)?))
+            let evidence = GroupedLinkCount {
+                value: row.get::<_, Value>(8)?,
+                distinct: row.get::<_, i64>(9)?,
+                min_class: row.get::<_, String>(10)?,
+                max_class: row.get::<_, String>(11)?,
+            };
+            Ok((file, evidence))
         })?;
 
         let mut files = Vec::new();
         for row in rows {
-            let (mut file, nlink) = row?;
-            file.nlink = link_count_from_sql(&nlink)?.to_u64();
+            let (mut file, evidence) = row?;
+            file.nlink = evidence.decode(&file.path)?.to_u64();
             files.push(file);
         }
         Ok(files)
@@ -5597,6 +5647,132 @@ mod tests {
             store.destructive_plan_verdict(id).is_err(),
             "and planning must never proceed"
         );
+    }
+
+    // ---- C3a: the grouped link-count boundary --------------------------------------------------
+
+    /// Object A under two names on inode 2, each with the given raw `nlink` literal, plus an
+    /// independent object B of the same size — so the size is genuinely eligible and A is genuinely
+    /// a candidate, rather than the test proving something about an empty set.
+    fn store_with_alias_pair(literals: [&str; 2]) -> (ScanStore, i64) {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank")]))
+            .unwrap();
+        let [first, second] = literals;
+        store
+            .conn
+            .execute_batch(&format!(
+                "INSERT INTO file(scan_id, path, size, mtime, mtime_nsec, ctime_sec, ctime_nsec,
+                                  device, inode, nlink)
+                 VALUES ({id}, '/tank/a1', 100, 5, 7, 9, 11, 1, 2, {first}),
+                        ({id}, '/tank/a2', 100, 5, 7, 9, 11, 1, 2, {second}),
+                        ({id}, '/tank/b',  100, 5, 7, 9, 11, 1, 3, 1);"
+            ))
+            .unwrap();
+        (store, id)
+    }
+
+    /// Grouping is where a corrupt cell can hide: `MIN` over `(integer 1, text 'oops')` returns the
+    /// integer, because SQLite sorts numbers below text. The valid alias must not vouch for its
+    /// broken twin — they are two names for one inode.
+    #[test]
+    fn a_corrupt_alias_cannot_hide_behind_a_valid_one() {
+        for (literal, class) in [("'oops'", "text"), ("1.5", "real"), ("X'78'", "blob")] {
+            let (store, id) = store_with_alias_pair(["1", literal]);
+            assert_eq!(
+                stored_class(&store, "/tank/a2"),
+                class,
+                "{literal} must really land as {class}"
+            );
+
+            match store.candidate_objects(id) {
+                Err(err) => assert!(
+                    err.to_string().contains(class),
+                    "the message must name the offending storage class: {err}"
+                ),
+                Ok(rows) => panic!(
+                    "{literal} was hidden by its valid alias, got link counts {:?}",
+                    rows.iter().map(|row| row.nlink).collect::<Vec<_>>()
+                ),
+            }
+        }
+    }
+
+    /// Two names for one inode cannot have two different link counts. That is an inconsistent
+    /// checkpoint, not a value to pick between.
+    #[test]
+    fn aliases_of_one_object_may_not_disagree_on_the_link_count() {
+        let (store, id) = store_with_alias_pair(["1", "2"]);
+        let err = store
+            .candidate_objects(id)
+            .expect_err("disagreeing link counts must refuse")
+            .to_string();
+        assert!(
+            err.contains("different link counts"),
+            "the message must name the cause: {err}"
+        );
+    }
+
+    /// The `NULL` half of the same boundary, asserted on the evidence type directly: the column's
+    /// `NOT NULL` keeps a NULL out of any manifest this build writes, so there is no DB fixture to
+    /// build — and the gate deliberately does not rely on that constraint holding. Aggregates skip
+    /// NULLs, which is exactly why the class extremes, not `MIN(nlink)`, are what detect it.
+    #[test]
+    fn a_null_alias_cannot_hide_behind_a_valid_one() {
+        let mixed = GroupedLinkCount {
+            value: Value::Integer(1),
+            distinct: 1,
+            min_class: "integer".to_string(),
+            max_class: "null".to_string(),
+        };
+        let err = mixed
+            .decode(Path::new("/tank/a1"))
+            .expect_err("a NULL beside an integer must refuse")
+            .to_string();
+        assert!(
+            err.contains("null") && err.contains("integer"),
+            "the message must name both classes: {err}"
+        );
+
+        // And a group that is wholly NULL reaches the shared decoder, which names it.
+        let all_null = GroupedLinkCount {
+            value: Value::Null,
+            distinct: 0,
+            min_class: "null".to_string(),
+            max_class: "null".to_string(),
+        };
+        assert!(all_null
+            .decode(Path::new("/tank/a1"))
+            .expect_err("a NULL link count must refuse")
+            .to_string()
+            .contains("stored as null"));
+    }
+
+    /// Control: aliases that agree on a real count produce exactly one representative for their
+    /// object, deterministically the first pathname, and the count survives unchanged.
+    #[test]
+    fn aliases_agreeing_on_a_positive_count_yield_one_representative() {
+        let (store, id) = store_with_alias_pair(["2", "2"]);
+        let rows = store.candidate_objects(id).unwrap();
+        assert_eq!(rows.len(), 2, "object A once, plus the control object B");
+
+        let a = rows.iter().find(|row| row.inode == 2).expect("object A");
+        assert_eq!(
+            a.path,
+            PathBuf::from("/tank/a1"),
+            "the representative is the first pathname of the object"
+        );
+        assert_eq!(a.nlink, 2, "and it carries the count its aliases agree on");
+    }
+
+    /// Control: a wholly legacy object stays the accepted unknown rather than becoming an error.
+    #[test]
+    fn all_legacy_zero_aliases_stay_the_accepted_unknown() {
+        let (store, id) = store_with_alias_pair(["0", "0"]);
+        let rows = store.candidate_objects(id).unwrap();
+        let a = rows.iter().find(|row| row.inode == 2).expect("object A");
+        assert_eq!(a.nlink, 0, "0 is legacy-unknown, not corruption");
     }
 
     // ---- R2B: hash once, preserve every pathname ----------------------------------------------
