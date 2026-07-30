@@ -17,18 +17,25 @@
 //! <base>/root/pair_utf8/left/bad\xffname.bin          name is not valid UTF-8
 //! <base>/root/pair_error/left/dangling -> missing      stat fails while following symlinks
 //! <base>/root/pair_error/left/loop -> pair_error/left  filesystem loop while following symlinks
+//! <base>/root/pair_injected/left/walk_fault.bin       ordinary file, removed only by an injected
+//! <base>/root/pair_injected/left/metadata_fault.bin   iterator fault / metadata fault
 //! <base>/root/deep/a/b/c/d/tiny.bin                   deep omission; ancestors stop at the root
 //! ```
 //!
 //! Deliberately no `chmod 000`: the gate runs as root, which walks straight through mode bits, so a
-//! permission-based error would be a test that silently proves nothing. The two error cases are
-//! symlink shapes the kernel refuses for everyone.
+//! permission-based error would be a test that silently proves nothing. The symlink cases are shapes
+//! the kernel refuses for everyone, and the `pair_injected` files are shapes the filesystem has no
+//! reason to refuse at all — they carry the allowed extension, an admissible size and normal
+//! permissions, so when one goes missing the injected fault is the only possible cause. See
+//! [`super::WalkFaults`] for why the injection is thread-local rather than a process-wide failpoint.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use super::WalkFault;
 use crate::model::scan::ScanConfig;
 
 /// Smallest file the fixture's config accepts.
@@ -57,8 +64,10 @@ pub enum OmissionReason {
     ExtensionFiltered,
     /// The name cannot be represented as UTF-8, so the walk refuses to touch it.
     NonUtf8,
-    /// The walk itself failed on the entry: only reachable while following symlinks.
+    /// The walk iterator failed on the entry instead of yielding it.
     WalkError,
+    /// The entry was yielded, but its metadata could not be read.
+    MetadataError,
 }
 
 /// Directory pairs whose twin claims depend on omissions. Removed on drop.
@@ -78,6 +87,8 @@ pub struct DirTrees {
     pub non_utf8: (PathBuf, PathBuf),
     /// `left` holds the two symlink shapes that make the walk fail.
     pub walk_error: (PathBuf, PathBuf),
+    /// `left` holds two perfectly ordinary files that only an injected fault can remove.
+    pub injected: (PathBuf, PathBuf),
     /// The deepest directory that actually contains an omitted file.
     pub deep_dir: PathBuf,
 }
@@ -135,6 +146,14 @@ impl DirTrees {
         std::os::unix::fs::symlink(&walk_error.0, walk_error.0.join("loop.bin"))
             .expect("create the looping symlink");
 
+        // Two files nothing about the filesystem excludes: right extension, size inside the window,
+        // ordinary regular files, readable. Only an injected fault can keep them out of a manifest,
+        // which is what makes them evidence about the walk's two silent-skip branches.
+        let injected = pair("pair_injected");
+        for name in ["walk_fault.bin", "metadata_fault.bin"] {
+            std::fs::write(injected.0.join(name), PAYLOAD_B).expect("write a nominated file");
+        }
+
         // The deep case: the omitted file sits five levels under the root, so the ledger has a real
         // ancestor chain to mark - and a clear place to stop.
         let deep_dir = root.join("deep").join("a").join("b").join("c").join("d");
@@ -152,10 +171,38 @@ impl DirTrees {
             extension,
             non_utf8,
             walk_error,
+            injected,
             deep_dir,
         };
         trees.verify();
         trees
+    }
+
+    /// The ordinary file that only an injected walk-iterator fault removes.
+    pub fn walk_fault_file(&self) -> PathBuf {
+        self.injected.0.join("walk_fault.bin")
+    }
+
+    /// The ordinary file that only an injected metadata fault removes.
+    pub fn metadata_fault_file(&self) -> PathBuf {
+        self.injected.0.join("metadata_fault.bin")
+    }
+
+    /// The two faults to arm, one per branch, each naming a different file — so a fault firing at the
+    /// wrong site, or firing twice, is visible rather than merely plausible.
+    pub fn injected_faults(&self) -> Vec<(PathBuf, WalkFault)> {
+        vec![
+            (self.walk_fault_file(), WalkFault::Iterator),
+            (self.metadata_fault_file(), WalkFault::Metadata),
+        ]
+    }
+
+    /// What the injected faults mean for a ledger, once one exists.
+    pub fn injected_omissions(&self) -> BTreeMap<PathBuf, OmissionReason> {
+        BTreeMap::from([
+            (self.walk_fault_file(), OmissionReason::WalkError),
+            (self.metadata_fault_file(), OmissionReason::MetadataError),
+        ])
     }
 
     /// The directory `Drop` removes.
@@ -301,6 +348,36 @@ impl DirTrees {
             );
         }
 
+        // The nominated files are ordinary in every way the walk cares about: the allowed extension,
+        // a size inside the window, a regular file rather than a link, and readable. So an absence
+        // cannot be blamed on filtering, symlink handling or permissions - only on the injection.
+        for file in [self.walk_fault_file(), self.metadata_fault_file()] {
+            let meta = std::fs::symlink_metadata(&file).expect("lstat a nominated file");
+            assert!(
+                meta.file_type().is_file(),
+                "{} must be a regular file",
+                file.display()
+            );
+            assert!(
+                meta.len() >= MIN_SIZE && meta.len() <= MAX_SIZE,
+                "{} must be admissible by size, it is {}",
+                file.display(),
+                meta.len()
+            );
+            assert_eq!(
+                file.extension().and_then(OsStr::to_str),
+                Some(KEPT_EXTENSION),
+                "{} must carry the allowed extension",
+                file.display()
+            );
+            assert_ne!(
+                meta.permissions().mode() & 0o400,
+                0,
+                "{} must stay readable: no permission games",
+                file.display()
+            );
+        }
+
         // Every `right` side holds exactly the files the manifest will see on the `left`.
         for (left, right) in [
             &self.below_min,
@@ -308,6 +385,7 @@ impl DirTrees {
             &self.extension,
             &self.non_utf8,
             &self.walk_error,
+            &self.injected,
         ]
         .map(|pair| (&pair.0, &pair.1))
         {
@@ -350,6 +428,7 @@ fn non_utf8_name() -> &'static OsStr {
 mod tests {
     use super::*;
     use crate::pipeline::walk::walk;
+    use crate::testfixtures::WalkFaults;
     use std::collections::BTreeSet;
     use std::sync::atomic::AtomicBool;
 
@@ -512,6 +591,157 @@ mod tests {
         assert!(
             !paths.contains(&trees.deep_dir.join("tiny.bin")),
             "while the deep omission is invisible"
+        );
+    }
+
+    /// Control for both injected cases: with nothing armed, the two nominated files are ordinary
+    /// duplicates and reach the manifest. Without this, an injected absence would prove nothing.
+    #[test]
+    fn without_injection_the_nominated_files_are_scanned() {
+        let trees = DirTrees::build("inject_none");
+        let (paths, _) = walked(&trees.scan_config());
+        for file in [trees.walk_fault_file(), trees.metadata_fault_file()] {
+            assert!(
+                paths.contains(&file),
+                "{} must be scanned when no fault is armed",
+                file.display()
+            );
+        }
+    }
+
+    /// The iterator branch: one fault, armed for one ordinary file, fires exactly once at the
+    /// iterator site and takes only that file out of the manifest.
+    #[test]
+    fn an_injected_walk_fault_removes_only_its_own_file() {
+        let trees = DirTrees::build("inject_walk");
+        let target = trees.walk_fault_file();
+        let faults = WalkFaults::arm(&[(target.clone(), WalkFault::Iterator)]);
+        let (paths, skipped) = walked(&trees.scan_config());
+
+        assert_eq!(
+            faults.fired(),
+            vec![(target.clone(), WalkFault::Iterator)],
+            "one fault, fired once, at the iterator site"
+        );
+        assert!(faults.pending().is_empty(), "nothing stayed armed");
+        assert!(
+            !paths.contains(&target),
+            "{} must be missing for the injected walk error",
+            target.display()
+        );
+        assert!(
+            paths.contains(&trees.metadata_fault_file()),
+            "the metadata-fault file is untouched by an iterator fault"
+        );
+        assert!(
+            paths.contains(&trees.injected.0.join("a.bin")),
+            "and so is its own directory's scannable file"
+        );
+        assert_eq!(
+            skipped, 1,
+            "no counter grows: only the non-UTF8 name is counted"
+        );
+    }
+
+    /// The metadata branch, which no filesystem shape in this fixture can reach. The recorded kind is
+    /// the call site: `Metadata` can only come from the `entry.metadata()` match.
+    #[test]
+    fn an_injected_metadata_fault_removes_only_its_own_file() {
+        let trees = DirTrees::build("inject_meta");
+        let target = trees.metadata_fault_file();
+        let faults = WalkFaults::arm(&[(target.clone(), WalkFault::Metadata)]);
+        let (paths, skipped) = walked(&trees.scan_config());
+
+        assert_eq!(
+            faults.fired(),
+            vec![(target.clone(), WalkFault::Metadata)],
+            "one fault, fired once, at the metadata site"
+        );
+        assert!(faults.pending().is_empty(), "nothing stayed armed");
+        assert!(
+            !paths.contains(&target),
+            "{} must be missing for the injected metadata error",
+            target.display()
+        );
+        assert!(
+            paths.contains(&trees.walk_fault_file()),
+            "the walk-fault file is untouched by a metadata fault"
+        );
+        assert_eq!(skipped, 1, "no counter grows for it either");
+    }
+
+    /// Both branches at once, alongside the real symlink errors: each fault fires exactly once, the
+    /// two are separately identified, and the manifest loses precisely those two paths.
+    #[test]
+    fn both_injected_faults_fire_once_and_lose_nothing_else() {
+        let trees = DirTrees::build("inject_both");
+        let (baseline, baseline_skipped) = walked(&trees.scan_config_following());
+
+        let faults = WalkFaults::arm(&trees.injected_faults());
+        let (paths, skipped) = walked(&trees.scan_config_following());
+
+        assert_eq!(faults.fired().len(), 2, "each fault fired exactly once");
+        assert!(faults.pending().is_empty(), "and neither stayed armed");
+        let fired: BTreeMap<PathBuf, WalkFault> = faults.fired().into_iter().collect();
+        let armed: BTreeMap<PathBuf, WalkFault> = trees.injected_faults().into_iter().collect();
+        assert_eq!(
+            fired, armed,
+            "each file lost its own, separately identified branch"
+        );
+
+        // Each file is missing for its declared reason: the branch that fired is the one the fixture
+        // publishes as that file's omission reason, not merely some branch or other.
+        let declared = trees.injected_omissions();
+        for (file, kind) in trees.injected_faults() {
+            let expected_reason = match kind {
+                WalkFault::Iterator => OmissionReason::WalkError,
+                WalkFault::Metadata => OmissionReason::MetadataError,
+            };
+            assert_eq!(
+                declared.get(&file).copied(),
+                Some(expected_reason),
+                "{} must be declared as {expected_reason:?}",
+                file.display()
+            );
+            assert_eq!(
+                fired.get(&file),
+                Some(&kind),
+                "{} must be lost through exactly that branch",
+                file.display()
+            );
+        }
+
+        let mut expected = baseline.clone();
+        for (file, _) in trees.injected_faults() {
+            assert!(
+                expected.remove(&file),
+                "{} was in the manifest before injection",
+                file.display()
+            );
+        }
+        assert_eq!(
+            paths, expected,
+            "exactly the two nominated files are gone, nothing else"
+        );
+        assert_eq!(
+            skipped, baseline_skipped,
+            "the non-UTF8 counter is unaffected by injection"
+        );
+
+        // The real symlink shapes still behave as before: no phantom descendant through the loop.
+        let under_error: BTreeSet<PathBuf> = paths
+            .iter()
+            .filter(|path| path.starts_with(&trees.walk_error.0))
+            .map(|path| {
+                path.strip_prefix(&trees.walk_error.0)
+                    .expect("under the error side")
+                    .to_path_buf()
+            })
+            .collect();
+        assert_eq!(
+            under_error,
+            BTreeSet::from([PathBuf::from("a.bin")]),
+            "the error side still contributes only its scannable file"
         );
     }
 

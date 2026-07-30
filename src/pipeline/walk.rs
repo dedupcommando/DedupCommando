@@ -80,6 +80,10 @@ pub fn walk(
         entries += 1;
 
         let entry = match result {
+            // Test-only: reach the outcome of the `Err` arm below for a nominated path, without a
+            // filesystem that has to misbehave. Absent from every non-test build.
+            #[cfg(test)]
+            Ok(ref entry) if crate::testfixtures::take_walk_fault(entry.path()) => continue,
             Ok(entry) => entry,
             Err(_) => continue, // no access / broken link — skip
         };
@@ -88,6 +92,9 @@ pub fn walk(
             _ => continue,
         }
         let meta = match entry.metadata() {
+            // Test-only counterpart for the metadata error below, same reasoning.
+            #[cfg(test)]
+            Ok(_) if crate::testfixtures::take_metadata_fault(entry.path()) => continue,
             Ok(meta) => meta,
             Err(_) => continue,
         };

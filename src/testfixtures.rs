@@ -27,6 +27,7 @@
 /// Directory pairs whose exact-twin claims depend on omitted files (`P-2`/`S-4`/`P-11`).
 pub mod dir_completeness;
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -308,6 +309,88 @@ pub fn note_content_read(path: &Path) {
     if let Some(reads) = slot().as_mut() {
         reads.push(path.to_path_buf());
     }
+}
+
+/// Which of the walk's two silently-skipping branches an injected fault stands in for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkFault {
+    /// The walk iterator yielded an error instead of an entry.
+    Iterator,
+    /// The entry arrived, but its metadata could not be read.
+    Metadata,
+}
+
+thread_local! {
+    /// Faults armed for this thread that have not fired yet.
+    static ARMED_FAULTS: RefCell<Vec<(PathBuf, WalkFault)>> = const { RefCell::new(Vec::new()) };
+    /// Faults that fired, in the order they fired.
+    static FIRED_FAULTS: RefCell<Vec<(PathBuf, WalkFault)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Arms walk faults for the current thread and disarms them on drop.
+///
+/// Thread-local, and that is the whole point: `walk` iterates on the caller's thread, so a fault
+/// cannot leak into a test running in parallel and nothing has to be serialized. (`ReadLog` above has
+/// the opposite constraint — hashing happens on rayon workers, so it must be process-wide.) Each
+/// fault fires at most once, and both what fired and what did not are observable, so a test can
+/// prove a fault was consumed exactly once rather than merely that a file went missing.
+///
+/// If `ignore` ever moved its iteration to another thread, the fault would simply never fire and the
+/// test would fail — never silently pass.
+pub struct WalkFaults;
+
+impl WalkFaults {
+    /// Arms `faults` for this thread, replacing anything armed before.
+    pub fn arm(faults: &[(PathBuf, WalkFault)]) -> Self {
+        ARMED_FAULTS.with(|armed| *armed.borrow_mut() = faults.to_vec());
+        FIRED_FAULTS.with(|fired| fired.borrow_mut().clear());
+        WalkFaults
+    }
+
+    /// Faults that have not fired.
+    pub fn pending(&self) -> Vec<(PathBuf, WalkFault)> {
+        ARMED_FAULTS.with(|armed| armed.borrow().clone())
+    }
+
+    /// Faults that fired, in order.
+    pub fn fired(&self) -> Vec<(PathBuf, WalkFault)> {
+        FIRED_FAULTS.with(|fired| fired.borrow().clone())
+    }
+}
+
+impl Drop for WalkFaults {
+    fn drop(&mut self) {
+        ARMED_FAULTS.with(|armed| armed.borrow_mut().clear());
+        FIRED_FAULTS.with(|fired| fired.borrow_mut().clear());
+    }
+}
+
+/// Consumes a fault of exactly this kind for exactly this path, if one is armed.
+fn take_fault(path: &Path, kind: WalkFault) -> bool {
+    let taken = ARMED_FAULTS.with(|armed| {
+        let mut armed = armed.borrow_mut();
+        let found = armed
+            .iter()
+            .position(|(faulty, armed_kind)| *armed_kind == kind && faulty == path);
+        found.map(|index| armed.remove(index))
+    });
+    match taken {
+        Some(fault) => {
+            FIRED_FAULTS.with(|fired| fired.borrow_mut().push(fault));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Called by the walk where an iterator error would have skipped the entry.
+pub(crate) fn take_walk_fault(path: &Path) -> bool {
+    take_fault(path, WalkFault::Iterator)
+}
+
+/// Called by the walk where a metadata error would have skipped the entry.
+pub(crate) fn take_metadata_fault(path: &Path) -> bool {
+    take_fault(path, WalkFault::Metadata)
 }
 
 #[cfg(test)]
