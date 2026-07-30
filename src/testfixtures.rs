@@ -24,6 +24,9 @@
 //! `alias_*`, `twin_a`, `twin_b` and `external.bin` are byte-identical, so the six pathnames inside
 //! the root form one content group made of three allocations.
 
+/// Directory pairs whose exact-twin claims depend on omitted files (`P-2`/`S-4`/`P-11`).
+pub mod dir_completeness;
+
 use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
