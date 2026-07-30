@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use rusqlite::types::Value;
 use rusqlite::{params, Connection, OpenFlags};
 
 use crate::error::{AppError, Result};
@@ -790,19 +791,31 @@ impl ScanStore {
     /// enough to make the scan unsafe to plan against — that row's allocation may have links
     /// nobody counted — and a manifest migrated from v2 is entirely in that state.
     ///
-    /// The worst row decides, so the query asks for the smallest non-positive count there is:
-    /// `NULL` means every row holds a real count (or the scan has no rows at all), `0` is the
-    /// ordinary legacy case, and anything negative cannot come from `st_nlink` and is refused
-    /// rather than believed.
+    /// One plan-time read returns the single worst cell, and `link_count_from_sql` decides what it
+    /// means. The storage class is part of the test, not only the number: SQLite's `INTEGER` is an
+    /// affinity rather than a constraint, so a `REAL`, `TEXT`, `BLOB` or `NULL` can sit in this
+    /// column — and none of those compare `<= 0`, because numbers sort below text and blobs. A
+    /// purely numeric filter would therefore skip them and call the manifest fully known.
+    ///
+    /// The ordering puts an invalid storage class ahead of every integer, so corruption is what
+    /// gets reported even when a `0` or a negative row is present too; among integers the smallest
+    /// comes first. No row selected at all means every count is a real one.
     pub fn scan_link_counts_known(&self, scan_id: i64) -> Result<bool> {
-        let worst: Option<i64> = self.conn.query_row(
-            "SELECT MIN(nlink) FROM file WHERE scan_id = ?1 AND nlink <= 0",
-            params![scan_id],
-            |row| row.get(0),
-        )?;
+        use rusqlite::OptionalExtension;
+        let worst: Option<Value> = self
+            .conn
+            .query_row(
+                "SELECT nlink FROM file
+                  WHERE scan_id = ?1 AND (typeof(nlink) <> 'integer' OR nlink <= 0)
+                  ORDER BY typeof(nlink) = 'integer', nlink
+                  LIMIT 1",
+                params![scan_id],
+                |row| row.get(0),
+            )
+            .optional()?;
         match worst {
             None => Ok(true),
-            Some(raw) => Ok(LinkCount::from_i64(raw)?.is_known()),
+            Some(value) => Ok(link_count_from_sql(&value)?.is_known()),
         }
     }
 
@@ -866,9 +879,10 @@ impl ScanStore {
                    GROUP BY size HAVING COUNT(*) >= 2
                )",
         )?;
-        // The link count travels beside the row rather than inside it: decoding it is checked and
-        // can fail, which a rusqlite row mapper cannot report. The field below is a placeholder
-        // the loop replaces before anything reads it.
+        // The link count travels beside the row rather than inside it, as a raw `Value`: decoding
+        // it is checked, rejects a non-integer storage class, and can fail — which a rusqlite row
+        // mapper cannot report. The field below is a placeholder the loop replaces before anything
+        // reads it.
         let rows = stmt.query_map(params![scan_id], |row| {
             let file = ManifestRow {
                 path: PathBuf::from(row.get::<_, String>(0)?),
@@ -881,13 +895,13 @@ impl ScanStore {
                 inode: row.get::<_, i64>(7)? as u64,
                 nlink: 0,
             };
-            Ok((file, row.get::<_, i64>(8)?))
+            Ok((file, row.get::<_, Value>(8)?))
         })?;
 
         let mut files = Vec::new();
         for row in rows {
             let (mut file, nlink) = row?;
-            file.nlink = LinkCount::from_i64(nlink)?.to_u64();
+            file.nlink = link_count_from_sql(&nlink)?.to_u64();
             files.push(file);
         }
         Ok(files)
@@ -2410,6 +2424,27 @@ fn mark_prepared(conn: &Connection, scan_id: i64) -> Result<()> {
         params![scan_id],
     )?;
     Ok(())
+}
+
+/// Decodes one `file.nlink` cell — the single gate between that column and the rest of the
+/// program, for reading a manifest row and for the planning check alike.
+///
+/// SQLite's declared `INTEGER` is a type *affinity*, not a domain constraint: in a non-`STRICT`
+/// table the cell can hold any storage class, and `1.5` really is stored as `real`, `'oops'` as
+/// `text`. Only `integer` reaches the numeric domain check in `LinkCount`; every other class is a
+/// damaged or externally modified DB and is refused here, at the store boundary, so the model
+/// layer stays free of SQLite.
+fn link_count_from_sql(value: &Value) -> Result<LinkCount> {
+    let class = match value {
+        Value::Integer(raw) => return LinkCount::from_i64(*raw),
+        Value::Null => "null",
+        Value::Real(_) => "real",
+        Value::Text(_) => "text",
+        Value::Blob(_) => "blob",
+    };
+    Err(AppError::msg(format!(
+        "dedcom.db holds a link count stored as {class}, not an integer. Rescan, or move the old dedcom.db aside."
+    )))
 }
 
 fn now_string() -> String {
@@ -5300,5 +5335,143 @@ mod tests {
             )
             .unwrap();
         assert_eq!(negative, 0, "nothing negative reached the manifest");
+    }
+
+    /// Seeds a scan whose `file.nlink` cells are written as the given raw SQL literals, and marks
+    /// the reclaim state `Exact` — so the link-count check is the only thing between the scan and
+    /// `Allowed`. All rows share one size, so every one of them is a hashing candidate.
+    ///
+    /// SQLite's `INTEGER` is a type *affinity*, not a constraint: `1.5` really is stored as `real`
+    /// and `'oops'` as `text` in a non-`STRICT` table. Each test asserts the storage class it got
+    /// before relying on it.
+    fn store_with_raw_nlinks(literals: &[&str]) -> (ScanStore, i64) {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank")]))
+            .unwrap();
+        for (index, literal) in literals.iter().enumerate() {
+            let inode = index + 1;
+            store
+                .conn
+                .execute_batch(&format!(
+                    "INSERT INTO file(scan_id, path, size, mtime, device, inode, nlink)
+                     VALUES ({id}, '/tank/f{index}', 100, 42, 10, {inode}, {literal});"
+                ))
+                .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE scan_stats SET reclaim_state = ?2 WHERE scan_id = ?1",
+                params![id, ReclaimState::Exact.as_i64()],
+            )
+            .unwrap();
+        (store, id)
+    }
+
+    fn stored_class(store: &ScanStore, path: &str) -> String {
+        store
+            .conn
+            .query_row(
+                "SELECT typeof(nlink) FROM file WHERE path = ?1",
+                params![path],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// A link count that is not an integer at all. None of these compare `<= 0` — numbers sort
+    /// below text and blobs — so a purely numeric test skips them and calls the manifest fully
+    /// known. They must be refused instead, both by the planning gate and by manifest reading.
+    #[test]
+    fn a_non_integer_link_count_refuses_planning_and_reading() {
+        for (literal, class) in [("1.5", "real"), ("'oops'", "text"), ("X'00'", "blob")] {
+            // A valid row beside it, so nothing here depends on the scan being otherwise empty.
+            let (store, id) = store_with_raw_nlinks(&[literal, "1"]);
+            assert_eq!(
+                stored_class(&store, "/tank/f0"),
+                class,
+                "{literal} must really land as {class}"
+            );
+
+            let err = store
+                .scan_link_counts_known(id)
+                .expect_err("a non-integer link count must not read as known")
+                .to_string();
+            assert!(
+                err.contains(&format!("stored as {class}")),
+                "the message must name the storage class: {err}"
+            );
+
+            match store.destructive_plan_verdict(id) {
+                Err(err) => assert!(
+                    err.to_string().contains("not an integer"),
+                    "the verdict must refuse for the same reason: {err}"
+                ),
+                Ok(verdict) => panic!("{literal} must never produce a verdict, got {verdict:?}"),
+            }
+
+            match store.candidate_files(id) {
+                Err(err) => assert!(
+                    err.to_string().contains(&format!("stored as {class}")),
+                    "reading must refuse for the same named reason: {err}"
+                ),
+                Ok(rows) => panic!("{literal} must not become a manifest row, got {rows:?}"),
+            }
+        }
+    }
+
+    /// Corruption must win over the ordinary legacy case: a row with an invalid storage class
+    /// cannot be hidden by a `0` or a negative row that the numeric ordering would otherwise
+    /// surface first.
+    #[test]
+    fn an_invalid_storage_class_is_not_hidden_by_a_zero_or_negative_row() {
+        let (store, id) = store_with_raw_nlinks(&["0", "'oops'", "-1"]);
+        assert_eq!(stored_class(&store, "/tank/f1"), "text");
+
+        let err = store
+            .scan_link_counts_known(id)
+            .expect_err("an invalid storage class must not be hidden")
+            .to_string();
+        assert!(
+            err.contains("stored as text"),
+            "the invalid type must be reported, not the 0 or the -1: {err}"
+        );
+        assert!(
+            store.destructive_plan_verdict(id).is_err(),
+            "and planning must never proceed"
+        );
+    }
+
+    /// The decoder itself, over every storage class SQLite can put in the column. `null` is here
+    /// even though `NOT NULL` should keep it out of a DB this build wrote — the point of the gate
+    /// is that it does not depend on the column definition holding.
+    #[test]
+    fn only_the_integer_storage_class_reaches_the_numeric_domain() {
+        for (value, class) in [
+            (Value::Null, "null"),
+            (Value::Real(1.5), "real"),
+            (Value::Text("oops".to_string()), "text"),
+            (Value::Blob(vec![0]), "blob"),
+        ] {
+            let err = link_count_from_sql(&value)
+                .expect_err("a non-integer storage class must not decode")
+                .to_string();
+            assert!(
+                err.contains(&format!("stored as {class}")),
+                "the message must name the storage class: {err}"
+            );
+        }
+
+        // Integers still go through the numeric domain unchanged.
+        assert_eq!(
+            link_count_from_sql(&Value::Integer(0)).unwrap(),
+            LinkCount::Unknown
+        );
+        assert_eq!(
+            link_count_from_sql(&Value::Integer(4)).unwrap(),
+            LinkCount::Known(4)
+        );
+        assert!(link_count_from_sql(&Value::Integer(-1)).is_err());
     }
 }
