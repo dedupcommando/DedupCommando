@@ -49,10 +49,26 @@ inside_fixture() {
 	esac
 }
 
+# Why the last `mount --bind` failed, for an honest SKIP message.
+BIND_ERROR=""
+
+# Binds $1 at $2, both inside the fixture. Returns non-zero if the mount failed, WITHOUT recording
+# the target or claiming success.
+#
+# The exit status is tested here rather than left to `set -e`: this function is called as an `if`
+# condition, and `errexit` is suppressed for everything inside such a condition. Relying on it meant
+# a failed mount carried on to append to MOUNTS, print `bound ...` and return the status of that
+# printf, so a container without CAP_SYS_ADMIN ran the scenario unmounted and failed instead of
+# skipping.
 bind_mount() {
 	inside_fixture "$1"
 	inside_fixture "$2"
-	mount --bind "$1" "$2"
+	BIND_ERROR=""
+	local output
+	if ! output="$(mount --bind "$1" "$2" 2>&1)"; then
+		BIND_ERROR="${output:-mount --bind failed with no message}"
+		return 1
+	fi
 	MOUNTS+=("$2")
 	printf 'bound %s -> %s\n' "$1" "$2"
 }
@@ -136,16 +152,16 @@ banner "3. symlinked root (canonical alias)"
 expect_rejected alias "canonical alias" "$FIXTURE/src" "$FIXTURE/link"
 
 banner "4. bind-mounted alias as a selected root"
-if bind_mount "$FIXTURE/src" "$FIXTURE/mirror" 2>/dev/null; then
+if bind_mount "$FIXTURE/src" "$FIXTURE/mirror"; then
 	expect_rejected bind "same directory object" "$FIXTURE/src" "$FIXTURE/mirror"
 	umount "$FIXTURE/mirror"
 	MOUNTS=("${MOUNTS[@]:0:${#MOUNTS[@]}-1}")
 else
-	skip "no CAP_SYS_ADMIN for mount --bind: selected-root bind case not exercised"
+	skip "selected-root bind case not exercised: $BIND_ERROR"
 fi
 
 banner "5. bind-mounted alias discovered during the walk"
-if bind_mount "$FIXTURE/src" "$FIXTURE/src/inner_mirror" 2>/dev/null; then
+if bind_mount "$FIXTURE/src" "$FIXTURE/src/inner_mirror"; then
 	output="$(scan_roots walk "$FIXTURE/src")" && status=0 || status=$?
 	printf '%s\n' "$output" | sed 's/^/    /'
 	[ "$status" -ne 0 ] || fail "walk: the scan was expected to fail, it exited 0"
@@ -157,7 +173,7 @@ if bind_mount "$FIXTURE/src" "$FIXTURE/src/inner_mirror" 2>/dev/null; then
 	umount "$FIXTURE/src/inner_mirror"
 	MOUNTS=("${MOUNTS[@]:0:${#MOUNTS[@]}-1}")
 else
-	skip "no CAP_SYS_ADMIN for mount --bind: walk-time bind case not exercised"
+	skip "walk-time bind case not exercised: $BIND_ERROR"
 fi
 
 banner "6. control: one root over the same tree still scans"
