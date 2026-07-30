@@ -57,6 +57,11 @@ fn hash_file_verified_hooked(
     after_before_snapshot: impl FnOnce(),
 ) -> io::Result<([u8; 32], FileIdentity)> {
     let file = open_regular_nofollow(path)?;
+    // One full read of this path's content is about to happen. Recorded for the Phase 2 tests that
+    // must count reads per physical object rather than per pathname; compiled out of a release
+    // build, and a no-op unless a test armed the recorder.
+    #[cfg(test)]
+    crate::testfixtures::note_content_read(path);
     let before = FileIdentity::from_metadata(&file.metadata()?);
 
     after_before_snapshot();

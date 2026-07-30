@@ -25,6 +25,9 @@ mod scan;
 mod signals;
 mod state;
 mod sysmon;
+/// Shared test fixtures (hardlink forest, content-read counting). Test builds only.
+#[cfg(test)]
+mod testfixtures;
 mod textsan;
 mod tui;
 mod zfs;
