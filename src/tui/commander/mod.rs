@@ -779,7 +779,7 @@ fn panel_hit(
         // Entry rows — under the top border, within the inner height. A file-group entry is two
         // rows tall (its reclaim claim has a line of its own), so the click maps by that height
         // rather than one row per entry.
-        let rows_per_entry = rows_per_entry(panel.view) as usize;
+        let rows_per_entry = rows_per_entry(panel.view, rect.width).max(1) as usize;
         let inner_rows = rect.height.saturating_sub(2);
         let entry = pos
             .y
@@ -1553,12 +1553,13 @@ fn cycle_sort(app: &mut App) {
     app.commander.status = format!("Sort: {}", sort.label());
 }
 
-/// Terminal rows one entry of a panel occupies. Only the file-group list is taller than a row:
-/// its reclaim claim gets a line of its own so the post-purge qualifier cannot be cut off in a
-/// narrow panel.
-fn rows_per_entry(view: PanelView) -> u16 {
+/// Terminal rows one entry of a panel occupies at this panel width. Only the file-group list is
+/// taller than a row: its reclaim claim gets lines of its own so the post-purge qualifier and its
+/// number cannot be cut off — and at 40 columns, which is what an 80-column terminal gives two
+/// panels, that takes two lines rather than one.
+fn rows_per_entry(view: PanelView, width: u16) -> u16 {
     match view {
-        PanelView::GroupList => crate::tui::screens::browser::GROUP_ROWS,
+        PanelView::GroupList => crate::tui::screens::browser::group_rows(width),
         _ => 1,
     }
 }
@@ -3730,6 +3731,148 @@ mod jump_tests {
             commander.pending_jump.is_some(),
             "we do not touch pending for another panel"
         );
+    }
+}
+
+#[cfg(test)]
+mod group_panel_tests {
+    //! The commander's own view of the file-group list: the width it really gets on an 80-column
+    //! terminal, and the click mapping that has to follow the entry height.
+
+    use super::*;
+    use crate::model::reclaim::ReclaimEstimate;
+    use crate::state::GroupSummary;
+    use crate::tui::screens::browser::tests::{shows_claim, CLAIM_WORDS};
+    use ratatui::layout::Position;
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::path::PathBuf;
+
+    fn summaries() -> Vec<GroupSummary> {
+        [
+            ReclaimEstimate::exact(4096),
+            ReclaimEstimate::upper_bound(4096),
+            ReclaimEstimate::unknown(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(rank, reclaim)| GroupSummary {
+            rank: rank as i64,
+            hash: format!("h{rank}"),
+            file_count: 3,
+            size_bytes: 4096,
+            object_count: 2,
+            reclaim,
+        })
+        .collect()
+    }
+
+    /// A commander with two panels, the first showing the group list.
+    fn app_with_group_panel() -> (
+        App,
+        crossbeam_channel::Receiver<crate::tui::event::AppEvent>,
+    ) {
+        let (mut app, events) = crate::app::test_app();
+        app.commander = CommanderState::new(&[PathBuf::from("/a"), PathBuf::from("/b")]);
+        app.commander.panels[0].view = PanelView::GroupList;
+        app.commander.panels[0].list.select(Some(0));
+        app.commander.group_summaries = summaries();
+        (app, events)
+    }
+
+    /// The acceptance condition C4b claimed and did not test: a REAL 80-column commander, which
+    /// draws two panels of 40, must show every claim complete — qualifier and figure both.
+    #[test]
+    fn an_eighty_column_two_panel_commander_shows_every_claim_in_full() {
+        assert_eq!(
+            layout::max_panels(80),
+            2,
+            "the layout this test exists for: 80 columns is two panels"
+        );
+        let (mut app, _events) = app_with_group_panel();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        for (name, claim) in CLAIM_WORDS {
+            assert!(
+                shows_claim(&rendered, claim),
+                "the {name} claim must read in full in an 80-column commander: {rendered}"
+            );
+        }
+        // The panel strip really is two panels wide — a test that passed by collapsing the
+        // commander to one wide panel would prove nothing about the width that failed.
+        let regions = layout::regions(Rect::new(0, 0, 80, 24));
+        let rects = layout::panel_rects(regions.panels, visible_panel_count(&app, 80));
+        assert_eq!(rects.len(), 2, "two panels must be on screen");
+        assert_eq!(rects[0].width, 40);
+        assert!(
+            rendered.contains(" 2 · "),
+            "the second panel's title must still be drawn: {rendered}"
+        );
+    }
+
+    /// Every visual line of a group entry selects that same entry — the click must not depend on
+    /// which line of the entry the pointer landed on.
+    #[test]
+    fn every_line_of_a_group_entry_hits_the_same_entry() {
+        let (app, _events) = app_with_group_panel();
+        let area = Rect::new(0, 0, 80, 24);
+        let regions = layout::regions(area);
+        let rects = layout::panel_rects(regions.panels, 2);
+        let panel = rects[0];
+        let rows = crate::tui::screens::browser::group_rows(panel.width) as usize;
+        assert_eq!(rows, 3, "40 columns wraps the claim onto a second line");
+
+        for entry in 0..app.commander.group_summaries.len() {
+            for line in 0..rows {
+                let y = panel.y + 1 + (entry * rows + line) as u16;
+                let hit = panel_hit(&app, &regions, Position { x: panel.x + 2, y });
+                assert_eq!(
+                    hit,
+                    Some((0, Some(entry))),
+                    "line {line} of entry {entry} must hit entry {entry}"
+                );
+            }
+        }
+
+        // Below the last entry there is nothing to hit.
+        let past = panel.y + 1 + (app.commander.group_summaries.len() * rows) as u16;
+        assert_eq!(
+            panel_hit(
+                &app,
+                &regions,
+                Position {
+                    x: panel.x + 2,
+                    y: past
+                }
+            ),
+            Some((0, None)),
+            "a click past the last entry selects nothing"
+        );
+    }
+
+    /// Only the group list is taller than a row. Every other view keeps one entry per line, so
+    /// this change cannot have moved anyone else's cursor.
+    #[test]
+    fn other_panel_views_are_still_one_row_per_entry() {
+        for view in [
+            PanelView::Files,
+            PanelView::DirsOnly,
+            PanelView::GroupFiles,
+            PanelView::DuplicatesOfCursor,
+            PanelView::DirGroupList,
+            PanelView::DirGroupFiles,
+        ] {
+            assert_eq!(rows_per_entry(view, 40), 1, "{view:?} must stay one row");
+        }
+        assert_eq!(rows_per_entry(PanelView::GroupList, 52), 2);
+        assert_eq!(rows_per_entry(PanelView::GroupList, 40), 3);
     }
 }
 

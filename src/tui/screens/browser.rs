@@ -104,7 +104,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // In entries, not terminal rows: a file group takes two rows, a folder group one, and PgUp/
     // PgDn steps by entries. Measuring this in rows would page twice as far on the Files tab.
     app.browser.group_visible_rows = match app.browser.tab {
-        BrowserTab::Files => groups_that_fit(panes[0].height) as u16,
+        BrowserTab::Files => groups_that_fit(panes[0]) as u16,
         BrowserTab::Dirs => panes[0].height.saturating_sub(2),
     };
     app.browser.files_visible_rows = panes[1].height.saturating_sub(2);
@@ -233,14 +233,64 @@ pub(crate) fn page_step(visible_rows: u16, delta_pages: i32) -> i32 {
     step * delta_pages
 }
 
-/// Terminal rows one entry of the file-group list occupies: the counters, and the reclaim claim
-/// on its own line beneath them.
-pub(crate) const GROUP_ROWS: u16 = 2;
+/// Indent that marks the reclaim claim as a continuation of the counters above it.
+pub(crate) const CLAIM_INDENT: &str = "  ";
 
-/// How many groups fit in a panel of this height — the borders, then two rows each. At least one,
-/// so a window too short to hold a whole entry still shows the selected one rather than nothing.
-pub(crate) fn groups_that_fit(height: u16) -> usize {
-    (height.saturating_sub(2) / GROUP_ROWS).max(1) as usize
+/// Columns a list panel spends before any item text: two borders and the highlight symbol, which
+/// `List` reserves on every row whether or not the row is selected.
+const LIST_CHROME: usize = 4;
+
+/// A byte figure at the top of what `human_bytes` prints before its own width starts growing:
+/// `1023.0 TiB`. One duplicate-content group worth more than that does not exist on a pool this
+/// program can scan, and the row height has to be a function of the panel width alone — the mouse
+/// mapping cannot be made to ask what a row happens to say.
+const WIDEST_FIGURE: u64 = 1023 << 40;
+
+/// Columns the reclaim claim gets on a line of its own in a list panel this wide.
+pub(crate) fn claim_columns(width: u16) -> usize {
+    (width as usize).saturating_sub(LIST_CHROME + CLAIM_INDENT.len())
+}
+
+/// Terminal rows one entry of the file-group list occupies at this panel width: the counters, plus
+/// however many lines the widest possible claim needs beneath them.
+///
+/// Width alone, never content. Every group in one rendered list is the same height, so a click at
+/// row `n` maps to an entry without knowing what any row says — and two rows is not always enough:
+/// an 80-column commander draws two panels of 40, where the exact claim does not fit on one line.
+pub(crate) fn group_rows(width: u16) -> u16 {
+    let widest =
+        crate::tui::reclaim_cell(crate::model::reclaim::ReclaimEstimate::exact(WIDEST_FIGURE));
+    1 + wrap_words(&widest, claim_columns(width)).len() as u16
+}
+
+/// How many groups fit in a panel of this size — the borders, then `group_rows` each. At least
+/// one, so a window too short to hold a whole entry still shows the selected one rather than
+/// nothing.
+pub(crate) fn groups_that_fit(area: Rect) -> usize {
+    (area.height.saturating_sub(2) / group_rows(area.width)).max(1) as usize
+}
+
+/// Greedy word wrap. A word wider than the column count gets a line of its own and is left to the
+/// terminal to clip — there is nothing better to do with it, and it cannot happen to the claim,
+/// whose longest word is `quarantine`.
+pub(crate) fn wrap_words(text: &str, columns: usize) -> Vec<String> {
+    if columns == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split(' ') {
+        match lines.last_mut() {
+            Some(line) if line.chars().count() + 1 + word.chars().count() <= columns => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _ => lines.push(word.to_string()),
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 /// Step of the visual separators in the browser lists:
@@ -345,33 +395,37 @@ pub(crate) fn render_group_list(
     // of thousands of groups would otherwise be formatted every frame and the UI starves for input.
     // Each group occupies `GROUP_ROWS` terminal rows, so the window is measured in groups, not in
     // rows; `ListState` counts items, which is why selection and paging stay group-based.
-    let rows = groups_that_fit(area.height);
+    let rows = groups_that_fit(area);
     let (start, local_sel) = crate::tui::visible_window(state, groups.len(), rows);
     let end = (start + rows).min(groups.len());
+    // Every entry is the same height, whatever its own claim needs: the claim is wrapped into the
+    // lines this width reserves and short ones are padded. A list whose rows varied in height
+    // would make a click's meaning depend on what the rows above it happened to say.
+    let claim_lines = group_rows(area.width).saturating_sub(1) as usize;
+    let columns = claim_columns(area.width);
     let items: Vec<ListItem> = groups[start..end]
         .iter()
         .map(|group| {
-            // Two lines, because this panel is 52 columns wide in the classic browser whatever
-            // the terminal is, and the counts plus a post-purge claim do not fit in one. The
-            // claim gets the second line to itself rather than being the thing that gets cut:
-            // a number whose qualifier fell off the right edge is the defect, not the layout.
-            //
-            // Pathnames and allocations are both on the first line, because they are different
-            // questions: «6 files» is what the operator sees, «3 objects» is what the filesystem
-            // frees.
-            ListItem::new(vec![
-                Line::from(format!(
-                    "#{:<4} {} files · {} objects · {}",
-                    group.rank,
-                    group.file_count,
-                    group.object_count,
-                    human_bytes(group.size_bytes),
-                )),
-                Line::from(Span::styled(
-                    format!("  {}", crate::tui::reclaim_cell(group.reclaim)),
+            // The counters first: pathnames and allocations are different questions — «6 files»
+            // is what the operator sees, «3 objects» is what the filesystem frees. The claim gets
+            // the lines below to itself rather than being the thing that gets cut, because a
+            // number whose qualifier fell off the right edge is the defect, not the layout.
+            let mut lines = vec![Line::from(format!(
+                "#{:<4} {} files · {} objects · {}",
+                group.rank,
+                group.file_count,
+                group.object_count,
+                human_bytes(group.size_bytes),
+            ))];
+            let wrapped = wrap_words(&crate::tui::reclaim_cell(group.reclaim), columns);
+            for index in 0..claim_lines {
+                let text = wrapped.get(index).map(String::as_str).unwrap_or("");
+                lines.push(Line::from(Span::styled(
+                    format!("{CLAIM_INDENT}{text}"),
                     Style::new().add_modifier(Modifier::DIM),
-                )),
-            ])
+                )));
+            }
+            ListItem::new(lines)
         })
         .collect();
     let list = List::new(items)
@@ -780,7 +834,7 @@ pub(crate) fn name_palette(group: &DuplicateGroup) -> HashMap<String, Color> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::duplicate::FileEntry;
     use crate::model::reclaim::{LinkCount, ReclaimEstimate};
@@ -851,37 +905,86 @@ mod tests {
         );
     }
 
-    /// The panel the classic browser draws is 52 columns wide whatever the terminal is. The
-    /// qualifier has to survive THAT width together with its number — hiding it past the right
-    /// edge would be the same lie in a different place.
+    /// The three claims, as words, for a width test to look for.
+    pub(crate) const CLAIM_WORDS: [(&str, &str); 3] = [
+        ("exact", "guaranteed after quarantine purge: 4.0 KiB"),
+        ("upper bound", "up to 4.0 KiB after quarantine purge"),
+        ("unknown", "rescan required"),
+    ];
+
+    fn claim_states() -> [ReclaimEstimate; 3] {
+        [
+            ReclaimEstimate::exact(4096),
+            ReclaimEstimate::upper_bound(4096),
+            ReclaimEstimate::unknown(),
+        ]
+    }
+
+    /// Whether every word of `claim` is on screen, in order, allowing the claim to have been
+    /// wrapped onto the next line. A plain `contains` cannot see a wrapped string, and dropping
+    /// the check entirely is how the missing number got through.
+    pub(crate) fn shows_claim(rendered: &str, claim: &str) -> bool {
+        let mut cursor = 0usize;
+        for word in claim.split(' ') {
+            match rendered[cursor..].find(word) {
+                Some(at) => cursor += at + word.len(),
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// The panel the classic browser draws is 52 columns wide whatever the terminal is, and two
+    /// panels of an 80-column commander are 40. The qualifier has to survive BOTH together with
+    /// its number — hiding it past the right edge would be the same lie in a different place.
     #[test]
-    fn the_post_purge_qualifier_survives_the_narrow_classic_panel() {
-        for (state, expected) in [
-            (
-                ReclaimEstimate::exact(4096),
-                "guaranteed after quarantine purge: 4.0 KiB",
-            ),
-            (
-                ReclaimEstimate::upper_bound(4096),
-                "up to 4.0 KiB after quarantine purge",
-            ),
-            (ReclaimEstimate::unknown(), "rescan required"),
-        ] {
-            let groups = vec![summary_row(0, state)];
-            let mut list = ListState::default();
-            let rendered = drawn(52, 6, |frame| {
-                render_group_list(
-                    frame,
-                    frame.area(),
-                    &groups,
-                    &mut list,
-                    true,
-                    Line::from(" groups "),
+    fn the_post_purge_qualifier_survives_every_panel_width_in_use() {
+        for width in [52, 40] {
+            for (state, (name, expected)) in claim_states().into_iter().zip(CLAIM_WORDS) {
+                let groups = vec![summary_row(0, state)];
+                let mut list = ListState::default();
+                let rendered = drawn(width, 8, |frame| {
+                    render_group_list(
+                        frame,
+                        frame.area(),
+                        &groups,
+                        &mut list,
+                        true,
+                        Line::from(" groups "),
+                    );
+                });
+                assert!(
+                    shows_claim(&rendered, expected),
+                    "the {name} claim must read in full at {width} columns: {rendered}"
                 );
-            });
+            }
+        }
+    }
+
+    /// The height rule is a function of the panel width and nothing else — the same for every row
+    /// of a list, so a click at a given row means one thing however the rows above it read.
+    #[test]
+    fn the_entry_height_follows_the_width_alone() {
+        assert_eq!(
+            group_rows(52),
+            2,
+            "the classic panel fits the claim on one line"
+        );
+        assert_eq!(
+            group_rows(40),
+            3,
+            "two panels of an 80-column commander need the claim wrapped"
+        );
+        assert_eq!(
+            group_rows(36),
+            group_rows(36),
+            "the commander's narrowest panel is still deterministic"
+        );
+        for state in claim_states() {
+            let claim = crate::tui::reclaim_cell(state);
             assert!(
-                rendered.contains(expected),
-                "at 52 columns the claim must still read in full: {rendered}"
+                (wrap_words(&claim, claim_columns(40)).len() as u16) < group_rows(40),
+                "every state must fit the lines the width reserves: {claim}"
             );
         }
     }
@@ -890,15 +993,27 @@ mod tests {
     /// not four half-drawn ones — and paging steps by the same number.
     #[test]
     fn the_group_window_counts_groups_not_terminal_rows() {
-        assert_eq!(GROUP_ROWS, 2);
-        assert_eq!(groups_that_fit(6), 2, "6 rows: 2 borders, 2 groups");
-        assert_eq!(groups_that_fit(11), 4);
+        let wide = |height| Rect::new(0, 0, 52, height);
+        assert_eq!(groups_that_fit(wide(6)), 2, "6 rows: 2 borders, 2 groups");
+        assert_eq!(groups_that_fit(wide(11)), 4);
         assert_eq!(
-            groups_that_fit(3),
+            groups_that_fit(wide(3)),
             1,
             "a window too short for a whole entry still shows the selected one"
         );
-        assert_eq!(groups_that_fit(0), 1);
+        assert_eq!(groups_that_fit(wide(0)), 1);
+        // The same height holds fewer groups where each one is taller.
+        assert_eq!(groups_that_fit(Rect::new(0, 0, 40, 11)), 3);
+    }
+
+    /// Word wrapping is what keeps the claim complete; a word that cannot fit is left whole rather
+    /// than broken in the middle.
+    #[test]
+    fn wrapping_breaks_on_spaces_only() {
+        assert_eq!(wrap_words("a bb ccc", 6), vec!["a bb", "ccc"]);
+        assert_eq!(wrap_words("quarantine", 4), vec!["quarantine"]);
+        assert_eq!(wrap_words("", 10), vec![""]);
+        assert_eq!(wrap_words("x y", 0), vec!["x y"], "no width, no wrapping");
     }
 
     /// The open group states its own claim in full, with the link evidence behind it — the same

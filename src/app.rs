@@ -1423,11 +1423,11 @@ impl App {
                 None => return, // click on a separator or outside the list — ignore
             }
         } else {
-            // The group list draws no separators and gives each group `GROUP_ROWS` rows, so the
-            // click maps by that height. Sharing the separator-aware mapping with the file panel
-            // would land the cursor on a different group than the one under the pointer.
-            let idx =
-                start + visual_row as usize / crate::tui::screens::browser::GROUP_ROWS as usize;
+            // The group list draws no separators and gives each group as many rows as this panel
+            // width needs, so the click maps by that height. Sharing the separator-aware mapping
+            // with the file panel would land the cursor on a different group than the pointer.
+            let rows = crate::tui::screens::browser::group_rows(area.width).max(1) as usize;
+            let idx = start + visual_row as usize / rows;
             if idx >= total {
                 return; // click below the last group — ignore
             }
@@ -3526,5 +3526,123 @@ mod action_review_scroll_tests {
             );
             assert!(app.apply.is_none(), "{answer:?} spawned an apply worker");
         }
+    }
+}
+
+#[cfg(test)]
+mod group_list_navigation_tests {
+    //! The file-group list is taller than one row per entry, so the two places that turn terminal
+    //! rows back into entries — the click mapping and the page step — have to agree with the
+    //! renderer. These are the guards for that agreement.
+
+    use super::*;
+    use crate::model::reclaim::ReclaimEstimate;
+    use crate::state::GroupSummary;
+    use crate::tui::screens::browser::{group_rows, groups_that_fit, BrowserTab};
+
+    /// The classic browser's group panel: a fixed 52 columns, 20 rows tall.
+    const PANEL: Rect = Rect {
+        x: 0,
+        y: 4,
+        width: 52,
+        height: 20,
+    };
+
+    fn browser_with_groups(count: usize) -> (App, crossbeam_channel::Receiver<AppEvent>) {
+        let (mut app, events) = test_app();
+        app.browser.group_summaries = (0..count)
+            .map(|rank| GroupSummary {
+                rank: rank as i64,
+                hash: format!("h{rank}"),
+                file_count: 3,
+                size_bytes: 4096,
+                object_count: 2,
+                reclaim: ReclaimEstimate::exact(4096),
+            })
+            .collect();
+        app.browser.tab = BrowserTab::Files;
+        app.browser.focus_files = false;
+        app.browser.groups_area = Some(PANEL);
+        app.browser.files_area = Some(Rect::new(52, 4, 40, 20));
+        app.browser.group_state.select(Some(0));
+        (app, events)
+    }
+
+    /// Whichever line of an entry the pointer lands on, the click selects that entry. A mapping
+    /// that still counted one row per group would select a different one for every second line.
+    #[test]
+    fn every_line_of_a_group_entry_selects_that_entry() {
+        let (mut app, _events) = browser_with_groups(6);
+        let rows = group_rows(PANEL.width);
+        assert_eq!(rows, 2, "the classic panel puts the claim on one line");
+        for entry in 0..6u16 {
+            for line in 0..rows {
+                let y = PANEL.y + 1 + entry * rows + line;
+                app.browser_mouse_click(PANEL.x + 3, y);
+                assert_eq!(
+                    app.browser.group_state.selected(),
+                    Some(entry as usize),
+                    "line {line} of entry {entry} must select entry {entry}"
+                );
+            }
+        }
+    }
+
+    /// A click below the last entry changes nothing — it is not a click on the last one.
+    #[test]
+    fn a_click_below_the_last_group_is_ignored() {
+        let (mut app, _events) = browser_with_groups(2);
+        let rows = group_rows(PANEL.width);
+        app.browser.group_state.select(Some(1));
+        app.browser_mouse_click(PANEL.x + 3, PANEL.y + 1 + 2 * rows);
+        assert_eq!(
+            app.browser.group_state.selected(),
+            Some(1),
+            "the cursor must not move for a click past the list"
+        );
+    }
+
+    /// PageUp/PageDown step by entries. `group_visible_rows` is what the renderer wrote, so the
+    /// step is a screenful of groups whatever height each one has.
+    #[test]
+    fn paging_steps_by_entries_not_by_terminal_lines() {
+        let (mut app, _events) = browser_with_groups(40);
+        // What `render` writes for the Files tab.
+        app.browser.group_visible_rows = groups_that_fit(PANEL) as u16;
+        assert_eq!(
+            app.browser.group_visible_rows, 9,
+            "18 rows inside the borders, two rows a group"
+        );
+        app.browser_page(1);
+        assert_eq!(
+            app.browser.group_state.selected(),
+            Some(8),
+            "a page is visible groups minus one, not visible terminal rows"
+        );
+    }
+
+    /// The folder tab is untouched: one row per group, and its own page step.
+    #[test]
+    fn the_folder_tab_still_counts_one_row_per_group() {
+        let (mut app, _events) = browser_with_groups(0);
+        app.browser.tab = BrowserTab::Dirs;
+        app.browser.dir_group_summaries = (0..40)
+            .map(|rank| crate::state::DirGroupSummary {
+                rank,
+                signature: format!("s{rank}"),
+                dir_count: 2,
+                file_count: 2,
+                size_per_dir: 100,
+            })
+            .collect();
+        app.browser.dir_group_state.select(Some(0));
+        // What `render` writes for the Folders tab: terminal rows, unchanged.
+        app.browser.group_visible_rows = PANEL.height.saturating_sub(2);
+        app.browser_dir_page(1);
+        assert_eq!(
+            app.browser.dir_group_state.selected(),
+            Some(17),
+            "18 rows inside the borders, one row a group"
+        );
     }
 }
