@@ -101,7 +101,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // browser_page (PgUp/PgDn) computes the page step from this number, browser_end
     // knows which index to scroll to. -2 for the frame. And the Rects themselves — for
     // mapping a mouse click in `App::browser_mouse_click`.
-    app.browser.group_visible_rows = panes[0].height.saturating_sub(2);
+    // In entries, not terminal rows: a file group takes two rows, a folder group one, and PgUp/
+    // PgDn steps by entries. Measuring this in rows would page twice as far on the Files tab.
+    app.browser.group_visible_rows = match app.browser.tab {
+        BrowserTab::Files => groups_that_fit(panes[0].height) as u16,
+        BrowserTab::Dirs => panes[0].height.saturating_sub(2),
+    };
     app.browser.files_visible_rows = panes[1].height.saturating_sub(2);
     app.browser.groups_area = Some(panes[0]);
     app.browser.files_area = Some(panes[1]);
@@ -228,6 +233,16 @@ pub(crate) fn page_step(visible_rows: u16, delta_pages: i32) -> i32 {
     step * delta_pages
 }
 
+/// Terminal rows one entry of the file-group list occupies: the counters, and the reclaim claim
+/// on its own line beneath them.
+pub(crate) const GROUP_ROWS: u16 = 2;
+
+/// How many groups fit in a panel of this height — the borders, then two rows each. At least one,
+/// so a window too short to hold a whole entry still shows the selected one rather than nothing.
+pub(crate) fn groups_that_fit(height: u16) -> usize {
+    (height.saturating_sub(2) / GROUP_ROWS).max(1) as usize
+}
+
 /// Step of the visual separators in the browser lists:
 /// every `SEPARATOR_EVERY` entries a ` N -------…` line is inserted
 /// (see `separator_line`), helping the user gauge their position in a long list.
@@ -328,22 +343,35 @@ pub(crate) fn render_group_list(
 ) {
     // Virtualization: we build ListItems only for the visible window — on /tank hundreds
     // of thousands of groups would otherwise be formatted every frame and the UI starves for input.
-    let rows = (area.height as usize).saturating_sub(2);
+    // Each group occupies `GROUP_ROWS` terminal rows, so the window is measured in groups, not in
+    // rows; `ListState` counts items, which is why selection and paging stay group-based.
+    let rows = groups_that_fit(area.height);
     let (start, local_sel) = crate::tui::visible_window(state, groups.len(), rows);
     let end = (start + rows).min(groups.len());
     let items: Vec<ListItem> = groups[start..end]
         .iter()
         .map(|group| {
-            // Pathnames and allocations are both shown, because they are different questions:
-            // «6 files» is what the operator sees, «3 allocations» is what the filesystem frees.
-            ListItem::new(format!(
-                "#{:<4} {} files · {} objects · {} · {}",
-                group.rank,
-                group.file_count,
-                group.object_count,
-                human_bytes(group.size_bytes),
-                crate::tui::reclaim_cell(group.reclaim),
-            ))
+            // Two lines, because this panel is 52 columns wide in the classic browser whatever
+            // the terminal is, and the counts plus a post-purge claim do not fit in one. The
+            // claim gets the second line to itself rather than being the thing that gets cut:
+            // a number whose qualifier fell off the right edge is the defect, not the layout.
+            //
+            // Pathnames and allocations are both on the first line, because they are different
+            // questions: «6 files» is what the operator sees, «3 objects» is what the filesystem
+            // frees.
+            ListItem::new(vec![
+                Line::from(format!(
+                    "#{:<4} {} files · {} objects · {}",
+                    group.rank,
+                    group.file_count,
+                    group.object_count,
+                    human_bytes(group.size_bytes),
+                )),
+                Line::from(Span::styled(
+                    format!("  {}", crate::tui::reclaim_cell(group.reclaim)),
+                    Style::new().add_modifier(Modifier::DIM),
+                )),
+            ])
         })
         .collect();
     let list = List::new(items)
@@ -794,7 +822,7 @@ mod tests {
             summary_row(2, ReclaimEstimate::unknown()),
         ];
         let mut state = ListState::default();
-        let rendered = drawn(70, 6, |frame| {
+        let rendered = drawn(70, 10, |frame| {
             render_group_list(
                 frame,
                 frame.area(),
@@ -808,14 +836,69 @@ mod tests {
             rendered.contains("3 files · 2 objects"),
             "pathnames and allocations are different questions: {rendered}"
         );
-        assert!(rendered.contains("free 4.0 KiB"), "{rendered}");
-        assert!(rendered.contains("up to 4.0 KiB"), "{rendered}");
-        assert!(rendered.contains("rescan required"), "{rendered}");
-        assert_eq!(
-            rendered.matches("free").count(),
-            1,
-            "only the exact row may say «free»: {rendered}"
+        assert!(
+            rendered.contains("guaranteed after quarantine purge: 4.0 KiB"),
+            "{rendered}"
         );
+        assert!(
+            rendered.contains("up to 4.0 KiB after quarantine purge"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("rescan required"), "{rendered}");
+        assert!(
+            !rendered.contains("free"),
+            "nothing is free before the quarantine is purged: {rendered}"
+        );
+    }
+
+    /// The panel the classic browser draws is 52 columns wide whatever the terminal is. The
+    /// qualifier has to survive THAT width together with its number — hiding it past the right
+    /// edge would be the same lie in a different place.
+    #[test]
+    fn the_post_purge_qualifier_survives_the_narrow_classic_panel() {
+        for (state, expected) in [
+            (
+                ReclaimEstimate::exact(4096),
+                "guaranteed after quarantine purge: 4.0 KiB",
+            ),
+            (
+                ReclaimEstimate::upper_bound(4096),
+                "up to 4.0 KiB after quarantine purge",
+            ),
+            (ReclaimEstimate::unknown(), "rescan required"),
+        ] {
+            let groups = vec![summary_row(0, state)];
+            let mut list = ListState::default();
+            let rendered = drawn(52, 6, |frame| {
+                render_group_list(
+                    frame,
+                    frame.area(),
+                    &groups,
+                    &mut list,
+                    true,
+                    Line::from(" groups "),
+                );
+            });
+            assert!(
+                rendered.contains(expected),
+                "at 52 columns the claim must still read in full: {rendered}"
+            );
+        }
+    }
+
+    /// The window is measured in groups, so a panel tall enough for four rows shows two groups,
+    /// not four half-drawn ones — and paging steps by the same number.
+    #[test]
+    fn the_group_window_counts_groups_not_terminal_rows() {
+        assert_eq!(GROUP_ROWS, 2);
+        assert_eq!(groups_that_fit(6), 2, "6 rows: 2 borders, 2 groups");
+        assert_eq!(groups_that_fit(11), 4);
+        assert_eq!(
+            groups_that_fit(3),
+            1,
+            "a window too short for a whole entry still shows the selected one"
+        );
+        assert_eq!(groups_that_fit(0), 1);
     }
 
     /// The open group states its own claim in full, with the link evidence behind it — the same

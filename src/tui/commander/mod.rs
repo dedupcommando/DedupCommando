@@ -776,13 +776,16 @@ fn panel_hit(
         }
         let panel = &app.commander.panels[index];
         let row_count = panel_row_count(app, index);
-        // Entry rows — under the top border, within the inner height.
+        // Entry rows — under the top border, within the inner height. A file-group entry is two
+        // rows tall (its reclaim claim has a line of its own), so the click maps by that height
+        // rather than one row per entry.
+        let rows_per_entry = rows_per_entry(panel.view) as usize;
         let inner_rows = rect.height.saturating_sub(2);
         let entry = pos
             .y
             .checked_sub(rect.y + 1)
             .filter(|row| *row < inner_rows)
-            .map(|row| panel.list.offset() + row as usize)
+            .map(|row| panel.list.offset() + row as usize / rows_per_entry)
             .filter(|entry| *entry < row_count);
         return Some((index, entry));
     }
@@ -1548,6 +1551,16 @@ fn cycle_sort(app: &mut App) {
         }
     }
     app.commander.status = format!("Sort: {}", sort.label());
+}
+
+/// Terminal rows one entry of a panel occupies. Only the file-group list is taller than a row:
+/// its reclaim claim gets a line of its own so the post-purge qualifier cannot be cut off in a
+/// narrow panel.
+fn rows_per_entry(view: PanelView) -> u16 {
+    match view {
+        PanelView::GroupList => crate::tui::screens::browser::GROUP_ROWS,
+        _ => 1,
+    }
 }
 
 /// Length of panel `index`'s navigable list — depends on its mode.

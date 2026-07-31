@@ -532,15 +532,22 @@ pub fn reclaim_phrase(estimate: ReclaimEstimate) -> String {
     }
 }
 
-/// The same figure where a list row has room for three words: `free X` only when X is really
-/// freed, `up to X` when it is a ceiling, and no number when nothing was established.
+/// The same figure for a list row: one clause instead of two, and never one word shorter than
+/// that.
+///
+/// The compact form used to say `free X` and `up to X`. Both were false in the same way: deleting
+/// a duplicate moves it into the quarantine inside the same dataset, so no block is released until
+/// `--purge-quarantine` runs, and a row that says «free» tells the operator the space is already
+/// back. The qualifier is what makes the number true, so it is not the part a narrow column may
+/// drop — the layouts give this string its own line rather than trim it.
 pub fn reclaim_cell(estimate: ReclaimEstimate) -> String {
     match estimate.potential_bytes() {
         None => "rescan required".to_string(),
-        Some(ceiling) if ceiling == estimate.guaranteed_bytes() => {
-            format!("free {}", human_bytes(estimate.guaranteed_bytes()))
-        }
-        Some(ceiling) => format!("up to {}", human_bytes(ceiling)),
+        Some(ceiling) if ceiling == estimate.guaranteed_bytes() => format!(
+            "guaranteed after quarantine purge: {}",
+            human_bytes(estimate.guaranteed_bytes())
+        ),
+        Some(ceiling) => format!("up to {} after quarantine purge", human_bytes(ceiling)),
     }
 }
 
@@ -605,13 +612,32 @@ mod format_tests {
             "rescan required"
         );
 
-        assert_eq!(reclaim_cell(ReclaimEstimate::exact(4096)), "free 4.0 KiB");
+        // The compact form is one clause instead of two, and never one word shorter: «free X» and
+        // «up to X» both told the operator the space was already back, when a purge still stands
+        // between them and it.
+        assert_eq!(
+            reclaim_cell(ReclaimEstimate::exact(4096)),
+            "guaranteed after quarantine purge: 4.0 KiB"
+        );
         assert_eq!(
             reclaim_cell(ReclaimEstimate::upper_bound(4096)),
-            "up to 4.0 KiB",
+            "up to 4.0 KiB after quarantine purge",
             "a ceiling never gets the word «free»"
         );
         assert_eq!(reclaim_cell(ReclaimEstimate::unknown()), "rescan required");
+        for state in [
+            ReclaimEstimate::exact(4096),
+            ReclaimEstimate::upper_bound(4096),
+            ReclaimEstimate::unknown(),
+        ] {
+            let cell = reclaim_cell(state);
+            for forbidden in ["free", "freed", "reclaimed"] {
+                assert!(
+                    !cell.contains(forbidden),
+                    "«{forbidden}» claims blocks were released at apply time: {cell}"
+                );
+            }
+        }
     }
 
     /// A mixed scan headlines its guarantee and states the bigger ceiling apart from it.

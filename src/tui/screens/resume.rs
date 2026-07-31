@@ -76,22 +76,26 @@ pub fn render(frame: &mut Frame, app: &App) {
                 Span::raw(format!("{}   ", session.created_at)),
                 status_span(session),
             ];
-            // For a completed scan — the summary: how much was scanned and what the result is
-            // worth (E2E feedback). Placed before the roots so a long path doesn't crowd out the
-            // numbers. The state-aware short form, so a session row cannot promise more than the
-            // scan's own summary does.
+            // For a completed scan — how much was scanned (E2E feedback), before the roots so a
+            // long path doesn't crowd out the number.
             if session.status.is_completed() {
                 spans.push(Span::styled(
-                    format!(
-                        "   {} files · {}",
-                        session.files_scanned,
-                        crate::tui::reclaim_cell(session.reclaim),
-                    ),
+                    format!("   {} files", session.files_scanned),
                     Style::new().fg(Color::DarkGray),
                 ));
             }
             spans.push(Span::raw(format!("   {roots}")));
-            ListItem::new(Line::from(spans))
+            let mut lines = vec![Line::from(spans)];
+            // What the scan is worth goes on its own line. On an 80-column terminal the id, date,
+            // status, file count and roots already fill the row, and the qualifier that makes the
+            // number true is not the part that may fall off the end.
+            if session.status.is_completed() {
+                lines.push(Line::from(Span::styled(
+                    format!("        {}", crate::tui::reclaim_cell(session.reclaim)),
+                    Style::new().fg(Color::DarkGray),
+                )));
+            }
+            ListItem::new(lines)
         })
         .collect();
 
@@ -115,6 +119,74 @@ pub fn render(frame: &mut Frame, app: &App) {
         &app.status,
         "↑↓ · R/Enter open · Del to trash · t trash · N new · Q quit",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::reclaim::ReclaimEstimate;
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::path::PathBuf;
+
+    fn session(reclaim: ReclaimEstimate) -> ResumeInfo {
+        ResumeInfo {
+            scan_id: 7,
+            created_at: "2026-07-31 10:00:00".to_string(),
+            status: ScanStatus::Complete,
+            roots: vec![PathBuf::from("/tank/data")],
+            files_total: 10,
+            files_hashed: 10,
+            cand_bytes_total: 1000,
+            cand_bytes_hashed: 1000,
+            files_scanned: 100,
+            reclaim,
+            already_linked_sets: None,
+        }
+    }
+
+    /// The saved-scan list is the other consumer of the compact claim, and it is drawn at the
+    /// full terminal width — where the id, date, status, file count and roots already fill an
+    /// 80-column row. The claim gets its own line, so the qualifier reads in full at that width.
+    #[test]
+    fn a_saved_scan_row_states_its_claim_post_purge_at_eighty_columns() {
+        for (state, expected) in [
+            (
+                ReclaimEstimate::exact(4096),
+                "guaranteed after quarantine purge: 4.0 KiB",
+            ),
+            (
+                ReclaimEstimate::upper_bound(4096),
+                "up to 4.0 KiB after quarantine purge",
+            ),
+            (ReclaimEstimate::unknown(), "rescan required"),
+        ] {
+            let (mut app, _events) = crate::app::test_app();
+            app.sessions_loading = false;
+            app.sessions = vec![session(state)];
+            app.session_cursor = 0;
+            let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                rendered.contains(expected),
+                "at 80 columns the claim must read in full: {rendered}"
+            );
+            assert!(
+                !rendered.contains("free"),
+                "nothing is free before the quarantine is purged: {rendered}"
+            );
+            assert!(
+                rendered.contains("/tank/data"),
+                "the roots must survive the extra line: {rendered}"
+            );
+        }
+    }
 }
 
 fn status_text(status: ScanStatus) -> &'static str {

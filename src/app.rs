@@ -1413,13 +1413,25 @@ impl App {
                 self.browser.group_summaries.len(),
             )
         };
-        let real_idx = match crate::tui::screens::browser::visual_to_real_index(
-            start,
-            visual_row as usize,
-            total,
-        ) {
-            Some(idx) => idx,
-            None => return, // click on a separator or outside the list — ignore
+        let real_idx = if want_focus_files {
+            match crate::tui::screens::browser::visual_to_real_index(
+                start,
+                visual_row as usize,
+                total,
+            ) {
+                Some(idx) => idx,
+                None => return, // click on a separator or outside the list — ignore
+            }
+        } else {
+            // The group list draws no separators and gives each group `GROUP_ROWS` rows, so the
+            // click maps by that height. Sharing the separator-aware mapping with the file panel
+            // would land the cursor on a different group than the one under the pointer.
+            let idx =
+                start + visual_row as usize / crate::tui::screens::browser::GROUP_ROWS as usize;
+            if idx >= total {
+                return; // click below the last group — ignore
+            }
+            idx
         };
 
         if want_focus_files {
