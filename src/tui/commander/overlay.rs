@@ -312,11 +312,19 @@ pub fn render_resume_scan(
     }
     if let Some(c) = complete {
         body.push(Line::from(format!(
-            "  Last completed from {} · files {} · frees {}",
-            c.created_at,
-            c.files_scanned,
-            crate::tui::human_bytes(c.reclaimable_bytes),
+            "  Last completed from {} · files {}",
+            c.created_at, c.files_scanned,
         )));
+        // Its own line: a mixed result's statement is two clauses long, and a claim that has to
+        // be readable is not one to leave hanging off the right edge of a fixed-width box.
+        body.push(Line::from(format!(
+            "  {}",
+            crate::tui::reclaim_phrase(c.reclaim)
+        )));
+        // Only when it was actually looked up — a bare «0» would read as an answer.
+        if let Some(sets) = c.already_linked_sets {
+            body.push(Line::from(format!("  already linked sets: {sets}")));
+        }
     }
     body.push(Line::from(""));
     body.push(Line::from(format!(
@@ -336,7 +344,15 @@ pub fn render_resume_scan(
     body.push(Line::from(format!("  {}", opts.join(" · "))));
 
     let height = body.len() as u16 + 2;
-    let area = centered(frame.area(), 74, height);
+    // Wide enough for the longest line it actually holds, never wider than the terminal: the box
+    // used to be a flat 74 columns, which quietly cut a reclaim statement in half.
+    let widest = body
+        .iter()
+        .map(|line| line.width() as u16)
+        .max()
+        .unwrap_or(0);
+    let width = widest.saturating_add(4).max(74).min(frame.area().width);
+    let area = centered(frame.area(), width, height);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(Text::from(body)).block(
@@ -382,7 +398,8 @@ mod resume_tests {
             cand_bytes_total: 1000,
             cand_bytes_hashed: 200,
             files_scanned: 100,
-            reclaimable_bytes: 4096,
+            reclaim: crate::model::reclaim::ReclaimEstimate::exact(4096),
+            already_linked_sets: Some(2),
         }
     }
 
@@ -405,6 +422,44 @@ mod resume_tests {
         let c = info("2026-05-02 10:00:00", ScanStatus::Complete);
         let r = resume_recommendation(None, Some(&c));
         assert!(r.contains("[O]") || r.contains("[N]"));
+    }
+
+    /// The commander's completed-scan summary uses the shared wording, and shows the
+    /// already-linked count that explains a group nobody found.
+    #[test]
+    fn the_completed_scan_line_states_the_reclaim_in_the_shared_words() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let rendered = |reclaim| {
+            let mut complete = info("2026-05-02 10:00:00", ScanStatus::Complete);
+            complete.reclaim = reclaim;
+            let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+            terminal
+                .draw(|frame| super::render_resume_scan(frame, "/x", None, Some(&complete)))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+
+        let exact = rendered(crate::model::reclaim::ReclaimEstimate::exact(4096));
+        assert!(
+            exact.contains("guaranteed after quarantine purge: 4.0 KiB"),
+            "{exact}"
+        );
+        assert!(exact.contains("already linked sets: 2"), "{exact}");
+
+        let bounded = rendered(crate::model::reclaim::ReclaimEstimate::upper_bound(4096));
+        assert!(
+            bounded.contains("up to 4.0 KiB after quarantine purge") && !bounded.contains("frees"),
+            "{bounded}"
+        );
+        let unknown = rendered(crate::model::reclaim::ReclaimEstimate::unknown());
+        assert!(unknown.contains("rescan required"), "{unknown}");
     }
 }
 

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::model::duplicate::DirSigAlgo;
+use crate::model::reclaim::ReclaimEstimate;
 use crate::state::GroupSummary;
 
 /// Quarantine directory name (excluded from scanning).
@@ -312,7 +313,14 @@ pub enum ScanProgress {
 pub struct ScanSummary {
     pub files_scanned: u64,
     pub groups_found: usize,
-    pub total_reclaimable_bytes: u64,
+    /// What the scan's groups are worth, and how far that is trusted. One typed value rather than
+    /// a bare byte count: the same number means «freed» or «at most» depending on whether every
+    /// link of every allocation was inside the scan.
+    pub reclaim: ReclaimEstimate,
+    /// Allocations that already had two or more pathnames in this scan. Informational, and
+    /// independent of hashing — it is what explains a directory of «duplicates» that produced no
+    /// group at all.
+    pub already_linked_sets: u64,
     /// Total volume of hashed files.
     pub bytes_hashed: u64,
     /// Accumulated active scan time, seconds.
@@ -350,9 +358,13 @@ pub struct ResumeInfo {
     pub cand_bytes_total: u64,
     pub cand_bytes_hashed: u64,
     /// The finished scan's result from `scan_stats` — for the session list: how many files
-    /// were scanned and how much space will be reclaimed (for unfinished ones = 0).
+    /// were scanned and what the result is worth (for unfinished ones: nothing established).
     pub files_scanned: u64,
-    pub reclaimable_bytes: u64,
+    pub reclaim: ReclaimEstimate,
+    /// Allocations that already had two or more pathnames in the scan. `None` — not looked up:
+    /// it costs a pass over the manifest, and the session list is a screen that must stay a
+    /// `scan_stats` read. Filled for the one completed scan the resume overlay actually states.
+    pub already_linked_sets: Option<u64>,
 }
 
 /// The environment in which the scan ran — for statistics and comparing runs.
@@ -380,7 +392,10 @@ pub struct ScanStatsRow {
     pub files_scanned: u64,
     pub bytes_hashed: u64,
     pub groups_found: u64,
-    pub reclaimable_bytes: u64,
+    /// What this scan's result is worth, with its trust state — never a bare byte count.
+    pub reclaim: ReclaimEstimate,
+    /// Allocations that already had two or more pathnames in this scan.
+    pub already_linked_sets: u64,
     /// Candidates without a committed hash at the moment of completion. Read in
     /// the `--stats` output (`list_stats` → the session table).
     pub hash_failures: u64,

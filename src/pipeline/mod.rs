@@ -273,10 +273,11 @@ fn run_phases(
         // the groups and write the verified ones the old way (result-identical to the previous behavior).
         if verify {
             tracing::info!("RSS probe: before duplicate_groups (--verify): {}", rss());
-            let mut groups = store.duplicate_groups(scan_id)?;
+            let groups = store.duplicate_groups(scan_id)?;
             // Byte-for-byte comparison — protection against a hash collision; may split groups.
-            groups = verify::verify_groups(groups);
-            crate::model::duplicate::sort_groups_by_benefit(&mut groups);
+            // A split changes which allocations a group holds, so its worth is recomputed from
+            // the surviving membership inside `record_file_results` — never carried over.
+            let groups = verify::verify_groups(groups);
             tracing::info!(
                 "RSS probe: after verify ({} groups): {}",
                 groups.len(),
@@ -310,12 +311,15 @@ fn run_phases(
     let summaries = store.group_summaries(scan_id)?;
     tracing::info!("RSS probe: grouping phase end: {}", rss());
 
-    // The summary statistics — from the light summaries: groups_found/reclaim no longer
-    // require the full Vec<DuplicateGroup> in RAM. Equivalent in value to before.
+    // The summary statistics — from the light summaries: groups_found no longer requires the full
+    // Vec<DuplicateGroup> in RAM. The reclaim total is READ from where it was published rather
+    // than re-summed here: publishing wrote the rows and the total together, and a second sum in
+    // a different place is a second answer waiting to disagree.
     let summary = ScanSummary {
         files_scanned: store.manifest_count(scan_id)?,
         groups_found: summaries.len(),
-        total_reclaimable_bytes: summaries.iter().map(|s| s.reclaim_bytes).sum(),
+        reclaim: store.scan_reclaim(scan_id)?,
+        already_linked_sets: store.already_linked_sets(scan_id)?,
         bytes_hashed: recon.hashed_bytes,
         elapsed_seconds: 0.0,
         // Candidates that stayed without a hash at completion time (reconciliation above).

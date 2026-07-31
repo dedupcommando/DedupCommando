@@ -12,7 +12,9 @@ use crate::model::duplicate::{
     build_dir_signatures_streaming, hex_encode, signature_of, DirGroup, DirSigAlgo, DuplicateGroup,
     FileEntry,
 };
-use crate::model::reclaim::{DestructivePlanVerdict, LinkCount, ReclaimState};
+use crate::model::reclaim::{
+    DestructivePlanVerdict, GroupReclaim, LinkCount, ReclaimEstimate, ReclaimState,
+};
 use crate::model::scan::{
     ResumeInfo, ScanConfig, ScanEnvironment, ScanStatsRow, ScanStatus, ScanSummary,
 };
@@ -101,11 +103,40 @@ pub struct GroupSummary {
     pub rank: i64,
     /// hex hash of the group.
     pub hash: String,
+    /// Pathnames in the group — what the operator sees, never a link count.
     pub file_count: u64,
     /// Size of a single file in the group.
     pub size_bytes: u64,
-    /// Reclaimable = size·(n−1) (independent of the keeper).
-    pub reclaim_bytes: u64,
+    /// Distinct physical allocations behind `file_count` pathnames. `0` = a migrated pre-v3 row.
+    pub object_count: u64,
+    /// What the group is worth and how far that is trusted. Reclaim is a property of the
+    /// allocations, so it never follows from `file_count`.
+    pub reclaim: ReclaimEstimate,
+}
+
+/// What a materialized group says about itself, for the views that show one group at a time.
+///
+/// Read from the group's own row plus a lookup over its manifest rows — never recomputed from the
+/// files currently on screen, because the browser pages a large group and a page is not the group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupClaim {
+    /// What the group is worth, and how far that is trusted.
+    pub reclaim: ReclaimEstimate,
+    /// Pathnames seen against links reported — the evidence behind the state.
+    pub links: GroupLinks,
+}
+
+/// How many of an allocation's links a group actually observed.
+///
+/// The pair only makes sense together: `observed` counts pathnames this scan holds, `total` counts
+/// the links the inodes report. Equal means the group is self-contained; `total` larger means
+/// something outside the scan still holds those bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupLinks {
+    /// Pathnames of the group.
+    pub observed: u64,
+    /// One validated link count per distinct allocation, summed.
+    pub total: LinkCount,
 }
 
 /// A lightweight twin-directory group summary — for
@@ -235,11 +266,10 @@ pub(crate) fn seed_marked_group(db: &Path) -> i64 {
     let mark = |path: &str, keeper: bool, action: Option<ActionKind>| FileEntry {
         path: PathBuf::from(path),
         size: 10,
-        mtime: 0,
         device: 1,
-        inode: 0,
         is_keeper: keeper,
         action,
+        ..Default::default()
     };
     store
         .save_marks(
@@ -327,6 +357,65 @@ fn candidate_stats_sql() -> String {
              COALESCE(SUM(objects.hashed_paths), 0),
              COALESCE(SUM(CASE WHEN objects.hashed_paths > 0 THEN objects.size ELSE 0 END), 0)
            FROM objects JOIN eligible ON eligible.size = objects.size"
+    )
+}
+
+/// One row per (digest, physical object): how many of the object's pathnames carry that digest,
+/// and the link-count evidence for the object as a whole.
+///
+/// This is the relation every result number comes off — group membership, pathname count, object
+/// count, link totals and state all read the same grouping, so no two of them can disagree. The
+/// object key is the complete temporal identity, spelled by `OBJECT_KEY` and never concatenated.
+///
+/// `observed` counts the object's pathnames *inside the group*, not inside the scan. That is the
+/// conservative reading and the correct one: a pathname whose digest never landed is not a
+/// pathname the result can act on, so counting it as observed would let a group promise to free an
+/// allocation while one of its links stays behind.
+fn group_objects_sql() -> String {
+    format!(
+        "SELECT hash AS digest, {OBJECT_KEY},
+                COUNT(*)                AS observed,
+                MIN(nlink)              AS nlink,
+                COUNT(DISTINCT nlink)   AS nlink_distinct,
+                MIN(typeof(nlink))      AS nlink_min_class,
+                MAX(typeof(nlink))      AS nlink_max_class,
+                MIN(path)               AS named
+           FROM file
+          WHERE scan_id = ?1 AND hash IS NOT NULL
+          GROUP BY hash, {OBJECT_KEY}"
+    )
+}
+
+/// The duplicate-content groups of a scan, off the object relation above.
+///
+/// `HAVING COUNT(*) >= 2` counts OBJECTS, not pathnames: a set of aliases is one allocation and
+/// therefore not a duplicate of anything. Membership, the ceiling and the state are decided here,
+/// once, and both the preflight and the materialization read this same definition so they cannot
+/// drift apart.
+///
+/// The state expression is the checkpoint's rule in SQL: one unrecorded link count makes the group
+/// unknown, one partially observed allocation makes it an upper bound, and only an all-observed
+/// group is exact. It may read `nlink` as a number because `refuse_untrustworthy_group_objects`
+/// has already refused, in this same transaction, every row whose storage class or value would
+/// make that comparison meaningless.
+fn group_rows_sql() -> String {
+    format!(
+        "WITH objects AS MATERIALIZED ({objects}),
+              groups AS (
+                  SELECT digest,
+                         SUM(observed)              AS file_count,
+                         MIN(size)                  AS size,
+                         COUNT(*)                   AS object_count,
+                         MIN(size) * (COUNT(*) - 1) AS ceiling,
+                         CASE WHEN MIN(CASE WHEN nlink > 0 THEN 1 ELSE 0 END) = 0 THEN 0
+                              WHEN MAX(CASE WHEN observed < nlink THEN 1 ELSE 0 END) = 1 THEN 2
+                              ELSE 1
+                         END                        AS state
+                    FROM objects
+                   GROUP BY digest
+                  HAVING COUNT(*) >= 2
+              )",
+        objects = group_objects_sql()
     )
 }
 
@@ -442,6 +531,119 @@ impl GroupedLinkCount {
         // alias of this object holds — including a non-integer class the whole group shares.
         link_count_from_sql(&self.value)
     }
+}
+
+/// Refuses to publish results whose allocations cannot be measured, before a single row is
+/// written.
+///
+/// Everything the group SQL later treats as a number is checked here first, in one set-based
+/// statement over the same relation the materialization uses: the storage class of every link
+/// count, whether an allocation's pathnames agree about it, whether it is a possible count at all,
+/// whether a group claims more pathnames of an allocation than its inode has links, and whether
+/// the ceiling stays inside the persisted integer domain. SQLite answers an overflowing `*` with a
+/// `REAL`, so `typeof(ceiling)` is the overflow test.
+///
+/// The `LIMIT 1` is safe in a way C3a's was not: the `WHERE` selects only rows that are already
+/// wrong, so any of them is a truthful report, and the deterministic order makes the message the
+/// same on every run. Called inside the publishing transaction, so a refusal rolls back the whole
+/// result rather than leaving part of it trusted.
+fn refuse_untrustworthy_group_objects(conn: &Connection, scan_id: i64) -> Result<()> {
+    use rusqlite::OptionalExtension;
+
+    type Offender = (String, i64, Value, i64, String, String, Value, i64);
+    let offender: Option<Offender> = conn
+        .query_row(
+            &format!(
+                "{groups}
+                 SELECT objects.named, objects.observed, objects.nlink, objects.nlink_distinct,
+                        objects.nlink_min_class, objects.nlink_max_class,
+                        groups.size, groups.object_count
+                   FROM objects JOIN groups ON groups.digest = objects.digest
+                  WHERE objects.nlink_min_class <> objects.nlink_max_class
+                     OR objects.nlink_distinct > 1
+                     OR typeof(objects.nlink) <> 'integer'
+                     OR objects.nlink < 0
+                     OR (objects.nlink > 0 AND objects.observed > objects.nlink)
+                     OR typeof(groups.size) <> 'integer'
+                     OR typeof(groups.ceiling) <> 'integer'
+                  ORDER BY objects.named
+                  LIMIT 1",
+                groups = group_rows_sql()
+            ),
+            params![scan_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((named, observed, nlink, distinct, min_class, max_class, size, object_count)) =
+        offender
+    else {
+        return Ok(());
+    };
+
+    // The message comes from whichever gate the row actually fails, so the operator reads the same
+    // wording here as anywhere else that decodes these columns.
+    let path = PathBuf::from(&named);
+    let sanitized = crate::textsan::terminal(&path.display().to_string());
+    let links = GroupedLinkCount {
+        value: nlink,
+        distinct,
+        min_class,
+        max_class,
+    }
+    .decode(&path)?;
+    let size = size_from_sql(&size, &sanitized)?;
+    ReclaimEstimate::for_objects(
+        size,
+        &[crate::model::reclaim::ObjectLinks {
+            observed: observed as u64,
+            links,
+        }],
+        &sanitized,
+    )?;
+    ReclaimEstimate::object_ceiling(size, object_count as u64)?;
+    Err(AppError::msg(format!(
+        "the reclaim of the group behind {sanitized} cannot be established. Rescan, or move the old dedcom.db aside."
+    )))
+}
+
+/// Recomputes the scan's totals from the group rows just written, and stores them beside their
+/// state.
+///
+/// Reads the rows rather than the objects, and folds them with `ReclaimEstimate::for_fresh_scan` —
+/// the one implementation of «what a set of groups is worth». The two publishing paths write
+/// identical rows, so folding them through the same function is what makes their scan totals
+/// identical too. The rows are read into a vector of three-field values first — on the largest
+/// /tank result that is tens of megabytes for the length of one statement, against a second
+/// implementation of the fold living in SQL where nothing could compare the two.
+fn record_scan_reclaim(tx: &Connection, scan_id: i64) -> Result<()> {
+    let mut stmt =
+        tx.prepare("SELECT reclaim, reclaim_state FROM file_group WHERE scan_id = ?1")?;
+    let mut rows = stmt.query(params![scan_id])?;
+    let mut groups = Vec::new();
+    while let Some(row) = rows.next()? {
+        groups.push(ReclaimEstimate::from_persisted(row.get(0)?, row.get(1)?)?);
+    }
+    let total = ReclaimEstimate::for_fresh_scan(groups)?;
+    tx.execute(
+        "UPDATE scan_stats SET reclaimable_bytes = ?2, reclaim_state = ?3 WHERE scan_id = ?1",
+        params![
+            scan_id,
+            total.persisted_bytes() as i64,
+            total.state().as_i64()
+        ],
+    )?;
+    Ok(())
 }
 
 /// Runs the one set-based propagation statement on an open transaction and returns the rows it
@@ -564,7 +766,8 @@ impl ScanStore {
                 cand_bytes_total: stats.total_bytes,
                 cand_bytes_hashed: stats.hashed_bytes,
                 files_scanned: 0,
-                reclaimable_bytes: 0,
+                reclaim: ReclaimEstimate::unknown(),
+                already_linked_sets: None,
             }));
         }
         Ok(None)
@@ -586,8 +789,24 @@ impl ScanStore {
     /// dozens of scans) that is exactly the F12/F2 freeze. COALESCE: old scans without the progress
     /// columns yield 0 (they migrate up on open — see load_or_materialize).
     fn scans_filtered(&self, active: bool) -> Result<Vec<ResumeInfo>> {
-        type Raw = (i64, String, String, String, i64, i64, i64, i64, i64, i64);
+        type Raw = (
+            i64,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        );
         let raw: Vec<Raw> = {
+            // The guaranteed sum joins in as ONE aggregation over `file_group` for every listed
+            // scan at once, not one query per row: `file_group` holds a row per group, and the
+            // session list is exactly where a per-scan query used to be the freeze.
             let mut stmt = self.conn.prepare(
                 "SELECT s.id, s.created_at, s.status, s.config_json,
                         COALESCE(st.cand_files_total, 0),
@@ -595,9 +814,13 @@ impl ScanStore {
                         COALESCE(st.cand_bytes_total, 0),
                         COALESCE(st.cand_bytes_hashed, 0),
                         COALESCE(st.files_scanned, 0),
-                        COALESCE(st.reclaimable_bytes, 0)
+                        COALESCE(st.reclaimable_bytes, 0),
+                        COALESCE(st.reclaim_state, 0),
+                        COALESCE(g.guaranteed, 0)
                  FROM scan s
                  LEFT JOIN scan_stats st ON st.scan_id = s.id
+                 LEFT JOIN (SELECT scan_id, SUM(reclaim) AS guaranteed FROM file_group
+                             WHERE reclaim_state = 1 GROUP BY scan_id) g ON g.scan_id = s.id
                  WHERE COALESCE(s.trashed, 0) = ?1
                  ORDER BY s.id DESC",
             )?;
@@ -615,6 +838,8 @@ impl ScanStore {
                     row.get::<_, i64>(7)?,
                     row.get::<_, i64>(8)?,
                     row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
                 ))
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -632,6 +857,8 @@ impl ScanStore {
             cb_hashed,
             fscanned,
             reclaim,
+            reclaim_state,
+            guaranteed,
         ) in raw
         {
             let Some(status) = ScanStatus::parse(&status_text) else {
@@ -666,7 +893,8 @@ impl ScanStore {
                 cand_bytes_total,
                 cand_bytes_hashed,
                 files_scanned: fscanned as u64,
-                reclaimable_bytes: reclaim as u64,
+                reclaim: ReclaimEstimate::from_persisted_scan(guaranteed, reclaim, reclaim_state)?,
+                already_linked_sets: None,
             });
         }
         Ok(scans)
@@ -695,6 +923,12 @@ impl ScanStore {
             if unfinished.is_some() && complete.is_some() {
                 break;
             }
+        }
+        // Only the completed one states an already-linked count, and only here: this probe runs in
+        // the background precisely so a manifest aggregation does not sit on the render path. The
+        // session list above keeps its `None` and stays a `scan_stats` read.
+        if let Some(info) = complete.as_mut() {
+            info.already_linked_sets = self.already_linked_sets(info.scan_id).ok();
         }
         Ok((unfinished, complete))
     }
@@ -828,8 +1062,7 @@ impl ScanStore {
     /// without recomputation (read in `spawn_open_completed`).
     pub fn scan_summary(&self, scan_id: i64) -> Result<ScanSummary> {
         let summary = self.conn.query_row(
-            "SELECT files_scanned, bytes_hashed, groups_found, reclaimable_bytes, elapsed_seconds,
-                    hash_failures
+            "SELECT files_scanned, bytes_hashed, groups_found, elapsed_seconds, hash_failures
              FROM scan_stats WHERE scan_id = ?1",
             params![scan_id],
             |row| {
@@ -837,13 +1070,18 @@ impl ScanStore {
                     files_scanned: row.get::<_, i64>(0)? as u64,
                     bytes_hashed: row.get::<_, i64>(1)? as u64,
                     groups_found: row.get::<_, i64>(2)? as usize,
-                    total_reclaimable_bytes: row.get::<_, i64>(3)? as u64,
-                    elapsed_seconds: row.get::<_, f64>(4)?,
-                    hash_failures: row.get::<_, i64>(5)? as u64,
+                    elapsed_seconds: row.get::<_, f64>(3)?,
+                    hash_failures: row.get::<_, i64>(4)? as u64,
+                    // Filled below: both are decoded, and decoding can fail.
+                    ..Default::default()
                 })
             },
         )?;
-        Ok(summary)
+        Ok(ScanSummary {
+            reclaim: self.scan_reclaim(scan_id)?,
+            already_linked_sets: self.already_linked_sets(scan_id)?,
+            ..summary
+        })
     }
 
     /// Changes the scan status.
@@ -895,16 +1133,40 @@ impl ScanStore {
         Ok(())
     }
 
-    /// Materializes a LIGHTWEIGHT `file_group` summary of file groups (`rank` = the «by
-    /// benefit» order of the already-sorted `groups` passed in). Opening a finished
-    /// scan reads the summaries from here, and group members — from the `file` manifest by hash
-    /// (`group_files`). Overwrites the scan's previous rows (idempotent).
-    /// `reclaim = size·(n−1)` is independent of the keeper.
+    /// Materializes a LIGHTWEIGHT `file_group` summary from groups held in RAM — the `--verify`
+    /// path, where byte-for-byte comparison may have split a group and only the caller knows the
+    /// final membership. Opening a finished scan reads the summaries from here, and group members
+    /// — from the `file` manifest by hash (`group_files`). Overwrites the scan's previous rows
+    /// (idempotent).
+    ///
+    /// Ordering happens here rather than at the call site, so the one place that knows each
+    /// group's guaranteed and potential bytes is also the place that ranks them. A caller cannot
+    /// hand in an order derived from anything else.
     ///
     /// `file_dedup` (membership) IS NO LONGER WRITTEN — `file` already stores
     /// path/size/mtime/device/inode, there is no point duplicating them (scan.db does not bloat).
     /// The table is kept defined for compatibility; we clean up legacy rows.
     pub fn record_file_results(&mut self, scan_id: i64, groups: &[DuplicateGroup]) -> Result<()> {
+        // Every figure first, before anything is written: an allocation nobody can measure has to
+        // stop the whole result, not half of it. Groups of fewer than two allocations are not
+        // duplicates of anything and never reach a row — the same rule the SQL path applies with
+        // `HAVING COUNT(*) >= 2`.
+        let mut rows: Vec<(&DuplicateGroup, GroupReclaim)> = Vec::with_capacity(groups.len());
+        for group in groups {
+            let reclaim = group.physical_reclaim()?;
+            if reclaim.object_count >= 2 {
+                rows.push((group, reclaim));
+            }
+        }
+        rows.sort_by(|(left, left_reclaim), (right, right_reclaim)| {
+            let (left_guaranteed, left_ceiling) = left_reclaim.estimate.order_key();
+            let (right_guaranteed, right_ceiling) = right_reclaim.estimate.order_key();
+            right_guaranteed
+                .cmp(&left_guaranteed)
+                .then(right_ceiling.cmp(&left_ceiling))
+                .then(left.hash.cmp(&right.hash))
+        });
+
         let tx = self.conn.transaction()?;
         tx.execute(
             "DELETE FROM file_group WHERE scan_id = ?1",
@@ -916,23 +1178,29 @@ impl ScanStore {
         )?;
         {
             let mut ins_group = tx.prepare(
-                "INSERT INTO file_group(scan_id, rank, hash, file_count, size, reclaim)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO file_group(scan_id, rank, hash, file_count, size, reclaim,
+                                        object_count, reclaim_state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
-            for (rank, group) in groups.iter().enumerate() {
+            for (rank, (group, reclaim)) in rows.iter().enumerate() {
                 ins_group.execute(params![
                     scan_id,
                     rank as i64,
                     group.hash,
-                    group.files.len() as i64,
+                    reclaim.observed_paths as i64,
                     group.size_bytes as i64,
-                    group.reclaimable_bytes() as i64,
+                    reclaim.estimate.persisted_bytes() as i64,
+                    reclaim.object_count as i64,
+                    reclaim.estimate.state().as_i64(),
                 ])?;
             }
         }
         // In the SAME transaction as the rows: a crash must never leave results without their
-        // marker. Written even for an empty `groups` — with --verify that means every candidate
-        // group was rejected, and the empty result is final, not re-derivable from raw hashes.
+        // totals or their marker, and an operator must never meet a scan whose headline was
+        // written by one result and whose groups came from another. Written even for an empty
+        // `groups` — with --verify that means every candidate group was rejected, and the empty
+        // result is final, not re-derivable from raw hashes.
+        record_scan_reclaim(&tx, scan_id)?;
         mark_prepared(&tx, scan_id)?;
         tx.commit()?;
         Ok(())
@@ -940,16 +1208,20 @@ impl ScanStore {
 
     /// Materializes LIGHTWEIGHT `file_group` summaries via SQL aggregation — without loading
     /// `Vec<DuplicateGroup>` into RAM (on the 2.2M /tank it cuts the transient peak of the
-    /// grouping phase). Result-identical to `record_file_results(&duplicate_groups)` on the path
-    /// WITHOUT `--verify`: the same rank/hash/file_count/size/reclaim.
+    /// grouping phase). Result-identical to `record_file_results(&duplicate_groups)`: the same
+    /// membership, pathname count, object count, state, guaranteed and potential bytes, and the
+    /// same rank.
     ///
-    /// The rank order is critical: the old path = a STABLE `reclaim DESC` sort on top of
-    /// groups in `hash ASC` order (from `duplicate_groups` `ORDER BY f.hash`) → the window
-    /// `ORDER BY reclaim DESC, hash ASC`, 0-based `ROW_NUMBER`. `hex_encode` = lower
-    /// case → `lower(hex(hash))` (string order == BLOB order). `MIN(size)` — within
-    /// a group the size is single (identical content). NOT the write path (apply/revalidate).
+    /// The rank order is the checkpoint's total key — guaranteed bytes first, the trusted ceiling
+    /// as the tiebreak, the hash last — expressed once as a window function here and once as a
+    /// comparator in `record_file_results`. A hash is unique within a scan, so the key is total
+    /// and the two paths cannot disagree about a tie. `hex_encode` = lower case →
+    /// `lower(hex(hash))` (string order == BLOB order). `MIN(size)` — within a group the size is
+    /// single (identical content). NOT the write path (apply/revalidate).
     pub fn materialize_file_groups(&mut self, scan_id: i64) -> Result<()> {
         let tx = self.conn.transaction()?;
+        // Before any row: nothing about this scan's allocations may be in doubt.
+        refuse_untrustworthy_group_objects(&tx, scan_id)?;
         tx.execute(
             "DELETE FROM file_group WHERE scan_id = ?1",
             params![scan_id],
@@ -959,25 +1231,27 @@ impl ScanStore {
             params![scan_id],
         )?;
         tx.execute(
-            "INSERT INTO file_group(scan_id, rank, hash, file_count, size, reclaim)
-             SELECT ?1,
-                    ROW_NUMBER() OVER (ORDER BY reclaim DESC, hash ASC) - 1,
-                    hash, file_count, size, reclaim
-             FROM (
-                 SELECT lower(hex(hash))          AS hash,
-                        COUNT(*)                  AS file_count,
-                        MIN(size)                 AS size,
-                        MIN(size) * (COUNT(*) - 1) AS reclaim
-                 FROM file
-                 WHERE scan_id = ?1 AND hash IS NOT NULL
-                 GROUP BY hash
-                 HAVING COUNT(*) >= 2
-             )",
+            &format!(
+                "{groups}
+                 INSERT INTO file_group(scan_id, rank, hash, file_count, size, reclaim,
+                                        object_count, reclaim_state)
+                 SELECT ?1,
+                        ROW_NUMBER() OVER (ORDER BY guaranteed DESC, reclaim DESC, hash ASC) - 1,
+                        hash, file_count, size, reclaim, object_count, state
+                   FROM (
+                       SELECT lower(hex(digest)) AS hash, file_count, size, object_count, state,
+                              CASE WHEN state = 1 THEN ceiling ELSE 0 END AS guaranteed,
+                              CASE WHEN state = 0 THEN 0 ELSE ceiling END AS reclaim
+                         FROM groups
+                   )",
+                groups = group_rows_sql()
+            ),
             params![scan_id],
         )?;
         // Same transaction as the rows (see record_file_results). Written even when the
         // aggregation produced nothing: «this scan has no duplicates» is a final answer, not a
         // reason to aggregate the manifest again on the next open.
+        record_scan_reclaim(&tx, scan_id)?;
         mark_prepared(&tx, scan_id)?;
         tx.commit()?;
         Ok(())
@@ -1008,6 +1282,125 @@ impl ScanStore {
             |row| row.get(0),
         )?;
         ReclaimState::from_i64(raw)
+    }
+
+    /// The scan's reclaim total: what its exact groups guarantee, the trusted ceiling beside it,
+    /// and the state that says which of the two may be spoken aloud.
+    ///
+    /// The guaranteed sum is derived from the group rows rather than persisted, because v3 has one
+    /// byte column per scan and the ceiling is the one that has to survive in it. Summing the
+    /// exact groups is a read of the same table the browser already loads whole.
+    pub fn scan_reclaim(&self, scan_id: i64) -> Result<ReclaimEstimate> {
+        let guaranteed: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(reclaim), 0) FROM file_group
+              WHERE scan_id = ?1 AND reclaim_state = ?2",
+            params![scan_id, ReclaimState::Exact.as_i64()],
+            |row| row.get(0),
+        )?;
+        let (ceiling, state): (i64, i64) = self.conn.query_row(
+            "SELECT COALESCE(MAX(reclaimable_bytes), 0), COALESCE(MAX(reclaim_state), 0)
+               FROM scan_stats WHERE scan_id = ?1",
+            params![scan_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        ReclaimEstimate::from_persisted_scan(guaranteed, ceiling, state)
+    }
+
+    /// How many scan-local allocations already have two or more pathnames inside this scan.
+    ///
+    /// Informational, and deliberately independent of hashing: a set of aliases of a size nothing
+    /// else shares is never hashed and never becomes a duplicate-content group, but it is exactly
+    /// what an operator is looking for when a directory of «duplicates» produced no group at all.
+    /// Counted from the manifest, never from synthetic rows — a link this scan never saw is not a
+    /// pathname and is not counted here.
+    pub fn already_linked_sets(&self, scan_id: i64) -> Result<u64> {
+        let count: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM (
+                     SELECT 1 FROM file WHERE scan_id = ?1
+                      GROUP BY {OBJECT_KEY} HAVING COUNT(*) >= 2)"
+            ),
+            params![scan_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// The same count for every scan at once — one pass over the manifest instead of one pass per
+    /// scan, for the `--stats` table and the session list.
+    pub fn already_linked_sets_by_scan(&self) -> Result<HashMap<i64, u64>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT scan_id, COUNT(*) FROM (
+                 SELECT scan_id FROM file GROUP BY scan_id, {OBJECT_KEY} HAVING COUNT(*) >= 2)
+              GROUP BY scan_id"
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as u64))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (scan_id, count) = row?;
+            out.insert(scan_id, count);
+        }
+        Ok(out)
+    }
+
+    /// How many of a group's allocations' links the scan actually observed.
+    ///
+    /// A point lookup for the one group on screen, not a column: the pathname count is persisted,
+    /// the link total is not, and re-deriving it for every row of a 645k-group list would put the
+    /// manifest aggregation back into every open. One validated count per allocation — summing
+    /// `nlink` once per pathname would multiply an alias set's links by its own size.
+    pub fn group_links(&self, scan_id: i64, hash_hex: &str) -> Result<GroupLinks> {
+        let Some(blob) = hex_decode(hash_hex) else {
+            return Ok(GroupLinks {
+                observed: 0,
+                total: LinkCount::Unknown,
+            });
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT COUNT(*), MIN(nlink), COUNT(DISTINCT nlink),
+                    MIN(typeof(nlink)), MAX(typeof(nlink)), MIN(path)
+               FROM file WHERE scan_id = ?1 AND hash = ?2
+              GROUP BY {OBJECT_KEY}"
+        ))?;
+        let rows = stmt.query_map(params![scan_id, blob], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                GroupedLinkCount {
+                    value: row.get::<_, Value>(1)?,
+                    distinct: row.get::<_, i64>(2)?,
+                    min_class: row.get::<_, String>(3)?,
+                    max_class: row.get::<_, String>(4)?,
+                },
+                PathBuf::from(row.get::<_, String>(5)?),
+            ))
+        })?;
+        let (mut observed, mut total) = (0u64, Some(0u64));
+        for row in rows {
+            let (paths, evidence, representative) = row?;
+            observed += paths as u64;
+            total = match (total, evidence.decode(&representative)?) {
+                (Some(sum), LinkCount::Known(links)) => sum.checked_add(links),
+                _ => None,
+            };
+        }
+        Ok(GroupLinks {
+            observed,
+            total: total.map_or(LinkCount::Unknown, LinkCount::from_u64),
+        })
+    }
+
+    /// Everything a single-group view needs to state its claim honestly: the persisted figure and
+    /// the link evidence behind it. `None` — this digest has no materialized group.
+    pub fn group_claim(&self, scan_id: i64, hash_hex: &str) -> Result<Option<GroupClaim>> {
+        let Some(summary) = self.group_summary_for_hash(scan_id, hash_hex)? else {
+            return Ok(None);
+        };
+        Ok(Some(GroupClaim {
+            reclaim: summary.reclaim,
+            links: self.group_links(scan_id, hash_hex)?,
+        }))
     }
 
     /// Whether every manifest row of the scan carries a real link count. One unrecorded count is
@@ -1399,44 +1792,91 @@ impl ScanStore {
         Ok(out)
     }
 
-    /// Assembles duplicate groups: files with a common hash occurring ≥ 2 times.
+    /// Assembles duplicate-content groups: files whose digest is shared by at least two DISTINCT
+    /// physical allocations.
+    ///
+    /// Two pathnames of one inode are one copy, so an alias set — however many pathnames it holds
+    /// — is not a group here, exactly as it is not one in `materialize_file_groups`. Every
+    /// pathname of a qualifying group is returned; nothing is collapsed.
+    ///
+    /// Returned in `hash ASC` order with `id` following it. Rank by payoff belongs to the one
+    /// place that computes payoff (`record_file_results`), so this reader has no benefit order to
+    /// get wrong.
     pub fn duplicate_groups(&self, scan_id: i64) -> Result<Vec<DuplicateGroup>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT f.path, f.size, f.mtime, f.device, f.inode, f.hash,
-                    m.is_keeper, m.action
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT f.path, f.size, f.mtime, f.mtime_nsec, f.ctime_sec, f.ctime_nsec,
+                    f.device, f.inode, f.nlink, f.hash, m.is_keeper, m.action
              FROM file f
              LEFT JOIN file_mark m ON m.scan_id = f.scan_id AND m.path = f.path
              WHERE f.scan_id = ?1 AND f.hash IS NOT NULL
                AND f.hash IN (
-                   SELECT hash FROM file WHERE scan_id = ?1 AND hash IS NOT NULL
-                   GROUP BY hash HAVING COUNT(*) >= 2
+                   SELECT digest FROM ({objects}) GROUP BY digest HAVING COUNT(*) >= 2
                )
              ORDER BY f.hash, f.path",
-        )?;
+            objects = group_objects_sql()
+        ))?;
 
+        type Row = (
+            PathBuf,
+            u64,
+            i64,
+            i64,
+            i64,
+            i64,
+            u64,
+            u64,
+            Value,
+            Vec<u8>,
+            Option<i64>,
+            Option<String>,
+        );
         let rows = stmt.query_map(params![scan_id], |row| {
-            Ok((
+            let assembled: Row = (
                 PathBuf::from(row.get::<_, String>(0)?),
                 row.get::<_, i64>(1)? as u64,
                 row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)? as u64,
-                row.get::<_, i64>(4)? as u64,
-                row.get::<_, Vec<u8>>(5)?,
-                row.get::<_, Option<i64>>(6)?,
-                row.get::<_, Option<String>>(7)?,
-            ))
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)? as u64,
+                row.get::<_, i64>(7)? as u64,
+                row.get::<_, Value>(8)?,
+                row.get::<_, Vec<u8>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+            );
+            Ok(assembled)
         })?;
 
         let mut groups: Vec<DuplicateGroup> = Vec::new();
         for row in rows {
-            let (path, size, mtime, device, inode, hash_bytes, is_keeper, action) = row?;
+            let (
+                path,
+                size,
+                mtime,
+                mtime_nsec,
+                ctime_sec,
+                ctime_nsec,
+                device,
+                inode,
+                nlink,
+                hash_bytes,
+                is_keeper,
+                action,
+            ) = row?;
             let hash = hex_encode(&hash_bytes);
             let entry = FileEntry {
                 path,
                 size,
                 mtime,
+                mtime_nsec,
+                ctime_sec,
+                ctime_nsec,
                 device,
                 inode,
+                // Through the one checked gate: a link count of a class this column should never
+                // hold is corruption, and turning it into a byte figure is how it would spread.
+                nlink: link_count_from_sql(&nlink)?.to_u64(),
                 is_keeper: is_keeper.unwrap_or(0) != 0,
                 action: action.as_deref().and_then(ActionKind::parse),
             };
@@ -1454,7 +1894,6 @@ impl ScanStore {
                 });
             }
         }
-        crate::model::duplicate::sort_groups_by_benefit(&mut groups);
         Ok(groups)
     }
 
@@ -1727,18 +2166,22 @@ impl ScanStore {
     }
 
     /// Records the final metrics of a completed scan.
+    ///
+    /// `reclaimable_bytes` and `reclaim_state` are deliberately NOT written here. They are
+    /// published with the group rows that justify them, in one transaction (`record_scan_reclaim`);
+    /// a second writer working from a summary carried through the pipeline is exactly how a
+    /// headline drifts away from the rows underneath it.
     pub fn record_scan_result(&self, scan_id: i64, summary: &ScanSummary) -> Result<()> {
         self.conn.execute(
             "UPDATE scan_stats
                 SET files_scanned = ?2, bytes_hashed = ?3,
-                    groups_found = ?4, reclaimable_bytes = ?5, hash_failures = ?6
+                    groups_found = ?4, hash_failures = ?5
               WHERE scan_id = ?1",
             params![
                 scan_id,
                 summary.files_scanned as i64,
                 summary.bytes_hashed as i64,
                 summary.groups_found as i64,
-                summary.total_reclaimable_bytes as i64,
                 summary.hash_failures as i64,
             ],
         )?;
@@ -1761,15 +2204,24 @@ impl ScanStore {
             i64,
             i64,
             i64,
+            i64,
+            i64,
         );
+        // Both aggregations are joined in once for the whole table rather than run per row: the
+        // report lists every scan there is, and a per-scan pass over the manifest would make
+        // `--stats` cost a full sweep for each of them.
+        let already_linked = self.already_linked_sets_by_scan()?;
         let raw: Vec<Raw> = {
             let mut stmt = self.conn.prepare(
                 "SELECT s.id, s.created_at, s.status, s.config_json,
                         st.elapsed_seconds, st.storage_type, st.pool_layout, st.zfs_version,
                         st.files_scanned, st.bytes_hashed, st.groups_found, st.reclaimable_bytes,
-                        st.hash_failures
+                        st.hash_failures, COALESCE(st.reclaim_state, 0),
+                        COALESCE(g.guaranteed, 0)
                    FROM scan s
                    JOIN scan_stats st ON st.scan_id = s.id
+                   LEFT JOIN (SELECT scan_id, SUM(reclaim) AS guaranteed FROM file_group
+                               WHERE reclaim_state = 1 GROUP BY scan_id) g ON g.scan_id = s.id
                   ORDER BY s.id DESC",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -1787,6 +2239,8 @@ impl ScanStore {
                     row.get::<_, i64>(10)?,
                     row.get::<_, i64>(11)?,
                     row.get::<_, i64>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, i64>(14)?,
                 ))
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -1807,6 +2261,8 @@ impl ScanStore {
             groups,
             reclaimable,
             hash_failures,
+            reclaim_state,
+            guaranteed,
         ) in raw
         {
             let config: ScanConfig = serde_json::from_str(&config_json)?;
@@ -1822,7 +2278,12 @@ impl ScanStore {
                 files_scanned: files as u64,
                 bytes_hashed: bytes as u64,
                 groups_found: groups as u64,
-                reclaimable_bytes: reclaimable as u64,
+                reclaim: ReclaimEstimate::from_persisted_scan(
+                    guaranteed,
+                    reclaimable,
+                    reclaim_state,
+                )?,
+                already_linked_sets: already_linked.get(&id).copied().unwrap_or(0),
                 hash_failures: hash_failures as u64,
             });
         }
@@ -1970,27 +2431,14 @@ impl ScanStore {
         let Some(blob) = hex_decode(hash_hex) else {
             return Ok(Vec::new());
         };
-        let mut stmt = self.conn.prepare(
-            "SELECT f.path, f.size, f.mtime, f.device, f.inode, m.is_keeper, m.action
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {GROUP_FILE_COLUMNS}
              FROM file f
              LEFT JOIN file_mark m ON m.scan_id = f.scan_id AND m.path = f.path
              WHERE f.scan_id = ?1 AND f.hash = ?2
-             ORDER BY f.path",
-        )?;
-        let rows = stmt.query_map(params![scan_id, blob], |row| {
-            Ok(FileEntry {
-                path: PathBuf::from(row.get::<_, String>(0)?),
-                size: row.get::<_, i64>(1)? as u64,
-                mtime: row.get::<_, i64>(2)?,
-                device: row.get::<_, i64>(3)? as u64,
-                inode: row.get::<_, i64>(4)? as u64,
-                is_keeper: row.get::<_, Option<i64>>(5)?.unwrap_or(0) != 0,
-                action: row
-                    .get::<_, Option<String>>(6)?
-                    .as_deref()
-                    .and_then(ActionKind::parse),
-            })
-        })?;
+             ORDER BY f.path"
+        ))?;
+        let rows = stmt.query_map(params![scan_id, blob], group_file_row)?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -2015,28 +2463,18 @@ impl ScanStore {
         let Some(blob) = hex_decode(hash_hex) else {
             return Ok(Vec::new());
         };
-        let mut stmt = self.conn.prepare(
-            "SELECT f.path, f.size, f.mtime, f.device, f.inode, m.is_keeper, m.action
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {GROUP_FILE_COLUMNS}
              FROM file f
              LEFT JOIN file_mark m ON m.scan_id = f.scan_id AND m.path = f.path
              WHERE f.scan_id = ?1 AND f.hash = ?2
              ORDER BY f.path
-             LIMIT ?3 OFFSET ?4",
+             LIMIT ?3 OFFSET ?4"
+        ))?;
+        let rows = stmt.query_map(
+            params![scan_id, blob, limit as i64, offset as i64],
+            group_file_row,
         )?;
-        let rows = stmt.query_map(params![scan_id, blob, limit as i64, offset as i64], |row| {
-            Ok(FileEntry {
-                path: PathBuf::from(row.get::<_, String>(0)?),
-                size: row.get::<_, i64>(1)? as u64,
-                mtime: row.get::<_, i64>(2)?,
-                device: row.get::<_, i64>(3)? as u64,
-                inode: row.get::<_, i64>(4)? as u64,
-                is_keeper: row.get::<_, Option<i64>>(5)?.unwrap_or(0) != 0,
-                action: row
-                    .get::<_, Option<String>>(6)?
-                    .as_deref()
-                    .and_then(ActionKind::parse),
-            })
-        })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -2454,21 +2892,30 @@ impl ScanStore {
     /// holds them instead of all `FileEntry`. A PK-covered query over `file_group`.
     pub fn group_summaries(&self, scan_id: i64) -> Result<Vec<GroupSummary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT rank, hash, file_count, size, reclaim FROM file_group
-             WHERE scan_id = ?1 ORDER BY rank",
+            "SELECT rank, hash, file_count, size, reclaim, object_count, reclaim_state
+             FROM file_group WHERE scan_id = ?1 ORDER BY rank",
         )?;
         let rows = stmt.query_map(params![scan_id], |row| {
-            Ok(GroupSummary {
-                rank: row.get(0)?,
-                hash: row.get(1)?,
-                file_count: row.get::<_, i64>(2)? as u64,
-                size_bytes: row.get::<_, i64>(3)? as u64,
-                reclaim_bytes: row.get::<_, i64>(4)? as u64,
-            })
+            Ok((
+                GroupSummary {
+                    rank: row.get(0)?,
+                    hash: row.get(1)?,
+                    file_count: row.get::<_, i64>(2)? as u64,
+                    size_bytes: row.get::<_, i64>(3)? as u64,
+                    object_count: row.get::<_, i64>(5)? as u64,
+                    reclaim: ReclaimEstimate::unknown(),
+                },
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(6)?,
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            // Decoding is fallible — an unrecognised state is corruption, not an `Unknown` guess —
+            // so it happens outside the rusqlite mapper, which has no way to report it.
+            let (mut summary, reclaim, state) = row?;
+            summary.reclaim = ReclaimEstimate::from_persisted(reclaim, state)?;
+            out.push(summary);
         }
         Ok(out)
     }
@@ -2482,21 +2929,29 @@ impl ScanStore {
         hash_hex: &str,
     ) -> Result<Option<GroupSummary>> {
         let row = self.conn.query_row(
-            "SELECT rank, hash, file_count, size, reclaim FROM file_group
-             WHERE scan_id = ?1 AND hash = ?2 LIMIT 1",
+            "SELECT rank, hash, file_count, size, reclaim, object_count, reclaim_state
+             FROM file_group WHERE scan_id = ?1 AND hash = ?2 LIMIT 1",
             params![scan_id, hash_hex],
             |row| {
-                Ok(GroupSummary {
-                    rank: row.get(0)?,
-                    hash: row.get(1)?,
-                    file_count: row.get::<_, i64>(2)? as u64,
-                    size_bytes: row.get::<_, i64>(3)? as u64,
-                    reclaim_bytes: row.get::<_, i64>(4)? as u64,
-                })
+                Ok((
+                    GroupSummary {
+                        rank: row.get(0)?,
+                        hash: row.get(1)?,
+                        file_count: row.get::<_, i64>(2)? as u64,
+                        size_bytes: row.get::<_, i64>(3)? as u64,
+                        object_count: row.get::<_, i64>(5)? as u64,
+                        reclaim: ReclaimEstimate::unknown(),
+                    },
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(6)?,
+                ))
             },
         );
         match row {
-            Ok(summary) => Ok(Some(summary)),
+            Ok((mut summary, reclaim, state)) => {
+                summary.reclaim = ReclaimEstimate::from_persisted(reclaim, state)?;
+                Ok(Some(summary))
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(err) => Err(err.into()),
         }
@@ -2706,16 +3161,71 @@ fn mark_prepared(conn: &Connection, scan_id: i64) -> Result<()> {
 /// damaged or externally modified DB and is refused here, at the store boundary, so the model
 /// layer stays free of SQLite.
 fn link_count_from_sql(value: &Value) -> Result<LinkCount> {
-    let class = match value {
-        Value::Integer(raw) => return LinkCount::from_i64(*raw),
+    if let Value::Integer(raw) = value {
+        return LinkCount::from_i64(*raw);
+    }
+    let class = storage_class(value);
+    Err(AppError::msg(format!(
+        "dedcom.db holds a link count stored as {class}, not an integer. Rescan, or move the old dedcom.db aside."
+    )))
+}
+
+/// The columns a group's file rows are read with: the complete temporal identity and the link
+/// count beside the marks, so a `FileEntry` never carries a half-filled identity that a later
+/// caller would take for the whole one.
+const GROUP_FILE_COLUMNS: &str = "f.path, f.size, f.mtime, f.mtime_nsec, f.ctime_sec,
+                                  f.ctime_nsec, f.device, f.inode, f.nlink,
+                                  m.is_keeper, m.action";
+
+/// Maps a `GROUP_FILE_COLUMNS` row. A link count of an impossible storage class decodes as
+/// unknown here rather than failing the read: this is the browsing path, and a group whose counts
+/// cannot be trusted is one the publishing gate already refused to give a figure to.
+fn group_file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {
+    Ok(FileEntry {
+        path: PathBuf::from(row.get::<_, String>(0)?),
+        size: row.get::<_, i64>(1)? as u64,
+        mtime: row.get::<_, i64>(2)?,
+        mtime_nsec: row.get::<_, i64>(3)?,
+        ctime_sec: row.get::<_, i64>(4)?,
+        ctime_nsec: row.get::<_, i64>(5)?,
+        device: row.get::<_, i64>(6)? as u64,
+        inode: row.get::<_, i64>(7)? as u64,
+        nlink: link_count_from_sql(&row.get::<_, Value>(8)?)
+            .unwrap_or(LinkCount::Unknown)
+            .to_u64(),
+        is_keeper: row.get::<_, Option<i64>>(9)?.unwrap_or(0) != 0,
+        action: row
+            .get::<_, Option<String>>(10)?
+            .as_deref()
+            .and_then(ActionKind::parse),
+    })
+}
+
+/// SQLite's name for what a cell actually holds — the same word `typeof()` returns, so a message
+/// and the SQL that found the cell say the same thing.
+fn storage_class(value: &Value) -> &'static str {
+    match value {
+        Value::Integer(_) => "integer",
         Value::Null => "null",
         Value::Real(_) => "real",
         Value::Text(_) => "text",
         Value::Blob(_) => "blob",
-    };
-    Err(AppError::msg(format!(
-        "dedcom.db holds a link count stored as {class}, not an integer. Rescan, or move the old dedcom.db aside."
-    )))
+    }
+}
+
+/// Decodes one `file.size` cell for the reclaim arithmetic. Same reasoning as
+/// `link_count_from_sql`: a byte count that is not a whole number is not a byte count.
+fn size_from_sql(value: &Value, named: &str) -> Result<u64> {
+    match value {
+        Value::Integer(raw) if *raw >= 0 => Ok(*raw as u64),
+        Value::Integer(raw) => Err(AppError::msg(format!(
+            "dedcom.db holds a negative file size ({raw}) for {named}. Rescan, or move the old dedcom.db aside."
+        ))),
+        other => Err(AppError::msg(format!(
+            "dedcom.db holds the size of {named} as {}, not an integer. Rescan, or move the old dedcom.db aside.",
+            storage_class(other)
+        ))),
+    }
 }
 
 fn now_string() -> String {
@@ -2792,7 +3302,9 @@ mod tests {
         let groups = store.duplicate_groups(scan_id).unwrap();
         assert_eq!(groups.len(), 1, "expect one group of duplicates");
         assert_eq!(groups[0].files.len(), 2);
-        assert_eq!(groups[0].reclaimable_bytes(), 100);
+        let reclaim = groups[0].physical_reclaim().unwrap();
+        assert_eq!(reclaim.object_count, 2);
+        assert_eq!(reclaim.estimate.guaranteed_bytes(), 100);
     }
 
     #[test]
@@ -3104,6 +3616,8 @@ mod tests {
         assert_eq!(candidates[0].path, PathBuf::from("/b"));
     }
 
+    /// A manifest row for one ordinary file: its own inode, one link, and no unrecorded
+    /// counts — the shape reclaim tests need unless they say otherwise.
     fn row(path: &str, size: u64, inode: u64) -> ManifestRow {
         ManifestRow {
             path: PathBuf::from(path),
@@ -3111,6 +3625,7 @@ mod tests {
             mtime: 0,
             device: 1,
             inode,
+            nlink: 1,
             ..Default::default()
         }
     }
@@ -3998,70 +4513,506 @@ mod tests {
         assert_eq!(groups[0].signature, "S_new");
     }
 
+    // === physical-object results ===
+    //
+    // Every regression below is published through BOTH paths by `published_both_ways`, so «the
+    // SQL aggregation and the --verify path agree» is not one test that could rot while the rest
+    // pass — it is the only way these tests can be written.
+
+    /// The shared payload size in the regressions: `S` in the checkpoint's matrix.
+    const S: u64 = 4096;
+
+    /// A manifest row that names its own allocation explicitly.
+    fn object_row(path: &str, size: u64, inode: u64, nlink: u64) -> ManifestRow {
+        ManifestRow {
+            path: PathBuf::from(path),
+            size,
+            mtime: 11,
+            mtime_nsec: 22,
+            ctime_sec: 33,
+            ctime_nsec: 44,
+            device: 1,
+            inode,
+            nlink,
+        }
+    }
+
+    /// Seeds a scan with `rows` and gives every named pathname its digest.
+    fn seed_objects(store: &mut ScanStore, rows: &[ManifestRow], hashed: &[(&str, u8)]) -> i64 {
+        let scan_id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store.record_files(scan_id, rows).unwrap();
+        let hashes: Vec<(PathBuf, [u8; 32])> = hashed
+            .iter()
+            .map(|(path, digest)| (PathBuf::from(*path), [*digest; 32]))
+            .collect();
+        store.record_hashes(scan_id, &hashes).unwrap();
+        scan_id
+    }
+
+    /// One published group row, flattened for comparison:
+    /// `(rank, hash, pathnames, size, allocations, state, guaranteed, potential)`.
+    type PublishedGroup = (i64, String, u64, u64, u64, ReclaimState, u64, Option<u64>);
+
+    /// What one publishing path produced: the group rows, the scan total and the informational
+    /// already-linked count.
+    #[derive(Debug, PartialEq)]
+    struct Published {
+        groups: Vec<PublishedGroup>,
+        scan: (ReclaimState, u64, Option<u64>),
+        already_linked_sets: u64,
+    }
+
+    fn published(store: &ScanStore, scan_id: i64) -> Published {
+        let scan = store.scan_reclaim(scan_id).unwrap();
+        Published {
+            groups: store
+                .group_summaries(scan_id)
+                .unwrap()
+                .into_iter()
+                .map(|group| {
+                    (
+                        group.rank,
+                        group.hash,
+                        group.file_count,
+                        group.size_bytes,
+                        group.object_count,
+                        group.reclaim.state(),
+                        group.reclaim.guaranteed_bytes(),
+                        group.reclaim.potential_bytes(),
+                    )
+                })
+                .collect(),
+            scan: (
+                scan.state(),
+                scan.guaranteed_bytes(),
+                scan.potential_bytes(),
+            ),
+            already_linked_sets: store.already_linked_sets(scan_id).unwrap(),
+        }
+    }
+
+    /// Publishes the same manifest through the SQL path and the RAM/`--verify` path, asserts the
+    /// two are identical down to the row order, and returns what they agreed on.
+    fn published_both_ways(seed: impl Fn(&mut ScanStore) -> i64) -> Published {
+        let mut sql = ScanStore::open_in_memory().unwrap();
+        let sql_id = seed(&mut sql);
+        sql.materialize_file_groups(sql_id).unwrap();
+
+        let mut ram = ScanStore::open_in_memory().unwrap();
+        let ram_id = seed(&mut ram);
+        let groups = ram.duplicate_groups(ram_id).unwrap();
+        ram.record_file_results(ram_id, &groups).unwrap();
+
+        let (from_sql, from_ram) = (published(&sql, sql_id), published(&ram, ram_id));
+        assert_eq!(
+            from_sql, from_ram,
+            "the SQL aggregation and the --verify path must publish the same result"
+        );
+        assert!(sql.results_materialized(sql_id).unwrap());
+        assert!(ram.results_materialized(ram_id).unwrap());
+        from_sql
+    }
+
+    /// A set of aliases is one allocation: nothing to free, nothing to group, and every pathname
+    /// still in the manifest. It is never hashed either, which is exactly why the informational
+    /// count cannot depend on hashing.
     #[test]
-    fn materialize_file_groups_equals_record_file_results() {
-        // SQL aggregation of file_group is bit-for-bit == the old path
-        // (duplicate_groups → sort_groups_by_benefit → record_file_results).
-        fn seed(store: &mut ScanStore) -> i64 {
-            let scan_id = store
-                .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
-                .unwrap();
-            store
-                .record_files(
-                    scan_id,
-                    &[
-                        row("/x/a", 100, 1),
-                        row("/x/b", 100, 2),
-                        row("/x/c", 100, 3), // group h1: 3×100 → reclaim 200
-                        row("/x/d", 50, 4),
-                        row("/x/e", 50, 5),  // group h2: 2×50 → reclaim 50
-                        row("/x/u", 200, 6), // unique → not a group
-                    ],
-                )
-                .unwrap();
-            let (h1, h2, hu) = ([1u8; 32], [2u8; 32], [9u8; 32]);
-            store
-                .record_hashes(
-                    scan_id,
-                    &[
-                        (PathBuf::from("/x/a"), h1),
-                        (PathBuf::from("/x/b"), h1),
-                        (PathBuf::from("/x/c"), h1),
-                        (PathBuf::from("/x/d"), h2),
-                        (PathBuf::from("/x/e"), h2),
-                        (PathBuf::from("/x/u"), hu),
-                    ],
-                )
-                .unwrap();
-            scan_id
+    fn an_alias_only_set_is_not_a_group_and_is_counted_separately() {
+        let result = published_both_ways(|store| {
+            seed_objects(
+                store,
+                &[
+                    object_row("/x/a1", S, 7, 3),
+                    object_row("/x/a2", S, 7, 3),
+                    object_row("/x/a3", S, 7, 3),
+                ],
+                &[("/x/a1", 1), ("/x/a2", 1), ("/x/a3", 1)],
+            )
+        });
+        assert!(
+            result.groups.is_empty(),
+            "one allocation is not a duplicate"
+        );
+        assert_eq!(result.scan, (ReclaimState::Exact, 0, Some(0)));
+        assert_eq!(
+            result.already_linked_sets, 1,
+            "the set is reported even though it never became a group"
+        );
+
+        // The pathnames themselves are untouched — nothing was collapsed away to make the group
+        // disappear.
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_objects(
+            &mut store,
+            &[
+                object_row("/x/a1", S, 7, 3),
+                object_row("/x/a2", S, 7, 3),
+                object_row("/x/a3", S, 7, 3),
+            ],
+            &[("/x/a1", 1), ("/x/a2", 1), ("/x/a3", 1)],
+        );
+        store.materialize_file_groups(scan_id).unwrap();
+        assert_eq!(store.manifest_count(scan_id).unwrap(), 3);
+    }
+
+    /// The control that must not move: two ordinary copies free exactly one of them.
+    #[test]
+    fn two_independent_copies_are_an_exact_group() {
+        let result = published_both_ways(|store| {
+            seed_objects(
+                store,
+                &[object_row("/x/a", S, 1, 1), object_row("/x/b", S, 2, 1)],
+                &[("/x/a", 1), ("/x/b", 1)],
+            )
+        });
+        assert_eq!(result.groups.len(), 1);
+        let (_, _, paths, size, objects, state, guaranteed, potential) = &result.groups[0];
+        assert_eq!((*paths, *size, *objects), (2, S, 2));
+        assert_eq!(*state, ReclaimState::Exact);
+        assert_eq!((*guaranteed, *potential), (S, Some(S)));
+        assert_eq!(result.scan, (ReclaimState::Exact, S, Some(S)));
+        assert_eq!(result.already_linked_sets, 0);
+    }
+
+    /// The mixed group: three pathnames, two allocations, and the answer is `S` — the pathname
+    /// formula's `2S` is one allocation that does not exist.
+    #[test]
+    fn a_mixed_group_frees_one_allocation_not_one_per_pathname() {
+        let result = published_both_ways(|store| {
+            seed_objects(
+                store,
+                &[
+                    object_row("/x/a1", S, 7, 2),
+                    object_row("/x/a2", S, 7, 2),
+                    object_row("/x/b", S, 9, 1),
+                ],
+                &[("/x/a1", 1), ("/x/a2", 1), ("/x/b", 1)],
+            )
+        });
+        assert_eq!(result.groups.len(), 1);
+        let (_, _, paths, _, objects, state, guaranteed, potential) = &result.groups[0];
+        assert_eq!(
+            (*paths, *objects),
+            (3, 2),
+            "every pathname is kept, and both counts are visible"
+        );
+        assert_eq!(*state, ReclaimState::Exact);
+        assert_eq!((*guaranteed, *potential), (S, Some(S)), "S, never 2S");
+        assert_eq!(
+            result.already_linked_sets, 1,
+            "the alias pair contributes to the informational count exactly once"
+        );
+    }
+
+    /// A link the scan never saw is a link that still holds the bytes. The ceiling survives, the
+    /// promise does not, and the numbers behind that verdict are visible.
+    #[test]
+    fn an_unobserved_external_link_makes_the_group_an_upper_bound() {
+        let result = published_both_ways(|store| {
+            seed_objects(
+                store,
+                &[
+                    object_row("/x/seen", S, 7, 2), // its other link lives outside the scan
+                    object_row("/x/twin", S, 9, 1),
+                ],
+                &[("/x/seen", 1), ("/x/twin", 1)],
+            )
+        });
+        assert_eq!(result.groups.len(), 1);
+        let (_, hash, paths, _, objects, state, guaranteed, potential) = &result.groups[0];
+        assert_eq!((*paths, *objects), (2, 2));
+        assert_eq!(*state, ReclaimState::UpperBound);
+        assert_eq!((*guaranteed, *potential), (0, Some(S)));
+        assert_eq!(result.scan, (ReclaimState::UpperBound, 0, Some(S)));
+
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_objects(
+            &mut store,
+            &[
+                object_row("/x/seen", S, 7, 2),
+                object_row("/x/twin", S, 9, 1),
+            ],
+            &[("/x/seen", 1), ("/x/twin", 1)],
+        );
+        store.materialize_file_groups(scan_id).unwrap();
+        let links = store.group_links(scan_id, hash).unwrap();
+        assert_eq!(
+            (links.observed, links.total),
+            (2, LinkCount::Known(3)),
+            "2 pathnames against 1 + 2 links: summed once per allocation, not once per pathname"
+        );
+    }
+
+    /// More pathnames of an allocation than its inode has links cannot be true. Refuse, and leave
+    /// nothing behind — no rows, no marker, no total.
+    #[test]
+    fn more_pathnames_than_links_refuses_and_leaves_no_partial_result() {
+        for verify in [false, true] {
+            let mut store = ScanStore::open_in_memory().unwrap();
+            let scan_id = seed_objects(
+                &mut store,
+                &[
+                    object_row("/x/a1", S, 7, 1), // two pathnames, one claimed link
+                    object_row("/x/a2", S, 7, 1),
+                    object_row("/x/b", S, 9, 1),
+                ],
+                &[("/x/a1", 1), ("/x/a2", 1), ("/x/b", 1)],
+            );
+            let err = if verify {
+                let groups = store.duplicate_groups(scan_id).unwrap();
+                store.record_file_results(scan_id, &groups).unwrap_err()
+            } else {
+                store.materialize_file_groups(scan_id).unwrap_err()
+            };
+            assert!(
+                err.to_string().contains("cannot be right"),
+                "the refusal must name the cause: {err}"
+            );
+            assert!(
+                store.group_summaries(scan_id).unwrap().is_empty(),
+                "a refused result leaves no rows"
+            );
+            assert!(
+                !store.results_materialized(scan_id).unwrap(),
+                "a refused result leaves no marker"
+            );
+            assert_eq!(
+                store.scan_reclaim(scan_id).unwrap().potential_bytes(),
+                None,
+                "a refused result leaves no trusted total"
+            );
         }
+    }
 
-        // Old path.
-        let mut old = ScanStore::open_in_memory().unwrap();
-        let old_id = seed(&mut old);
-        let mut groups = old.duplicate_groups(old_id).unwrap();
-        crate::model::duplicate::sort_groups_by_benefit(&mut groups);
-        old.record_file_results(old_id, &groups).unwrap();
-        let old_sum = old.group_summaries(old_id).unwrap();
-
-        // New path (SQL aggregation).
-        let mut new = ScanStore::open_in_memory().unwrap();
-        let new_id = seed(&mut new);
-        new.materialize_file_groups(new_id).unwrap();
-        let new_sum = new.group_summaries(new_id).unwrap();
-
-        assert_eq!(old_sum.len(), new_sum.len(), "number of groups");
-        for (o, n) in old_sum.iter().zip(&new_sum) {
-            assert_eq!(o.rank, n.rank, "rank");
-            assert_eq!(o.hash, n.hash, "hash (value and case)");
-            assert_eq!(o.file_count, n.file_count, "file_count");
-            assert_eq!(o.size_bytes, n.size_bytes, "size");
-            assert_eq!(o.reclaim_bytes, n.reclaim_bytes, "reclaim");
+    /// A ceiling that leaves the persisted integer domain is refused on both paths. SQLite answers
+    /// an overflowing `*` with a `REAL`, which is how a byte count would quietly become an
+    /// approximation; the Rust path would have to wrap. Neither is allowed to happen.
+    #[test]
+    fn a_reclaim_ceiling_outside_the_integer_domain_refuses_on_both_paths() {
+        let huge = (i64::MAX / 2) as u64 + 1;
+        let seed = |store: &mut ScanStore| {
+            seed_objects(
+                store,
+                &[
+                    object_row("/x/a", huge, 1, 1),
+                    object_row("/x/b", huge, 2, 1),
+                    object_row("/x/c", huge, 3, 1),
+                ],
+                &[("/x/a", 1), ("/x/b", 1), ("/x/c", 1)],
+            )
+        };
+        for verify in [false, true] {
+            let mut store = ScanStore::open_in_memory().unwrap();
+            let scan_id = seed(&mut store);
+            let err = if verify {
+                let groups = store.duplicate_groups(scan_id).unwrap();
+                store.record_file_results(scan_id, &groups).unwrap_err()
+            } else {
+                store.materialize_file_groups(scan_id).unwrap_err()
+            };
+            assert!(
+                err.to_string().contains("does not fit"),
+                "the refusal must name the cause: {err}"
+            );
+            assert!(store.group_summaries(scan_id).unwrap().is_empty());
+            assert!(!store.results_materialized(scan_id).unwrap());
         }
-        // Exactly two groups; rank 0 — larger benefit (200), then 50; the unique one is discarded.
-        assert_eq!(new_sum.len(), 2);
-        assert_eq!(new_sum[0].reclaim_bytes, 200);
-        assert_eq!(new_sum[1].reclaim_bytes, 50);
+    }
+
+    /// Bare `(device, inode)` would call these one allocation and hide a whole copy. The complete
+    /// temporal key is what tells them apart.
+    #[test]
+    fn a_reused_inode_is_a_different_allocation() {
+        let result = published_both_ways(|store| {
+            let mut reused = object_row("/x/b", S, 7, 1);
+            reused.ctime_sec = 999;
+            seed_objects(
+                store,
+                &[object_row("/x/a", S, 7, 1), reused],
+                &[("/x/a", 1), ("/x/b", 1)],
+            )
+        });
+        assert_eq!(result.groups.len(), 1);
+        let (_, _, paths, _, objects, state, guaranteed, _) = &result.groups[0];
+        assert_eq!(
+            (*paths, *objects),
+            (2, 2),
+            "the temporal key separates them"
+        );
+        assert_eq!((*state, *guaranteed), (ReclaimState::Exact, S));
+        assert_eq!(
+            result.already_linked_sets, 0,
+            "two allocations sharing an inode number are not an already-linked set"
+        );
+    }
+
+    /// A scan with nothing to say says exactly that: exact zero, and it stays that way on reopen.
+    #[test]
+    fn a_scan_without_duplicates_is_an_exact_zero() {
+        let result = published_both_ways(|store| {
+            seed_objects(
+                store,
+                &[object_row("/x/a", S, 1, 1), object_row("/x/u", S / 2, 2, 1)],
+                &[("/x/a", 1), ("/x/u", 2)],
+            )
+        });
+        assert!(result.groups.is_empty());
+        assert_eq!(result.scan, (ReclaimState::Exact, 0, Some(0)));
+
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_objects(
+            &mut store,
+            &[object_row("/x/a", S, 1, 1), object_row("/x/u", S / 2, 2, 1)],
+            &[("/x/a", 1), ("/x/u", 2)],
+        );
+        store.materialize_file_groups(scan_id).unwrap();
+        store.ensure_materialized(scan_id).unwrap();
+        assert_eq!(
+            store.scan_reclaim(scan_id).unwrap().potential_bytes(),
+            Some(0),
+            "reopening an exact zero does not turn it into an unknown"
+        );
+    }
+
+    /// Mixed results are where the order matters: what is guaranteed leads, and the scan total keeps
+    /// the guarantee and the ceiling apart.
+    #[test]
+    fn mixed_groups_order_by_guarantee_and_total_honestly() {
+        let result = published_both_ways(|store| {
+            seed_objects(
+                store,
+                &[
+                    // An upper-bound group with the LARGEST ceiling — it must still rank below
+                    // every exact group, because a ceiling is not a payoff.
+                    object_row("/x/big_seen", 8 * S, 1, 2),
+                    object_row("/x/big_twin", 8 * S, 2, 1),
+                    // Two exact groups of different sizes.
+                    object_row("/x/mid_a", 2 * S, 3, 1),
+                    object_row("/x/mid_b", 2 * S, 4, 1),
+                    object_row("/x/small_a", S, 5, 1),
+                    object_row("/x/small_b", S, 6, 1),
+                ],
+                &[
+                    ("/x/big_seen", 1),
+                    ("/x/big_twin", 1),
+                    ("/x/mid_a", 2),
+                    ("/x/mid_b", 2),
+                    ("/x/small_a", 3),
+                    ("/x/small_b", 3),
+                ],
+            )
+        });
+        let ranked: Vec<(i64, ReclaimState, u64, Option<u64>)> = result
+            .groups
+            .iter()
+            .map(|(rank, _, _, _, _, state, guaranteed, potential)| {
+                (*rank, *state, *guaranteed, *potential)
+            })
+            .collect();
+        assert_eq!(
+            ranked,
+            vec![
+                (0, ReclaimState::Exact, 2 * S, Some(2 * S)),
+                (1, ReclaimState::Exact, S, Some(S)),
+                (2, ReclaimState::UpperBound, 0, Some(8 * S)),
+            ],
+            "guaranteed first, ceiling second — the biggest ceiling ranks last"
+        );
+        assert_eq!(
+            result.scan,
+            (ReclaimState::UpperBound, 3 * S, Some(11 * S)),
+            "the headline is what the exact groups guarantee; the ceiling is stated apart"
+        );
+    }
+
+    /// A group whose link counts were never recorded is browseable and worth nothing anyone may
+    /// act on — the shape a v2 manifest migrated into v3 arrives in.
+    #[test]
+    fn an_unrecorded_link_count_publishes_an_unknown_result() {
+        let result = published_both_ways(|store| {
+            let mut legacy = object_row("/x/a", S, 1, 0);
+            legacy.nlink = 0; // never recorded
+            seed_objects(
+                store,
+                &[legacy, object_row("/x/b", S, 2, 1)],
+                &[("/x/a", 1), ("/x/b", 1)],
+            )
+        });
+        assert_eq!(result.groups.len(), 1, "the group stays browseable");
+        let (_, _, _, _, _, state, guaranteed, potential) = &result.groups[0];
+        assert_eq!(*state, ReclaimState::Unknown);
+        assert_eq!((*guaranteed, *potential), (0, None));
+        assert_eq!(
+            result.scan,
+            (ReclaimState::Unknown, 0, None),
+            "one unmeasured group makes the scan total unmeasured, not smaller"
+        );
+    }
+
+    /// A migrated v2 summary keeps its old pathname number in the database as history, and hands
+    /// none of it to anyone.
+    #[test]
+    fn a_migrated_v2_summary_stays_browseable_and_untrusted() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_objects(
+            &mut store,
+            &[object_row("/x/a", S, 1, 1), object_row("/x/b", S, 2, 1)],
+            &[("/x/a", 1), ("/x/b", 1)],
+        );
+        // Exactly what the v3 migration leaves behind: the old row, its old positive figure, and
+        // the defaults that say nothing about it is established.
+        store
+            .conn
+            .execute(
+                "INSERT INTO file_group(scan_id, rank, hash, file_count, size, reclaim,
+                                        object_count, reclaim_state)
+                 VALUES (?1, 0, 'aabb', 3, ?2, ?3, 0, 0)",
+                params![scan_id, S as i64, (2 * S) as i64],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE scan_stats SET reclaimable_bytes = ?2, reclaim_state = 0,
+                        files_scanned = 3, bytes_hashed = 100, groups_found = 1
+                  WHERE scan_id = ?1",
+                params![scan_id, (2 * S) as i64],
+            )
+            .unwrap();
+        store.set_status(scan_id, ScanStatus::Complete).unwrap();
+
+        store.ensure_materialized(scan_id).unwrap();
+        let summaries = store.group_summaries(scan_id).unwrap();
+        assert_eq!(summaries.len(), 1, "the row remains browseable");
+        assert_eq!(summaries[0].file_count, 3, "its pathnames are still listed");
+        assert_eq!(summaries[0].reclaim.state(), ReclaimState::Unknown);
+        assert_eq!(summaries[0].reclaim.potential_bytes(), None);
+        assert_eq!(
+            crate::tui::reclaim_cell(summaries[0].reclaim),
+            "rescan required"
+        );
+        assert_eq!(store.scan_reclaim(scan_id).unwrap().potential_bytes(), None);
+        assert_eq!(
+            store.scan_summary(scan_id).unwrap().reclaim.state(),
+            ReclaimState::Unknown
+        );
+        assert_eq!(
+            store.destructive_plan_verdict(scan_id).unwrap(),
+            DestructivePlanVerdict::RescanRequired,
+            "the existing plan guard still refuses it"
+        );
+        // The stored number is history: still in the table, never handed out.
+        let stored: i64 = store
+            .conn
+            .query_row(
+                "SELECT reclaim FROM file_group WHERE scan_id = ?1",
+                params![scan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, (2 * S) as i64, "the migrated row is not rewritten");
     }
 
     #[test]
@@ -4131,7 +5082,7 @@ mod tests {
         assert!(store.results_materialized(scan_id).unwrap());
         let prepared = store.group_summaries(scan_id).unwrap();
         assert_eq!(prepared.len(), 2);
-        assert_eq!(prepared[0].reclaim_bytes, 200);
+        assert_eq!(prepared[0].reclaim.guaranteed_bytes(), 200);
         // A second call changes nothing.
         store.ensure_materialized(scan_id).unwrap();
         assert_eq!(store.group_summaries(scan_id).unwrap().len(), 2);
@@ -4214,8 +5165,7 @@ mod tests {
         let mut store = ScanStore::open_in_memory().unwrap();
         let scan_id = seed_two_groups(&mut store);
         let mut groups = store.duplicate_groups(scan_id).unwrap();
-        crate::model::duplicate::sort_groups_by_benefit(&mut groups);
-        groups.truncate(1); // verification dropped the smaller group
+        groups.truncate(1); // verification dropped one of them
         store.record_file_results(scan_id, &groups).unwrap();
         store
             .conn
@@ -4598,10 +5548,10 @@ mod tests {
         let summary = ScanSummary {
             files_scanned: 10,
             groups_found: 2,
-            total_reclaimable_bytes: 4096,
             bytes_hashed: 8192,
             elapsed_seconds: 1.5,
             hash_failures: 3,
+            ..Default::default()
         };
         store.record_scan_result(id, &summary).unwrap();
 
@@ -4616,7 +5566,11 @@ mod tests {
             got.files_scanned, 10,
             "columns did not shift across the SELECT indexes"
         );
-        assert_eq!(got.total_reclaimable_bytes, 4096);
+        assert_eq!(
+            got.reclaim.potential_bytes(),
+            None,
+            "the summary of a scan whose results were never materialized promises nothing"
+        );
 
         // list_stats (--stats) also returns the column.
         let stats = store.list_stats().unwrap();
@@ -4648,12 +5602,9 @@ mod tests {
     fn mark_fe(path: &str, keeper: bool, action: Option<ActionKind>) -> FileEntry {
         FileEntry {
             path: PathBuf::from(path),
-            size: 0,
-            mtime: 0,
-            device: 0,
-            inode: 0,
             is_keeper: keeper,
             action,
+            ..Default::default()
         }
     }
 
@@ -4762,8 +5713,8 @@ mod tests {
             mtime: 1,
             device: 1,
             inode: 1,
-            is_keeper: false,
             action: Some(ActionKind::Delete),
+            ..Default::default()
         };
         assert!(
             observer.save_marks(scan_id, [&marked].into_iter()).is_err(),
@@ -4995,9 +5946,9 @@ mod tests {
         assert_eq!(summaries[0].rank, 0, "newest by benefit — rank 0");
         assert_eq!(summaries[0].file_count, 3);
         assert_eq!(summaries[0].size_bytes, 100);
-        assert_eq!(summaries[0].reclaim_bytes, 200);
+        assert_eq!(summaries[0].reclaim.guaranteed_bytes(), 200);
         assert_eq!(summaries[1].rank, 1);
-        assert_eq!(summaries[1].reclaim_bytes, 50);
+        assert_eq!(summaries[1].reclaim.guaranteed_bytes(), 50);
     }
 
     /// group_files reads members from the `file` manifest, and NOT from file_dedup (which
@@ -5380,9 +6331,14 @@ mod tests {
         );
     }
 
-    /// The other side of the gate. A fresh v3 scan does record every link count — but the trust
-    /// state itself is still unknown, because computing it belongs to `R2C`; the verdict stays
-    /// closed until something establishes it, and then opens.
+    /// The other side of the gate, end to end on a real filesystem: a fresh scan of the hardlink
+    /// forest records every link count, publishes what the forest is physically worth, and opens
+    /// the gate on its own.
+    ///
+    /// The forest is six duplicate pathnames over three allocations: four aliases of one inode
+    /// (all four seen), an independent twin, and a twin whose second link lives outside the scan
+    /// root. Keeping one allocation could free two — but one of those two is held by a link
+    /// nobody scanned, so nothing is guaranteed.
     #[test]
     fn a_fresh_scan_knows_its_link_counts_and_the_gate_opens_on_a_trusted_state() {
         let forest = crate::testfixtures::HardlinkForest::build("verdict_v3");
@@ -5408,27 +6364,40 @@ mod tests {
             store.scan_link_counts_known(id).unwrap(),
             "every walked row carries a real link count"
         );
+        let summaries = store.group_summaries(id).unwrap();
+        assert_eq!(summaries.len(), 1, "one duplicate-content group");
+        let size = summaries[0].size_bytes;
         assert_eq!(
-            store.scan_reclaim_state(id).unwrap(),
-            ReclaimState::Unknown,
-            "R2A records link counts; R2C is what establishes trust"
+            (summaries[0].file_count, summaries[0].object_count),
+            (6, 3),
+            "six pathnames over three allocations — every pathname kept"
+        );
+        assert_eq!(summaries[0].reclaim.state(), ReclaimState::UpperBound);
+        assert_eq!(
+            (
+                summaries[0].reclaim.guaranteed_bytes(),
+                summaries[0].reclaim.potential_bytes()
+            ),
+            (0, Some(2 * size)),
+            "the outside link guarantees nothing, and the ceiling is two allocations"
+        );
+        let links = store.group_links(id, &summaries[0].hash).unwrap();
+        assert_eq!(
+            (links.observed, links.total),
+            (6, LinkCount::Known(7)),
+            "4 + 1 + 2 links, counted once per allocation; the seventh is the one outside"
         );
         assert_eq!(
-            store.destructive_plan_verdict(id).unwrap(),
-            DestructivePlanVerdict::RescanRequired,
-            "fail closed while the state is unknown"
+            store.already_linked_sets(id).unwrap(),
+            1,
+            "the alias set is reported once"
         );
-
-        // Once a trusted state is persisted, the same scan is plannable — the gate is a gate, not
-        // a permanent refusal.
-        store
-            .conn
-            .execute(
-                "UPDATE scan_stats SET reclaim_state = ?2 WHERE scan_id = ?1",
-                params![id, ReclaimState::Exact.as_i64()],
-            )
-            .unwrap();
-        assert_eq!(store.scan_reclaim_state(id).unwrap(), ReclaimState::Exact);
+        assert_eq!(
+            store.scan_reclaim(id).unwrap().state(),
+            ReclaimState::UpperBound
+        );
+        // The state is established, so the gate opens on its own — it is a gate, not a permanent
+        // refusal. What may be claimed once it is open is R2D's question.
         assert_eq!(
             store.destructive_plan_verdict(id).unwrap(),
             DestructivePlanVerdict::Allowed

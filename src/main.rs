@@ -529,23 +529,9 @@ fn run_headless_scan(cli: &cli::Cli) -> Result<()> {
         ScanOutcome::Completed(results) => {
             println!();
             println!("=== Done ===");
-            println!("Files scanned:        {}", results.summary.files_scanned);
-            // Candidates without a pinned hash (error/identity) — did NOT take part in
-            // duplicate detection. >0 → scan status `complete_with_warnings`.
-            println!("Failed to hash:       {}", results.summary.hash_failures);
-            println!("Duplicate groups:     {}", results.summary.groups_found);
-            println!(
-                "Potentially reclaimable: {} bytes",
-                results.summary.total_reclaimable_bytes
-            );
-            println!(
-                "Scan time:            {} (speed {})",
-                tui::format_duration(results.summary.elapsed_seconds),
-                tui::format_speed(
-                    results.summary.bytes_hashed,
-                    results.summary.elapsed_seconds
-                ),
-            );
+            for line in completion_lines(&results.summary) {
+                println!("{line}");
+            }
             for summary in results.summaries.iter().take(50) {
                 println!(
                     "  #{:<4} {} files x {} bytes",
@@ -611,19 +597,9 @@ fn run_stats(cli: &cli::Cli) -> Result<()> {
             "  environment: storage={} layout={} ZFS={}",
             row.storage_type, row.pool_layout, row.zfs_version,
         );
-        println!(
-            "  workload:    files={} volume(hash)={} groups={} reclaimable={} failures(hash)={}",
-            row.files_scanned,
-            tui::human_bytes(row.bytes_hashed),
-            row.groups_found,
-            tui::human_bytes(row.reclaimable_bytes),
-            row.hash_failures,
-        );
-        println!(
-            "  time:        {} (speed {})",
-            tui::format_duration(row.elapsed_seconds),
-            tui::format_speed(row.bytes_hashed, row.elapsed_seconds),
-        );
+        for line in stats_lines(row) {
+            println!("{line}");
+        }
     }
     Ok(())
 }
@@ -1046,6 +1022,144 @@ mod headless_readonly_tests {
         assert_eq!(after, old, "a reporting mode must not migrate the DB");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// What the headless run prints when a scan completes.
+///
+/// A function rather than a run of `println!` so the wording can be asserted: the whole point of
+/// this reporting is that every surface says the same thing about the same result, and a claim
+/// nothing tests is a claim waiting to drift.
+fn completion_lines(summary: &model::scan::ScanSummary) -> Vec<String> {
+    vec![
+        format!("Files scanned:        {}", summary.files_scanned),
+        // Candidates without a pinned hash (error/identity) — did NOT take part in
+        // duplicate detection. >0 → scan status `complete_with_warnings`.
+        format!("Failed to hash:       {}", summary.hash_failures),
+        format!("Duplicate groups:     {}", summary.groups_found),
+        format!("Already linked sets:  {}", summary.already_linked_sets),
+        format!(
+            "Reclaim:              {}",
+            tui::reclaim_phrase(summary.reclaim)
+        ),
+        format!(
+            "Scan time:            {} (speed {})",
+            tui::format_duration(summary.elapsed_seconds),
+            tui::format_speed(summary.bytes_hashed, summary.elapsed_seconds),
+        ),
+    ]
+}
+
+/// The per-scan block of the `--stats` report, for the same reason.
+fn stats_lines(row: &model::scan::ScanStatsRow) -> Vec<String> {
+    vec![
+        format!(
+            "  workload:    files={} volume(hash)={} groups={} already-linked-sets={} failures(hash)={}",
+            row.files_scanned,
+            tui::human_bytes(row.bytes_hashed),
+            row.groups_found,
+            row.already_linked_sets,
+            row.hash_failures,
+        ),
+        format!("  reclaim:     {}", tui::reclaim_phrase(row.reclaim)),
+        format!(
+            "  time:        {} (speed {})",
+            tui::format_duration(row.elapsed_seconds),
+            tui::format_speed(row.bytes_hashed, row.elapsed_seconds),
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod reporting_tests {
+    use super::*;
+    use model::reclaim::ReclaimEstimate;
+    use model::scan::{ScanStatsRow, ScanSummary};
+
+    fn summary(reclaim: ReclaimEstimate) -> ScanSummary {
+        ScanSummary {
+            files_scanned: 6,
+            groups_found: 1,
+            reclaim,
+            already_linked_sets: 2,
+            bytes_hashed: 4096,
+            elapsed_seconds: 1.0,
+            hash_failures: 0,
+        }
+    }
+
+    fn stats_row(reclaim: ReclaimEstimate) -> ScanStatsRow {
+        ScanStatsRow {
+            scan_id: 1,
+            created_at: "2026-07-31 00:00:00".to_string(),
+            status: "complete".to_string(),
+            roots: vec![PathBuf::from("/x")],
+            elapsed_seconds: 1.0,
+            storage_type: "ssd".to_string(),
+            pool_layout: "mirror".to_string(),
+            zfs_version: "2.3.1".to_string(),
+            files_scanned: 6,
+            bytes_hashed: 4096,
+            groups_found: 1,
+            reclaim,
+            already_linked_sets: 2,
+            hash_failures: 0,
+        }
+    }
+
+    /// Headless says what the browser says: the state-aware phrase and the already-linked count,
+    /// through the same formatter.
+    #[test]
+    fn headless_completion_states_the_reclaim_and_never_calls_a_bound_free() {
+        let exact = completion_lines(&summary(ReclaimEstimate::exact(4096))).join("\n");
+        assert!(
+            exact.contains("Reclaim:              guaranteed after quarantine purge: 4.0 KiB"),
+            "{exact}"
+        );
+        assert!(exact.contains("Already linked sets:  2"), "{exact}");
+
+        let bounded = completion_lines(&summary(ReclaimEstimate::upper_bound(4096))).join("\n");
+        assert!(
+            bounded.contains("guaranteed after quarantine purge: 0 B")
+                && bounded.contains("up to 4.0 KiB after quarantine purge"),
+            "an upper bound must state both halves: {bounded}"
+        );
+        assert!(
+            !bounded.contains("free"),
+            "an upper bound is never labelled freed: {bounded}"
+        );
+
+        let unknown = completion_lines(&summary(ReclaimEstimate::unknown())).join("\n");
+        assert!(
+            unknown.contains("Reclaim:              rescan required"),
+            "{unknown}"
+        );
+        assert!(
+            !unknown.contains("KiB") && !unknown.contains(" B"),
+            "an unestablished result offers no number: {unknown}"
+        );
+    }
+
+    /// `--stats` reports the same three shapes in the same words.
+    #[test]
+    fn stats_report_states_the_reclaim_in_the_same_words() {
+        let exact = stats_lines(&stats_row(ReclaimEstimate::exact(4096))).join("\n");
+        assert!(
+            exact.contains("reclaim:     guaranteed after quarantine purge: 4.0 KiB"),
+            "{exact}"
+        );
+        assert!(exact.contains("already-linked-sets=2"), "{exact}");
+
+        let bounded = stats_lines(&stats_row(ReclaimEstimate::upper_bound(4096))).join("\n");
+        assert!(
+            bounded.contains("up to 4.0 KiB after quarantine purge") && !bounded.contains("free"),
+            "{bounded}"
+        );
+        let unknown = stats_lines(&stats_row(ReclaimEstimate::unknown())).join("\n");
+        assert!(
+            unknown.contains("reclaim:     rescan required"),
+            "{unknown}"
+        );
     }
 }
 

@@ -144,12 +144,13 @@ pub fn render_panel(
             // When there's no result — a targeted message keyed by empty.
             let title = format!(" {} · {} ", index + 1, panel.view.label());
             match (panel.view, source_result) {
-                (_, Some(WatchResult::FileGroup(group))) => {
+                (_, Some(WatchResult::FileGroup(group, claim))) => {
                     let colors = browser::name_palette(group);
                     browser::render_group_files(
                         frame,
                         area,
                         Some(group),
+                        Some(*claim),
                         &colors,
                         &mut panel.list,
                         PathStyle::NameFirst,

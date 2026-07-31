@@ -5,15 +5,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::model::action::ActionKind;
+use crate::model::reclaim::{GroupReclaim, LinkCount, ObjectLinks};
 
 /// A file that is part of a duplicate group.
-#[derive(Debug, Clone)]
+///
+/// The identity fields are the complete scan-local temporal one, not bare `(device, inode)`: an
+/// inode number is reused after a delete, and a same-second in-place edit would otherwise look
+/// unchanged. `nlink` travels with the row because reclaim is a question about the allocation, and
+/// the answer needs the links this scan never saw.
+#[derive(Debug, Clone, Default)]
 pub struct FileEntry {
     pub path: PathBuf,
     pub size: u64,
     pub mtime: i64,
+    pub mtime_nsec: i64,
+    pub ctime_sec: i64,
+    pub ctime_nsec: i64,
     pub device: u64,
     pub inode: u64,
+    /// `st_nlink` as the walk observed it; `0` = never recorded (a legacy pre-v3 row).
+    pub nlink: u64,
     /// The "keeper" file — it remains, no action is applied to it.
     pub is_keeper: bool,
     /// The planned action on the file (if marked by the user).
@@ -25,6 +36,20 @@ impl FileEntry {
     /// (already hardlinked): deleting one will not free any space.
     pub fn same_physical(&self, other: &FileEntry) -> bool {
         self.device == other.device && self.inode == other.inode
+    }
+
+    /// The complete scan-local temporal physical identity — the key that decides whether two
+    /// pathnames are the same allocation *right now*.
+    pub fn object_key(&self) -> (u64, u64, u64, i64, i64, i64, i64) {
+        (
+            self.device,
+            self.inode,
+            self.size,
+            self.mtime,
+            self.mtime_nsec,
+            self.ctime_sec,
+            self.ctime_nsec,
+        )
     }
 }
 
@@ -40,21 +65,44 @@ pub struct DuplicateGroup {
 }
 
 impl DuplicateGroup {
-    /// How much space is freed if one file from the group is kept.
-    pub fn reclaimable_bytes(&self) -> u64 {
-        let extra = self.files.len().saturating_sub(1) as u64;
-        self.size_bytes * extra
+    /// What this group's pathnames say about the allocations behind them.
+    ///
+    /// Computed from the files rather than stored, so a group that verification split cannot keep
+    /// a figure that belonged to its old membership. There is deliberately no pathname-based
+    /// counterpart: `size × (paths − 1)` is the P-1 defect, and leaving that seam anywhere invites
+    /// a caller to revive it.
+    ///
+    /// Only meaningful for a COMPLETE group. The browser pages a large group's files, so a display
+    /// path must read the materialized summary instead of calling this on a partial `files`.
+    pub fn physical_reclaim(&self) -> Result<GroupReclaim> {
+        // Keyed rather than scanned: a top /tank group holds tens of thousands of pathnames, and
+        // an inner search per file would make publishing the result quadratic in the group size.
+        // The fold below is order-independent, so a hash map costs nothing in determinism.
+        let mut objects: std::collections::HashMap<ObjectKey, ObjectLinks> =
+            std::collections::HashMap::new();
+        for file in &self.files {
+            objects
+                .entry(file.object_key())
+                .and_modify(|links| links.observed += 1)
+                .or_insert(ObjectLinks {
+                    observed: 1,
+                    links: LinkCount::from_u64(file.nlink),
+                });
+        }
+        let named = crate::textsan::terminal(
+            &self
+                .files
+                .first()
+                .map(|file| file.path.display().to_string())
+                .unwrap_or_default(),
+        );
+        let links: Vec<ObjectLinks> = objects.into_values().collect();
+        GroupReclaim::of_objects(self.size_bytes, &links, &named)
     }
 }
 
-/// Sorts groups by descending reclaimable space and reassigns `id`
-/// in display order.
-pub fn sort_groups_by_benefit(groups: &mut [DuplicateGroup]) {
-    groups.sort_by_key(|group| std::cmp::Reverse(group.reclaimable_bytes()));
-    for (index, group) in groups.iter_mut().enumerate() {
-        group.id = index;
-    }
-}
+/// The complete scan-local temporal physical identity of a manifest row.
+type ObjectKey = (u64, u64, u64, i64, i64, i64, i64);
 
 /// A group of directories with matching SCANNED contents. The signature is the blake3 of the sorted list (relative path, file hash)
 /// over all files under the directory; the same for directories with the same tree. It is emitted ONLY
@@ -322,6 +370,7 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// A group of `files` pathnames, each its own allocation with exactly one link.
     fn group(id: usize, size: u64, files: usize) -> DuplicateGroup {
         DuplicateGroup {
             id,
@@ -331,25 +380,60 @@ mod tests {
                 .map(|n| FileEntry {
                     path: PathBuf::from(format!("/f{id}_{n}")),
                     size,
-                    mtime: 0,
-                    device: 0,
                     inode: n as u64,
-                    is_keeper: false,
-                    action: None,
+                    nlink: 1,
+                    ..Default::default()
                 })
                 .collect(),
         }
     }
 
+    /// Aliases of one allocation are one allocation, however many pathnames point at them.
     #[test]
-    fn sort_groups_by_benefit_orders_by_reclaim_desc_and_reids() {
-        // benefit = size * (files-1): g0=10*1=10, g1=100*2=200, g2=50*0=0.
-        let mut groups = vec![group(0, 10, 2), group(1, 100, 3), group(2, 50, 1)];
-        sort_groups_by_benefit(&mut groups);
-        let reclaim: Vec<u64> = groups.iter().map(|g| g.reclaimable_bytes()).collect();
-        assert_eq!(reclaim, [200, 10, 0], "by descending benefit");
-        let ids: Vec<usize> = groups.iter().map(|g| g.id).collect();
-        assert_eq!(ids, [0, 1, 2], "ids reassigned in display order");
+    fn a_group_counts_allocations_not_pathnames() {
+        let mut aliases = group(0, 100, 3);
+        for file in &mut aliases.files {
+            file.inode = 7;
+            file.nlink = 3;
+        }
+        let reclaim = aliases.physical_reclaim().unwrap();
+        assert_eq!(reclaim.observed_paths, 3);
+        assert_eq!(reclaim.object_count, 1, "one inode, one allocation");
+        assert_eq!(reclaim.total_links, LinkCount::Known(3), "counted once");
+        assert_eq!(
+            reclaim.estimate.guaranteed_bytes(),
+            0,
+            "keeping the one allocation frees nothing"
+        );
+    }
+
+    /// The same inode number with a different temporal identity is a different allocation — the
+    /// complete key is what rejects inode reuse.
+    #[test]
+    fn the_temporal_key_separates_a_reused_inode() {
+        let mut reused = group(0, 100, 2);
+        reused.files[0].inode = 7;
+        reused.files[1].inode = 7;
+        reused.files[1].ctime_sec = 999;
+        let reclaim = reused.physical_reclaim().unwrap();
+        assert_eq!(
+            reclaim.object_count, 2,
+            "same (device, inode), different ctime: two allocations"
+        );
+        assert_eq!(reclaim.estimate.guaranteed_bytes(), 100);
+    }
+
+    /// Independent copies are exactly the case the old pathname formula got right, and it must
+    /// keep getting it right.
+    #[test]
+    fn independent_copies_still_free_one_allocation_each() {
+        let reclaim = group(1, 100, 3).physical_reclaim().unwrap();
+        assert_eq!(reclaim.object_count, 3);
+        assert_eq!(reclaim.estimate.guaranteed_bytes(), 200);
+        assert_eq!(
+            reclaim.estimate.state(),
+            crate::model::reclaim::ReclaimState::Exact
+        );
     }
 
     #[test]

@@ -214,6 +214,9 @@ pub struct BrowserState {
     /// ONCE when the group is loaded, NOT during render. On a /tank group of 2.2M
     /// files, recomputing the palette every frame caused ~4 s of freeze per cursor move.
     pub open_group_colors: HashMap<String, Color>,
+    /// What the OPEN group's materialized row claims — read from `file_group` plus its link
+    /// evidence when the group is opened, never derived from the page of files on screen.
+    pub open_group_claim: Option<crate::state::GroupClaim>,
     pub group_state: ListState,
     pub file_state: ListState,
     /// true — focus on the files panel, false — on the groups panel.
@@ -221,9 +224,6 @@ pub struct BrowserState {
     pub summary: ScanSummary,
     /// Path display mode in the "Group files" panel.
     pub path_style: PathStyle,
-    /// Cache of the total reclaimable benefit (E2E fix): from group
-    /// summaries, independent of marks — computed on load, not every frame.
-    pub reclaim_total: u64,
     /// Cache of the count of files marked for action — from the DB (`marked_count`).
     pub marked_count: usize,
     /// TOTAL number of files in the open group (`COUNT(*)` from
@@ -271,14 +271,6 @@ pub struct BrowserState {
     pub tab_files_area: Option<Rect>,
     /// The same for the `[2] Directories` tab.
     pub tab_dirs_area: Option<Rect>,
-}
-
-impl BrowserState {
-    /// Recomputes the total reclaim from group summaries (independent of marks).
-    /// `marked_count` is updated separately from the DB (`App::refresh_marked_count`).
-    pub fn recompute_reclaim(&mut self) {
-        self.reclaim_total = self.group_summaries.iter().map(|s| s.reclaim_bytes).sum();
-    }
 }
 
 /// State of the action-review screen.
@@ -742,7 +734,6 @@ impl App {
         self.browser.group_summaries = summaries;
         self.browser.open_group = None;
         self.browser.summary = summary;
-        self.browser.recompute_reclaim();
         self.browser.group_state = ListState::default();
         self.browser.file_state = ListState::default();
         self.browser.focus_files = false;
@@ -849,11 +840,13 @@ impl App {
             (self.current_scan_id, self.browser.group_state.selected())
         else {
             self.browser.open_group = None;
+            self.browser.open_group_claim = None;
             self.browser.file_state.select(None);
             return;
         };
         let Some(summary) = self.browser.group_summaries.get(index) else {
             self.browser.open_group = None;
+            self.browser.open_group_claim = None;
             self.browser.file_state.select(None);
             return;
         };
@@ -865,7 +858,21 @@ impl App {
         // it loads as the cursor scrolls (`maybe_load_more_files`) up to the
         // upper limit `BROWSE_GROUP_FILE_MAX`. The cap on a single page is no
         // longer "result truncation" — it's a progressive-loading window.
-        let (mut files, total) = if let Some(store) = self.browse_conn() {
+        // The group's claim comes from its own materialized row and the link evidence behind it,
+        // not from this page of files: a page is a window, and a window cannot say how many
+        // allocations the whole group holds.
+        let claim =
+            self.browser
+                .group_summaries
+                .get(index)
+                .map(|summary| crate::state::GroupClaim {
+                    reclaim: summary.reclaim,
+                    links: crate::state::GroupLinks {
+                        observed: summary.file_count,
+                        total: crate::model::reclaim::LinkCount::Unknown,
+                    },
+                });
+        let (mut files, total, claim) = if let Some(store) = self.browse_conn() {
             let files = store
                 .group_files_page(scan_id, &hash, 0, BROWSE_GROUP_FILE_PAGE)
                 .unwrap_or_default();
@@ -873,9 +880,10 @@ impl App {
             let total = store
                 .group_files_count(scan_id, &hash)
                 .unwrap_or(total_from_summary);
-            (files, total)
+            let claim = store.group_claim(scan_id, &hash).ok().flatten().or(claim);
+            (files, total, claim)
         } else {
-            (Vec::new(), total_from_summary)
+            (Vec::new(), total_from_summary, claim)
         };
         // Default keeper for display, if no file is marked as keeper.
         if !files.iter().any(|file| file.is_keeper) {
@@ -896,6 +904,7 @@ impl App {
         // recomputing every frame caused ~4 s of freeze per move. Render reads the ready map in O(1).
         self.browser.open_group_colors = crate::tui::screens::browser::name_palette(&group);
         self.browser.open_group = Some(group);
+        self.browser.open_group_claim = claim;
         self.browser
             .file_state
             .select(if has_files { Some(0) } else { None });

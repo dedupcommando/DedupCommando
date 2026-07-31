@@ -98,12 +98,18 @@ fn collect_marked(app: &App) -> Vec<FileEntry> {
                 Ok(meta) if meta.is_file() => meta,
                 _ => continue,
             };
+            // The whole identity, not just `(device, inode)`: the same `lstat` already answers it,
+            // and a row that carries half an identity is one a later caller can misread as whole.
             files.push(FileEntry {
                 path: path.clone(),
                 size: meta.size(),
                 mtime: meta.mtime(),
+                mtime_nsec: meta.mtime_nsec(),
+                ctime_sec: meta.ctime(),
+                ctime_nsec: meta.ctime_nsec(),
                 device: meta.dev(),
                 inode: meta.ino(),
+                nlink: meta.nlink(),
                 is_keeper: matches!(mark, Mark::Keeper),
                 action: mark.action(),
             });

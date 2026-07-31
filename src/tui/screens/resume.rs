@@ -76,14 +76,16 @@ pub fn render(frame: &mut Frame, app: &App) {
                 Span::raw(format!("{}   ", session.created_at)),
                 status_span(session),
             ];
-            // For a completed scan — the summary: how much was scanned and how much will be freed
-            // (E2E feedback). Placed before the roots so a long path doesn't crowd out the numbers.
+            // For a completed scan — the summary: how much was scanned and what the result is
+            // worth (E2E feedback). Placed before the roots so a long path doesn't crowd out the
+            // numbers. The state-aware short form, so a session row cannot promise more than the
+            // scan's own summary does.
             if session.status.is_completed() {
                 spans.push(Span::styled(
                     format!(
-                        "   {} files · free {}",
+                        "   {} files · {}",
                         session.files_scanned,
-                        crate::tui::human_bytes(session.reclaimable_bytes),
+                        crate::tui::reclaim_cell(session.reclaim),
                     ),
                     Style::new().fg(Color::DarkGray),
                 ));

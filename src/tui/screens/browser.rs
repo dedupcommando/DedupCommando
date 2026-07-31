@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use crate::app::{App, PathStyle};
 use crate::model::action::ActionKind;
 use crate::model::duplicate::{DirGroup, DuplicateGroup};
-use crate::state::{DirGroupSummary, GroupSummary};
+use crate::state::{DirGroupSummary, GroupClaim, GroupSummary};
 use crate::tui::human_bytes;
 
 /// Active browser tab: `Files` —
@@ -31,7 +31,9 @@ pub enum BrowserTab {
 /// `[2] Files` tabs are embedded in the left panel's title.
 pub fn render(frame: &mut Frame, app: &mut App) {
     let rows = Layout::vertical([
-        Constraint::Length(3),
+        // Four, not three: the reclaim statement gets its own line rather than being clipped off
+        // the end of a counters row. What a figure means is not an optional part of it.
+        Constraint::Length(4),
         Constraint::Min(0),
         Constraint::Length(4),
     ])
@@ -52,24 +54,44 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         ),
         Span::raw(" Duplicates "),
     ]);
-    let header_text = match app.browser.tab {
-        BrowserTab::Files => format!(
-            " Groups: {}   Scanned: {}   Will free: {}   Marked: {} ",
-            app.browser.group_summaries.len(),
-            app.browser.summary.files_scanned,
-            human_bytes(app.browser.reclaim_total),
-            app.browser.marked_count,
-        ),
-        BrowserTab::Dirs => format!(
-            " Groups: {}   Scanned: {}   Will free: {}   Marked: {} ",
-            app.browser.dir_group_summaries.len(),
-            app.browser.summary.files_scanned,
-            human_bytes(app.browser.dir_groups_reclaim_total),
-            app.browser.marked_count,
-        ),
+    // The file tab states the scan's own reclaim through the shared formatter; the folder tab
+    // keeps its own arithmetic, which this change does not touch. `already linked sets` belongs to
+    // the scan, so both tabs show it.
+    let header_lines = match app.browser.tab {
+        BrowserTab::Files => vec![
+            format!(
+                " Groups: {}   Scanned: {}   Marked: {} ",
+                app.browser.group_summaries.len(),
+                app.browser.summary.files_scanned,
+                app.browser.marked_count,
+            ),
+            format!(
+                " {}   already linked sets: {} ",
+                crate::tui::reclaim_phrase(app.browser.summary.reclaim),
+                app.browser.summary.already_linked_sets,
+            ),
+        ],
+        BrowserTab::Dirs => vec![
+            format!(
+                " Groups: {}   Scanned: {}   Will free: {}   Marked: {} ",
+                app.browser.dir_group_summaries.len(),
+                app.browser.summary.files_scanned,
+                human_bytes(app.browser.dir_groups_reclaim_total),
+                app.browser.marked_count,
+            ),
+            format!(
+                " already linked sets: {} ",
+                app.browser.summary.already_linked_sets
+            ),
+        ],
     };
-    let header = Paragraph::new(Line::from(header_text))
-        .block(Block::default().borders(Borders::ALL).title(title));
+    let header = Paragraph::new(
+        header_lines
+            .into_iter()
+            .map(Line::from)
+            .collect::<Vec<Line>>(),
+    )
+    .block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(header, rows[0]);
 
     // The left panel — a fixed width of 52; the right one stretches to fit.
@@ -163,6 +185,7 @@ fn render_files_tab(frame: &mut Frame, panes: std::rc::Rc<[ratatui::layout::Rect
         frame,
         panes[1],
         app.browser.open_group.as_ref(),
+        app.browser.open_group_claim,
         &app.browser.open_group_colors,
         &mut app.browser.file_state,
         path_style,
@@ -311,12 +334,15 @@ pub(crate) fn render_group_list(
     let items: Vec<ListItem> = groups[start..end]
         .iter()
         .map(|group| {
+            // Pathnames and allocations are both shown, because they are different questions:
+            // «6 files» is what the operator sees, «3 allocations» is what the filesystem frees.
             ListItem::new(format!(
-                "#{:<4} {} files · {} · free {}",
+                "#{:<4} {} files · {} objects · {} · {}",
                 group.rank,
                 group.file_count,
+                group.object_count,
                 human_bytes(group.size_bytes),
-                human_bytes(group.reclaim_bytes),
+                crate::tui::reclaim_cell(group.reclaim),
             ))
         })
         .collect();
@@ -336,22 +362,51 @@ pub(crate) fn render_group_list(
 
 /// Draws the file list of group `group` — reused by the
 /// Browser screen and the commander panels (GroupFiles / DuplicatesOfCursor).
-#[allow(clippy::too_many_arguments)] // render function: 8 list-drawing parameters
+#[allow(clippy::too_many_arguments)] // render function: 9 list-drawing parameters
 pub(crate) fn render_group_files(
     frame: &mut Frame,
     area: Rect,
     group: Option<&DuplicateGroup>,
+    claim: Option<GroupClaim>,
     name_colors: &HashMap<String, Color>,
     state: &mut ListState,
     path_style: PathStyle,
     focused: bool,
     title: &str,
 ) {
+    // The block is drawn here rather than by the List, so the group's own claim gets a line inside
+    // it. That line is the group's full statement — the list row next door has room for three
+    // words, this one has room for what those three words mean.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title.to_string())
+        .border_style(focus_style(focused));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let (claim_area, list_area) = match claim {
+        Some(_) if inner.height > 1 => {
+            let split = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+            (Some(split[0]), split[1])
+        }
+        _ => (None, inner),
+    };
+    if let (Some(claim_area), Some(claim)) = (claim_area, claim) {
+        frame.render_widget(
+            Paragraph::new(Line::from(format!(
+                "{} · {}",
+                crate::tui::reclaim_phrase(claim.reclaim),
+                crate::tui::links_phrase(claim.links)
+            )))
+            .style(Style::new().add_modifier(Modifier::DIM)),
+            claim_area,
+        );
+    }
+
     // Virtualization: we build ListItems ONLY for the visible window. On /tank the top
     // "by payoff" groups are tens of thousands of files; building them all + O(N²) name_palette on
     // EVERY frame starved input (freeze per move). Mirror of render_group_list (browser.rs:76).
-    let rows = (area.height as usize).saturating_sub(2);
-    let inner_width = (area.width as usize).saturating_sub(2);
+    let rows = list_area.height as usize;
+    let inner_width = inner.width as usize;
     let (local_sel, file_items, window_start): (Option<usize>, Vec<ListItem>, usize) = match group {
         Some(group) => {
             let (start, local_sel) = crate::tui::visible_window(state, group.files.len(), rows);
@@ -424,19 +479,13 @@ pub(crate) fn render_group_files(
         }
     };
     let list = List::new(file_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title.to_string())
-                .border_style(focus_style(focused)),
-        )
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
     let mut local = ListState::default();
     local.select(
         local_sel.map(|sel| sel + separators_before_cursor(window_start, window_start + sel)),
     );
-    frame.render_stateful_widget(list, area, &mut local);
+    frame.render_stateful_widget(list, list_area, &mut local);
 }
 
 /// Draws the list of duplicate-directory groups — for the
@@ -706,7 +755,110 @@ pub(crate) fn name_palette(group: &DuplicateGroup) -> HashMap<String, Color> {
 mod tests {
     use super::*;
     use crate::model::duplicate::FileEntry;
+    use crate::model::reclaim::{LinkCount, ReclaimEstimate};
+    use crate::state::GroupLinks;
+    use ratatui::{backend::TestBackend, Terminal};
     use std::path::PathBuf;
+
+    /// Everything drawn into a fixed-size buffer, as one string.
+    fn drawn(width: u16, height: u16, draw: impl FnOnce(&mut Frame)) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(draw).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn summary_row(rank: i64, reclaim: ReclaimEstimate) -> GroupSummary {
+        GroupSummary {
+            rank,
+            hash: format!("h{rank}"),
+            file_count: 3,
+            size_bytes: 4096,
+            object_count: 2,
+            reclaim,
+        }
+    }
+
+    /// The list row shows both counts and never labels a ceiling as freed. This is the row the
+    /// classic browser and the commander's group panel both draw.
+    #[test]
+    fn a_group_row_shows_allocations_and_refuses_to_call_a_bound_free() {
+        let groups = vec![
+            summary_row(0, ReclaimEstimate::exact(4096)),
+            summary_row(1, ReclaimEstimate::upper_bound(4096)),
+            summary_row(2, ReclaimEstimate::unknown()),
+        ];
+        let mut state = ListState::default();
+        let rendered = drawn(70, 6, |frame| {
+            render_group_list(
+                frame,
+                frame.area(),
+                &groups,
+                &mut state,
+                true,
+                Line::from(" groups "),
+            );
+        });
+        assert!(
+            rendered.contains("3 files · 2 objects"),
+            "pathnames and allocations are different questions: {rendered}"
+        );
+        assert!(rendered.contains("free 4.0 KiB"), "{rendered}");
+        assert!(rendered.contains("up to 4.0 KiB"), "{rendered}");
+        assert!(rendered.contains("rescan required"), "{rendered}");
+        assert_eq!(
+            rendered.matches("free").count(),
+            1,
+            "only the exact row may say «free»: {rendered}"
+        );
+    }
+
+    /// The open group states its own claim in full, with the link evidence behind it — the same
+    /// panel the commander draws for GroupFiles and DuplicatesOfCursor.
+    #[test]
+    fn an_open_group_states_its_claim_and_the_links_behind_it() {
+        let group = group_with_names(&["a.bin", "b.bin"]);
+        let claim = crate::state::GroupClaim {
+            reclaim: ReclaimEstimate::upper_bound(4096),
+            links: GroupLinks {
+                observed: 2,
+                total: LinkCount::Known(3),
+            },
+        };
+        let colors = HashMap::new();
+        let mut state = ListState::default();
+        let rendered = drawn(100, 8, |frame| {
+            render_group_files(
+                frame,
+                frame.area(),
+                Some(&group),
+                Some(claim),
+                &colors,
+                &mut state,
+                PathStyle::NameFirst,
+                true,
+                " Group files ",
+            );
+        });
+        assert!(
+            rendered.contains("guaranteed after quarantine purge: 0 B"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("up to 4.0 KiB after quarantine purge"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("links seen 2/3"), "{rendered}");
+        assert!(
+            rendered.contains("a.bin") && rendered.contains("b.bin"),
+            "the claim line must not cost the panel its files: {rendered}"
+        );
+    }
 
     fn group_with_names(names: &[&str]) -> DuplicateGroup {
         DuplicateGroup {
@@ -719,11 +871,9 @@ mod tests {
                 .map(|(n, name)| FileEntry {
                     path: PathBuf::from(format!("/dir{n}/{name}")),
                     size: 100,
-                    mtime: 0,
-                    device: 0,
                     inode: n as u64,
-                    is_keeper: false,
-                    action: None,
+                    nlink: 1,
+                    ..Default::default()
                 })
                 .collect(),
         }

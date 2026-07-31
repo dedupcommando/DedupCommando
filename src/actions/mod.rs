@@ -672,12 +672,9 @@ mod tests {
     fn mark(path: &str, keeper: bool, action: Option<ActionKind>) -> FileEntry {
         FileEntry {
             path: PathBuf::from(path),
-            size: 0,
-            mtime: 0,
-            device: 0,
-            inode: 0,
             is_keeper: keeper,
             action,
+            ..Default::default()
         }
     }
 

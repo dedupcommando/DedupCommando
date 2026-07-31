@@ -639,8 +639,9 @@ pub enum WatchKey {
 /// of twin directories, or (fallback) duplicate files inside the dir-cursor.
 #[derive(Debug, Clone)]
 pub enum WatchResult {
-    /// The old path (GroupFiles / DupOf): a group of duplicate files.
-    FileGroup(DuplicateGroup),
+    /// The old path (GroupFiles / DupOf): a group of duplicate files, with what its materialized
+    /// row claims — the panel states the claim, and a group carries the claim of its own row.
+    FileGroup(DuplicateGroup, crate::state::GroupClaim),
     /// Cursor on a directory that has a twin in `dir_dedup`.
     DirGroup(DirGroup),
     /// Cursor on a directory WITHOUT a twin, but with duplicate files
@@ -683,7 +684,7 @@ impl WatchEntry {
     /// through this helper, unaware of DirGroup/InnerDupes.
     pub fn as_file_group(&self) -> Option<&DuplicateGroup> {
         match &self.result {
-            Some(WatchResult::FileGroup(g)) => Some(g),
+            Some(WatchResult::FileGroup(g, _)) => Some(g),
             _ => None,
         }
     }

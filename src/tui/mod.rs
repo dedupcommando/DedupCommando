@@ -22,6 +22,8 @@ use ratatui::{
 };
 
 use crate::app::{App, AppMode, ConfirmAction, Screen};
+use crate::model::reclaim::{LinkCount, ReclaimEstimate};
+use crate::state::GroupLinks;
 
 pub mod commander;
 pub mod event;
@@ -505,6 +507,52 @@ pub fn human_bytes_parts(bytes: u64) -> (String, &'static str) {
     }
 }
 
+/// The one place a reclaim figure becomes words.
+///
+/// Every claim is post-purge, because deleting a duplicate moves it into the quarantine inside the
+/// same dataset and frees nothing until `--purge-quarantine` runs. An upper bound never gets the
+/// words «free», «freed» or «guaranteed» attached to its own number: it says what is guaranteed
+/// (nothing, for a group) and then, separately, how far the number could go. A result whose link
+/// counts were never recorded says so and offers no number at all.
+///
+/// Classic, commander, headless, `--stats` and the session list all call this rather than
+/// formatting bytes themselves, so the same result cannot read differently in two windows.
+pub fn reclaim_phrase(estimate: ReclaimEstimate) -> String {
+    match estimate.potential_bytes() {
+        None => "rescan required".to_string(),
+        Some(ceiling) if ceiling == estimate.guaranteed_bytes() => format!(
+            "guaranteed after quarantine purge: {}",
+            human_bytes(estimate.guaranteed_bytes())
+        ),
+        Some(ceiling) => format!(
+            "guaranteed after quarantine purge: {} · up to {} after quarantine purge",
+            human_bytes(estimate.guaranteed_bytes()),
+            human_bytes(ceiling)
+        ),
+    }
+}
+
+/// The same figure where a list row has room for three words: `free X` only when X is really
+/// freed, `up to X` when it is a ceiling, and no number when nothing was established.
+pub fn reclaim_cell(estimate: ReclaimEstimate) -> String {
+    match estimate.potential_bytes() {
+        None => "rescan required".to_string(),
+        Some(ceiling) if ceiling == estimate.guaranteed_bytes() => {
+            format!("free {}", human_bytes(estimate.guaranteed_bytes()))
+        }
+        Some(ceiling) => format!("up to {}", human_bytes(ceiling)),
+    }
+}
+
+/// How many of a group's allocations' links the scan saw — the sentence that explains why an
+/// upper bound is an upper bound.
+pub fn links_phrase(links: GroupLinks) -> String {
+    match links.total {
+        LinkCount::Known(total) => format!("links seen {}/{total}", links.observed),
+        LinkCount::Unknown => format!("links seen {}/unrecorded", links.observed),
+    }
+}
+
 /// Human-readable duration: 134 s -> "2m14s", 3725 s -> "1h02m", 9 s -> "9s".
 pub fn format_duration(seconds: f64) -> String {
     let total = seconds.max(0.0) as u64;
@@ -539,6 +587,65 @@ mod format_tests {
         assert_eq!(format_speed(47 * 1024 * 1024, 1.0), "47.0 MiB/s");
         assert_eq!(format_speed(0, 1.0), "—", "zero bytes → dash");
         assert_eq!(format_speed(1024 * 1024, 0.0), "—", "zero time → dash");
+    }
+
+    /// The exact wording, once, so every surface that calls this is asserting it too.
+    #[test]
+    fn a_reclaim_figure_says_what_kind_of_figure_it_is() {
+        assert_eq!(
+            reclaim_phrase(ReclaimEstimate::exact(4096)),
+            "guaranteed after quarantine purge: 4.0 KiB"
+        );
+        assert_eq!(
+            reclaim_phrase(ReclaimEstimate::upper_bound(4096)),
+            "guaranteed after quarantine purge: 0 B · up to 4.0 KiB after quarantine purge"
+        );
+        assert_eq!(
+            reclaim_phrase(ReclaimEstimate::unknown()),
+            "rescan required"
+        );
+
+        assert_eq!(reclaim_cell(ReclaimEstimate::exact(4096)), "free 4.0 KiB");
+        assert_eq!(
+            reclaim_cell(ReclaimEstimate::upper_bound(4096)),
+            "up to 4.0 KiB",
+            "a ceiling never gets the word «free»"
+        );
+        assert_eq!(reclaim_cell(ReclaimEstimate::unknown()), "rescan required");
+    }
+
+    /// A mixed scan headlines its guarantee and states the bigger ceiling apart from it.
+    #[test]
+    fn a_mixed_scan_total_reads_as_two_different_numbers() {
+        let mixed = ReclaimEstimate::for_fresh_scan([
+            ReclaimEstimate::exact(1024),
+            ReclaimEstimate::upper_bound(3072),
+        ])
+        .unwrap();
+        assert_eq!(
+            reclaim_phrase(mixed),
+            "guaranteed after quarantine purge: 1.0 KiB · up to 4.0 KiB after quarantine purge"
+        );
+    }
+
+    /// The link evidence: what was seen against what exists, and an admission when the count was
+    /// never recorded.
+    #[test]
+    fn link_evidence_states_both_numbers_or_admits_it_has_none() {
+        assert_eq!(
+            links_phrase(GroupLinks {
+                observed: 2,
+                total: LinkCount::Known(3)
+            }),
+            "links seen 2/3"
+        );
+        assert_eq!(
+            links_phrase(GroupLinks {
+                observed: 2,
+                total: LinkCount::Unknown
+            }),
+            "links seen 2/unrecorded"
+        );
     }
 }
 

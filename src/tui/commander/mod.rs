@@ -1570,7 +1570,7 @@ fn panel_row_count(app: &App, index: usize) -> usize {
             .get(index)
             .and_then(|entry| entry.result.as_ref())
         {
-            Some(WatchResult::FileGroup(g)) => g.files.len(),
+            Some(WatchResult::FileGroup(g, _)) => g.files.len(),
             Some(WatchResult::DirGroup(g)) => g.paths.len(),
             Some(WatchResult::InnerDupes(paths)) => paths.len(),
             None => 0,
@@ -1912,12 +1912,22 @@ fn resolve_watch_group(
             let files = store
                 .group_files(scan_id, &hash)
                 .map_err(|_| state::WatchEmpty::NoDuplicates)?;
-            Ok(state::WatchResult::FileGroup(DuplicateGroup {
-                id: *idx,
-                size_bytes: files.first().map(|file| file.size).unwrap_or(0),
-                hash,
-                files,
-            }))
+            // A group whose claim cannot be read is shown as no group at all: an unstated figure
+            // is what this whole change exists to remove.
+            let claim = store
+                .group_claim(scan_id, &hash)
+                .ok()
+                .flatten()
+                .ok_or(state::WatchEmpty::NoDuplicates)?;
+            Ok(state::WatchResult::FileGroup(
+                DuplicateGroup {
+                    id: *idx,
+                    size_bytes: files.first().map(|file| file.size).unwrap_or(0),
+                    hash,
+                    files,
+                },
+                claim,
+            ))
         }
         state::WatchKey::DupOf(path) => {
             // Hash_for_path = None → the file is not in the scan manifest → NotInScan.
@@ -1927,24 +1937,22 @@ fn resolve_watch_group(
                 Err(_) => return Err(state::WatchEmpty::NotInScan),
             };
             let hex = crate::model::duplicate::hex_encode(&hash);
-            // group_summary_for_hash = None → the file is in the scan, but not in a duplicate group.
-            if store
-                .group_summary_for_hash(scan_id, &hex)
-                .ok()
-                .flatten()
-                .is_none()
-            {
+            // No claim → the file is in the scan, but not in a materialized duplicate group.
+            let Some(claim) = store.group_claim(scan_id, &hex).ok().flatten() else {
                 return Err(state::WatchEmpty::NoDuplicates);
-            }
+            };
             let files = store
                 .group_files(scan_id, &hex)
                 .map_err(|_| state::WatchEmpty::NoDuplicates)?;
-            Ok(state::WatchResult::FileGroup(DuplicateGroup {
-                id: 0,
-                size_bytes: files.first().map(|file| file.size).unwrap_or(0),
-                hash: hex,
-                files,
-            }))
+            Ok(state::WatchResult::FileGroup(
+                DuplicateGroup {
+                    id: 0,
+                    size_bytes: files.first().map(|file| file.size).unwrap_or(0),
+                    hash: hex,
+                    files,
+                },
+                claim,
+            ))
         }
         state::WatchKey::DirOf(path) => {
             // First we look for twins in `dir_dedup`.
@@ -2799,6 +2807,8 @@ fn persist_mark(app: &mut App, entry: &PanelEntry, mark: Option<Mark>) {
     let Some(scan_id) = app.commander.dedup_scan_id else {
         return;
     };
+    // `save_marks` persists only path/is_keeper/action; the rest of the identity is not known
+    // here and is deliberately left at its default rather than half-filled.
     let file = FileEntry {
         path: entry.path.clone(),
         size: entry.size,
@@ -2807,6 +2817,7 @@ fn persist_mark(app: &mut App, entry: &PanelEntry, mark: Option<Mark>) {
         inode: entry.inode,
         is_keeper: mark == Some(Mark::Keeper),
         action: mark.and_then(|mark| mark.action()),
+        ..Default::default()
     };
     if let Ok(mut store) = ScanStore::open(&app.db_path) {
         // We write the mark only for a file that is part of the scan (a pinpoint DB lookup
@@ -3544,11 +3555,10 @@ mod jump_tests {
         FileEntry {
             path: PathBuf::from(path),
             size: 100,
-            mtime: 0,
             device: 1,
             inode: 1,
-            is_keeper: false,
-            action: None,
+            nlink: 1,
+            ..Default::default()
         }
     }
 
@@ -3607,12 +3617,21 @@ mod jump_tests {
         commander.panels[0].list.select(Some(0));
         commander.active = 0;
         let entry = state::WatchEntry {
-            result: Some(state::WatchResult::FileGroup(DuplicateGroup {
-                id: 0,
-                size_bytes: 100,
-                hash: "abc".to_string(),
-                files: vec![make_file_entry("/tmp/dir/foo.bin")],
-            })),
+            result: Some(state::WatchResult::FileGroup(
+                DuplicateGroup {
+                    id: 0,
+                    size_bytes: 100,
+                    hash: "abc".to_string(),
+                    files: vec![make_file_entry("/tmp/dir/foo.bin")],
+                },
+                crate::state::GroupClaim {
+                    reclaim: crate::model::reclaim::ReclaimEstimate::exact(100),
+                    links: crate::state::GroupLinks {
+                        observed: 1,
+                        total: crate::model::reclaim::LinkCount::Known(1),
+                    },
+                },
+            )),
             ..Default::default()
         };
         commander.watch_cache = vec![entry, state::WatchEntry::default()];
