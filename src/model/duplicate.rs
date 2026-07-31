@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::model::action::ActionKind;
 use crate::model::reclaim::{GroupReclaim, LinkCount, ObjectLinks};
 
@@ -77,32 +77,82 @@ impl DuplicateGroup {
     pub fn physical_reclaim(&self) -> Result<GroupReclaim> {
         // Keyed rather than scanned: a top /tank group holds tens of thousands of pathnames, and
         // an inner search per file would make publishing the result quadratic in the group size.
-        // The fold below is order-independent, so a hash map costs nothing in determinism.
-        let mut objects: std::collections::HashMap<ObjectKey, ObjectLinks> =
+        let mut objects: std::collections::HashMap<ObjectKey, ObjectEvidence> =
             std::collections::HashMap::new();
         for file in &self.files {
-            objects
-                .entry(file.object_key())
-                .and_modify(|links| links.observed += 1)
-                .or_insert(ObjectLinks {
-                    observed: 1,
-                    links: LinkCount::from_u64(file.nlink),
-                });
+            let links = LinkCount::from_u64(file.nlink);
+            match objects.entry(file.object_key()) {
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let seen = slot.get_mut();
+                    // Checked: a pathname count is what the manifest holds, and no arithmetic on
+                    // the way to a byte figure may wrap corrupt input into a trusted one.
+                    seen.observed = seen.observed.checked_add(1).ok_or_else(|| {
+                        AppError::msg(
+                            "a duplicate-content group with more pathnames than a count can hold"
+                                .to_string(),
+                        )
+                    })?;
+                    // Extremes, not a running value: every alias is weighed, and the object's
+                    // smallest pathname names it however the rows arrived.
+                    if file.path < seen.representative {
+                        seen.representative = file.path.clone();
+                    }
+                    if links.to_u64() < seen.low.to_u64() {
+                        seen.low = links;
+                    }
+                    if links.to_u64() > seen.high.to_u64() {
+                        seen.high = links;
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(ObjectEvidence {
+                        representative: file.path.clone(),
+                        observed: 1,
+                        low: links,
+                        high: links,
+                    });
+                }
+            }
         }
-        let named = crate::textsan::terminal(
-            &self
-                .files
-                .first()
-                .map(|file| file.path.display().to_string())
-                .unwrap_or_default(),
-        );
-        let links: Vec<ObjectLinks> = objects.into_values().collect();
+
+        // Sorted before anything is judged, so a group with two damaged allocations reports the
+        // same one every time — a hash map's iteration order is not an order.
+        let mut evidence: Vec<ObjectEvidence> = objects.into_values().collect();
+        evidence.sort_by(|left, right| left.representative.cmp(&right.representative));
+        let named = evidence
+            .first()
+            .map(|first| crate::textsan::terminal(&first.representative.display().to_string()))
+            .unwrap_or_default();
+
+        let mut links = Vec::with_capacity(evidence.len());
+        for object in &evidence {
+            let object_named =
+                crate::textsan::terminal(&object.representative.display().to_string());
+            links.push(ObjectLinks {
+                observed: object.observed,
+                links: LinkCount::agreed(object.low, object.high, &object_named)?,
+            });
+        }
         GroupReclaim::of_objects(self.size_bytes, &links, &named)
     }
 }
 
 /// The complete scan-local temporal physical identity of a manifest row.
 type ObjectKey = (u64, u64, u64, i64, i64, i64, i64);
+
+/// What one temporal object's pathnames collectively reported, folded so that neither the verdict
+/// nor the message depends on the order they arrived in.
+struct ObjectEvidence {
+    /// The object's smallest pathname — the same representative the SQL path picks with
+    /// `MIN(path)`.
+    representative: PathBuf,
+    /// Pathnames of this object inside the group.
+    observed: u64,
+    /// The lowest and highest link count its aliases reported. Unequal means they disagree, and
+    /// an unrecorded count sorts below every real one, exactly as the `0` it is stored as does.
+    low: LinkCount,
+    high: LinkCount,
+}
 
 /// A group of directories with matching SCANNED contents. The signature is the blake3 of the sorted list (relative path, file hash)
 /// over all files under the directory; the same for directories with the same tree. It is emitted ONLY
@@ -420,6 +470,90 @@ mod tests {
             reclaim.object_count, 2,
             "same (device, inode), different ctime: two allocations"
         );
+        assert_eq!(reclaim.estimate.guaranteed_bytes(), 100);
+    }
+
+    /// Two pathnames of one inode cannot report two different link counts, and which of them the
+    /// grouping happened to meet first must make no difference. Keeping the first and ignoring the
+    /// rest is what let a corrupt manifest publish an exact figure.
+    #[test]
+    fn aliases_that_disagree_about_the_link_count_refuse_in_either_order() {
+        for (first, second) in [(2u64, 1u64), (1, 2)] {
+            let mut aliases = group(0, 100, 3);
+            aliases.files[0].inode = 7;
+            aliases.files[0].nlink = first;
+            aliases.files[1].inode = 7;
+            aliases.files[1].nlink = second;
+            // A third, independent object, so the group is a real one and the refusal cannot be
+            // mistaken for «not a duplicate group».
+            aliases.files[2].inode = 9;
+            aliases.files[2].nlink = 1;
+            let err = aliases
+                .physical_reclaim()
+                .expect_err("disagreeing aliases must not produce a figure");
+            assert!(
+                err.to_string().contains("different link counts (1 and 2)"),
+                "the message names both counts, in a stable order: {err}"
+            );
+        }
+    }
+
+    /// An unrecorded count against a real one is a disagreement too: half a manifest is not a
+    /// measurement, and reading the recorded half as the truth is how an unmeasured allocation
+    /// acquires an exact figure.
+    #[test]
+    fn an_unrecorded_count_beside_a_real_one_refuses_in_either_order() {
+        for (first, second) in [(0u64, 1u64), (1, 0)] {
+            let mut aliases = group(0, 100, 3);
+            aliases.files[0].inode = 7;
+            aliases.files[0].nlink = first;
+            aliases.files[1].inode = 7;
+            aliases.files[1].nlink = second;
+            aliases.files[2].inode = 9;
+            aliases.files[2].nlink = 1;
+            let err = aliases
+                .physical_reclaim()
+                .expect_err("an unrecorded count beside a real one must not produce a figure");
+            assert!(
+                err.to_string()
+                    .contains("different link counts (unrecorded and 1)"),
+                "the message admits which half is missing: {err}"
+            );
+        }
+    }
+
+    /// The message names the object's own smallest pathname, whatever order its aliases arrived
+    /// in — so two runs over the same damaged manifest read identically.
+    #[test]
+    fn the_refusal_names_the_objects_smallest_pathname() {
+        let mut aliases = group(0, 100, 3);
+        aliases.files[0].path = PathBuf::from("/x/zebra");
+        aliases.files[0].inode = 7;
+        aliases.files[0].nlink = 2;
+        aliases.files[1].path = PathBuf::from("/x/alpha");
+        aliases.files[1].inode = 7;
+        aliases.files[1].nlink = 1;
+        aliases.files[2].inode = 9;
+        aliases.files[2].nlink = 1;
+        let err = aliases.physical_reclaim().unwrap_err().to_string();
+        assert!(err.contains("/x/alpha"), "{err}");
+        assert!(!err.contains("/x/zebra"), "{err}");
+    }
+
+    /// The control the refusal must not swallow: aliases that agree are still an ordinary
+    /// fully observed allocation.
+    #[test]
+    fn aliases_that_agree_are_untouched_by_the_check() {
+        let mut aliases = group(0, 100, 3);
+        for index in 0..2 {
+            aliases.files[index].inode = 7;
+            aliases.files[index].nlink = 2;
+        }
+        aliases.files[2].inode = 9;
+        aliases.files[2].nlink = 1;
+        let reclaim = aliases.physical_reclaim().unwrap();
+        assert_eq!((reclaim.observed_paths, reclaim.object_count), (3, 2));
+        assert_eq!(reclaim.total_links, LinkCount::Known(3));
         assert_eq!(reclaim.estimate.guaranteed_bytes(), 100);
     }
 

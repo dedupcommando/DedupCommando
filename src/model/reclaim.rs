@@ -118,6 +118,37 @@ impl LinkCount {
     pub const fn is_known(self) -> bool {
         matches!(self, Self::Known(_))
     }
+
+    /// The one count an allocation's pathnames agree on, or an error naming their disagreement.
+    ///
+    /// Takes the two extremes the object's aliases reported rather than a running value, so both
+    /// the answer and the message are the same whatever order the pathnames arrived in. This is
+    /// the in-memory counterpart of the SQL path's `COUNT(DISTINCT nlink)`, and it exists for the
+    /// same reason: keeping the first alias's count and ignoring the rest lets one valid pathname
+    /// vouch for a corrupt sibling, which is exactly the shape C3a fixed on the SQL side.
+    ///
+    /// `Unknown` against a real count is a disagreement too. One pathname of an allocation cannot
+    /// have a link count while another has none — that is a manifest half-written by two builds,
+    /// and reading the recorded half as the truth would publish a figure for an object nobody
+    /// fully measured.
+    pub fn agreed(low: Self, high: Self, named: &str) -> Result<Self> {
+        if low == high {
+            return Ok(low);
+        }
+        Err(AppError::msg(format!(
+            "dedcom.db holds different link counts ({} and {}) for the one allocation behind {named}; its pathnames are the same inode and cannot disagree. Rescan, or move the old dedcom.db aside.",
+            low.describe(),
+            high.describe()
+        )))
+    }
+
+    /// How a count reads in a message: the number, or the admission that none was recorded.
+    fn describe(self) -> String {
+        match self {
+            Self::Unknown => "unrecorded".to_string(),
+            Self::Known(count) => count.to_string(),
+        }
+    }
 }
 
 /// Whether a scan's results may be turned into a destructive plan.

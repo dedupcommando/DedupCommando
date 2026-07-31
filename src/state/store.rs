@@ -4786,6 +4786,56 @@ mod tests {
         }
     }
 
+    /// Aliases of one allocation reporting different link counts must be refused by BOTH
+    /// publishing paths, and neither may leave anything behind.
+    ///
+    /// The rows and digests are seeded straight into the manifest, deliberately bypassing
+    /// `candidate_objects` — that is where C3a already refuses this corruption during a real scan,
+    /// and going through it would prove nothing about what the publishing paths do when a
+    /// checkpoint is damaged after hashing, or written by something else.
+    #[test]
+    fn aliases_that_disagree_about_the_link_count_refuse_on_both_paths() {
+        let seed = |store: &mut ScanStore| {
+            seed_objects(
+                store,
+                &[
+                    object_row("/x/a1", S, 7, 2),
+                    object_row("/x/a2", S, 7, 1), // the same inode, a different count
+                    object_row("/x/b", S, 9, 1),
+                ],
+                &[("/x/a1", 1), ("/x/a2", 1), ("/x/b", 1)],
+            )
+        };
+        for verify in [false, true] {
+            let mut store = ScanStore::open_in_memory().unwrap();
+            let scan_id = seed(&mut store);
+            let err = if verify {
+                let groups = store.duplicate_groups(scan_id).unwrap();
+                store.record_file_results(scan_id, &groups).unwrap_err()
+            } else {
+                store.materialize_file_groups(scan_id).unwrap_err()
+            };
+            assert!(
+                err.to_string().contains("different link counts"),
+                "both paths must name the same condition ({}): {err}",
+                if verify { "RAM/--verify" } else { "SQL" }
+            );
+            assert!(
+                store.group_summaries(scan_id).unwrap().is_empty(),
+                "a refused result leaves no rows"
+            );
+            assert!(
+                !store.results_materialized(scan_id).unwrap(),
+                "a refused result leaves no marker"
+            );
+            assert_eq!(
+                store.scan_reclaim(scan_id).unwrap().potential_bytes(),
+                None,
+                "a refused result leaves no trusted total"
+            );
+        }
+    }
+
     /// A ceiling that leaves the persisted integer domain is refused on both paths. SQLite answers
     /// an overflowing `*` with a `REAL`, which is how a byte count would quietly become an
     /// approximation; the Rust path would have to wrap. Neither is allowed to happen.
