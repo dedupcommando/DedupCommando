@@ -3742,15 +3742,18 @@ mod group_panel_tests {
     use super::*;
     use crate::model::reclaim::ReclaimEstimate;
     use crate::state::GroupSummary;
-    use crate::tui::screens::browser::tests::{shows_claim, CLAIM_WORDS};
+    use crate::tui::screens::browser::tests::entry_text;
     use ratatui::layout::Position;
     use ratatui::{backend::TestBackend, Terminal};
     use std::path::PathBuf;
 
+    /// Three groups with DIFFERENT figures, so no row can stand in for another's number: if the
+    /// exact entry loses its own `4.0 KiB` it cannot borrow one, because nothing else on screen
+    /// says `4.0 KiB`.
     fn summaries() -> Vec<GroupSummary> {
         [
             ReclaimEstimate::exact(4096),
-            ReclaimEstimate::upper_bound(4096),
+            ReclaimEstimate::upper_bound(9 * 1024 * 1024),
             ReclaimEstimate::unknown(),
         ]
         .into_iter()
@@ -3781,8 +3784,12 @@ mod group_panel_tests {
 
     /// The acceptance condition C4b claimed and did not test: a REAL 80-column commander, which
     /// draws two panels of 40, must show every claim complete — qualifier and figure both.
+    ///
+    /// Each claim is read out of its OWN entry's rows and columns. C4b1 searched the whole screen
+    /// for the claim's words in order, which let the exact row — rendered with its figure cut
+    /// off — pass by finding a `4.0 KiB` that belonged to the row below it.
     #[test]
-    fn an_eighty_column_two_panel_commander_shows_every_claim_in_full() {
+    fn an_eighty_column_two_panel_commander_shows_every_claim_in_its_own_entry() {
         assert_eq!(
             layout::max_panels(80),
             2,
@@ -3791,29 +3798,72 @@ mod group_panel_tests {
         let (mut app, _events) = app_with_group_panel();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let rendered: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
+        let buffer = terminal.backend().buffer().clone();
 
-        for (name, claim) in CLAIM_WORDS {
-            assert!(
-                shows_claim(&rendered, claim),
-                "the {name} claim must read in full in an 80-column commander: {rendered}"
-            );
-        }
-        // The panel strip really is two panels wide — a test that passed by collapsing the
-        // commander to one wide panel would prove nothing about the width that failed.
         let regions = layout::regions(Rect::new(0, 0, 80, 24));
         let rects = layout::panel_rects(regions.panels, visible_panel_count(&app, 80));
         assert_eq!(rects.len(), 2, "two panels must be on screen");
-        assert_eq!(rects[0].width, 40);
+        assert_eq!(rects[0].width, 40, "the width this defect lives at");
+        let panel = rects[0];
+        let rows = crate::tui::screens::browser::group_rows(panel.width);
+
+        let claims: Vec<String> = app
+            .commander
+            .group_summaries
+            .iter()
+            .map(|group| crate::tui::reclaim_cell(group.reclaim))
+            .collect();
+        // Every figure on screen is distinct, so a borrowed number cannot satisfy a check.
+        assert_eq!(
+            claims
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            claims.len(),
+            "the fixture must not repeat a claim"
+        );
+
+        for (entry, claim) in claims.iter().enumerate() {
+            let text = entry_text(&buffer, panel, entry, rows);
+            assert!(
+                text.contains(claim.as_str()),
+                "entry {entry} must state «{claim}» in its own rows: {text}"
+            );
+        }
+        // The second panel is still a panel — a test that passed by collapsing the commander to
+        // one wide column would prove nothing about the width that failed.
         assert!(
-            rendered.contains(" 2 · "),
-            "the second panel's title must still be drawn: {rendered}"
+            (0..24).any(|y| {
+                (rects[1].x..(rects[1].x + rects[1].width))
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("2 · ")
+            }),
+            "the second panel's title must still be drawn"
+        );
+    }
+
+    /// The row-local reading is what makes the test above mean anything, so it is itself checked:
+    /// an entry's text must not contain a neighbour's claim.
+    #[test]
+    fn an_entrys_text_stops_at_its_own_rows() {
+        let (mut app, _events) = app_with_group_panel();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let regions = layout::regions(Rect::new(0, 0, 80, 24));
+        let panel = layout::panel_rects(regions.panels, 2)[0];
+        let rows = crate::tui::screens::browser::group_rows(panel.width);
+
+        let first = entry_text(&buffer, panel, 0, rows);
+        let second = crate::tui::reclaim_cell(app.commander.group_summaries[1].reclaim);
+        assert!(
+            first.contains("4.0 KiB"),
+            "the first entry keeps its own figure: {first}"
+        );
+        assert!(
+            !first.contains(&second),
+            "the first entry must not reach into the second: {first}"
         );
     }
 
@@ -3871,8 +3921,13 @@ mod group_panel_tests {
         ] {
             assert_eq!(rows_per_entry(view, 40), 1, "{view:?} must stay one row");
         }
-        assert_eq!(rows_per_entry(PanelView::GroupList, 52), 2);
+        assert_eq!(rows_per_entry(PanelView::GroupList, 52), 3);
         assert_eq!(rows_per_entry(PanelView::GroupList, 40), 3);
+        assert_eq!(
+            rows_per_entry(PanelView::GroupList, 96),
+            2,
+            "a panel wide enough for the widest claim spends one line on it"
+        );
     }
 }
 

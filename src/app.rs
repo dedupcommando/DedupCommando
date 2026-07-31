@@ -3574,7 +3574,10 @@ mod group_list_navigation_tests {
     fn every_line_of_a_group_entry_selects_that_entry() {
         let (mut app, _events) = browser_with_groups(6);
         let rows = group_rows(PANEL.width);
-        assert_eq!(rows, 2, "the classic panel puts the claim on one line");
+        assert_eq!(
+            rows, 3,
+            "the widest figure the columns accept wraps onto a second claim line even here"
+        );
         for entry in 0..6u16 {
             for line in 0..rows {
                 let y = PANEL.y + 1 + entry * rows + line;
@@ -3610,13 +3613,13 @@ mod group_list_navigation_tests {
         // What `render` writes for the Files tab.
         app.browser.group_visible_rows = groups_that_fit(PANEL) as u16;
         assert_eq!(
-            app.browser.group_visible_rows, 9,
-            "18 rows inside the borders, two rows a group"
+            app.browser.group_visible_rows, 6,
+            "18 rows inside the borders, three rows a group"
         );
         app.browser_page(1);
         assert_eq!(
             app.browser.group_state.selected(),
-            Some(8),
+            Some(5),
             "a page is visible groups minus one, not visible terminal rows"
         );
     }

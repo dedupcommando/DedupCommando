@@ -240,11 +240,15 @@ pub(crate) const CLAIM_INDENT: &str = "  ";
 /// `List` reserves on every row whether or not the row is selected.
 const LIST_CHROME: usize = 4;
 
-/// A byte figure at the top of what `human_bytes` prints before its own width starts growing:
-/// `1023.0 TiB`. One duplicate-content group worth more than that does not exist on a pool this
-/// program can scan, and the row height has to be a function of the panel width alone — the mouse
-/// mapping cannot be made to ask what a row happens to say.
-const WIDEST_FIGURE: u64 = 1023 << 40;
+/// The largest reclaim figure this program can be asked to display.
+///
+/// It is the persisted domain, not an environment: `file_group.reclaim` and
+/// `scan_stats.reclaimable_bytes` are SQLite's signed integers, so every value through `i64::MAX`
+/// is one the store accepts and hands back. A sparse file, or a row seeded straight into a valid
+/// database, is not bounded by what a pool happens to hold today — reasoning from storage capacity
+/// is how the previous constant came to be `1023 TiB`, one line short of `8388608.0 TiB`, and how
+/// a 52-column panel came to drop the unit off the end of its own claim.
+const WIDEST_FIGURE: u64 = i64::MAX as u64;
 
 /// Columns the reclaim claim gets on a line of its own in a list panel this wide.
 pub(crate) fn claim_columns(width: u16) -> usize {
@@ -258,9 +262,21 @@ pub(crate) fn claim_columns(width: u16) -> usize {
 /// row `n` maps to an entry without knowing what any row says — and two rows is not always enough:
 /// an 80-column commander draws two panels of 40, where the exact claim does not fit on one line.
 pub(crate) fn group_rows(width: u16) -> u16 {
-    let widest =
-        crate::tui::reclaim_cell(crate::model::reclaim::ReclaimEstimate::exact(WIDEST_FIGURE));
-    1 + wrap_words(&widest, claim_columns(width)).len() as u16
+    use crate::model::reclaim::ReclaimEstimate;
+    let columns = claim_columns(width);
+    // Every state at the widest figure the columns accept, not just the exact one: the reserve has
+    // to hold whichever of them a row turns out to carry, and «the longest string must wrap into
+    // the most lines» is an argument, not a measurement.
+    let lines = [
+        ReclaimEstimate::exact(WIDEST_FIGURE),
+        ReclaimEstimate::upper_bound(WIDEST_FIGURE),
+        ReclaimEstimate::unknown(),
+    ]
+    .into_iter()
+    .map(|state| wrap_words(&crate::tui::reclaim_cell(state), columns).len())
+    .max()
+    .unwrap_or(1);
+    1 + lines as u16
 }
 
 /// How many groups fit in a panel of this size — the borders, then `group_rows` each. At least
@@ -905,33 +921,71 @@ pub(crate) mod tests {
         );
     }
 
-    /// The three claims, as words, for a width test to look for.
-    pub(crate) const CLAIM_WORDS: [(&str, &str); 3] = [
-        ("exact", "guaranteed after quarantine purge: 4.0 KiB"),
-        ("upper bound", "up to 4.0 KiB after quarantine purge"),
-        ("unknown", "rescan required"),
-    ];
-
-    fn claim_states() -> [ReclaimEstimate; 3] {
-        [
-            ReclaimEstimate::exact(4096),
-            ReclaimEstimate::upper_bound(4096),
-            ReclaimEstimate::unknown(),
-        ]
+    /// One entry of a rendered group list, as one normalised string: its own rows, its own
+    /// columns, and nothing else.
+    ///
+    /// Row-local on purpose. A search over the whole rendered screen let a truncated row borrow
+    /// the number it was missing from the row below it — the exact claim's absent `4.0 KiB` was
+    /// satisfied by the upper-bound row underneath, and the test that was named «shows every claim
+    /// in full» reported it as present.
+    pub(crate) fn entry_text(
+        buffer: &ratatui::buffer::Buffer,
+        panel: Rect,
+        entry: usize,
+        rows: u16,
+    ) -> String {
+        let first = panel.y + 1 + entry as u16 * rows;
+        let mut text = String::new();
+        for y in first..(first + rows).min(panel.y + panel.height - 1) {
+            for x in (panel.x + 1)..(panel.x + panel.width - 1) {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            // A claim wrapped onto the next line is still one claim: joining the entry's rows with
+            // a single space is what lets the whole string be asserted as a substring.
+            text.push(' ');
+        }
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    /// Whether every word of `claim` is on screen, in order, allowing the claim to have been
-    /// wrapped onto the next line. A plain `contains` cannot see a wrapped string, and dropping
-    /// the check entirely is how the missing number got through.
-    pub(crate) fn shows_claim(rendered: &str, claim: &str) -> bool {
-        let mut cursor = 0usize;
-        for word in claim.split(' ') {
-            match rendered[cursor..].find(word) {
-                Some(at) => cursor += at + word.len(),
-                None => return false,
-            }
-        }
-        true
+    /// The same, for a list rendered into the whole frame.
+    fn drawn_entry(width: u16, entry: usize, groups: &[GroupSummary]) -> String {
+        let area = Rect::new(0, 0, width, 12);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let mut list = ListState::default();
+        terminal
+            .draw(|frame| {
+                render_group_list(
+                    frame,
+                    frame.area(),
+                    groups,
+                    &mut list,
+                    true,
+                    Line::from(" groups "),
+                );
+            })
+            .unwrap();
+        entry_text(terminal.backend().buffer(), area, entry, group_rows(width))
+    }
+
+    /// The claims a row can carry, at a figure the caller chooses.
+    pub(crate) fn claims_of(bytes: u64) -> [(&'static str, ReclaimEstimate, String); 3] {
+        [
+            (
+                "exact",
+                ReclaimEstimate::exact(bytes),
+                crate::tui::reclaim_cell(ReclaimEstimate::exact(bytes)),
+            ),
+            (
+                "upper bound",
+                ReclaimEstimate::upper_bound(bytes),
+                crate::tui::reclaim_cell(ReclaimEstimate::upper_bound(bytes)),
+            ),
+            (
+                "unknown",
+                ReclaimEstimate::unknown(),
+                crate::tui::reclaim_cell(ReclaimEstimate::unknown()),
+            ),
+        ]
     }
 
     /// The panel the classic browser draws is 52 columns wide whatever the terminal is, and two
@@ -939,71 +993,98 @@ pub(crate) mod tests {
     /// its number — hiding it past the right edge would be the same lie in a different place.
     #[test]
     fn the_post_purge_qualifier_survives_every_panel_width_in_use() {
-        for width in [52, 40] {
-            for (state, (name, expected)) in claim_states().into_iter().zip(CLAIM_WORDS) {
-                let groups = vec![summary_row(0, state)];
-                let mut list = ListState::default();
-                let rendered = drawn(width, 8, |frame| {
-                    render_group_list(
-                        frame,
-                        frame.area(),
-                        &groups,
-                        &mut list,
-                        true,
-                        Line::from(" groups "),
-                    );
-                });
+        for width in [52, 40, 36] {
+            for (name, state, claim) in claims_of(4096) {
+                let text = drawn_entry(width, 0, &[summary_row(0, state)]);
                 assert!(
-                    shows_claim(&rendered, expected),
-                    "the {name} claim must read in full at {width} columns: {rendered}"
+                    text.contains(&claim),
+                    "the {name} claim must read in full at {width} columns: {text}"
+                );
+            }
+        }
+    }
+
+    /// The figure the persisted columns really accept, in the panel that reserves the fewest
+    /// lines. `8388608.0 TiB` is what `i64::MAX` prints as, and its unit used to fall off the end.
+    #[test]
+    fn the_largest_persisted_figure_reads_in_full_at_every_width() {
+        let widest = i64::MAX as u64;
+        assert_eq!(
+            crate::tui::human_bytes(widest),
+            "8388608.0 TiB",
+            "the domain's widest figure, as the formatter prints it"
+        );
+        for width in [52, 40, 36] {
+            for (name, state, claim) in claims_of(widest) {
+                let text = drawn_entry(width, 0, &[summary_row(0, state)]);
+                assert!(
+                    text.contains(&claim),
+                    "the {name} claim at the persisted maximum must read in full at {width}                      columns: {text}"
                 );
             }
         }
     }
 
     /// The height rule is a function of the panel width and nothing else — the same for every row
-    /// of a list, so a click at a given row means one thing however the rows above it read.
+    /// of a list, so a click at a given row means one thing however the rows above it read. And it
+    /// has to hold over the whole byte domain, not over the figures a test happened to pick.
     #[test]
-    fn the_entry_height_follows_the_width_alone() {
+    fn the_entry_height_holds_every_claim_at_every_width_in_use() {
         assert_eq!(
-            group_rows(52),
+            [group_rows(36), group_rows(40), group_rows(52)],
+            [3, 3, 3],
+            "the persisted maximum wraps onto a second claim line at all three widths"
+        );
+        assert_eq!(
+            group_rows(96),
             2,
-            "the classic panel fits the claim on one line"
+            "a panel wide enough for the widest claim spends one line on it"
         );
-        assert_eq!(
-            group_rows(40),
-            3,
-            "two panels of an 80-column commander need the claim wrapped"
-        );
-        assert_eq!(
-            group_rows(36),
-            group_rows(36),
-            "the commander's narrowest panel is still deterministic"
-        );
-        for state in claim_states() {
-            let claim = crate::tui::reclaim_cell(state);
-            assert!(
-                (wrap_words(&claim, claim_columns(40)).len() as u16) < group_rows(40),
-                "every state must fit the lines the width reserves: {claim}"
-            );
+        // Boundaries of `human_bytes` plus the ends of the domain: every state at every width must
+        // fit the lines that width reserves.
+        let figures = [
+            0,
+            1,
+            1023,
+            1024,
+            1024 * 1024 - 1,
+            1024 * 1024,
+            1023 * 1024 * 1024 * 1024,
+            1u64 << 40,
+            (1u64 << 40) + 1,
+            i64::MAX as u64 - 1,
+            i64::MAX as u64,
+        ];
+        for width in [36, 40, 52, 96] {
+            let reserved = group_rows(width) - 1;
+            for bytes in figures {
+                for (name, _, claim) in claims_of(bytes) {
+                    let lines = wrap_words(&claim, claim_columns(width)).len() as u16;
+                    assert!(
+                        lines <= reserved,
+                        "{name} of {bytes} needs {lines} lines at {width} columns,                          {reserved} reserved: {claim}"
+                    );
+                }
+            }
         }
     }
 
-    /// The window is measured in groups, so a panel tall enough for four rows shows two groups,
-    /// not four half-drawn ones — and paging steps by the same number.
+    /// The window is measured in groups, so a panel tall enough for four rows shows one whole
+    /// group, not two half-drawn ones — and paging steps by the same number.
     #[test]
     fn the_group_window_counts_groups_not_terminal_rows() {
         let wide = |height| Rect::new(0, 0, 52, height);
-        assert_eq!(groups_that_fit(wide(6)), 2, "6 rows: 2 borders, 2 groups");
-        assert_eq!(groups_that_fit(wide(11)), 4);
+        assert_eq!(group_rows(52), 3, "the rule these numbers follow");
+        assert_eq!(groups_that_fit(wide(5)), 1, "5 rows: 2 borders, 1 group");
+        assert_eq!(groups_that_fit(wide(11)), 3);
         assert_eq!(
             groups_that_fit(wide(3)),
             1,
             "a window too short for a whole entry still shows the selected one"
         );
         assert_eq!(groups_that_fit(wide(0)), 1);
-        // The same height holds fewer groups where each one is taller.
-        assert_eq!(groups_that_fit(Rect::new(0, 0, 40, 11)), 3);
+        // A wider panel spends fewer lines on each claim, so the same height holds more groups.
+        assert_eq!(groups_that_fit(Rect::new(0, 0, 96, 11)), 4);
     }
 
     /// Word wrapping is what keeps the claim complete; a word that cannot fit is left whole rather
