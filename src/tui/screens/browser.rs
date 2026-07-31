@@ -1133,10 +1133,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// The counters line is cut, not wrapped: at 36 columns a row already loses the tail of its
-    /// size. So the missing count is worded to occupy exactly the columns the number it replaces
-    /// would have — `objects unknown` costs six more, which at 40 columns is the whole size figure
-    /// and at 36 the end of the phrase itself.
+    /// The counters line is cut at the panel edge, not wrapped, so the missing count is worded to
+    /// occupy exactly the columns the number it replaces would have. `objects unknown` costs six
+    /// more: rendered on this fixture it cuts the size to `4.` at 40 columns, and at 36 takes the
+    /// size and its separator off the row altogether.
     #[test]
     fn the_unknown_count_costs_no_more_columns_than_the_number_it_replaces() {
         let legacy = counted_row(0, 3, 0, 4096, ReclaimEstimate::unknown());
