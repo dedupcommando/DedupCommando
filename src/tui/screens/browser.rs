@@ -427,10 +427,10 @@ pub(crate) fn render_group_list(
             // the lines below to itself rather than being the thing that gets cut, because a
             // number whose qualifier fell off the right edge is the defect, not the layout.
             let mut lines = vec![Line::from(format!(
-                "#{:<4} {} files · {} objects · {}",
+                "#{:<4} {} files · {} · {}",
                 group.rank,
                 group.file_count,
-                group.object_count,
+                crate::tui::objects_cell(group.object_count, group.reclaim),
                 human_bytes(group.size_bytes),
             ))];
             let wrapped = wrap_words(&crate::tui::reclaim_cell(group.reclaim), columns);
@@ -947,9 +947,8 @@ pub(crate) mod tests {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    /// The same, for a list rendered into the whole frame.
-    fn drawn_entry(width: u16, entry: usize, groups: &[GroupSummary]) -> String {
-        let area = Rect::new(0, 0, width, 12);
+    /// One group list drawn into a frame of exactly this size.
+    fn drawn_list(area: Rect, groups: &[GroupSummary]) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         let mut list = ListState::default();
         terminal
@@ -964,7 +963,24 @@ pub(crate) mod tests {
                 );
             })
             .unwrap();
-        entry_text(terminal.backend().buffer(), area, entry, group_rows(width))
+        terminal.backend().buffer().clone()
+    }
+
+    /// The same, for a list rendered into the whole frame.
+    fn drawn_entry(width: u16, entry: usize, groups: &[GroupSummary]) -> String {
+        let area = Rect::new(0, 0, width, 12);
+        entry_text(&drawn_list(area, groups), area, entry, group_rows(width))
+    }
+
+    /// Every entry of one list, each read from its own rows. The frame is made tall enough for the
+    /// whole fixture, so a case cannot pass by being scrolled out of the window instead of drawn.
+    pub(crate) fn drawn_entries(width: u16, groups: &[GroupSummary]) -> Vec<String> {
+        let rows = group_rows(width);
+        let area = Rect::new(0, 0, width, 2 + rows * groups.len() as u16);
+        let buffer = drawn_list(area, groups);
+        (0..groups.len())
+            .map(|entry| entry_text(&buffer, area, entry, rows))
+            .collect()
     }
 
     /// The claims a row can carry, at a figure the caller chooses.
@@ -1022,6 +1038,122 @@ pub(crate) mod tests {
                     "the {name} claim at the persisted maximum must read in full at {width}                      columns: {text}"
                 );
             }
+        }
+    }
+
+    /// A group row whose counts and claim are chosen per case.
+    fn counted_row(
+        rank: i64,
+        file_count: u64,
+        object_count: u64,
+        size_bytes: u64,
+        reclaim: ReclaimEstimate,
+    ) -> GroupSummary {
+        GroupSummary {
+            rank,
+            hash: format!("h{rank}"),
+            file_count,
+            size_bytes,
+            object_count,
+            reclaim,
+        }
+    }
+
+    /// The four rows the count wording has to tell apart, with every number distinct: a row that
+    /// lost its own text cannot be rescued by a neighbour's. `object_count == 0` is the migrated
+    /// sentinel only where nothing about the row is established — the second row has a real count
+    /// and an untrusted figure, and keeps its number.
+    fn count_cases() -> [(&'static str, GroupSummary, &'static str); 4] {
+        [
+            (
+                "migrated legacy",
+                counted_row(0, 3, 0, 4096, ReclaimEstimate::unknown()),
+                "? objects",
+            ),
+            (
+                "unknown with a recorded count",
+                counted_row(1, 7, 5, 8192, ReclaimEstimate::unknown()),
+                "5 objects",
+            ),
+            (
+                "exact",
+                counted_row(2, 9, 2, 12288, ReclaimEstimate::exact(12288)),
+                "2 objects",
+            ),
+            (
+                "upper bound",
+                counted_row(
+                    3,
+                    6,
+                    4,
+                    16384,
+                    ReclaimEstimate::upper_bound(9 * 1024 * 1024),
+                ),
+                "4 objects",
+            ),
+        ]
+    }
+
+    /// `object_count == 0` on a migrated row means the allocations were never counted, and a
+    /// browseable duplicate group cannot hold none — so the row says the count is missing rather
+    /// than printing a zero the operator would read as a measurement. Every row that does have a
+    /// count still prints it, and the rest of the row is untouched.
+    #[test]
+    fn a_migrated_group_counts_its_objects_as_unknown_and_the_rest_keep_theirs() {
+        let cases = count_cases();
+        let groups: Vec<GroupSummary> = cases.iter().map(|(_, row, _)| row.clone()).collect();
+        for width in [52, 40] {
+            let entries = drawn_entries(width, &groups);
+            for (entry, (name, group, phrase)) in cases.iter().enumerate() {
+                let text = &entries[entry];
+                assert!(
+                    text.contains(*phrase),
+                    "the {name} row must count its allocations as «{phrase}» at {width} columns: {text}"
+                );
+                assert!(
+                    !text.contains("0 objects"),
+                    "no browseable duplicate group holds zero allocations ({name}, {width} columns): {text}"
+                );
+                // The rest of the row is the point of the wording: the claim, the size and the
+                // pathname count all have to survive the phrase that replaced the number.
+                let claim = crate::tui::reclaim_cell(group.reclaim);
+                assert!(
+                    text.contains(&claim),
+                    "the {name} row must still state «{claim}» at {width} columns: {text}"
+                );
+                assert!(
+                    text.contains(&human_bytes(group.size_bytes)),
+                    "the {name} row must still show its size at {width} columns: {text}"
+                );
+                assert!(
+                    text.contains(&format!("{} files", group.file_count)),
+                    "the {name} row must still show its pathnames at {width} columns: {text}"
+                );
+            }
+        }
+    }
+
+    /// The counters line is cut, not wrapped: at 36 columns a row already loses the tail of its
+    /// size. So the missing count is worded to occupy exactly the columns the number it replaces
+    /// would have — `objects unknown` costs six more, which at 40 columns is the whole size figure
+    /// and at 36 the end of the phrase itself.
+    #[test]
+    fn the_unknown_count_costs_no_more_columns_than_the_number_it_replaces() {
+        let legacy = counted_row(0, 3, 0, 4096, ReclaimEstimate::unknown());
+        let counted = counted_row(0, 3, 7, 4096, ReclaimEstimate::unknown());
+        for width in [52, 40, 36] {
+            let sentinel = drawn_entries(width, std::slice::from_ref(&legacy));
+            let known = drawn_entries(width, std::slice::from_ref(&counted));
+            let (sentinel, known) = (&sentinel[0], &known[0]);
+            assert!(
+                sentinel.contains("? objects"),
+                "the sentinel row at {width} columns: {sentinel}"
+            );
+            assert_eq!(
+                sentinel.chars().count(),
+                known.chars().count(),
+                "the missing count must occupy the columns «7 objects» would at {width} columns: {sentinel} / {known}"
+            );
         }
     }
 

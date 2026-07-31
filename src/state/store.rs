@@ -5001,18 +5001,14 @@ mod tests {
         );
     }
 
-    /// A migrated v2 summary keeps its old pathname number in the database as history, and hands
-    /// none of it to anyone.
-    #[test]
-    fn a_migrated_v2_summary_stays_browseable_and_untrusted() {
-        let mut store = ScanStore::open_in_memory().unwrap();
+    /// Exactly what the v3 migration leaves behind: the old row, its old positive figure, and the
+    /// defaults that say nothing about it is established.
+    fn seed_migrated_v2(store: &mut ScanStore) -> i64 {
         let scan_id = seed_objects(
-            &mut store,
+            store,
             &[object_row("/x/a", S, 1, 1), object_row("/x/b", S, 2, 1)],
             &[("/x/a", 1), ("/x/b", 1)],
         );
-        // Exactly what the v3 migration leaves behind: the old row, its old positive figure, and
-        // the defaults that say nothing about it is established.
         store
             .conn
             .execute(
@@ -5032,6 +5028,15 @@ mod tests {
             )
             .unwrap();
         store.set_status(scan_id, ScanStatus::Complete).unwrap();
+        scan_id
+    }
+
+    /// A migrated v2 summary keeps its old pathname number in the database as history, and hands
+    /// none of it to anyone.
+    #[test]
+    fn a_migrated_v2_summary_stays_browseable_and_untrusted() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_migrated_v2(&mut store);
 
         store.ensure_materialized(scan_id).unwrap();
         let summaries = store.group_summaries(scan_id).unwrap();
@@ -5063,6 +5068,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, (2 * S) as i64, "the migrated row is not rewritten");
+    }
+
+    /// The migrated row as the operator actually meets it: the summary comes out of the store and
+    /// goes through the shared group renderer that classic and the commander both draw. A summary
+    /// built by hand in the UI's own tests cannot show that the sentinel survives the database.
+    #[test]
+    fn a_migrated_v2_summary_reaches_the_browser_as_an_unknown_count() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_migrated_v2(&mut store);
+        store.ensure_materialized(scan_id).unwrap();
+        let summaries = store.group_summaries(scan_id).unwrap();
+        assert_eq!(
+            (summaries[0].object_count, summaries[0].reclaim.state()),
+            (0, ReclaimState::Unknown),
+            "the sentinel the renderer has to recognise"
+        );
+        for width in [52, 40] {
+            let entries = crate::tui::screens::browser::tests::drawn_entries(width, &summaries);
+            let text = &entries[0];
+            assert!(
+                text.contains("? objects"),
+                "a count that was never recorded is not a count of zero ({width} columns): {text}"
+            );
+            assert!(
+                !text.contains("0 objects"),
+                "the contradiction this row used to draw ({width} columns): {text}"
+            );
+            assert!(
+                text.contains("rescan required"),
+                "the row still says how to get the count ({width} columns): {text}"
+            );
+            assert!(
+                text.contains("3 files"),
+                "its pathnames are still listed ({width} columns): {text}"
+            );
+        }
+        // Reading the row does not rewrite it: the sentinel is still in the table afterwards.
+        let stored: i64 = store
+            .conn
+            .query_row(
+                "SELECT object_count FROM file_group WHERE scan_id = ?1",
+                params![scan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 0, "the migrated row keeps its sentinel");
     }
 
     #[test]

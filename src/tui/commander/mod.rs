@@ -3867,6 +3867,57 @@ mod group_panel_tests {
         );
     }
 
+    /// Three groups whose allocation counts all differ, the first one as the v3 migration leaves
+    /// it: `object_count == 0` with nothing established about the row.
+    fn summaries_with_a_migrated_row() -> Vec<GroupSummary> {
+        [
+            (0u64, ReclaimEstimate::unknown()),
+            (5, ReclaimEstimate::unknown()),
+            (2, ReclaimEstimate::exact(4096)),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (object_count, reclaim))| GroupSummary {
+            rank: rank as i64,
+            hash: format!("h{rank}"),
+            file_count: 3,
+            size_bytes: 4096,
+            object_count,
+            reclaim,
+        })
+        .collect()
+    }
+
+    /// The migrated sentinel in the layout that is hardest on it: an 80-column commander draws two
+    /// panels of 40, and the counters line is cut there rather than wrapped. Every row is read
+    /// from its own rows and columns, and no two rows count the same, so nothing can be borrowed.
+    #[test]
+    fn an_eighty_column_commander_says_a_migrated_groups_count_is_unknown() {
+        let (mut app, _events) = app_with_group_panel();
+        app.commander.group_summaries = summaries_with_a_migrated_row();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let regions = layout::regions(Rect::new(0, 0, 80, 24));
+        let rects = layout::panel_rects(regions.panels, visible_panel_count(&app, 80));
+        assert_eq!(rects[0].width, 40, "the width this wording has to fit");
+        let panel = rects[0];
+        let rows = crate::tui::screens::browser::group_rows(panel.width);
+
+        for (entry, phrase) in ["? objects", "5 objects", "2 objects"].iter().enumerate() {
+            let text = entry_text(&buffer, panel, entry, rows);
+            assert!(
+                text.contains(*phrase),
+                "entry {entry} must count its allocations as «{phrase}» in its own rows: {text}"
+            );
+            assert!(
+                !text.contains("0 objects"),
+                "entry {entry} must not report zero allocations: {text}"
+            );
+        }
+    }
+
     /// Every visual line of a group entry selects that same entry — the click must not depend on
     /// which line of the entry the pointer landed on.
     #[test]

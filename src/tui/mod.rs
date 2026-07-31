@@ -22,7 +22,7 @@ use ratatui::{
 };
 
 use crate::app::{App, AppMode, ConfirmAction, Screen};
-use crate::model::reclaim::{LinkCount, ReclaimEstimate};
+use crate::model::reclaim::{LinkCount, ReclaimEstimate, ReclaimState};
 use crate::state::GroupLinks;
 
 pub mod commander;
@@ -551,6 +551,26 @@ pub fn reclaim_cell(estimate: ReclaimEstimate) -> String {
     }
 }
 
+/// The one place a group's allocation count becomes words.
+///
+/// `object_count == 0` on a row nothing is established about is the migrated pre-v3 sentinel: the
+/// allocations behind those pathnames were never counted. It is not the statement that the group
+/// holds none, which a browseable duplicate group cannot — so the row says the count is missing
+/// instead of printing a zero the operator would read as a measurement. Every other row prints its
+/// number, including one that is untrusted for a different reason and does know how many
+/// allocations it has.
+///
+/// `? objects` is exactly as wide as the `0 objects` it replaces. The counters line is cut at the
+/// panel edge rather than wrapped, and a 40-column commander panel has a single column to spare,
+/// so a wider phrase — `objects unknown` is six columns more — would push the group's size off the
+/// end of the row instead: the same defect moved to a different field.
+pub fn objects_cell(object_count: u64, reclaim: ReclaimEstimate) -> String {
+    match (object_count, reclaim.state()) {
+        (0, ReclaimState::Unknown) => "? objects".to_string(),
+        _ => format!("{object_count} objects"),
+    }
+}
+
 /// How many of a group's allocations' links the scan saw — the sentence that explains why an
 /// upper bound is an upper bound.
 pub fn links_phrase(links: GroupLinks) -> String {
@@ -638,6 +658,33 @@ mod format_tests {
                 );
             }
         }
+    }
+
+    /// The count wording, once, in the same place as the reclaim wording: a count that was never
+    /// recorded says so, and every count that exists is printed as it is.
+    #[test]
+    fn a_count_that_was_never_recorded_is_not_a_count_of_zero() {
+        assert_eq!(objects_cell(0, ReclaimEstimate::unknown()), "? objects");
+        assert_eq!(
+            objects_cell(3, ReclaimEstimate::unknown()),
+            "3 objects",
+            "an untrusted row that does know its allocations keeps the number"
+        );
+        assert_eq!(objects_cell(2, ReclaimEstimate::exact(4096)), "2 objects");
+        assert_eq!(
+            objects_cell(4, ReclaimEstimate::upper_bound(4096)),
+            "4 objects"
+        );
+        assert_eq!(
+            objects_cell(0, ReclaimEstimate::exact(0)),
+            "0 objects",
+            "only the migration's own default is read as a missing count"
+        );
+        assert_eq!(
+            objects_cell(0, ReclaimEstimate::unknown()).chars().count(),
+            "0 objects".chars().count(),
+            "the wording must not cost the row a column it used to have"
+        );
     }
 
     /// A mixed scan headlines its guarantee and states the bigger ceiling apart from it.
