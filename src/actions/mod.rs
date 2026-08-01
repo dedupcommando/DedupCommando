@@ -8,7 +8,7 @@ use crate::model::action::{
     ActionKind, ActionOutcome, BatchResult, FileIdentity, RevalidationMode,
 };
 use crate::model::dataset::Dataset;
-use crate::model::plan::{ActionPlan, ActionResult, PlanAction, RuntimeLedger};
+use crate::model::plan::{ActionPlan, ActionResult, PlanAction, PlanResult, RuntimeLedger};
 use crate::pipeline::hash;
 use crate::zfs::snapshots;
 
@@ -472,8 +472,9 @@ impl Batch<'_> {
                 // temporary link was made and unmade, and a rolled-back original's moved when it
                 // went to quarantine and back. Those are this batch's own marks; adopting them is
                 // what keeps the NEXT action on those allocations from being refused for a change
-                // nobody outside made.
-                let _ = match &published {
+                // nobody outside made. A settle that does NOT add up is not swallowed: the
+                // allocation stops being trusted and the operator is told, in the same message.
+                let target_settle = match &published {
                     Publication::Stranded { quarantined, .. } => self.ledger.quarantined(
                         action.target_object(),
                         action.target(),
@@ -481,14 +482,21 @@ impl Batch<'_> {
                     ),
                     _ => self.ledger.settled(action.target_object(), action.target()),
                 };
-                let _ = self.ledger.settled(action.keeper_object(), action.keeper());
+                let unaccounted = self.settle_or_poison(action.target_object(), target_settle);
+                let keeper_settle = self.ledger.settled(action.keeper_object(), action.keeper());
+                let unaccounted = unaccounted
+                    .or_else(|| self.settle_or_poison(action.keeper_object(), keeper_settle));
                 let (quarantine, result, outcome) = published.split();
+                let mut detail = outcome.err().map(|err| err.to_string()).unwrap_or_default();
+                if let Some(extra) = unaccounted {
+                    detail.push_str(&format!("; {extra}"));
+                }
                 (
                     ActionOutcome {
                         kind: action.kind(),
                         target: action.target().to_path_buf(),
                         quarantine,
-                        result: outcome.map_err(|err| err.to_string()),
+                        result: Err(detail),
                     },
                     result,
                 )
@@ -512,27 +520,58 @@ impl Batch<'_> {
                     self.ledger
                         .linked(action.keeper_object(), action.keeper(), action.target())
                 }
-                Some(Linkage::Reflink) => {
-                    self.ledger
-                        .cloned(action.keeper_object(), action.keeper(), action.target())
-                }
+                Some(Linkage::Reflink) => self.ledger.cloned(
+                    action.keeper_object(),
+                    action.keeper(),
+                    action.target(),
+                    self.plan.target_object_of(action).key().device,
+                ),
             });
-        // The action itself succeeded — the original is in quarantine either way. A transition the
-        // ledger cannot account for means somebody else moved with us, so the batch stops trusting
-        // that allocation rather than pretending the accounting is sound.
-        let result = match transition {
-            Ok(()) => Ok(()),
-            Err(refusal) => Err(refusal.to_string()),
-        };
-        (
-            ActionOutcome {
-                kind: action.kind(),
-                target: action.target().to_path_buf(),
-                quarantine: Some(moved.to_path_buf()),
-                result,
-            },
-            ActionResult::Removed,
-        )
+        // The pathname moved, and yet the reading that would justify a claim is the one that
+        // disagreed. Calling this `Removed` is how a batch promised an allocation's worth of space
+        // that a late outside link was quietly holding: the syscall succeeded, so the old code
+        // folded `Completed` while the ledger was saying it could not tell what had happened.
+        // Neither allocation is trusted again, and the object claims nothing.
+        match transition {
+            Ok(()) => (
+                ActionOutcome {
+                    kind: action.kind(),
+                    target: action.target().to_path_buf(),
+                    quarantine: Some(moved.to_path_buf()),
+                    result: Ok(()),
+                },
+                ActionResult::Removed,
+            ),
+            Err(refusal) => {
+                self.ledger.poison(action.target_object());
+                self.ledger.poison(action.keeper_object());
+                let detail = refusal.to_string();
+                (
+                    ActionOutcome {
+                        kind: action.kind(),
+                        target: action.target().to_path_buf(),
+                        quarantine: Some(moved.to_path_buf()),
+                        result: Err(detail.clone()),
+                    },
+                    ActionResult::Unsettled {
+                        quarantine: moved.to_path_buf(),
+                        detail,
+                    },
+                )
+            }
+        }
+    }
+
+    /// Records a settle attempt: on failure the allocation is poisoned and the reason returned so
+    /// the caller can put it in front of the operator. Never discarded.
+    fn settle_or_poison(&mut self, object: usize, outcome: PlanResult<()>) -> Option<String> {
+        match outcome {
+            Ok(()) => None,
+            Err(refusal) => {
+                self.ledger.poison(object);
+                Some(refusal.to_string())
+            }
+        }
     }
 
     fn target_dataset(&self, action: &PlanAction) -> Option<&'_ Dataset> {
@@ -1324,6 +1363,136 @@ pub(crate) mod tests {
         }
     }
 
+    /// Anything named `name` under `dir`, however deep — the quarantine mirrors the source tree.
+    fn find_under(dir: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = find_under(&path, name) {
+                    return Some(found);
+                }
+            } else if path.file_name() == Some(name) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// The C5-2a defect: the syscall succeeded, the ledger could not account for what it left, and
+    /// the accounting folded the allocation as fully released anyway.
+    ///
+    /// While the hardlink is being published, the ORIGINAL — already in quarantine — is given a
+    /// second pathname outside the scan. Purging the quarantine now releases nothing, because that
+    /// outside link holds every block. The action must not report a completed allocation, and the
+    /// allocations it touched must stop authorizing later work.
+    #[test]
+    fn a_late_outside_link_realizes_unknown_and_poisons_the_allocations() {
+        let _role = crate::state::store::role_guard();
+        let scenario = PlanScenario::new("late_outside_link");
+        let keeper = scenario.file("keeper.bin");
+        let first = scenario.file("twin_a.bin");
+        let second = scenario.file("twin_b.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), first.clone(), second.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &first,
+            false,
+            Some(ActionKind::Hardlink),
+        );
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &second,
+            false,
+            Some(ActionKind::Hardlink),
+        );
+        drop(store);
+
+        let plan = plan_of(&scenario, scan_id);
+        let outside = scenario.outside.join("late.bin");
+        let quarantine_root = scenario.root.join(crate::model::scan::QUARANTINE_DIR_NAME);
+        let ops = FakeOps::new().on_before_publication(move |target, _temp| {
+            if outside.exists() {
+                return;
+            }
+            let name = target.file_name().expect("a target has a name");
+            let evacuated = find_under(&quarantine_root, name).expect("the evacuated original");
+            std::fs::hard_link(&evacuated, &outside).unwrap();
+        });
+        let batch = run(&ops, &plan, &[dataset_over(&scenario.root, "tank/test")]).unwrap();
+
+        assert_eq!(
+            batch.realized_summary.guaranteed_bytes(),
+            0,
+            "an outside link holds the allocation, so nothing is released: {:?}",
+            batch.realized
+        );
+        assert_eq!(batch.realized_summary.completed_objects(), 0);
+        assert_eq!(batch.realized_summary.unknown_objects(), 1);
+        let unknown = batch.unknown_objects();
+        let (_, quarantine) = unknown.first().expect("the unsettled allocation");
+        let quarantine = quarantine.expect("recovery needs the exact path");
+        assert!(quarantine.exists(), "{}", quarantine.display());
+        assert_eq!(quarantine.file_name(), first.file_name());
+
+        // And the keeper it touched is no longer trusted, so the second action on it is refused
+        // rather than authorized from a reading nobody can vouch for.
+        assert_eq!(batch.failed(), 2, "{:?}", batch.outcomes);
+        let second_message = batch.outcomes[1].result.as_ref().unwrap_err();
+        assert!(
+            second_message.contains("cannot account for"),
+            "the later action must be refused by the ledger: {second_message}"
+        );
+    }
+
+    /// Each ledger transition refuses the shape it is supposed to refuse, and each refusal is the
+    /// one the batch turns into an unknown allocation.
+    #[test]
+    fn every_transition_refuses_what_it_cannot_account_for() {
+        let scenario = PlanScenario::new("transitions");
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &twin, false, Some(ActionKind::Delete));
+        drop(store);
+        let plan = plan_of(&scenario, scan_id);
+        let action = &plan.actions()[0];
+        let (target, keeper_object) = (action.target_object(), action.keeper_object());
+        let device = plan.target_object_of(action).key().device;
+
+        // `quarantined`: the pathname the batch says it moved is not the allocation it moved.
+        let mut ledger = RuntimeLedger::open(plan.preflight().unwrap());
+        let err = ledger
+            .quarantined(target, &twin, &keeper)
+            .expect_err("that is the keeper, not the moved original");
+        assert!(err.to_string().contains("inode"), "{err}");
+
+        // `linked`: the published pathname is not the keeper's allocation.
+        let mut ledger = RuntimeLedger::open(plan.preflight().unwrap());
+        let err = ledger
+            .linked(keeper_object, &keeper, &twin)
+            .expect_err("twin.bin is its own allocation");
+        assert!(err.to_string().contains("moved while the batch"), "{err}");
+
+        // `cloned`: a published pathname that shares the keeper's inode is a hardlink, not a clone.
+        let mut ledger = RuntimeLedger::open(plan.preflight().unwrap());
+        let err = ledger
+            .cloned(keeper_object, &keeper, &keeper, device)
+            .expect_err("a clone is never the keeper itself");
+        assert!(err.to_string().contains("inode"), "{err}");
+        // And one on the wrong device is refused too.
+        let mut ledger = RuntimeLedger::open(plan.preflight().unwrap());
+        let err = ledger
+            .cloned(keeper_object, &keeper, &twin, device + 1)
+            .expect_err("the clone must land on the target's own device");
+        assert!(err.to_string().contains("device"), "{err}");
+    }
+
     /// One allocation failing must not take another one's figure with it.
     #[test]
     fn a_completed_allocation_keeps_its_figure_when_another_fails() {
@@ -1358,6 +1527,7 @@ pub(crate) mod tests {
             "the unrelated allocation kept its own figure: {:?}",
             batch.realized
         );
+        assert_eq!(batch.realized_summary.unknown_objects(), 0);
         assert_eq!(
             batch.realized_summary.guaranteed_bytes(),
             std::fs::metadata(&keeper).unwrap().size()

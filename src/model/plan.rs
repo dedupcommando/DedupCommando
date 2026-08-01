@@ -111,6 +111,8 @@ pub enum PlanRefusal {
     AlreadyLinkedNow { target: PathBuf, keeper: PathBuf },
     #[error("{} moved while the batch was running ({field}) — action cancelled", .path.display())]
     ExternalChange { path: PathBuf, field: &'static str },
+    #[error("{} was left in a state this batch cannot account for — nothing more is applied to it", .path.display())]
+    UnsettledObject { path: PathBuf },
     #[error("{detail}")]
     Arithmetic { detail: String },
     #[error("dedcom.db could not be read while building the plan: {detail}")]
@@ -861,6 +863,7 @@ impl ActionPlan {
             objects.push(ObjectState {
                 identity: live,
                 paths: object.members().to_vec(),
+                settled: true,
             });
         }
         // D-4, live: an action whose target became the keeper's own allocation after the plan was
@@ -935,7 +938,9 @@ fn object_realization(
     results: &[Option<&ActionResult>],
 ) -> ObjectRealization {
     for result in results.iter().flatten() {
-        if let ActionResult::Stranded { quarantine, detail } = result {
+        if let ActionResult::Stranded { quarantine, detail }
+        | ActionResult::Unsettled { quarantine, detail } = result
+        {
             return ObjectRealization::Unknown {
                 reason: detail.clone(),
                 quarantine: Some(quarantine.clone()),
@@ -1035,6 +1040,10 @@ pub struct ObjectState {
     /// Where this allocation's pathnames are — the manifest's locations at preflight time, and the
     /// quarantine locations the batch itself moves them to afterwards.
     paths: Vec<PathBuf>,
+    /// `false` once a transition on this allocation could not be accounted for. The ledger then
+    /// holds a reading that no longer describes the disk, and a later action checked against it
+    /// would be authorized by state nobody can vouch for.
+    settled: bool,
 }
 
 impl ObjectState {
@@ -1097,6 +1106,13 @@ impl RuntimeLedger {
     /// it.
     pub fn check(&self, object: usize) -> PlanResult<()> {
         let entry = self.entry(object)?;
+        // An allocation whose last transition could not be accounted for is not something a later
+        // action may be authorized against: the reading here is stale by admission.
+        if !entry.settled {
+            return Err(PlanRefusal::UnsettledObject {
+                path: entry.paths.first().cloned().unwrap_or_default(),
+            });
+        }
         for path in &entry.paths {
             let live = live_identity(path)?;
             if let Some(field) = drift_between(&entry.identity, &live) {
@@ -1158,24 +1174,32 @@ impl RuntimeLedger {
         Ok(())
     }
 
+    /// Stops trusting this allocation. Every later check of it refuses.
+    pub fn poison(&mut self, object: usize) {
+        if let Some(entry) = self.objects.get_mut(object) {
+            entry.settled = false;
+        }
+    }
+
     /// A hardlink to `keeper_path` was published at `published`.
     ///
     /// The keeper's allocation gains exactly one link and a new `ctime`; nothing else about it may
-    /// move. The published pathname now belongs to that allocation, so a later action that checks
-    /// the keeper checks it too.
+    /// move. The published pathname is then `stat`ed in its own right and must BE that allocation —
+    /// a risen link count on the keeper alone does not say the new pathname is the link we made,
+    /// only that the count went up, which is exactly what an outsider's link looks like too.
     pub fn linked(
         &mut self,
         object: usize,
         keeper_path: &Path,
         published: &Path,
     ) -> PlanResult<()> {
-        let entry = self.entry_mut(object)?;
+        let before = self.entry(object)?.identity;
         let live = live_identity(keeper_path)?;
         let expected = LiveIdentity {
-            nlink: entry.identity.nlink.saturating_add(1),
+            nlink: before.nlink.saturating_add(1),
             ctime_sec: live.ctime_sec,
             ctime_nsec: live.ctime_nsec,
-            ..entry.identity
+            ..before
         };
         if let Some(field) = drift_between(&expected, &live) {
             return Err(PlanRefusal::ExternalChange {
@@ -1183,35 +1207,66 @@ impl RuntimeLedger {
                 field,
             });
         }
+        // The same allocation, read from the other end.
+        let landed = live_identity(published)?;
+        if let Some(field) = drift_between(&live, &landed) {
+            return Err(PlanRefusal::ExternalChange {
+                path: published.to_path_buf(),
+                field,
+            });
+        }
+        let entry = self.entry_mut(object)?;
         entry.identity = live;
         entry.paths.push(published.to_path_buf());
         Ok(())
     }
 
-    /// A block clone of `keeper_path` was published at `published`.
+    /// A block clone of `keeper_path` was published at `published`, on device `device`.
     ///
     /// A clone reads the keeper and writes a new inode, so the keeper's allocation must come back
-    /// bit for bit identical — including its link count and `ctime`. The published pathname is a
-    /// fresh, independently stated allocation and gets its own ledger entry; the original stays
-    /// wherever quarantine put it.
+    /// bit for bit identical — including its link count and `ctime`. The published pathname is then
+    /// checked to be what a clone actually produces: the target's own device, the keeper's size,
+    /// exactly one link, and an allocation that is NOT the keeper's. A published pathname that
+    /// turned out to share the keeper's inode is a hardlink, and calling that a reflink is how a
+    /// «separate file» claim becomes false.
     pub fn cloned(
         &mut self,
         object: usize,
         keeper_path: &Path,
         published: &Path,
+        device: u64,
     ) -> PlanResult<()> {
-        let entry = self.entry(object)?;
+        let keeper = self.entry(object)?.identity;
         let live = live_identity(keeper_path)?;
-        if let Some(field) = drift_between(&entry.identity, &live) {
+        if let Some(field) = drift_between(&keeper, &live) {
             return Err(PlanRefusal::ExternalChange {
                 path: keeper_path.to_path_buf(),
                 field,
             });
         }
         let identity = live_identity(published)?;
+        let wrong = [
+            ("device", identity.device != device),
+            (
+                "inode",
+                (identity.device, identity.inode) == (keeper.device, keeper.inode),
+            ),
+            ("size", identity.size != keeper.size),
+            ("link count", identity.nlink != 1),
+        ]
+        .into_iter()
+        .find(|(_, bad)| *bad)
+        .map(|(field, _)| field);
+        if let Some(field) = wrong {
+            return Err(PlanRefusal::ExternalChange {
+                path: published.to_path_buf(),
+                field,
+            });
+        }
         self.objects.push(ObjectState {
             identity,
             paths: vec![published.to_path_buf()],
+            settled: true,
         });
         Ok(())
     }
@@ -1269,6 +1324,10 @@ pub enum ActionResult {
     Refused { rolled_back: bool },
     /// The original is neither where it was nor back again; it is at this exact quarantine path.
     Stranded { quarantine: PathBuf, detail: String },
+    /// The filesystem did what it was asked, but the state it left could not be reconciled with
+    /// what the batch itself had done. The pathname moved, and yet nothing may be claimed for the
+    /// allocation: the very reading that would justify a claim is the one that disagreed.
+    Unsettled { quarantine: PathBuf, detail: String },
 }
 
 /// Why an allocation is worth nothing after the batch.

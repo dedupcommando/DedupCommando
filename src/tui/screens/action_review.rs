@@ -8,6 +8,8 @@ use ratatui::{
 };
 
 use crate::app::App;
+use crate::model::plan::PlanSummary;
+use crate::tui::screens::browser::wrap_words;
 use crate::tui::{centered, human_bytes};
 
 /// Action review screen: dry-run list + confirmation modal.
@@ -102,25 +104,43 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     );
 
     if app.review.confirming {
-        let claim = summary.map_or_else(String::new, |summary| {
-            crate::tui::reclaim_phrase(summary.estimate())
-        });
-        render_confirm(frame, count, &claim);
+        if let Some(summary) = summary {
+            render_confirm(frame, summary);
+        }
     }
 }
 
-fn render_confirm(frame: &mut Frame, count: usize, claim: &str) {
-    let area = centered(frame.area(), 56, 8);
+/// The [Y]/[N] line, which no shrink may ever take away.
+const CONFIRM_DECISION: &str = "            [Y] yes        [N] no";
+
+/// The box will not grow past this, however wide the terminal is: a claim that runs the full width
+/// of a 200-column terminal is one line the eye has to track across the whole screen.
+const CONFIRM_MAX_WIDTH: u16 = 72;
+
+/// The last destructive question, quoted from the plan itself.
+///
+/// It states what the review states — how many actions, how many allocations, the complete
+/// post-purge claim and the reason behind a zero — because this modal, not the screen behind it, is
+/// what the operator is looking at when they decide. The box is sized to the terminal and the text
+/// wraps inside it: the previous fixed 56×8 box cut `up to 4.0 KiB after quarantine purge` off at
+/// `up to 4.0 K`, which reads as a smaller number rather than as a truncated one.
+fn render_confirm(frame: &mut Frame, summary: &PlanSummary) {
+    let screen = frame.area();
+    let width = screen
+        .width
+        .saturating_sub(4)
+        .clamp(24, CONFIRM_MAX_WIDTH.max(24));
+    let inner = width.saturating_sub(4).max(8) as usize;
+    // Two borders, the decision line, and at least the two lines that state what is about to run.
+    let body_budget = screen.height.saturating_sub(3).max(2) as usize;
+    let body = confirm_body(summary, inner, body_budget);
+
+    let height = (body.len() + 3) as u16;
+    let area = centered(screen, width, height.min(screen.height));
     frame.render_widget(Clear, area);
 
-    let text = vec![
-        Line::from(""),
-        Line::from(format!("  Execute {count} operations?").bold()),
-        Line::from("  A snapshot + quarantine are created — actions"),
-        Line::from("  are reversible until purge."),
-        Line::from(format!("  {claim}")),
-        Line::from("            [Y] yes        [N] no"),
-    ];
+    let mut text: Vec<Line> = body.into_iter().map(Line::from).collect();
+    text.push(Line::from(CONFIRM_DECISION));
     frame.render_widget(
         Paragraph::new(text).block(
             Block::default()
@@ -129,6 +149,48 @@ fn render_confirm(frame: &mut Frame, count: usize, claim: &str) {
         ),
         area,
     );
+}
+
+/// The modal's body, in priority order, wrapped to `inner` and cut to `budget` lines.
+///
+/// What goes first is the reassurance about snapshots; then the warnings past the first, replaced
+/// by `… and N more`. The count line and the complete claim are never given up — they are the two
+/// things the answer depends on.
+fn confirm_body(summary: &PlanSummary, inner: usize, budget: usize) -> Vec<String> {
+    let indent = |line: &str| format!("  {line}");
+    let head = format!(
+        "Execute {} action(s) over {} allocation(s)?",
+        summary.actions(),
+        summary.covered_objects()
+    );
+    let mut essential: Vec<String> = wrap_words(&head, inner).iter().map(|l| indent(l)).collect();
+    essential.extend(
+        wrap_words(&crate::tui::reclaim_phrase(summary.estimate()), inner)
+            .iter()
+            .map(|l| indent(l)),
+    );
+
+    let warnings = summary.warnings();
+    let mut optional: Vec<String> = Vec::new();
+    if let Some(first) = warnings.first() {
+        optional.extend(wrap_words(&first.reason(), inner).iter().map(|l| indent(l)));
+        if warnings.len() > 1 {
+            optional.push(indent(&format!("… and {} more", warnings.len() - 1)));
+        }
+    }
+    let note = "A snapshot + quarantine are created — reversible until purge.";
+    let reassurance: Vec<String> = wrap_words(note, inner).iter().map(|l| indent(l)).collect();
+
+    // Fill from the essentials outwards, so a short terminal loses the reassurance and then the
+    // extra warning lines rather than the numbers the decision rests on.
+    let mut lines = essential;
+    for extra in [optional, reassurance] {
+        if lines.len() + extra.len() <= budget {
+            lines.extend(extra);
+        }
+    }
+    lines.truncate(budget.max(1));
+    lines
 }
 
 #[cfg(test)]
@@ -169,6 +231,23 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         app.handle_event(AppEvent::Key(KeyEvent::from(code)));
+    }
+
+    /// What the operator reads, with the box drawing and the line breaks taken out: a sentence
+    /// wrapped inside a modal is still one sentence, and the defect this guards against is a
+    /// sentence that simply stops.
+    fn visible_prose(screen: &str) -> String {
+        let text: String = screen
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_graphic() || ch.is_alphanumeric() {
+                    ch
+                } else {
+                    ' '
+                }
+            })
+            .collect();
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     /// The defect U-3 names: a plan longer than the window used to end at the first
@@ -254,6 +333,81 @@ mod tests {
         assert!(
             tiny.contains("50 of 50"),
             "shrinking keeps the cursor too, it does not reset to the top:\n{tiny}"
+        );
+    }
+
+    /// R2D-C5-2a, blocker C: the last destructive question has to carry the whole plan, and on the
+    /// terminals the tool supports it has to be READABLE — the fixed 56×8 box cut
+    /// `up to 4.0 KiB after quarantine purge` off at `up to 4.0 K`, which reads as a smaller
+    /// number rather than as a truncated one.
+    #[test]
+    fn the_confirmation_quotes_the_whole_plan_at_every_supported_size() {
+        let _role = crate::state::store::role_guard();
+        let scenario = crate::testfixtures::PlanScenario::new("confirm_parity");
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let _outside = scenario.outside_link(&twin, "elsewhere.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &twin,
+            false,
+            Some(crate::model::action::ActionKind::Delete),
+        );
+        drop(store);
+
+        let (mut app, _rx) = test_app();
+        app.review.plan = Some(crate::actions::tests::plan_of(&scenario, scan_id));
+        app.review.confirming = true;
+
+        for (width, height) in [(80u16, 12u16), (120, 30), (60, 14)] {
+            let screen = screen_text(&mut app, width, height);
+            // The box wraps, so the phrase is read across the line break. What must never happen —
+            // and is what the red showed — is a phrase that simply stops.
+            let prose = visible_prose(&screen);
+            assert!(
+                prose.contains("up to 4.0 KiB after quarantine purge"),
+                "{width}x{height}: the claim must be readable in full:\n{screen}"
+            );
+            assert!(
+                prose.contains("guaranteed after quarantine purge: 0 B"),
+                "{width}x{height}: including the guarantee:\n{screen}"
+            );
+            assert!(
+                prose.contains("1 allocation(s)") && prose.contains("1 action(s)"),
+                "{width}x{height}: with the counts the answer rests on:\n{screen}"
+            );
+            assert!(
+                prose.contains("outside this scan"),
+                "{width}x{height}: and the reason the guarantee is zero:\n{screen}"
+            );
+            assert!(
+                prose.contains("[Y] yes") && prose.contains("[N] no"),
+                "{width}x{height}: the way out is never shed:\n{screen}"
+            );
+        }
+    }
+
+    /// A terminal too short for everything still shows the numbers and the way out.
+    #[test]
+    fn a_very_short_terminal_keeps_the_numbers_and_the_answer() {
+        let (mut app, _rx) = review_app(3);
+        app.review.confirming = true;
+        let screen = screen_text(&mut app, 80, 8);
+        assert!(
+            screen.contains("3 action(s) over 3 allocation(s)"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("guaranteed after quarantine purge"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("[Y] yes") && screen.contains("[N] no"),
+            "{screen}"
         );
     }
 

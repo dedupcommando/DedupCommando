@@ -33,6 +33,11 @@ use crate::zfs::ZfsEnvironment;
 pub const MARKS_NOT_SETTLED: &str =
     "WARNING: the saved marks were not updated — the plan on disk still lists what was applied";
 
+/// Shown when the batch refused itself before touching anything. Nothing was applied, so the marks
+/// are exactly where the operator left them and the plan can simply be run again.
+pub const BATCH_REFUSED: &str =
+    "The batch was refused before any change — the marks are kept; check the snapshots it created";
+
 /// Page size for incremental loading of files in the
 /// open group — `group_files_page` loads exactly this many at a time. When the
 /// cursor scrolls toward the end of the window, `maybe_load_more_files` loads
@@ -1054,6 +1059,22 @@ impl App {
         }
         let from_commander = self.commander.return_to_commander;
         match result {
+            // A batch that refused itself after the snapshots ran NOTHING. Reconciling its marks
+            // would delete the whole plan from the database over a batch that touched no file, and
+            // «unsettled» would be a lie of its own: the database never refused a write, because
+            // none should have been attempted. The snapshots it did create are in the result and
+            // have to be reported so they can be destroyed.
+            Ok(batch) if batch.aborted.is_some() => {
+                self.apply_affected.clear();
+                self.marks_unsettled = false;
+                self.status = String::new();
+                self.summary_result = Some(batch);
+                self.screen = Screen::Summary;
+                if from_commander {
+                    self.commander.status = BATCH_REFUSED.to_string();
+                }
+                self.refresh_marked_count();
+            }
             Ok(batch) => {
                 // A cancelled batch is not a finished one: only what was actually attempted loses
                 // its mark, so the marking work for the rest of the plan survives.
@@ -2119,15 +2140,18 @@ impl App {
                 self.screen = Screen::ScanConfig;
                 // «Applied» would be a lie after a cancelled batch — the marks that were never
                 // reached are still there, waiting to be executed again.
-                let cancelled = self
-                    .summary_result
-                    .as_ref()
-                    .map(|result| result.cancelled)
+                let result = self.summary_result.as_ref();
+                let cancelled = result.map(|result| result.cancelled).unwrap_or(false);
+                let refused = result
+                    .map(|result| result.aborted.is_some())
                     .unwrap_or(false);
-                // Unsettled marks outrank both lines: the plan on disk still holds what was
-                // applied, and this screen is where the operator would start the next one.
+                // Unsettled marks outrank the rest: the plan on disk still holds what was applied,
+                // and this screen is where the operator would start the next one. A refused batch
+                // outranks «applied» for the opposite reason — nothing was applied at all.
                 self.status = if self.marks_unsettled {
                     MARKS_NOT_SETTLED.to_string()
+                } else if refused {
+                    BATCH_REFUSED.to_string()
                 } else if cancelled {
                     "Application cancelled. The marks that were not reached are kept.".to_string()
                 } else {
@@ -3343,6 +3367,102 @@ mod cancel_tests {
         );
         assert!(app.status.is_empty(), "no warning when the DB was settled");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An aborted result: the second preflight refused after the safety snapshots existed, so the
+    /// batch reached no action at all.
+    fn refused(snapshots: Vec<String>, planned: usize) -> AppEvent {
+        AppEvent::ApplyFinished(Ok(BatchResult {
+            outcomes: Vec::new(),
+            snapshots,
+            planned,
+            cancelled: false,
+            aborted: Some("a covered pathname moved after the snapshots".to_string()),
+            ..Default::default()
+        }))
+    }
+
+    /// R2D-C5-2a, blocker B: nothing ran, so nothing may be settled. Reconciling here deleted the
+    /// whole plan from the database over a batch that had not touched a single file.
+    #[test]
+    fn an_aborted_batch_keeps_every_durable_mark() {
+        let _role = crate::state::store::role_guard();
+        let (dir, mut app, _rx, scan_id) = app_over_seeded_db("wizard_aborted", false);
+        let db_path = app.db_path.clone();
+
+        app.handle_event(refused(vec!["tank/ds_a@dedcom-ts".to_string()], 2));
+
+        assert_eq!(
+            plan_targets(&db_path, scan_id),
+            vec![PathBuf::from("/x/b"), PathBuf::from("/x/c")],
+            "no action ran, so the plan on disk is untouched"
+        );
+        assert!(
+            !app.marks_unsettled,
+            "the database refused nothing — no write should have been attempted"
+        );
+        assert!(matches!(app.screen, Screen::Summary));
+        let summary = app.summary_result.as_ref().expect("a result is shown");
+        assert_eq!(summary.snapshots.len(), 1, "the snapshot is still reported");
+        assert!(summary.aborted.is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A snapshot that fails after an earlier one succeeded aborts the same way, and must be
+    /// treated the same way.
+    #[test]
+    fn a_partial_snapshot_abort_keeps_the_commanders_marks() {
+        let _role = crate::state::store::role_guard();
+        let (dir, mut app, _rx, scan_id) = app_over_seeded_db("commander_aborted", true);
+        let db_path = app.db_path.clone();
+        for path in ["/x/b", "/x/c"] {
+            app.commander.panels[0]
+                .marks
+                .insert(PathBuf::from(path), Mark::Delete);
+        }
+
+        app.handle_event(refused(vec!["tank/ds_a@dedcom-ts".to_string()], 2));
+
+        assert_eq!(
+            plan_targets(&db_path, scan_id),
+            vec![PathBuf::from("/x/b"), PathBuf::from("/x/c")],
+            "the durable plan survives"
+        );
+        let marks = &app.commander.panels[0].marks;
+        assert!(
+            marks.contains_key(&PathBuf::from("/x/b"))
+                && marks.contains_key(&PathBuf::from("/x/c")),
+            "and so do the panel's own marks"
+        );
+        assert!(
+            app.commander.status.contains("refused"),
+            "the commander is told why: {}",
+            app.commander.status
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Leaving that summary must never read as a completed run.
+    #[test]
+    fn leaving_the_summary_of_a_refused_batch_says_the_marks_are_kept() {
+        let (mut app, _rx) = test_app();
+        app.show_disclaimer = false;
+        app.mode = AppMode::Wizard;
+        app.handle_event(refused(vec!["tank/ds_a@dedcom-ts".to_string()], 2));
+        assert!(matches!(app.screen, Screen::Summary));
+
+        app.handle_event(AppEvent::Key(KeyEvent::from(KeyCode::Esc)));
+
+        assert!(
+            app.status.contains("refused") && app.status.contains("marks are kept"),
+            "the operator must read what happened: {}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("Actions applied"),
+            "nothing was applied: {}",
+            app.status
+        );
     }
 
     /// The DB is the durable half. If it cannot be updated we must not imply it was: the marks in
