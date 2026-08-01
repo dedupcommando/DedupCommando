@@ -12,6 +12,10 @@ use crate::model::duplicate::{
     build_dir_signatures_streaming, hex_encode, signature_of, DirGroup, DirSigAlgo, DuplicateGroup,
     FileEntry,
 };
+use crate::model::plan::{
+    ActionPlan, LiveIdentity, PlanGroupInput, PlanMemberEvidence, PlanObjectKey, PlanRefusal,
+    PlanResult,
+};
 use crate::model::reclaim::{
     DestructivePlanVerdict, GroupReclaim, LinkCount, ReclaimEstimate, ReclaimState,
 };
@@ -3137,6 +3141,199 @@ impl ScanStore {
     }
 }
 
+/// The destructive-plan authority.
+///
+/// Inert in R2D-C5-1: no production entry point reaches this block, so the whole of it is
+/// unreachable code until R2D-C5-2 switches classic and the commander onto it and retires
+/// `plan_actions` / `plan_actions_from_db`. It lives in its own `impl` so that one `allow` covers
+/// the feature instead of one per item.
+#[allow(dead_code)]
+impl ScanStore {
+    /// Builds the one destructive plan from durable evidence, or refuses.
+    ///
+    /// `requested` is what the caller believes is marked right now — a commander panel's marks, or
+    /// the group open in the classic browser. It is reconciled against the database rather than
+    /// trusted: the database is the authority for what is marked, and it is the only place that
+    /// holds the members nobody marked. An unmarked alias is exactly the evidence that decides
+    /// whether removing its sibling releases anything, so a plan assembled from marked pathnames
+    /// alone cannot be right — that is the shape this builder exists to make impossible.
+    ///
+    /// Nothing is dropped to make a plan pass: every condition that cannot be justified refuses the
+    /// whole plan and names the pathname.
+    pub fn build_action_plan(&self, scan_id: i64, requested: &[PathBuf]) -> PlanResult<ActionPlan> {
+        // The coarse gate first: a scan nobody could measure is not planned against at all.
+        let verdict = self
+            .destructive_plan_verdict(scan_id)
+            .map_err(Self::store_refusal)?;
+        if verdict != DestructivePlanVerdict::Allowed {
+            return Err(PlanRefusal::RescanRequired);
+        }
+
+        let marks = self.durable_marks(scan_id)?;
+        if marks.is_empty() {
+            return Err(PlanRefusal::NoMarks);
+        }
+        // Every mark the caller holds has to exist durably. Durable marks the caller does NOT hold
+        // stay in: they are the operator's earlier work on another panel, not an error.
+        for path in requested {
+            if !marks.iter().any(|(marked, _)| marked == path) {
+                return Err(PlanRefusal::MarkNotPersisted { path: path.clone() });
+            }
+        }
+
+        let mut digests: Vec<Vec<u8>> = marks.into_iter().map(|(_, digest)| digest).collect();
+        digests.sort();
+        digests.dedup();
+        let mut groups = Vec::with_capacity(digests.len());
+        for digest in &digests {
+            groups.push(self.plan_group(scan_id, digest)?);
+        }
+
+        // The model decides what becomes an action and what the plan may claim.
+        let plan = ActionPlan::try_new(scan_id, groups)?;
+        // And the files have to still be the files the manifest describes. Done here rather than
+        // left to the caller: a plan that can be returned unvalidated is a plan someone forgets to
+        // validate.
+        Self::validate_live(&plan)?;
+        Ok(plan)
+    }
+
+    /// The scan's durable marks, each with the digest of its manifest row.
+    ///
+    /// A mark whose manifest row is gone, or whose row carries no digest, refuses the plan: both
+    /// are pathnames the operator asked to act on and nothing can vouch for.
+    fn durable_marks(&self, scan_id: i64) -> PlanResult<Vec<(PathBuf, Vec<u8>)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT m.path, f.path, f.hash
+                   FROM file_mark m
+                   LEFT JOIN file f ON f.scan_id = m.scan_id AND f.path = m.path
+                  WHERE m.scan_id = ?1 AND (m.is_keeper = 1 OR m.action IS NOT NULL)
+                  ORDER BY m.path",
+            )
+            .map_err(Self::store_refusal)?;
+        let rows = stmt
+            .query_map(params![scan_id], |row| {
+                Ok((
+                    PathBuf::from(row.get::<_, String>(0)?),
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            })
+            .map_err(Self::store_refusal)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (path, manifest, digest) = row.map_err(Self::store_refusal)?;
+            if manifest.is_none() {
+                return Err(PlanRefusal::NotInManifest { path });
+            }
+            match digest {
+                Some(digest) => out.push((path, digest)),
+                None => return Err(PlanRefusal::MissingDigest { path }),
+            }
+        }
+        Ok(out)
+    }
+
+    /// One referenced digest with EVERY persisted member, marked or not, strictly decoded.
+    fn plan_group(&self, scan_id: i64, digest: &[u8]) -> PlanResult<PlanGroupInput> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT f.path, f.size, f.mtime, f.mtime_nsec, f.ctime_sec, f.ctime_nsec,
+                        f.device, f.inode, f.nlink, f.identity_version,
+                        m.is_keeper, m.action
+                   FROM file f
+                   LEFT JOIN file_mark m ON m.scan_id = f.scan_id AND m.path = f.path
+                  WHERE f.scan_id = ?1 AND f.hash = ?2
+                  ORDER BY f.path",
+            )
+            .map_err(Self::store_refusal)?;
+        let rows = stmt
+            .query_map(params![scan_id, digest], |row| {
+                Ok((
+                    PathBuf::from(row.get::<_, String>(0)?),
+                    PlanObjectKey {
+                        size: row.get::<_, i64>(1)? as u64,
+                        mtime: row.get::<_, i64>(2)?,
+                        mtime_nsec: row.get::<_, i64>(3)?,
+                        ctime_sec: row.get::<_, i64>(4)?,
+                        ctime_nsec: row.get::<_, i64>(5)?,
+                        device: row.get::<_, i64>(6)? as u64,
+                        inode: row.get::<_, i64>(7)? as u64,
+                        identity_version: row.get::<_, i64>(9)?,
+                    },
+                    row.get::<_, Value>(8)?,
+                    row.get::<_, Option<i64>>(10)?.unwrap_or(0) != 0,
+                    row.get::<_, Option<String>>(11)?,
+                ))
+            })
+            .map_err(Self::store_refusal)?;
+        let mut members = Vec::new();
+        for row in rows {
+            let (path, key, nlink, is_keeper, action) = row.map_err(Self::store_refusal)?;
+            // Strict, unlike `group_file_row`: browsing may show a group whose counts cannot be
+            // read, a destructive plan may not be built on one.
+            let links =
+                link_count_from_sql(&nlink).map_err(|err| PlanRefusal::CorruptLinkCount {
+                    path: path.clone(),
+                    detail: err.to_string(),
+                })?;
+            let action = action.as_deref().and_then(ActionKind::parse);
+            members.push(PlanMemberEvidence::new(
+                path, key, links, is_keeper, action,
+            )?);
+        }
+        Ok(PlanGroupInput {
+            hash: hex_encode(digest),
+            members,
+        })
+    }
+
+    /// Every pathname the plan rests on must still be the file the manifest describes.
+    ///
+    /// Not only targets and keepers: an unmarked alias is what makes a target's figure a zero or a
+    /// size, so a plan whose bystander moved is a plan whose arithmetic no longer holds.
+    fn validate_live(plan: &ActionPlan) -> PlanResult<()> {
+        use std::os::unix::fs::MetadataExt;
+        for object in plan.objects() {
+            for path in object.members() {
+                let meta = std::fs::symlink_metadata(path)
+                    .map_err(|_| PlanRefusal::Vanished { path: path.clone() })?;
+                if meta.file_type().is_symlink() {
+                    return Err(PlanRefusal::Symlink { path: path.clone() });
+                }
+                let live = LiveIdentity {
+                    device: meta.dev(),
+                    inode: meta.ino(),
+                    size: meta.size(),
+                    mtime: meta.mtime(),
+                    mtime_nsec: meta.mtime_nsec(),
+                    ctime_sec: meta.ctime(),
+                    ctime_nsec: meta.ctime_nsec(),
+                    nlink: meta.nlink(),
+                };
+                if let Some(field) = object.key().first_drift(&live, object.links()) {
+                    return Err(PlanRefusal::Drifted {
+                        path: path.clone(),
+                        field,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A read that failed is a refusal like any other — the plan is not built on a half-read
+    /// database.
+    fn store_refusal(err: impl std::fmt::Display) -> PlanRefusal {
+        PlanRefusal::Store {
+            detail: err.to_string(),
+        }
+    }
+}
+
 /// Sets the «results prepared» marker on an open transaction, so the marker and the rows it
 /// describes commit together. `INSERT OR IGNORE` first — a scan from before `scan_stats` existed
 /// has no row to update.
@@ -5114,6 +5311,504 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, 0, "the migrated row keeps its sentinel");
+    }
+
+    // === R2D-C5-1: the inert plan authority ===
+    //
+    // Every test below drives `build_action_plan` over real files on a real filesystem: the builder
+    // stats every pathname it plans and compares the full temporal identity, so synthetic manifest
+    // rows would test something the production path never does. Nothing in production calls the
+    // builder yet — C5-2 does the switching.
+
+    use crate::model::plan::PlanWarning;
+    use crate::testfixtures::PlanScenario;
+
+    /// The size of one member, read from the file rather than assumed.
+    fn payload_size(path: &Path) -> u64 {
+        std::fs::symlink_metadata(path).unwrap().len()
+    }
+
+    /// The commander's blind spot, from the store side: a panel marked one alias, the other alias
+    /// exists only in the persisted group — and it is exactly what makes the plan worth nothing.
+    #[test]
+    fn a_plan_sees_the_unmarked_alias_a_panel_never_showed() {
+        let _role = role_guard();
+        let scenario = PlanScenario::new("blindspot");
+        let keeper = scenario.file("keeper.bin");
+        let alias_0 = scenario.file("alias_0.bin");
+        let alias_1 = scenario.link(&alias_0, "alias_1.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(
+            &mut store,
+            &[keeper.clone(), alias_0.clone(), alias_1.clone()],
+        );
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &alias_0,
+            false,
+            Some(ActionKind::Delete),
+        );
+
+        let plan = store
+            .build_action_plan(scan_id, std::slice::from_ref(&alias_0))
+            .expect("the plan is allowed — it is simply worth nothing");
+
+        assert_eq!(plan.actions().len(), 1);
+        assert_eq!(
+            plan.summary().guaranteed_bytes(),
+            0,
+            "the unmarked alias keeps every block"
+        );
+        assert_eq!(plan.summary().potential_bytes(), Some(0));
+        let object = plan.target_object_of(&plan.actions()[0]);
+        assert_eq!((object.observed_links(), object.covered_links()), (2, 1));
+        assert!(
+            object.members().contains(&alias_1),
+            "the alias nobody marked is in the evidence: {:?}",
+            object.members()
+        );
+        assert_eq!(
+            plan.summary().warnings(),
+            &[PlanWarning::UncoveredAlias {
+                representative: alias_0,
+                remaining: 1,
+            }]
+        );
+    }
+
+    /// Both pathnames of the allocation marked: one allocation, one size.
+    #[test]
+    fn a_plan_over_both_aliases_claims_one_allocation() {
+        let _role = role_guard();
+        let scenario = PlanScenario::new("covered");
+        let keeper = scenario.file("keeper.bin");
+        let alias_0 = scenario.file("alias_0.bin");
+        let alias_1 = scenario.link(&alias_0, "alias_1.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(
+            &mut store,
+            &[keeper.clone(), alias_0.clone(), alias_1.clone()],
+        );
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &alias_0,
+            false,
+            Some(ActionKind::Delete),
+        );
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &alias_1,
+            false,
+            Some(ActionKind::Delete),
+        );
+
+        let plan = store
+            .build_action_plan(scan_id, &[alias_0.clone(), alias_1])
+            .expect("a fully covered allocation is plannable");
+
+        assert_eq!(plan.actions().len(), 2, "two pathnames are removed");
+        assert_eq!(plan.summary().covered_objects(), 1, "one allocation goes");
+        assert_eq!(plan.summary().guaranteed_bytes(), payload_size(&alias_0));
+        assert!(plan.summary().warnings().is_empty());
+    }
+
+    /// A link outside the scan keeps the allocation alive: nothing guaranteed, the ceiling stays.
+    #[test]
+    fn an_external_link_keeps_the_guarantee_at_zero() {
+        let _role = role_guard();
+        let scenario = PlanScenario::new("external");
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin_b.bin");
+        scenario.outside_link(&twin, "external.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &twin, false, Some(ActionKind::Delete));
+
+        let plan = store
+            .build_action_plan(scan_id, std::slice::from_ref(&twin))
+            .expect("an upper-bound plan is allowed");
+
+        assert_eq!(plan.summary().guaranteed_bytes(), 0);
+        assert_eq!(plan.summary().potential_bytes(), Some(payload_size(&twin)));
+        assert_eq!(
+            plan.summary().warnings(),
+            &[PlanWarning::ExternalLinks {
+                representative: twin,
+                outside: 1,
+            }]
+        );
+    }
+
+    /// Durable marks are the plan; the caller's own view only has to agree with them.
+    ///
+    /// A mark made in another panel is the operator's earlier work and stays in. A path the caller
+    /// believes is marked while the database holds no such mark refuses the whole plan, rather than
+    /// planning the part that happened to be persisted.
+    #[test]
+    fn durable_marks_are_planned_and_a_phantom_mark_refuses() {
+        let _role = role_guard();
+        let scenario = PlanScenario::new("durable");
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        // A second content, marked earlier in another panel.
+        let other_keeper = scenario.root.join("other_keeper.bin");
+        let other_twin = scenario.root.join("other_twin.bin");
+        std::fs::write(&other_keeper, vec![9u8; 2048]).unwrap();
+        std::fs::write(&other_twin, vec![9u8; 2048]).unwrap();
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(
+            &mut store,
+            &[
+                keeper.clone(),
+                twin.clone(),
+                other_keeper.clone(),
+                other_twin.clone(),
+            ],
+        );
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &twin, false, Some(ActionKind::Delete));
+        scenario.mark(&mut store, scan_id, &other_keeper, true, None);
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &other_twin,
+            false,
+            Some(ActionKind::Delete),
+        );
+
+        let plan = store
+            .build_action_plan(scan_id, std::slice::from_ref(&twin))
+            .expect("both durable groups are planned");
+        let targets: Vec<&Path> = plan
+            .actions()
+            .iter()
+            .map(crate::model::plan::PlanAction::target)
+            .collect();
+        assert!(
+            targets.contains(&other_twin.as_path()),
+            "a mark from another panel is still the operator's work: {targets:?}"
+        );
+
+        let phantom = scenario.root.join("never_marked.bin");
+        std::fs::write(&phantom, vec![7u8; 64]).unwrap();
+        assert_eq!(
+            store
+                .build_action_plan(scan_id, &[twin, phantom.clone()])
+                .expect_err("the caller believes in a mark the database never got"),
+            PlanRefusal::MarkNotPersisted { path: phantom }
+        );
+    }
+
+    /// The coarse gate comes first: a scan whose figures were never established is refused before
+    /// a single mark is read, whatever the individual rows say.
+    #[test]
+    fn an_unestablished_scan_refuses_before_anything_else() {
+        let _role = role_guard();
+        let scenario = PlanScenario::new("unmeasured");
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &twin, false, Some(ActionKind::Delete));
+        store
+            .build_action_plan(scan_id, std::slice::from_ref(&twin))
+            .expect("the control: this scan is plannable");
+
+        // Exactly what a migrated pre-v3 result carries.
+        store
+            .conn
+            .execute(
+                "UPDATE scan_stats SET reclaim_state = 0 WHERE scan_id = ?1",
+                params![scan_id],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .build_action_plan(scan_id, std::slice::from_ref(&twin))
+                .expect_err("nothing measured, nothing planned"),
+            PlanRefusal::RescanRequired
+        );
+
+        // A link count nobody recorded reaches the same verdict through the same gate.
+        store
+            .conn
+            .execute(
+                "UPDATE scan_stats SET reclaim_state = 1 WHERE scan_id = ?1",
+                params![scan_id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE file SET nlink = 0 WHERE scan_id = ?1 AND path = ?2",
+                params![scan_id, twin.to_string_lossy()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .build_action_plan(scan_id, &[twin])
+                .expect_err("an unrecorded link count"),
+            PlanRefusal::RescanRequired
+        );
+    }
+
+    /// A digest this build never verified against the file cannot anchor a destructive plan, even
+    /// though the scan-wide gate has nothing to say about it.
+    #[test]
+    fn a_digest_that_was_never_verified_refuses_the_plan() {
+        let _role = role_guard();
+        let scenario = PlanScenario::new("unverified");
+        let keeper = scenario.file("keeper.bin");
+        let alias_0 = scenario.file("alias_0.bin");
+        let alias_1 = scenario.link(&alias_0, "alias_1.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(
+            &mut store,
+            &[keeper.clone(), alias_0.clone(), alias_1.clone()],
+        );
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &alias_0,
+            false,
+            Some(ActionKind::Delete),
+        );
+
+        // The unmarked alias is the one demoted: a referenced member is enough, it need not be a
+        // target.
+        store
+            .conn
+            .execute(
+                "UPDATE file SET identity_version = 0 WHERE scan_id = ?1 AND path = ?2",
+                params![scan_id, alias_1.to_string_lossy()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .build_action_plan(scan_id, &[alias_0])
+                .expect_err("an unverified row in a referenced group"),
+            PlanRefusal::UnverifiedIdentity { path: alias_1 }
+        );
+    }
+
+    /// A mark without a keeper, a mark without a digest, and a mark on the keeper's own allocation.
+    #[test]
+    fn keeperless_unhashed_and_already_linked_marks_refuse() {
+        let _role = role_guard();
+        let scenario = PlanScenario::new("refusals");
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let linked = scenario.link(&keeper, "linked.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone(), linked.clone()]);
+
+        // No keeper anywhere in the group.
+        scenario.mark(&mut store, scan_id, &twin, false, Some(ActionKind::Delete));
+        assert!(
+            matches!(
+                store.build_action_plan(scan_id, std::slice::from_ref(&twin)),
+                Err(PlanRefusal::MissingKeeper { .. })
+            ),
+            "a group with a target and no keeper"
+        );
+
+        // The keeper's own allocation, marked: no action, and the mark is not swallowed.
+        scenario.mark(&mut store, scan_id, &twin, false, None);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &linked,
+            false,
+            Some(ActionKind::Delete),
+        );
+        assert_eq!(
+            store
+                .build_action_plan(scan_id, std::slice::from_ref(&linked))
+                .expect_err("nothing is left to do"),
+            PlanRefusal::NothingToDo
+        );
+
+        // A marked pathname whose row lost its digest.
+        store
+            .conn
+            .execute(
+                "UPDATE file SET hash = NULL WHERE scan_id = ?1 AND path = ?2",
+                params![scan_id, linked.to_string_lossy()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .build_action_plan(scan_id, std::slice::from_ref(&linked))
+                .expect_err("nothing vouches for that pathname"),
+            PlanRefusal::MissingDigest { path: linked }
+        );
+    }
+
+    /// The files have to still be the files: drift, a replacement, a symlink and a disappearance
+    /// each refuse before the plan is returned.
+    #[test]
+    fn live_drift_refuses_before_the_plan_is_returned() {
+        let _role = role_guard();
+        let scenario = PlanScenario::new("drift");
+        let keeper = scenario.file("keeper.bin");
+        let alias_0 = scenario.file("alias_0.bin");
+        let alias_1 = scenario.link(&alias_0, "alias_1.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(
+            &mut store,
+            &[keeper.clone(), alias_0.clone(), alias_1.clone()],
+        );
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &alias_0,
+            false,
+            Some(ActionKind::Delete),
+        );
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &alias_1,
+            false,
+            Some(ActionKind::Delete),
+        );
+        store
+            .build_action_plan(scan_id, std::slice::from_ref(&alias_0))
+            .expect("the control: nothing has moved yet");
+
+        // One alias re-counted and the other left alone: two pathnames of one inode cannot report
+        // different link counts, and that is caught before anything is compared with the disk.
+        store
+            .conn
+            .execute(
+                "UPDATE file SET nlink = 3 WHERE scan_id = ?1 AND path = ?2",
+                params![scan_id, alias_0.to_string_lossy()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .build_action_plan(scan_id, std::slice::from_ref(&alias_0))
+                .expect_err("one allocation, two counts"),
+            PlanRefusal::DisagreeingLinkCounts {
+                path: alias_0.clone(),
+                low: 2,
+                high: 3,
+            }
+        );
+
+        // Both aliases re-counted: the manifest now agrees with itself and not with the inode.
+        store
+            .conn
+            .execute(
+                "UPDATE file SET nlink = 3 WHERE scan_id = ?1 AND path = ?2",
+                params![scan_id, alias_1.to_string_lossy()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .build_action_plan(scan_id, std::slice::from_ref(&alias_0))
+                .expect_err("the manifest says three links, the inode says two"),
+            PlanRefusal::Drifted {
+                path: alias_0.clone(),
+                field: "link count",
+            }
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE file SET nlink = 2 WHERE scan_id = ?1 AND path IN (?2, ?3)",
+                params![
+                    scan_id,
+                    alias_0.to_string_lossy(),
+                    alias_1.to_string_lossy()
+                ],
+            )
+            .unwrap();
+
+        // The keeper is rewritten with the same bytes: a new temporal identity all the same.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&keeper, vec![7u8; payload_size(&keeper) as usize]).unwrap();
+        assert!(
+            matches!(
+                store.build_action_plan(scan_id, std::slice::from_ref(&alias_0)),
+                Err(PlanRefusal::Drifted { ref path, .. }) if *path == keeper
+            ),
+            "a rewritten keeper is not the file the plan measured"
+        );
+
+        // A member replaced by a symbolic link, and a member that is simply gone.
+        let scenario2 = PlanScenario::new("drift2");
+        let keeper2 = scenario2.file("keeper.bin");
+        let twin2 = scenario2.file("twin.bin");
+        let mut store2 = scenario2.store();
+        let scan2 = scenario2.seed(&mut store2, &[keeper2.clone(), twin2.clone()]);
+        scenario2.mark(&mut store2, scan2, &keeper2, true, None);
+        scenario2.mark(&mut store2, scan2, &twin2, false, Some(ActionKind::Delete));
+        std::fs::remove_file(&twin2).unwrap();
+        assert_eq!(
+            store2
+                .build_action_plan(scan2, std::slice::from_ref(&twin2))
+                .expect_err("the target is gone"),
+            PlanRefusal::Vanished {
+                path: twin2.clone()
+            }
+        );
+        std::os::unix::fs::symlink(&keeper2, &twin2).unwrap();
+        assert_eq!(
+            store2
+                .build_action_plan(scan2, std::slice::from_ref(&twin2))
+                .expect_err("the target is a symlink now"),
+            PlanRefusal::Symlink { path: twin2 }
+        );
+    }
+
+    /// One database, one plan: what the caller passes as its own view cannot change the answer.
+    #[test]
+    fn both_windows_build_the_same_plan_from_the_same_marks() {
+        let _role = role_guard();
+        let scenario = PlanScenario::new("parity");
+        let keeper = scenario.file("keeper.bin");
+        let alias_0 = scenario.file("alias_0.bin");
+        let alias_1 = scenario.link(&alias_0, "alias_1.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(
+            &mut store,
+            &[keeper.clone(), alias_0.clone(), alias_1.clone()],
+        );
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &alias_0,
+            false,
+            Some(ActionKind::Delete),
+        );
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &alias_1,
+            false,
+            Some(ActionKind::Delete),
+        );
+
+        // The classic browser hands over the whole open group; a commander panel hands over the
+        // marks it happens to hold.
+        let classic = store
+            .build_action_plan(scan_id, &[keeper, alias_0.clone(), alias_1])
+            .unwrap();
+        let commander = store.build_action_plan(scan_id, &[alias_0]).unwrap();
+        assert_eq!(classic, commander, "the database is the only authority");
+        assert_eq!(classic.digest(), commander.digest());
     }
 
     #[test]

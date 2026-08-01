@@ -393,6 +393,147 @@ pub(crate) fn take_metadata_fault(path: &Path) -> bool {
     take_fault(path, WalkFault::Metadata)
 }
 
+/// A real directory of byte-identical files — some of them hardlinked, some with a link outside the
+/// scanned root — together with a store whose manifest describes them exactly as a walk would.
+///
+/// The plan authority `stat`s every pathname it plans and compares the full temporal identity
+/// against the manifest, so its tests cannot be written against synthetic rows: the rows have to BE
+/// the files. Everything is created before `seed` records the manifest, because a link made
+/// afterwards changes the inode's `nlink` and `ctime` and the plan would rightly refuse the fixture.
+pub struct PlanScenario {
+    base: PathBuf,
+    /// The scanned directory.
+    pub root: PathBuf,
+    /// A sibling of `root`, never scanned — for links the manifest can never see.
+    pub outside: PathBuf,
+    pub db_path: PathBuf,
+}
+
+impl PlanScenario {
+    pub fn new(tag: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before the epoch")
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("dedcom_plan_{tag}_{}_{nanos}", std::process::id()));
+        let root = base.join("root");
+        let outside = base.join("out");
+        std::fs::create_dir_all(&root).expect("scenario root");
+        std::fs::create_dir_all(&outside).expect("scenario outside");
+        let db_path = base.join("dedcom.db");
+        Self {
+            base,
+            root,
+            outside,
+            db_path,
+        }
+    }
+
+    /// A file carrying the shared payload: every one of them is byte-identical, so they form one
+    /// content group.
+    pub fn file(&self, name: &str) -> PathBuf {
+        let path = self.root.join(name);
+        std::fs::write(&path, vec![7u8; DUP_SIZE]).expect("scenario payload");
+        path
+    }
+
+    /// Another pathname for the same allocation, inside the root.
+    pub fn link(&self, source: &Path, name: &str) -> PathBuf {
+        let path = self.root.join(name);
+        std::fs::hard_link(source, &path).expect("scenario alias");
+        path
+    }
+
+    /// A link to the same allocation OUTSIDE the root: the manifest never sees it, `st_nlink` does.
+    pub fn outside_link(&self, source: &Path, name: &str) -> PathBuf {
+        let path = self.outside.join(name);
+        std::fs::hard_link(source, &path).expect("scenario external link");
+        path
+    }
+
+    /// A writable store on this scenario's database.
+    pub fn store(&self) -> crate::state::ScanStore {
+        crate::state::ScanStore::open_writable(&self.db_path).expect("scenario store")
+    }
+
+    /// Records `paths` as a completed, published scan: manifest rows from the real `stat`,
+    /// fd-verified digests (so `identity_version = 1`), and the group figures the browser reads.
+    pub fn seed(&self, store: &mut crate::state::ScanStore, paths: &[PathBuf]) -> i64 {
+        use crate::model::scan::ScanStatus;
+        use crate::state::store::ManifestRow;
+        use std::sync::atomic::AtomicU64;
+
+        let scan_id = store
+            .begin_scan(&ScanConfig::new(vec![self.root.clone()]))
+            .expect("scenario scan");
+        let rows: Vec<ManifestRow> = paths
+            .iter()
+            .map(|path| {
+                let meta = std::fs::symlink_metadata(path).expect("scenario stat");
+                ManifestRow {
+                    path: path.clone(),
+                    size: meta.size(),
+                    mtime: meta.mtime(),
+                    mtime_nsec: meta.mtime_nsec(),
+                    ctime_sec: meta.ctime(),
+                    ctime_nsec: meta.ctime_nsec(),
+                    device: meta.dev(),
+                    inode: meta.ino(),
+                    nlink: meta.nlink(),
+                }
+            })
+            .collect();
+        store
+            .record_files(scan_id, &rows)
+            .expect("scenario manifest");
+        let verified: Vec<(ManifestRow, [u8; 32])> = rows
+            .into_iter()
+            .map(|row| {
+                let digest = crate::pipeline::hash::hash_file(&row.path, &AtomicU64::new(0))
+                    .expect("scenario digest");
+                (row, digest)
+            })
+            .collect();
+        store
+            .record_hashes_verified(scan_id, &verified)
+            .expect("scenario digests");
+        store
+            .set_status(scan_id, ScanStatus::Complete)
+            .expect("scenario status");
+        store
+            .ensure_materialized(scan_id)
+            .expect("scenario publication");
+        scan_id
+    }
+
+    /// Persists one mark, exactly as both windows do.
+    pub fn mark(
+        &self,
+        store: &mut crate::state::ScanStore,
+        scan_id: i64,
+        path: &Path,
+        is_keeper: bool,
+        action: Option<crate::model::action::ActionKind>,
+    ) {
+        let entry = crate::model::duplicate::FileEntry {
+            path: path.to_path_buf(),
+            is_keeper,
+            action,
+            ..Default::default()
+        };
+        store
+            .save_marks(scan_id, std::iter::once(&entry))
+            .expect("scenario mark");
+    }
+}
+
+impl Drop for PlanScenario {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.base).ok();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
