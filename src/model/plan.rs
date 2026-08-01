@@ -15,7 +15,7 @@
 //! Inert in R2D-C5-1: nothing in production builds an `ActionPlan` yet. R2D-C5-2 switches classic
 //! and the commander onto it and retires the two pathname-based builders.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -41,6 +41,38 @@ pub enum PlanRefusal {
     NothingToDo,
     #[error("{} is marked in this window but the database holds no such mark — re-mark it", .path.display())]
     MarkNotPersisted { path: PathBuf },
+    #[error("{} is marked as {} in this window and as {} in the database — re-mark it", .path.display(), .requested.describe(), .durable.describe())]
+    MarkDisagrees {
+        path: PathBuf,
+        requested: MarkIntent,
+        durable: MarkIntent,
+    },
+    #[error("{} was requested twice with two different meanings", .path.display())]
+    RequestContradictsItself { path: PathBuf },
+    #[error("dedcom.db holds an unreadable mark for {} ({field}: {detail}). Rescan, or move the old dedcom.db aside.", .path.display())]
+    CorruptMark {
+        path: PathBuf,
+        field: &'static str,
+        detail: String,
+    },
+    #[error("{} is marked both as the keeper and for an action. Re-mark it, or move the old dedcom.db aside.", .path.display())]
+    ContradictoryMark { path: PathBuf },
+    #[error("the group {hash} has two keepers ({} and {}) — exactly one file is kept", .first.display(), .second.display())]
+    MultipleKeepers {
+        hash: String,
+        first: PathBuf,
+        second: PathBuf,
+    },
+    #[error("the group {hash} was handed to the plan twice")]
+    DuplicateGroupInput { hash: String },
+    #[error("{} appears twice in the plan's evidence", .path.display())]
+    DuplicatePathEvidence { path: PathBuf },
+    #[error("{} is one allocation carrying two digests ({first} and {second}). Rescan, or move the old dedcom.db aside.", .path.display())]
+    ObjectInTwoGroups {
+        path: PathBuf,
+        first: String,
+        second: String,
+    },
     #[error("{} carries a mark but has no row in this scan's manifest. Rescan, or move the old dedcom.db aside.", .path.display())]
     NotInManifest { path: PathBuf },
     #[error("{} is marked but has no digest in this scan — rescan required", .path.display())]
@@ -80,6 +112,53 @@ pub enum PlanRefusal {
 impl From<PlanRefusal> for AppError {
     fn from(refusal: PlanRefusal) -> Self {
         AppError::msg(refusal.to_string())
+    }
+}
+
+/// What a mark means. The two states are exclusive by construction, so «keeper AND delete» is a
+/// shape this type cannot hold — the database can, and decoding one refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkIntent {
+    /// The file that stays; no action is applied to it.
+    Keeper,
+    /// The action the operator asked for on this pathname.
+    Act(ActionKind),
+}
+
+impl MarkIntent {
+    /// How the mark reads in a refusal.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Keeper => "the keeper",
+            Self::Act(kind) => kind.label(),
+        }
+    }
+}
+
+/// One mark exactly as the window that asks for a plan believes it stands.
+///
+/// The store compares this with the durable mark for the same pathname, so a mark whose write to
+/// the database failed cannot be quietly replaced by the older meaning it was supposed to overwrite
+/// — the operator would confirm a screen that says DELETE over a database that still says HARDLINK.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestedMark {
+    pub path: PathBuf,
+    pub intent: MarkIntent,
+}
+
+impl RequestedMark {
+    pub fn keeper(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            intent: MarkIntent::Keeper,
+        }
+    }
+
+    pub fn acting(path: impl Into<PathBuf>, kind: ActionKind) -> Self {
+        Self {
+            path: path.into(),
+            intent: MarkIntent::Act(kind),
+        }
     }
 }
 
@@ -150,8 +229,9 @@ pub struct PlanMemberEvidence {
     path: PathBuf,
     key: PlanObjectKey,
     links: u64,
-    is_keeper: bool,
-    action: Option<ActionKind>,
+    /// `None` — a member of the group nobody marked. It is evidence all the same: it is what
+    /// decides whether removing its siblings releases anything.
+    mark: Option<MarkIntent>,
 }
 
 impl PlanMemberEvidence {
@@ -159,8 +239,7 @@ impl PlanMemberEvidence {
         path: PathBuf,
         key: PlanObjectKey,
         links: LinkCount,
-        is_keeper: bool,
-        action: Option<ActionKind>,
+        mark: Option<MarkIntent>,
     ) -> PlanResult<Self> {
         if key.identity_version != 1 {
             return Err(PlanRefusal::UnverifiedIdentity { path });
@@ -173,8 +252,7 @@ impl PlanMemberEvidence {
             path,
             key,
             links,
-            is_keeper,
-            action,
+            mark,
         })
     }
 
@@ -190,12 +268,19 @@ impl PlanMemberEvidence {
         self.links
     }
 
+    pub fn mark(&self) -> Option<MarkIntent> {
+        self.mark
+    }
+
     pub fn is_keeper(&self) -> bool {
-        self.is_keeper
+        matches!(self.mark, Some(MarkIntent::Keeper))
     }
 
     pub fn action(&self) -> Option<ActionKind> {
-        self.action
+        match self.mark {
+            Some(MarkIntent::Act(kind)) => Some(kind),
+            _ => None,
+        }
     }
 }
 
@@ -468,20 +553,27 @@ impl ActionPlan {
         if groups.is_empty() {
             return Err(PlanRefusal::NoMarks);
         }
+        // One normalisation up front, so every check below and every figure that follows reads the
+        // same evidence in the same order.
         groups.sort_by(|left, right| left.hash.cmp(&right.hash));
+        for group in &mut groups {
+            group
+                .members
+                .sort_by(|left, right| left.path.cmp(&right.path));
+        }
+        Self::check_global_evidence(&groups)?;
 
         let mut objects: Vec<PlannedObject> = Vec::new();
         let mut actions: Vec<PlanAction> = Vec::new();
         let mut warnings: Vec<PlanWarning> = Vec::new();
 
         for group in &groups {
-            if group.members.is_empty() {
+            let members = &group.members;
+            if members.is_empty() {
                 return Err(PlanRefusal::MissingKeeper {
                     hash: group.hash.clone(),
                 });
             }
-            let mut members: Vec<&PlanMemberEvidence> = group.members.iter().collect();
-            members.sort_by(|left, right| left.path.cmp(&right.path));
 
             // One digest is one content, so one size. Two sizes under one digest is a damaged
             // manifest, and the plan's arithmetic would be built on whichever row it read first.
@@ -492,17 +584,28 @@ impl ActionPlan {
                 });
             }
 
-            let keeper = members.iter().find(|member| member.is_keeper).copied();
+            // Exactly one file is kept. Two keeper marks are not a preference to resolve by sort
+            // order — they are two different plans, and only the operator knows which one they
+            // meant. `file_mark` has no constraint against it and the commander writes one pathname
+            // at a time, so this is reachable without touching the database by hand.
+            let keepers: Vec<&PlanMemberEvidence> =
+                members.iter().filter(|member| member.is_keeper()).collect();
+            if keepers.len() > 1 {
+                return Err(PlanRefusal::MultipleKeepers {
+                    hash: group.hash.clone(),
+                    first: keepers[0].path.clone(),
+                    second: keepers[1].path.clone(),
+                });
+            }
             let targets: Vec<&PlanMemberEvidence> = members
                 .iter()
-                .filter(|member| !member.is_keeper && member.action.is_some())
-                .copied()
+                .filter(|member| !member.is_keeper() && member.action().is_some())
                 .collect();
-            let keeper = match (keeper, targets.is_empty()) {
+            let keeper = match (keepers.first().copied(), targets.is_empty()) {
                 (Some(keeper), _) => keeper,
                 // Nothing is being removed from this group; it contributes evidence only.
                 (None, true) => {
-                    push_objects(&mut objects, group, &members, None, &[])?;
+                    push_objects(&mut objects, group, members, None, &[])?;
                     continue;
                 }
                 (None, false) => {
@@ -525,7 +628,7 @@ impl ActionPlan {
             }
 
             let first_object = objects.len();
-            push_objects(&mut objects, group, &members, Some(keeper), &covered)?;
+            push_objects(&mut objects, group, members, Some(keeper), &covered)?;
             let index_of = |key: PlanObjectKey| -> Option<usize> {
                 objects[first_object..]
                     .iter()
@@ -536,7 +639,7 @@ impl ActionPlan {
             for target in covered {
                 let target_object = index_of(target.key).expect("a target is one of the members");
                 actions.push(PlanAction {
-                    kind: target.action.expect("targets carry an action"),
+                    kind: target.action().expect("targets carry an action"),
                     target: target.path.clone(),
                     keeper: keeper.path.clone(),
                     target_object,
@@ -578,6 +681,50 @@ impl ActionPlan {
             actions,
             summary,
         })
+    }
+
+    /// The invariants that hold over the WHOLE input rather than inside one group.
+    ///
+    /// A plan is arithmetic over evidence, so evidence that says one thing twice is not something to
+    /// merge, pick a winner from or count twice — it is a damaged database, and the plan refuses.
+    /// Checked before any total or action is folded, so nothing is derived from it first.
+    fn check_global_evidence(groups: &[PlanGroupInput]) -> PlanResult<()> {
+        for pair in groups.windows(2) {
+            if pair[0].hash == pair[1].hash {
+                return Err(PlanRefusal::DuplicateGroupInput {
+                    hash: pair[0].hash.clone(),
+                });
+            }
+        }
+        let mut paths: BTreeSet<&Path> = BTreeSet::new();
+        let mut owner: BTreeMap<PlanObjectKey, (&str, &Path)> = BTreeMap::new();
+        for group in groups {
+            for member in &group.members {
+                if !paths.insert(member.path.as_path()) {
+                    return Err(PlanRefusal::DuplicatePathEvidence {
+                        path: member.path.clone(),
+                    });
+                }
+                match owner.entry(member.key) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert((group.hash.as_str(), member.path.as_path()));
+                    }
+                    std::collections::btree_map::Entry::Occupied(slot) => {
+                        let (first_hash, first_path) = *slot.get();
+                        // One inode holds one content. The same allocation under two digests would
+                        // be counted — and acted on — as two groups.
+                        if first_hash != group.hash {
+                            return Err(PlanRefusal::ObjectInTwoGroups {
+                                path: first_path.to_path_buf(),
+                                first: first_hash.to_string(),
+                                second: group.hash.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn scan_id(&self) -> i64 {
@@ -660,7 +807,7 @@ impl PlanDigest {
 fn push_objects(
     objects: &mut Vec<PlannedObject>,
     group: &PlanGroupInput,
-    members: &[&PlanMemberEvidence],
+    members: &[PlanMemberEvidence],
     keeper: Option<&PlanMemberEvidence>,
     covered: &[&PlanMemberEvidence],
 ) -> PlanResult<()> {
@@ -742,6 +889,9 @@ mod tests {
         }
     }
 
+    /// The fixture still spells a mark as the database does — a flag and an action — and translates
+    /// it into the intent the evidence now carries. The fourth arm is the combination `MarkIntent`
+    /// made unrepresentable: it can no longer be constructed, only refused while decoding a row.
     fn member(
         path: &str,
         key: PlanObjectKey,
@@ -749,14 +899,14 @@ mod tests {
         is_keeper: bool,
         action: Option<ActionKind>,
     ) -> PlanMemberEvidence {
-        PlanMemberEvidence::new(
-            PathBuf::from(path),
-            key,
-            LinkCount::Known(links),
-            is_keeper,
-            action,
-        )
-        .expect("the fixture is well formed")
+        let mark = match (is_keeper, action) {
+            (true, None) => Some(MarkIntent::Keeper),
+            (false, Some(kind)) => Some(MarkIntent::Act(kind)),
+            (false, None) => None,
+            (true, Some(_)) => panic!("a keeper that also acts is not a state this type can hold"),
+        };
+        PlanMemberEvidence::new(PathBuf::from(path), key, LinkCount::Known(links), mark)
+            .expect("the fixture is well formed")
     }
 
     fn group(members: Vec<PlanMemberEvidence>) -> PlanGroupInput {
@@ -936,8 +1086,7 @@ mod tests {
                 PathBuf::from("/x/a.bin"),
                 key(10, S),
                 LinkCount::Unknown,
-                false,
-                Some(ActionKind::Delete),
+                Some(MarkIntent::Act(ActionKind::Delete)),
             )
             .expect_err("a legacy row"),
             PlanRefusal::UnrecordedLinkCount {
@@ -953,8 +1102,7 @@ mod tests {
                 PathBuf::from("/x/a.bin"),
                 unverified,
                 LinkCount::Known(1),
-                false,
-                Some(ActionKind::Delete),
+                Some(MarkIntent::Act(ActionKind::Delete)),
             )
             .expect_err("a digest nobody verified"),
             PlanRefusal::UnverifiedIdentity {
@@ -1145,6 +1293,105 @@ mod tests {
         assert_eq!(digest.hidden, 0);
         assert_eq!(digest.samples.len(), 2);
         assert_eq!(digest.warnings, plan.summary().warnings());
+    }
+
+    /// Two keeper marks are two different plans. The sort order is not allowed to pick one.
+    #[test]
+    fn two_keepers_in_one_group_refuse() {
+        let refusal = ActionPlan::try_new(
+            1,
+            vec![group(vec![
+                member("/x/a_keeper.bin", key(10, S), 1, true, None),
+                member("/x/b_keeper.bin", key(11, S), 1, true, None),
+                member(
+                    "/x/c_twin.bin",
+                    key(12, S),
+                    1,
+                    false,
+                    Some(ActionKind::Delete),
+                ),
+            ])],
+        )
+        .expect_err("nothing says which file is kept");
+        assert_eq!(
+            refusal,
+            PlanRefusal::MultipleKeepers {
+                hash: "ab".repeat(32),
+                first: PathBuf::from("/x/a_keeper.bin"),
+                second: PathBuf::from("/x/b_keeper.bin"),
+            }
+        );
+
+        // A group with no targets is refused just the same: it is still evidence the plan reads.
+        assert!(matches!(
+            ActionPlan::try_new(
+                1,
+                vec![group(vec![
+                    member("/x/a_keeper.bin", key(10, S), 1, true, None),
+                    member("/x/b_keeper.bin", key(11, S), 1, true, None),
+                ])],
+            ),
+            Err(PlanRefusal::MultipleKeepers { .. })
+        ));
+    }
+
+    /// One inode holds one content. The same allocation under two digests would be counted, and
+    /// acted on, as two groups — the refusal comes before any total is folded.
+    #[test]
+    fn one_allocation_under_two_digests_refuses() {
+        let shared = key(11, S);
+        let mut first = group(vec![
+            member("/x/a_keeper.bin", key(10, S), 1, true, None),
+            member("/x/alias_0.bin", shared, 2, false, Some(ActionKind::Delete)),
+        ]);
+        first.hash = "aa".repeat(32);
+        let mut second = group(vec![
+            member("/x/b_keeper.bin", key(20, S), 1, true, None),
+            member("/x/alias_1.bin", shared, 2, false, Some(ActionKind::Delete)),
+        ]);
+        second.hash = "bb".repeat(32);
+
+        assert_eq!(
+            ActionPlan::try_new(1, vec![first, second]).expect_err("one inode, two digests"),
+            PlanRefusal::ObjectInTwoGroups {
+                path: PathBuf::from("/x/alias_0.bin"),
+                first: "aa".repeat(32),
+                second: "bb".repeat(32),
+            }
+        );
+    }
+
+    /// Evidence handed in twice is refused rather than folded twice.
+    #[test]
+    fn duplicate_evidence_refuses() {
+        let twice = || {
+            group(vec![
+                member("/x/keeper.bin", key(10, S), 1, true, None),
+                member(
+                    "/x/twin.bin",
+                    key(11, S),
+                    1,
+                    false,
+                    Some(ActionKind::Delete),
+                ),
+            ])
+        };
+        assert_eq!(
+            ActionPlan::try_new(1, vec![twice(), twice()]).expect_err("one digest, two inputs"),
+            PlanRefusal::DuplicateGroupInput {
+                hash: "ab".repeat(32)
+            }
+        );
+
+        let mut second = twice();
+        second.hash = "cd".repeat(32);
+        assert_eq!(
+            ActionPlan::try_new(1, vec![twice(), second])
+                .expect_err("one pathname under two digests"),
+            PlanRefusal::DuplicatePathEvidence {
+                path: PathBuf::from("/x/keeper.bin")
+            }
+        );
     }
 
     /// The live comparison names the first field that moved, and ignores the one `stat` cannot
