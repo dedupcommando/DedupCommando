@@ -482,13 +482,22 @@ impl Batch<'_> {
                     ),
                     _ => self.ledger.settled(action.target_object(), action.target()),
                 };
-                let unaccounted = self.settle_or_poison(action.target_object(), target_settle);
                 let keeper_settle = self.ledger.settled(action.keeper_object(), action.keeper());
-                let unaccounted = unaccounted
-                    .or_else(|| self.settle_or_poison(action.keeper_object(), keeper_settle));
+                // Both, unconditionally, in a fixed order. A short-circuiting combinator here is
+                // how the keeper's already-computed failure was thrown away: its allocation went
+                // unpoisoned and its reason never reached the operator, while the target's did.
+                let mut unaccounted: Vec<String> = Vec::new();
+                for (object, settle) in [
+                    (action.target_object(), target_settle),
+                    (action.keeper_object(), keeper_settle),
+                ] {
+                    if let Some(reason) = self.settle_or_poison(object, settle) {
+                        unaccounted.push(reason);
+                    }
+                }
                 let (quarantine, result, outcome) = published.split();
                 let mut detail = outcome.err().map(|err| err.to_string()).unwrap_or_default();
-                if let Some(extra) = unaccounted {
+                for extra in unaccounted {
                     detail.push_str(&format!("; {extra}"));
                 }
                 (
@@ -522,9 +531,9 @@ impl Batch<'_> {
                 }
                 Some(Linkage::Reflink) => self.ledger.cloned(
                     action.keeper_object(),
+                    action.target_object(),
                     action.keeper(),
                     action.target(),
-                    self.plan.target_object_of(action).key().device,
                 ),
             });
         // The pathname moved, and yet the reading that would justify a claim is the one that
@@ -1448,6 +1457,183 @@ pub(crate) mod tests {
         );
     }
 
+    /// Sets both timestamps of `path`, so a fixture can hold a modification time no publication
+    /// of this batch could have produced.
+    fn set_mtime(path: &Path, sec: i64, nsec: i64) {
+        use std::os::unix::ffi::OsStrExt;
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let stamp = libc::timespec {
+            tv_sec: sec as libc::time_t,
+            tv_nsec: nsec as _,
+        };
+        let times = [stamp, stamp];
+        // SAFETY: the path string and the array both live across the call.
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, path_c.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(rc, 0, "the fixture must be able to set a timestamp");
+    }
+
+    /// A reflink publication carries the REPLACED file's own identity onto the fresh inode, so the
+    /// pathname that comes back has to be checked against the target's allocation — not the
+    /// keeper's, and not merely for being «some fresh file of the right size».
+    ///
+    /// None of this needs FICLONE: the contract is about what the published pathname must look
+    /// like, and a filesystem that cannot clone is no reason to leave it unchecked.
+    #[test]
+    fn a_published_clone_must_carry_the_replaced_files_identity() {
+        let scenario = PlanScenario::new("clone_contract");
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &twin, false, Some(ActionKind::Reflink));
+        drop(store);
+        let plan = plan_of(&scenario, scan_id);
+        let action = &plan.actions()[0];
+        let (keeper_object, target_object) = (action.keeper_object(), action.target_object());
+        let original = std::fs::symlink_metadata(&twin).unwrap();
+        let size = original.size() as usize;
+        let (mtime, mtime_nsec) = (original.mtime(), original.mtime_nsec());
+
+        // A replacement that really does carry the replaced file's identity is accepted.
+        let good = scenario.root.join("good.bin");
+        std::fs::write(&good, vec![7u8; size]).unwrap();
+        set_mtime(&good, mtime, mtime_nsec);
+        let mut ledger = RuntimeLedger::open(plan.preflight().unwrap());
+        ledger
+            .cloned(keeper_object, target_object, &keeper, &good)
+            .expect("a fresh allocation with the target's own identity");
+
+        // And every way of not being that is refused, each naming its own field.
+        let refuse = |name: &str, prepare: &dyn Fn(&Path)| -> String {
+            let path = scenario.root.join(name);
+            prepare(&path);
+            let mut ledger = RuntimeLedger::open(plan.preflight().unwrap());
+            ledger
+                .cloned(keeper_object, target_object, &keeper, &path)
+                .expect_err(&format!("{name} must be refused"))
+                .to_string()
+        };
+
+        let wrong_time = refuse("wrong_time.bin", &|path| {
+            std::fs::write(path, vec![7u8; size]).unwrap();
+            set_mtime(path, 1, 0);
+        });
+        assert!(wrong_time.contains("(mtime)"), "{wrong_time}");
+
+        let wrong_nsec = refuse("wrong_nsec.bin", &|path| {
+            std::fs::write(path, vec![7u8; size]).unwrap();
+            set_mtime(path, mtime, if mtime_nsec == 0 { 1 } else { 0 });
+        });
+        assert!(wrong_nsec.contains("(mtime_nsec)"), "{wrong_nsec}");
+
+        let wrong_size = refuse("wrong_size.bin", &|path| {
+            std::fs::write(path, vec![7u8; size + 1]).unwrap();
+            set_mtime(path, mtime, mtime_nsec);
+        });
+        assert!(wrong_size.contains("(size)"), "{wrong_size}");
+
+        let extra_link = refuse("extra_link.bin", &|path| {
+            std::fs::write(path, vec![7u8; size]).unwrap();
+            set_mtime(path, mtime, mtime_nsec);
+            std::fs::hard_link(path, scenario.outside.join("second_name.bin")).unwrap();
+        });
+        assert!(extra_link.contains("(link count)"), "{extra_link}");
+
+        // The keeper's own allocation is a hardlink, not a clone.
+        let mut ledger = RuntimeLedger::open(plan.preflight().unwrap());
+        let as_keeper = ledger
+            .cloned(keeper_object, target_object, &keeper, &keeper)
+            .expect_err("the keeper is not a fresh allocation")
+            .to_string();
+        assert!(as_keeper.contains("(inode)"), "{as_keeper}");
+
+        // And so is the original itself: if nothing was published, nothing may be booked.
+        let mut ledger = RuntimeLedger::open(plan.preflight().unwrap());
+        let as_original = ledger
+            .cloned(keeper_object, target_object, &keeper, &twin)
+            .expect_err("the original is not a replacement of itself")
+            .to_string();
+        assert!(as_original.contains("(inode)"), "{as_original}");
+    }
+
+    /// Both settlement failures are the operator's to see, and each allocation poisons itself.
+    /// Handling them through a short-circuiting combinator silently kept only the first.
+    #[test]
+    fn two_settlement_failures_are_both_reported_and_both_poison() {
+        let _role = crate::state::store::role_guard();
+        let scenario = PlanScenario::new("two_settles");
+        let keeper = scenario.file("keeper.bin");
+        let first = scenario.file("twin_a.bin");
+        let second = scenario.file("twin_b.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), first.clone(), second.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &first,
+            false,
+            Some(ActionKind::Hardlink),
+        );
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &second,
+            false,
+            Some(ActionKind::Hardlink),
+        );
+        drop(store);
+        let plan = plan_of(&scenario, scan_id);
+
+        let quarantine_root = scenario.root.join(crate::model::scan::QUARANTINE_DIR_NAME);
+        let keeper_for_hook = keeper.clone();
+        let out_original = scenario.outside.join("original_link.bin");
+        let out_keeper = scenario.outside.join("keeper_link.bin");
+        let ops = FakeOps::new().on_before_publication(move |target, _temp| {
+            if out_keeper.exists() {
+                return;
+            }
+            let name = target.file_name().expect("a target has a name");
+            let evacuated = find_under(&quarantine_root, name).expect("the evacuated original");
+            std::fs::hard_link(&evacuated, &out_original).unwrap();
+            std::fs::hard_link(&keeper_for_hook, &out_keeper).unwrap();
+            // The slot is taken, so publication AND rollback both fail: the original is stranded.
+            std::fs::write(target, b"squatter").unwrap();
+        });
+        let batch = run(&ops, &plan, &[dataset_over(&scenario.root, "tank/test")]).unwrap();
+
+        let message = batch.outcomes[0]
+            .result
+            .as_ref()
+            .expect_err("the publication failed");
+        assert!(
+            message.contains(&first.display().to_string()),
+            "the target's own failure is there: {message}"
+        );
+        assert!(
+            message.contains(&keeper.display().to_string()),
+            "and so is the keeper's, which used to be computed and dropped: {message}"
+        );
+        // The keeper really was poisoned, not merely left drifting: the next action on it is
+        // refused for being unaccountable rather than for having moved.
+        let next = batch.outcomes[1]
+            .result
+            .as_ref()
+            .expect_err("the second action cannot run on an unaccountable keeper");
+        assert!(
+            next.contains("cannot account for"),
+            "the keeper must be poisoned, not just stale: {next}"
+        );
+        // The original really is stranded, and the result still names where it is.
+        let (_, state) = &batch.realized[0];
+        let ObjectRealization::Unknown { quarantine, .. } = state else {
+            panic!("a stranded original is not a plain zero: {state:?}");
+        };
+        assert!(quarantine.as_ref().expect("the exact path").exists());
+        assert_eq!(batch.realized_summary.guaranteed_bytes(), 0);
+    }
+
     /// Each ledger transition refuses the shape it is supposed to refuse, and each refusal is the
     /// one the batch turns into an unknown allocation.
     #[test]
@@ -1463,7 +1649,6 @@ pub(crate) mod tests {
         let plan = plan_of(&scenario, scan_id);
         let action = &plan.actions()[0];
         let (target, keeper_object) = (action.target_object(), action.keeper_object());
-        let device = plan.target_object_of(action).key().device;
 
         // `quarantined`: the pathname the batch says it moved is not the allocation it moved.
         let mut ledger = RuntimeLedger::open(plan.preflight().unwrap());
@@ -1479,18 +1664,16 @@ pub(crate) mod tests {
             .expect_err("twin.bin is its own allocation");
         assert!(err.to_string().contains("moved while the batch"), "{err}");
 
-        // `cloned`: a published pathname that shares the keeper's inode is a hardlink, not a clone.
+        // Poisoning is not the same thing as drift, and a later action must be able to say so.
         let mut ledger = RuntimeLedger::open(plan.preflight().unwrap());
+        assert!(ledger.is_settled(keeper_object));
+        ledger.check(keeper_object).expect("nothing has moved yet");
+        ledger.poison(keeper_object);
+        assert!(!ledger.is_settled(keeper_object));
         let err = ledger
-            .cloned(keeper_object, &keeper, &keeper, device)
-            .expect_err("a clone is never the keeper itself");
-        assert!(err.to_string().contains("inode"), "{err}");
-        // And one on the wrong device is refused too.
-        let mut ledger = RuntimeLedger::open(plan.preflight().unwrap());
-        let err = ledger
-            .cloned(keeper_object, &keeper, &twin, device + 1)
-            .expect_err("the clone must land on the target's own device");
-        assert!(err.to_string().contains("device"), "{err}");
+            .check(keeper_object)
+            .expect_err("an unaccountable allocation authorizes nothing");
+        assert!(err.to_string().contains("cannot account for"), "{err}");
     }
 
     /// One allocation failing must not take another one's figure with it.

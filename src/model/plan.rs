@@ -1221,22 +1221,30 @@ impl RuntimeLedger {
         Ok(())
     }
 
-    /// A block clone of `keeper_path` was published at `published`, on device `device`.
+    /// A block clone of `keeper_path` was published at the pathname `target` used to hold.
     ///
-    /// A clone reads the keeper and writes a new inode, so the keeper's allocation must come back
-    /// bit for bit identical — including its link count and `ctime`. The published pathname is then
-    /// checked to be what a clone actually produces: the target's own device, the keeper's size,
-    /// exactly one link, and an allocation that is NOT the keeper's. A published pathname that
-    /// turned out to share the keeper's inode is a hardlink, and calling that a reflink is how a
-    /// «separate file» claim becomes false.
+    /// Two allocations have to agree for this to be a reflink publication. The keeper's must come
+    /// back bit for bit identical, link count and `ctime` included — it was only read. The
+    /// published pathname must be what the publication actually produces: a FRESH allocation
+    /// carrying the replaced file's own identity, because the clone is given the target's owner,
+    /// mode, xattrs and timestamps before it is published (`actions::meta`). So it is checked
+    /// against the target's allocation as this batch last left it — in quarantine — not against
+    /// the keeper's.
+    ///
+    /// Device, size and both halves of `mtime` are that identity. `ctime` is not compared: a new
+    /// inode's is new by construction, and it is adopted from the live read. A pathname that has
+    /// the right size and link count but somebody else's modification time is not the file that
+    /// was replaced, and booking it as correctly published is how a swap after the copy becomes
+    /// invisible.
     pub fn cloned(
         &mut self,
-        object: usize,
+        keeper_object: usize,
+        target_object: usize,
         keeper_path: &Path,
         published: &Path,
-        device: u64,
     ) -> PlanResult<()> {
-        let keeper = self.entry(object)?.identity;
+        let keeper = self.entry(keeper_object)?.identity;
+        let original = self.entry(target_object)?.identity;
         let live = live_identity(keeper_path)?;
         if let Some(field) = drift_between(&keeper, &live) {
             return Err(PlanRefusal::ExternalChange {
@@ -1245,13 +1253,19 @@ impl RuntimeLedger {
             });
         }
         let identity = live_identity(published)?;
+        let allocation = (identity.device, identity.inode);
         let wrong = [
-            ("device", identity.device != device),
+            // Freshness first: an allocation that is the keeper's is a hardlink, and one that is
+            // still the original's means nothing was published at all.
             (
                 "inode",
-                (identity.device, identity.inode) == (keeper.device, keeper.inode),
+                allocation == (keeper.device, keeper.inode)
+                    || allocation == (original.device, original.inode),
             ),
-            ("size", identity.size != keeper.size),
+            ("device", identity.device != original.device),
+            ("size", identity.size != original.size),
+            ("mtime", identity.mtime != original.mtime),
+            ("mtime_nsec", identity.mtime_nsec != original.mtime_nsec),
             ("link count", identity.nlink != 1),
         ]
         .into_iter()
@@ -1269,6 +1283,16 @@ impl RuntimeLedger {
             settled: true,
         });
         Ok(())
+    }
+
+    /// Whether this allocation is still trusted. Test-only: poisoning and ordinary live drift both
+    /// refuse a later action, and the tests have to be able to tell them apart.
+    #[cfg(test)]
+    pub fn is_settled(&self, object: usize) -> bool {
+        self.objects
+            .get(object)
+            .map(|entry| entry.settled)
+            .unwrap_or(false)
     }
 
     fn entry(&self, object: usize) -> PlanResult<&ObjectState> {
