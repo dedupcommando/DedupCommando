@@ -1457,6 +1457,33 @@ pub(crate) mod tests {
         );
     }
 
+    /// A fixture on `/dev/shm` — a second real filesystem on the Linux gate — removed however the
+    /// test ends, so a failing assertion cannot leave it behind for the next run.
+    struct ShmFile {
+        path: PathBuf,
+    }
+
+    impl ShmFile {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            Self {
+                path: PathBuf::from(format!(
+                    "/dev/shm/dedcom_{tag}_{}_{nanos}.bin",
+                    std::process::id()
+                )),
+            }
+        }
+    }
+
+    impl Drop for ShmFile {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.path).ok();
+        }
+    }
+
     /// Sets both timestamps of `path`, so a fixture can hold a modification time no publication
     /// of this batch could have produced.
     fn set_mtime(path: &Path, sec: i64, nsec: i64) {
@@ -1540,6 +1567,26 @@ pub(crate) mod tests {
         });
         assert!(extra_link.contains("(link count)"), "{extra_link}");
 
+        // A replacement that landed on some OTHER filesystem is not the target's replacement,
+        // however right the rest of it looks. `/dev/shm` is a real second device on the gate; the
+        // fixture asserts that before it proves anything, so a host where the two coincide fails
+        // loudly instead of passing on a check that never fired.
+        let elsewhere = ShmFile::new("clone_device");
+        std::fs::write(&elsewhere.path, vec![7u8; size]).unwrap();
+        set_mtime(&elsewhere.path, mtime, mtime_nsec);
+        let their_device = std::fs::symlink_metadata(&elsewhere.path).unwrap().dev();
+        assert_ne!(
+            their_device,
+            original.dev(),
+            "the fixture only means something on two different devices"
+        );
+        let mut ledger = RuntimeLedger::open(plan.preflight().unwrap());
+        let wrong_device = ledger
+            .cloned(keeper_object, target_object, &keeper, &elsewhere.path)
+            .expect_err("a clone on another filesystem is not this target's replacement")
+            .to_string();
+        assert!(wrong_device.contains("(device)"), "{wrong_device}");
+
         // The keeper's own allocation is a hardlink, not a clone.
         let mut ledger = RuntimeLedger::open(plan.preflight().unwrap());
         let as_keeper = ledger
@@ -1563,28 +1610,46 @@ pub(crate) mod tests {
     fn two_settlement_failures_are_both_reported_and_both_poison() {
         let _role = crate::state::store::role_guard();
         let scenario = PlanScenario::new("two_settles");
+        // One allocation with two covered pathnames, plus an independent one — all against the
+        // same keeper. That is what makes the two poisons separately observable: the second action
+        // meets the poisoned TARGET allocation, the third meets the poisoned KEEPER.
         let keeper = scenario.file("keeper.bin");
-        let first = scenario.file("twin_a.bin");
-        let second = scenario.file("twin_b.bin");
+        let alias_a = scenario.file("alias_a.bin");
+        let alias_b = scenario.link(&alias_a, "alias_b.bin");
+        let independent = scenario.file("twin.bin");
         let mut store = scenario.store();
-        let scan_id = scenario.seed(&mut store, &[keeper.clone(), first.clone(), second.clone()]);
+        let scan_id = scenario.seed(
+            &mut store,
+            &[
+                keeper.clone(),
+                alias_a.clone(),
+                alias_b.clone(),
+                independent.clone(),
+            ],
+        );
         scenario.mark(&mut store, scan_id, &keeper, true, None);
-        scenario.mark(
-            &mut store,
-            scan_id,
-            &first,
-            false,
-            Some(ActionKind::Hardlink),
-        );
-        scenario.mark(
-            &mut store,
-            scan_id,
-            &second,
-            false,
-            Some(ActionKind::Hardlink),
-        );
+        for target in [&alias_a, &alias_b, &independent] {
+            scenario.mark(
+                &mut store,
+                scan_id,
+                target,
+                false,
+                Some(ActionKind::Hardlink),
+            );
+        }
         drop(store);
         let plan = plan_of(&scenario, scan_id);
+        // Sorted by pathname, so which action meets which poisoned allocation is not an accident.
+        let targets: Vec<&Path> = plan
+            .actions()
+            .iter()
+            .map(|action| action.target())
+            .collect();
+        assert_eq!(
+            targets,
+            vec![alias_a.as_path(), alias_b.as_path(), independent.as_path()],
+            "the action order this test reads is the plan's own"
+        );
 
         let quarantine_root = scenario.root.join(crate::model::scan::QUARANTINE_DIR_NAME);
         let keeper_for_hook = keeper.clone();
@@ -1608,22 +1673,38 @@ pub(crate) mod tests {
             .as_ref()
             .expect_err("the publication failed");
         assert!(
-            message.contains(&first.display().to_string()),
+            message.contains(&alias_a.display().to_string()),
             "the target's own failure is there: {message}"
         );
         assert!(
             message.contains(&keeper.display().to_string()),
             "and so is the keeper's, which used to be computed and dropped: {message}"
         );
-        // The keeper really was poisoned, not merely left drifting: the next action on it is
-        // refused for being unaccountable rather than for having moved.
-        let next = batch.outcomes[1]
+        // Both allocations really were poisoned, and each is observed on its own. Action 2 is the
+        // other pathname of the SAME target allocation; action 3 is an untouched allocation whose
+        // only unaccountable neighbour is the keeper. Neither can pass by meeting the other's
+        // poison, because the refusal names the allocation it stopped at.
+        let same_allocation = batch.outcomes[1]
             .result
             .as_ref()
-            .expect_err("the second action cannot run on an unaccountable keeper");
+            .expect_err("the other alias of an unaccountable allocation cannot be applied");
         assert!(
-            next.contains("cannot account for"),
-            "the keeper must be poisoned, not just stale: {next}"
+            same_allocation.contains("cannot account for")
+                && same_allocation.contains(&alias_a.display().to_string()),
+            "the target allocation must be poisoned: {same_allocation}"
+        );
+        let through_the_keeper = batch.outcomes[2]
+            .result
+            .as_ref()
+            .expect_err("an independent target still needs an accountable keeper");
+        assert!(
+            through_the_keeper.contains("cannot account for")
+                && through_the_keeper.contains(&keeper.display().to_string()),
+            "the keeper allocation must be poisoned: {through_the_keeper}"
+        );
+        assert!(
+            independent.exists(),
+            "and the independent target was never touched"
         );
         // The original really is stranded, and the result still names where it is.
         let (_, state) = &batch.realized[0];
