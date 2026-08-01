@@ -1,37 +1,56 @@
 // SPDX-License-Identifier: Apache-2.0
 //! F11 — building and executing deduplication actions from panel marks.
 
-use std::collections::HashMap;
-
 use crate::app::{App, AppMode};
 use crate::model::dataset::Dataset;
-use crate::model::duplicate::{hex_encode, DuplicateGroup, FileEntry};
+use crate::model::plan::{MarkIntent, PlanRefusal, RequestedMark};
 use crate::state::ScanStore;
 
-use super::state::{ConfirmScroll, ConfirmTab, Mark, Overlay, PlanDigest};
+use super::state::{ConfirmScroll, ConfirmTab, Mark, Overlay};
 
-/// F11: collects marks from all panels, builds a plan, opens the confirmation.
+/// F11: submits the panels' marks to the one plan authority and opens the confirmation.
+///
+/// The plan is built by the store over the COMPLETE persisted evidence of every referenced group.
+/// The commander used to assemble it from the marked pathnames alone, which structurally cannot
+/// contain the unmarked alias that decides whether removing its sibling releases anything — the
+/// panel would promise one allocation's worth of space that no purge would ever return. Files whose
+/// hash could not be resolved used to be dropped into a status-line count; now nothing is dropped:
+/// the whole plan is refused and the pathname is named.
 pub fn prepare_execution(app: &mut App) {
     if app.deny_if_read_only("executing actions") {
         return;
     }
-    let files = collect_marked(app);
-    if files.is_empty() {
+    let requested = requested_marks(app);
+    if requested.is_empty() {
         app.commander.status = "No marked files (F5/F6/F7/F8)".to_string();
         return;
     }
-    let (groups, no_hash) = build_groups(app, files);
-    let plan = crate::actions::plan_actions(&groups);
-    if plan.is_empty() {
-        app.commander.status = if no_hash > 0 {
-            format!("No actions: {no_hash} files without a hash — run a scan (F2)")
-        } else {
-            "No actions: a group needs one keeper (F7) and at least one action".to_string()
-        };
+    let Some(scan_id) = app.commander.dedup_scan_id else {
+        app.commander.status =
+            "No scan is loaded — load one (F2/F12) before executing actions".to_string();
         return;
-    }
-    let count = plan.len();
-    let reclaim: u64 = plan.iter().map(|action| action.size).sum();
+    };
+    let store = match ScanStore::open(&app.db_path) {
+        Ok(store) => store,
+        Err(err) => {
+            app.commander.status = format!("dedcom.db could not be opened: {err}");
+            return;
+        }
+    };
+    let plan = match store.build_action_plan(scan_id, &requested) {
+        Ok(plan) => plan,
+        Err(PlanRefusal::NoMarks) => {
+            app.commander.status = "No marked files (F5/F6/F7/F8)".to_string();
+            return;
+        }
+        Err(refusal) => {
+            // Every refusal is visible and leaves nothing behind: no overlay, no pending plan, no
+            // script, no worker.
+            clear_pending(app);
+            app.commander.status = refusal.to_string();
+            return;
+        }
+    };
     // Shell-script preview — datasets are needed for quarantine
     // and snapshot paths, as in apply_batch.
     let datasets: Vec<Dataset> = app
@@ -53,26 +72,27 @@ pub fn prepare_execution(app: &mut App) {
         rows: 0,
     };
     app.commander.confirm_script = script;
-    app.commander.confirm_digest = PlanDigest::of(&plan);
-    app.commander.pending_actions = plan;
+    app.commander.confirm_digest = plan.digest();
+    app.commander.pending_plan = Some(plan);
+    app.commander.status.clear();
     app.commander.overlay = Overlay::Confirm {
-        files: count,
-        reclaim,
         tab: ConfirmTab::Summary,
     };
 }
 
-/// F11 confirmation: applies the actions and moves to the summary screen.
+/// F11 confirmation: applies the plan and moves to the summary screen.
 pub fn confirm_execution(app: &mut App) {
     if app.deny_if_read_only("executing actions") {
+        clear_pending(app);
         app.commander.overlay = Overlay::None;
         return;
     }
-    let plan = std::mem::take(&mut app.commander.pending_actions);
+    let plan = app.commander.pending_plan.take();
+    app.commander.confirm_script.clear();
     app.commander.overlay = Overlay::None;
-    if plan.is_empty() {
+    let Some(plan) = plan else {
         return;
-    }
+    };
     // Application runs in the BACKGROUND — the UI does not freeze. The
     // Applying/Summary screens belong to the wizard, so we switch to Wizard and flag
     // the return to commander; re-reading the panels after success happens in
@@ -84,72 +104,42 @@ pub fn confirm_execution(app: &mut App) {
 
 /// Cancels the F11 confirmation.
 pub fn cancel_execution(app: &mut App) {
-    app.commander.pending_actions.clear();
+    clear_pending(app);
     app.commander.overlay = Overlay::None;
 }
 
-/// Collects marked files from all panels with fresh metadata.
-fn collect_marked(app: &App) -> Vec<FileEntry> {
-    use std::os::unix::fs::MetadataExt;
-    let mut files = Vec::new();
+/// Drops everything that describes a plan, together. A script left beside a plan that is gone is a
+/// screen quoting something nobody can execute.
+fn clear_pending(app: &mut App) {
+    app.commander.pending_plan = None;
+    app.commander.confirm_script.clear();
+    app.commander.confirm_digest = crate::model::plan::PlanDigest::default();
+    app.commander.confirm_scroll = ConfirmScroll::default();
+}
+
+/// The marks the panels believe they hold, exactly as they stand.
+///
+/// One pathname may be marked in two panels; the store refuses a request that means two different
+/// things for one pathname, so a window that has lost track of its own state cannot plan.
+fn requested_marks(app: &App) -> Vec<RequestedMark> {
+    let mut marks = Vec::new();
     for panel in &app.commander.panels {
         for (path, mark) in &panel.marks {
-            let meta = match std::fs::symlink_metadata(path) {
-                Ok(meta) if meta.is_file() => meta,
-                _ => continue,
+            let intent = match mark {
+                Mark::Keeper => MarkIntent::Keeper,
+                other => match other.action() {
+                    Some(kind) => MarkIntent::Act(kind),
+                    None => continue,
+                },
             };
-            // The whole identity, not just `(device, inode)`: the same `lstat` already answers it,
-            // and a row that carries half an identity is one a later caller can misread as whole.
-            files.push(FileEntry {
+            marks.push(RequestedMark {
                 path: path.clone(),
-                size: meta.size(),
-                mtime: meta.mtime(),
-                mtime_nsec: meta.mtime_nsec(),
-                ctime_sec: meta.ctime(),
-                ctime_nsec: meta.ctime_nsec(),
-                device: meta.dev(),
-                inode: meta.ino(),
-                nlink: meta.nlink(),
-                is_keeper: matches!(mark, Mark::Keeper),
-                action: mark.action(),
+                intent,
             });
         }
     }
-    files
-}
-
-/// Groups marked files by hash; returns the groups and the count of files without a hash.
-/// Each file's hash is read from the DB via a pointed lookup (there is no RAM index).
-fn build_groups(app: &App, files: Vec<FileEntry>) -> (Vec<DuplicateGroup>, usize) {
-    let mut by_hash: HashMap<String, Vec<FileEntry>> = HashMap::new();
-    let mut no_hash = 0usize;
-    let scan_id = app.commander.dedup_scan_id;
-    let store = scan_id.and_then(|_| ScanStore::open(&app.db_path).ok());
-    for file in files {
-        let hash = match (scan_id, &store) {
-            (Some(scan_id), Some(store)) => store
-                .hash_for_path(scan_id, &file.path)
-                .ok()
-                .flatten()
-                .map(|bytes| hex_encode(&bytes)),
-            _ => None,
-        };
-        match hash {
-            Some(hash) => by_hash.entry(hash).or_default().push(file),
-            None => no_hash += 1,
-        }
-    }
-    let groups = by_hash
-        .into_iter()
-        .enumerate()
-        .map(|(id, (hash, files))| DuplicateGroup {
-            id,
-            size_bytes: files.first().map(|file| file.size).unwrap_or(0),
-            hash,
-            files,
-        })
-        .collect();
-    (groups, no_hash)
+    marks.sort_by(|left, right| left.path.cmp(&right.path));
+    marks
 }
 
 #[cfg(test)]
@@ -157,45 +147,40 @@ mod tests {
     use super::*;
     use crate::app::test_app_with_db;
     use crate::model::action::ActionKind;
-    use crate::state::store::{role_guard, ManifestRow};
-    use std::path::{Path, PathBuf};
+    use crate::state::store::role_guard;
+    use crate::testfixtures::PlanScenario;
+    use std::path::PathBuf;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir =
-            std::env::temp_dir().join(format!("dedcom_u4a_{tag}_{}_{nanos}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// Real files on disk (`collect_marked` stats them) whose paths carry one shared hash in
-    /// the DB (`build_groups` looks each one up) — the minimum for F11 to build a plan.
-    fn seed(dir: &Path, names: &[&str]) -> (PathBuf, i64) {
-        let db_path = dir.join("dedcom.db");
-        let mut store = ScanStore::open_writable(&db_path).unwrap();
-        let scan_id = store
-            .begin_scan(&crate::model::scan::ScanConfig::new(
-                vec![dir.to_path_buf()],
-            ))
-            .unwrap();
-        let mut rows = Vec::new();
-        let mut hashes = Vec::new();
-        for name in names {
-            let path = dir.join(name);
-            std::fs::write(&path, b"identical content").unwrap();
-            rows.push(ManifestRow {
-                path: path.clone(),
-                size: 17,
-                ..Default::default()
-            });
-            hashes.push((path, [7u8; 32]));
+    /// A commander over a scenario's database, with the same marks in the panel and in the DB —
+    /// which is what F11 now requires: the window submits what it believes, and the store checks
+    /// it against what is durable.
+    fn commander_over(
+        tag: &str,
+        marks: &[(&str, Mark)],
+        extra: &[&str],
+    ) -> (PlanScenario, App, Vec<PathBuf>) {
+        let scenario = PlanScenario::new(tag);
+        let mut paths: Vec<PathBuf> = marks.iter().map(|(name, _)| scenario.file(name)).collect();
+        paths.extend(extra.iter().map(|name| scenario.file(name)));
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &paths);
+        for ((_, mark), path) in marks.iter().zip(paths.iter()) {
+            scenario.mark(
+                &mut store,
+                scan_id,
+                path,
+                *mark == Mark::Keeper,
+                mark.action(),
+            );
         }
-        store.record_files(scan_id, &rows).unwrap();
-        store.record_hashes(scan_id, &hashes).unwrap();
-        (db_path, scan_id)
+        drop(store);
+
+        let (mut app, _rx) = test_app_with_db(scenario.db_path.clone());
+        app.commander.dedup_scan_id = Some(scan_id);
+        for ((_, mark), path) in marks.iter().zip(paths.iter()) {
+            app.commander.panels[0].marks.insert(path.clone(), *mark);
+        }
+        (scenario, app, paths)
     }
 
     /// The review's failure scenario: F8 landed where F7 was meant, so the batch deletes the
@@ -204,22 +189,23 @@ mod tests {
     #[test]
     fn the_confirmation_digest_names_a_mis_marked_batch() {
         let _role = role_guard();
-        let dir = temp_dir("mismarked");
-        let (db_path, scan_id) = seed(&dir, &["keeper.bin", "dup1.bin", "dup2.bin"]);
-
-        let (mut app, _rx) = test_app_with_db(db_path);
-        app.commander.dedup_scan_id = Some(scan_id);
-        let marks = &mut app.commander.panels[0].marks;
-        marks.insert(dir.join("keeper.bin"), Mark::Keeper);
-        marks.insert(dir.join("dup1.bin"), Mark::Delete);
-        marks.insert(dir.join("dup2.bin"), Mark::Delete);
+        let (_scenario, mut app, paths) = commander_over(
+            "mismarked",
+            &[
+                ("keeper.bin", Mark::Keeper),
+                ("dup1.bin", Mark::Delete),
+                ("dup2.bin", Mark::Delete),
+            ],
+            &[],
+        );
 
         prepare_execution(&mut app);
 
         assert!(
-            matches!(app.commander.overlay, Overlay::Confirm { files: 2, .. }),
-            "the plan is two deletions: {:?}",
-            app.commander.overlay
+            matches!(app.commander.overlay, Overlay::Confirm { .. }),
+            "the plan is two deletions: {:?} — {}",
+            app.commander.overlay,
+            app.commander.status
         );
         let digest = &app.commander.confirm_digest;
         assert_eq!(
@@ -229,38 +215,49 @@ mod tests {
         );
         let named: Vec<&PathBuf> = digest.samples.iter().map(|(_, path)| path).collect();
         assert!(
-            named.contains(&&dir.join("dup1.bin")) && named.contains(&&dir.join("dup2.bin")),
+            named.contains(&&paths[1]) && named.contains(&&paths[2]),
             "both targets are named: {named:?}"
         );
         assert_eq!(digest.hidden, 0);
-        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(digest.covered_objects, 2, "two independent allocations");
     }
 
     /// A stale digest is worse than none: the overlay would describe the previous plan.
     #[test]
     fn a_second_plan_replaces_the_first_digest() {
         let _role = role_guard();
-        let dir = temp_dir("replace");
-        let (db_path, scan_id) = seed(&dir, &["keeper.bin", "dup1.bin", "dup2.bin"]);
-
-        let (mut app, _rx) = test_app_with_db(db_path);
-        app.commander.dedup_scan_id = Some(scan_id);
-        {
-            let marks = &mut app.commander.panels[0].marks;
-            marks.insert(dir.join("keeper.bin"), Mark::Keeper);
-            marks.insert(dir.join("dup1.bin"), Mark::Delete);
-            marks.insert(dir.join("dup2.bin"), Mark::Delete);
-        }
+        let (scenario, mut app, paths) = commander_over(
+            "replace",
+            &[
+                ("keeper.bin", Mark::Keeper),
+                ("dup1.bin", Mark::Delete),
+                ("dup2.bin", Mark::Delete),
+            ],
+            &[],
+        );
         prepare_execution(&mut app);
         assert_eq!(app.commander.confirm_digest.counts.len(), 1);
 
         // The operator backs out and re-marks one file as a hardlink instead.
         cancel_execution(&mut app);
+        assert!(app.commander.pending_plan.is_none());
+        assert!(app.commander.confirm_script.is_empty());
         {
-            let marks = &mut app.commander.panels[0].marks;
-            marks.remove(&dir.join("dup2.bin"));
-            marks.insert(dir.join("dup1.bin"), Mark::Hardlink);
+            let scan_id = app.commander.dedup_scan_id.unwrap();
+            let mut store = scenario.store();
+            scenario.mark(&mut store, scan_id, &paths[2], false, None);
+            scenario.mark(
+                &mut store,
+                scan_id,
+                &paths[1],
+                false,
+                Some(ActionKind::Hardlink),
+            );
         }
+        app.commander.panels[0].marks.remove(&paths[2]);
+        app.commander.panels[0]
+            .marks
+            .insert(paths[1].clone(), Mark::Hardlink);
         prepare_execution(&mut app);
 
         assert_eq!(
@@ -268,6 +265,200 @@ mod tests {
             vec![(ActionKind::Hardlink, 1)],
             "the digest describes the plan on screen now, not the one that was cancelled"
         );
-        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The blind spot C5 exists for: the panel holds one alias of an allocation and cannot see the
+    /// other, so a plan built from its marks promised space no purge would ever return. The store
+    /// sees both, and the confirmation now says zero.
+    #[test]
+    fn a_marked_alias_whose_sibling_is_unmarked_promises_nothing() {
+        let _role = role_guard();
+        let scenario = PlanScenario::new("commander_alias");
+        let keeper = scenario.file("keeper.bin");
+        let alias_a = scenario.file("alias_a.bin");
+        let alias_b = scenario.link(&alias_a, "alias_b.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(
+            &mut store,
+            &[keeper.clone(), alias_a.clone(), alias_b.clone()],
+        );
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &alias_a,
+            false,
+            Some(ActionKind::Delete),
+        );
+        drop(store);
+
+        let (mut app, _rx) = test_app_with_db(scenario.db_path.clone());
+        app.commander.dedup_scan_id = Some(scan_id);
+        app.commander.panels[0].marks.insert(keeper, Mark::Keeper);
+        app.commander.panels[0].marks.insert(alias_a, Mark::Delete);
+
+        prepare_execution(&mut app);
+
+        let plan = app
+            .commander
+            .pending_plan
+            .as_ref()
+            .expect("a plan is allowed, it is simply worth nothing");
+        assert_eq!(plan.summary().guaranteed_bytes(), 0);
+        assert_eq!(plan.summary().potential_bytes(), Some(0));
+        assert_eq!(
+            app.commander.confirm_digest.warnings.len(),
+            1,
+            "and the confirmation has to say why"
+        );
+        assert!(app.commander.confirm_digest.warnings[0]
+            .message()
+            .starts_with("zero guaranteed reclaim"));
+    }
+
+    /// Row 10: identical marks through classic and the commander are identical everywhere — the
+    /// plan value, the confirmation digest and the bytes of the saved script.
+    #[test]
+    fn both_windows_produce_the_same_plan_digest_and_script() {
+        let _role = role_guard();
+        let scenario = PlanScenario::new("parity_windows");
+        let keeper = scenario.file("keeper.bin");
+        let first = scenario.file("dup1.bin");
+        let second = scenario.file("dup2.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), first.clone(), second.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &first, false, Some(ActionKind::Delete));
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &second,
+            false,
+            Some(ActionKind::Hardlink),
+        );
+        drop(store);
+
+        // The classic browser submits the group it has open; the commander submits its panels'
+        // marks. Different vectors, one database, one answer.
+        let classic = vec![
+            RequestedMark::keeper(keeper.clone()),
+            RequestedMark::acting(first.clone(), ActionKind::Delete),
+            RequestedMark::acting(second.clone(), ActionKind::Hardlink),
+        ];
+        let commander = vec![
+            RequestedMark::acting(second.clone(), ActionKind::Hardlink),
+            RequestedMark::keeper(keeper.clone()),
+            RequestedMark::acting(first.clone(), ActionKind::Delete),
+        ];
+        let store = scenario.store();
+        let from_classic = store.build_action_plan(scan_id, &classic).unwrap();
+        let from_commander = store.build_action_plan(scan_id, &commander).unwrap();
+        assert_eq!(from_classic, from_commander, "the whole owning value");
+        assert_eq!(from_classic.digest(), from_commander.digest());
+
+        let datasets = vec![crate::model::dataset::Dataset {
+            name: "tank".to_string(),
+            mountpoint: scenario.root.clone(),
+            device_id: Some(std::os::unix::fs::MetadataExt::dev(
+                &std::fs::symlink_metadata(&scenario.root).unwrap(),
+            )),
+            snapdir_visible: false,
+        }];
+        let render = |plan: &_| {
+            let script = crate::actions::script_preview::render_script(
+                plan,
+                &datasets,
+                Some("/usr/sbin/zfs"),
+            );
+            // The rendering stamp is the wall clock, so two renders a second apart differ in a
+            // way that has nothing to do with the plan. Normalising it is what leaves the
+            // comparison about the plan.
+            let stamp = script
+                .lines()
+                .find_map(|line| line.strip_prefix("# Plan snapshot from "))
+                .map(|rest| rest.trim_end_matches('.').to_string())
+                .expect("the header carries the stamp");
+            script.replace(&stamp, "TS")
+        };
+        assert_eq!(
+            render(&from_classic),
+            render(&from_commander),
+            "the saved script must be the same bytes from either window"
+        );
+
+        // And a stale mark refuses both with the same sentence.
+        let stale = vec![RequestedMark::acting(first.clone(), ActionKind::Hardlink)];
+        let classic_refusal = store.build_action_plan(scan_id, &stale).unwrap_err();
+        let commander_refusal = store.build_action_plan(scan_id, &stale).unwrap_err();
+        assert_eq!(classic_refusal, commander_refusal);
+        assert!(
+            classic_refusal.to_string().contains("re-mark it"),
+            "{classic_refusal}"
+        );
+    }
+
+    /// A store that cannot be opened leaves the commander with nothing pending — and says so,
+    /// rather than reporting the operator's marks as absent.
+    #[test]
+    fn an_unreadable_store_leaves_no_pending_plan_and_no_script() {
+        let _role = role_guard();
+        let (scenario, mut app, _paths) = commander_over(
+            "store_error",
+            &[("keeper.bin", Mark::Keeper), ("dup1.bin", Mark::Delete)],
+            &[],
+        );
+        prepare_execution(&mut app);
+        assert!(app.commander.pending_plan.is_some(), "the fixture plans");
+        cancel_execution(&mut app);
+
+        // A regular file where the DB's directory should be is ENOTDIR for anyone, root included.
+        let blocker = scenario.outside.join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        app.db_path = blocker.join("dedcom.db");
+
+        prepare_execution(&mut app);
+
+        assert!(matches!(app.commander.overlay, Overlay::None));
+        assert!(app.commander.pending_plan.is_none());
+        assert!(app.commander.confirm_script.is_empty());
+        assert!(app.apply.is_none(), "no worker may have been dispatched");
+        assert!(
+            app.commander.status.contains("could not be opened"),
+            "the operator is told what happened: {}",
+            app.commander.status
+        );
+    }
+
+    /// A pathname the manifest never heard of is not silently dropped into a status-line count any
+    /// more: the whole plan is refused, nothing is left pending, and the pathname is named.
+    #[test]
+    fn a_mark_outside_the_manifest_refuses_the_whole_plan() {
+        let _role = role_guard();
+        let (scenario, mut app, _paths) = commander_over(
+            "outside",
+            &[("keeper.bin", Mark::Keeper), ("dup1.bin", Mark::Delete)],
+            &[],
+        );
+        let stranger = scenario.outside.join("stranger.bin");
+        std::fs::write(&stranger, b"not in this scan").unwrap();
+        app.commander.panels[0]
+            .marks
+            .insert(stranger.clone(), Mark::Delete);
+
+        prepare_execution(&mut app);
+
+        assert!(
+            matches!(app.commander.overlay, Overlay::None),
+            "no confirmation may open over a plan that was refused"
+        );
+        assert!(app.commander.pending_plan.is_none());
+        assert!(app.commander.confirm_script.is_empty());
+        assert!(
+            app.commander
+                .status
+                .contains(&stranger.display().to_string()),
+            "the refusal names the pathname: {}",
+            app.commander.status
+        );
     }
 }

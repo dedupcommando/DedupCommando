@@ -11,6 +11,11 @@ use crate::app::App;
 use crate::tui::{centered, human_bytes};
 
 /// Action review screen: dry-run list + confirmation modal.
+///
+/// Every figure comes out of the owning plan — the action count, the number of allocations at least
+/// one pathname of which is being removed, the guaranteed/potential state and the warnings. Nothing
+/// on this screen sums file sizes of its own, which is what let a review claim one allocation's
+/// worth of space once per alias.
 pub fn render(frame: &mut Frame, app: &mut App) {
     let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(6)]).split(frame.area());
 
@@ -19,7 +24,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     app.review.visible_rows = visible;
     // Virtualization, as in the browser lists: a plan can hold every duplicate of a scan,
     // and formatting all of them every frame starves the UI thread for input.
-    let count = app.review.actions.len();
+    let empty = Vec::new();
+    let actions = app
+        .review
+        .plan
+        .as_ref()
+        .map_or(&empty[..], |plan| plan.actions());
+    let count = actions.len();
     let (start, local_sel) =
         crate::tui::visible_window(&mut app.review.list, count, visible as usize);
     let end = (start + visible as usize).min(count);
@@ -29,14 +40,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // No selection (an empty plan) reads as `0 of 0` rather than panicking on `+ 1`.
     let position = local_sel.map_or(0, |local| start + local + 1);
 
-    let items: Vec<ListItem> = app.review.actions[start..end]
+    let items: Vec<ListItem> = actions[start..end]
         .iter()
         .map(|action| {
             ListItem::new(format!(
                 "{:9}  {}   ({})",
-                action.kind.label(),
-                action.target.display(),
-                human_bytes(action.size),
+                action.kind().label(),
+                action.target().display(),
+                human_bytes(action.size()),
             ))
         })
         .collect();
@@ -50,15 +61,39 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     local.select(local_sel);
     frame.render_stateful_widget(list, rows[0], &mut local);
 
-    let total: u64 = app.review.actions.iter().map(|action| action.size).sum();
+    let summary = app.review.plan.as_ref().map(|plan| plan.summary());
+    let counts = summary.map_or_else(
+        || " Operations: 0 · allocations: 0 ".to_string(),
+        |summary| {
+            format!(
+                " Operations: {} · allocations: {} ",
+                summary.actions(),
+                summary.covered_objects()
+            )
+        },
+    );
+    // Its own line, as everywhere else the claim is printed: the qualifier is what makes the
+    // number true, so it is not the part a narrow terminal may drop.
+    let claim = summary.map_or_else(String::new, |summary| {
+        format!(" {} ", crate::tui::reclaim_phrase(summary.estimate()))
+    });
+    let third = match summary.map(|summary| summary.warnings()) {
+        // The pathname is already in the list above; what a fixed-height footer must not lose is
+        // the clause that explains the zero.
+        Some(warnings) if !warnings.is_empty() => {
+            let more = warnings.len() - 1;
+            let mut line = format!(" {} ", warnings[0].reason());
+            if more > 0 {
+                line.push_str(&format!("· and {more} more "));
+            }
+            line
+        }
+        _ => format!(" {} ", app.status),
+    };
     let footer = vec![
-        Line::from(format!(
-            " Operations: {} · potential to free: {} ",
-            app.review.actions.len(),
-            human_bytes(total),
-        )),
-        Line::from(" Before applying, ZFS snapshots of the affected datasets will be created. "),
-        Line::from(format!(" {} ", app.status)),
+        Line::from(counts),
+        Line::from(claim),
+        Line::from(third),
         Line::from(" ↑↓/PgUp/PgDn/Home/End scroll · [Y] execute · [Esc] back to browser ".dim()),
     ];
     frame.render_widget(
@@ -67,11 +102,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     );
 
     if app.review.confirming {
-        render_confirm(frame, app.review.actions.len(), total);
+        let claim = summary.map_or_else(String::new, |summary| {
+            crate::tui::reclaim_phrase(summary.estimate())
+        });
+        render_confirm(frame, count, &claim);
     }
 }
 
-fn render_confirm(frame: &mut Frame, count: usize, total: u64) {
+fn render_confirm(frame: &mut Frame, count: usize, claim: &str) {
     let area = centered(frame.area(), 56, 8);
     frame.render_widget(Clear, area);
 
@@ -79,11 +117,8 @@ fn render_confirm(frame: &mut Frame, count: usize, total: u64) {
         Line::from(""),
         Line::from(format!("  Execute {count} operations?").bold()),
         Line::from("  A snapshot + quarantine are created — actions"),
-        Line::from(format!(
-            "  are reversible until purge.  (frees ~{})",
-            human_bytes(total)
-        )),
-        Line::from(""),
+        Line::from("  are reversible until purge."),
+        Line::from(format!("  {claim}")),
         Line::from("            [Y] yes        [N] no"),
     ];
     frame.render_widget(
@@ -125,7 +160,7 @@ mod tests {
         app.show_disclaimer = false;
         app.mode = AppMode::Wizard;
         app.screen = Screen::ActionReview;
-        app.review.actions = test_plan(count);
+        app.review.plan = test_plan(count);
         if count > 0 {
             app.review.list.select(Some(0));
         }
@@ -143,7 +178,7 @@ mod tests {
         let (mut app, _rx) = review_app(50);
 
         let before = screen_text(&mut app, 80, 16);
-        assert!(before.contains("dup0.bin"), "the plan starts at the top");
+        assert!(before.contains("dup00.bin"), "the plan starts at the top");
         assert!(
             before.contains("1 of 50"),
             "the counter opens at the top:\n{before}"

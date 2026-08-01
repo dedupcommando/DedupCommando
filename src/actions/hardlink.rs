@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::path::Path;
 
-use crate::error::Result;
+use super::{ApplyOps, Publication};
 
 /// Replaces `target` with a hard link to `keeper` WITHOUT destroy-in-place.
 ///
@@ -10,13 +10,18 @@ use crate::error::Result;
 /// (only delete was safe — via quarantine). Now the original `target`
 /// is evacuated to quarantine (recoverable), and only then is the link published; on
 /// a publication failure the original is restored. See [`super::evacuate_then_publish`].
+///
+/// The [`Publication`] it returns says where the original ended up, so the caller never has to
+/// guess that from a message.
 pub fn hardlink(
+    ops: &dyn ApplyOps,
     target: &Path,
     keeper: &Path,
     mountpoint: &Path,
     quarantine_dir: &Path,
-) -> Result<()> {
+) -> Publication {
     super::evacuate_then_publish(
+        ops,
         target,
         |temp| {
             std::fs::hard_link(keeper, temp)?;
@@ -25,5 +30,4 @@ pub fn hardlink(
         mountpoint,
         quarantine_dir,
     )
-    .map(|_| ())
 }

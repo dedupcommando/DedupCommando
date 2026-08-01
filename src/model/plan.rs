@@ -12,10 +12,14 @@
 //! boundary is being introduced. `PlanMemberEvidence` therefore carries its own eight-field key and
 //! refuses, at construction, both an unrecorded link count and a digest this build never verified.
 //!
-//! Inert in R2D-C5-1: nothing in production builds an `ActionPlan` yet. R2D-C5-2 switches classic
-//! and the commander onto it and retires the two pathname-based builders.
+//! Since R2D-C5-2 this is the only shape a destructive plan has: both windows, the review, both
+//! confirmations, the saved script and the apply worker read this one value, and the pathname-based
+//! builders it replaced are gone. The same module also owns what happens to the plan afterwards —
+//! the structural preflight, the runtime ledger that tracks the batch's own transitions, and the
+//! realization that says what was achieved rather than what was attempted.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -103,6 +107,10 @@ pub enum PlanRefusal {
     Symlink { path: PathBuf },
     #[error("{} changed since the scan ({field}) — rescan required", .path.display())]
     Drifted { path: PathBuf, field: &'static str },
+    #[error("{} is now the same allocation as its keeper {} — rescan required", .target.display(), .keeper.display())]
+    AlreadyLinkedNow { target: PathBuf, keeper: PathBuf },
+    #[error("{} moved while the batch was running ({field}) — action cancelled", .path.display())]
+    ExternalChange { path: PathBuf, field: &'static str },
     #[error("{detail}")]
     Arithmetic { detail: String },
     #[error("dedcom.db could not be read while building the plan: {detail}")]
@@ -448,6 +456,27 @@ impl PlanWarning {
             ),
         }
     }
+
+    /// The same statement without the pathname.
+    ///
+    /// A deep pathname is longer than a panel is wide, and a line clipped at the right edge loses
+    /// the half that explains the zero — which is the half the operator needs. The screens that
+    /// name the pathname elsewhere (the review list, the confirmation's quoted targets) print
+    /// this; the script header and the final summary, which have no width to fight over, print
+    /// the whole sentence.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::AlreadyLinkedWithKeeper { .. } => {
+                "already linked — 0 payoff: the keeper's own allocation".to_string()
+            }
+            Self::UncoveredAlias { remaining, .. } => format!(
+                "zero guaranteed reclaim — {remaining} pathname(s) of this allocation stay outside the plan"
+            ),
+            Self::ExternalLinks { outside, .. } => format!(
+                "zero guaranteed reclaim — {outside} link(s) outside this scan keep this allocation alive"
+            ),
+        }
+    }
 }
 
 /// One action of a plan. It cannot exist without the objects it refers to.
@@ -495,7 +524,7 @@ impl PlanAction {
 }
 
 /// What the whole plan claims.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanSummary {
     actions: usize,
     covered_objects: usize,
@@ -750,6 +779,11 @@ impl ActionPlan {
         &self.objects[action.target_object]
     }
 
+    /// The object an action links or clones from.
+    pub fn keeper_object_of(&self, action: &PlanAction) -> &PlannedObject {
+        &self.objects[action.keeper_object]
+    }
+
     /// What a confirmation screen shows, derived from this plan and nothing else.
     pub fn digest(&self) -> PlanDigest {
         let mut counts = Vec::new();
@@ -782,10 +816,205 @@ impl ActionPlan {
             warnings: self.summary.warnings.clone(),
         }
     }
+
+    /// The one structural check over the whole plan, against the disk.
+    ///
+    /// Every target, every keeper and every other persisted member of every referenced object: it
+    /// exists, it is not a symlink, its complete temporal identity is the one the manifest recorded,
+    /// its inode still reports the agreed link count, and no target is the keeper's own allocation.
+    /// A mismatch anywhere refuses the WHOLE plan and names the pathname and the field — a claim
+    /// that spans two aliases is not something to discover halfway through.
+    ///
+    /// The store calls it before it hands a plan out, and `apply_batch` calls it twice more: once
+    /// before the first snapshot, and once after every snapshot immediately before the first
+    /// mutation. The second reading is what the runtime ledger starts from, because a scan-time row
+    /// is stale by construction.
+    pub fn preflight(&self) -> PlanResult<PlanLiveState> {
+        let mut objects: Vec<ObjectState> = Vec::with_capacity(self.objects.len());
+        for object in &self.objects {
+            let mut identity: Option<LiveIdentity> = None;
+            for path in object.members() {
+                let live = live_identity(path)?;
+                if let Some(field) = object.key().first_drift(&live, object.links()) {
+                    return Err(PlanRefusal::Drifted {
+                        path: path.clone(),
+                        field,
+                    });
+                }
+                identity = Some(live);
+            }
+            // The plan counted pathnames of this allocation; the inode has to be able to hold them.
+            // Checked again here rather than trusted from build time: `links` is what the live
+            // `stat` just agreed to, and coverage is what the figure rests on.
+            let live = identity.ok_or_else(|| PlanRefusal::MissingKeeper {
+                hash: object.hash().to_string(),
+            })?;
+            if object.observed_links() > live.nlink
+                || object.covered_links() > object.observed_links()
+            {
+                return Err(PlanRefusal::ImpossibleManifest {
+                    path: object.representative().to_path_buf(),
+                    observed: object.observed_links(),
+                    links: live.nlink,
+                });
+            }
+            objects.push(ObjectState {
+                identity: live,
+                paths: object.members().to_vec(),
+            });
+        }
+        // D-4, live: an action whose target became the keeper's own allocation after the plan was
+        // built would push the keeper's own data through the evacuate/publish cycle.
+        for action in &self.actions {
+            let target = &objects[action.target_object].identity;
+            let keeper = &objects[action.keeper_object].identity;
+            if (target.device, target.inode) == (keeper.device, keeper.inode) {
+                return Err(PlanRefusal::AlreadyLinkedNow {
+                    target: action.target.clone(),
+                    keeper: action.keeper.clone(),
+                });
+            }
+        }
+        Ok(PlanLiveState { objects })
+    }
+
+    /// What the batch achieved, object by object, from this plan and the typed outcomes of its
+    /// actions — never from pathname sizes.
+    ///
+    /// `outcomes` is parallel to [`ActionPlan::actions`] and may be shorter: a cancelled batch never
+    /// reached the rest. An object whose actions all succeeded keeps its own figure even when
+    /// another object failed, because they are different allocations.
+    pub fn realize(
+        &self,
+        outcomes: &[ActionResult],
+    ) -> PlanResult<(Vec<(PlanObjectKey, ObjectRealization)>, RealizedSummary)> {
+        let mut realized = Vec::new();
+        for (index, object) in self.objects.iter().enumerate() {
+            if object.covered_links() == 0 {
+                continue;
+            }
+            let mine: Vec<Option<&ActionResult>> = self
+                .actions
+                .iter()
+                .enumerate()
+                .filter(|(_, action)| action.target_object == index)
+                .map(|(position, _)| outcomes.get(position))
+                .collect();
+            realized.push((object.key(), object_realization(object, &mine)));
+        }
+        // A pathname the plan skipped because it was already the keeper's own allocation is still
+        // something the operator marked. It reports its own zero rather than vanishing from the
+        // result the way it used to vanish from the plan.
+        for warning in &self.summary.warnings {
+            if let PlanWarning::AlreadyLinkedWithKeeper { path } = warning {
+                if let Some(object) = self
+                    .objects
+                    .iter()
+                    .find(|object| object.members().iter().any(|member| member == path))
+                {
+                    realized.push((
+                        object.key(),
+                        ObjectRealization::Zero {
+                            reason: ZeroReason::AlreadyLinked,
+                        },
+                    ));
+                }
+            }
+        }
+        let summary = RealizedSummary::fold(realized.iter().map(|(_, state)| state))?;
+        Ok((realized, summary))
+    }
+}
+
+/// The verdict for one covered object, in a fixed order so the same run always reads the same way.
+///
+/// Ambiguity first, then what the batch did, then what the plan itself already knew: an operator
+/// who has a stranded original needs to be told that before anything else on the screen.
+fn object_realization(
+    object: &PlannedObject,
+    results: &[Option<&ActionResult>],
+) -> ObjectRealization {
+    for result in results.iter().flatten() {
+        if let ActionResult::Stranded { quarantine, detail } = result {
+            return ObjectRealization::Unknown {
+                reason: detail.clone(),
+                quarantine: Some(quarantine.clone()),
+            };
+        }
+    }
+    if results.iter().any(Option::is_none) {
+        return ObjectRealization::Zero {
+            reason: ZeroReason::Cancelled,
+        };
+    }
+    let removed = results
+        .iter()
+        .flatten()
+        .filter(|result| matches!(result, ActionResult::Removed))
+        .count();
+    if results
+        .iter()
+        .flatten()
+        .any(|result| matches!(result, ActionResult::Refused { rolled_back: true }))
+    {
+        return ObjectRealization::Zero {
+            reason: ZeroReason::RolledBack,
+        };
+    }
+    if results
+        .iter()
+        .flatten()
+        .any(|result| matches!(result, ActionResult::Refused { .. }))
+    {
+        return ObjectRealization::Zero {
+            reason: if removed > 0 {
+                ZeroReason::PartialCoverage
+            } else {
+                ZeroReason::Refused
+            },
+        };
+    }
+    // Everything the plan asked for happened. What the allocation is worth is still the plan's
+    // arithmetic: a pathname left behind, or a link outside the scan, keeps every block.
+    if object.remaining_inside() > 0 {
+        return ObjectRealization::Zero {
+            reason: ZeroReason::NotFullyCovered,
+        };
+    }
+    if object.unobserved_links() > 0 {
+        return ObjectRealization::Zero {
+            reason: ZeroReason::ExternalLinks,
+        };
+    }
+    ObjectRealization::Completed {
+        guaranteed_bytes: object.key().size,
+    }
+}
+
+/// One pathname's live `stat`, or the refusal that pathname earns.
+fn live_identity(path: &Path) -> PlanResult<LiveIdentity> {
+    let meta = std::fs::symlink_metadata(path).map_err(|_| PlanRefusal::Vanished {
+        path: path.to_path_buf(),
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(PlanRefusal::Symlink {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(LiveIdentity {
+        device: meta.dev(),
+        inode: meta.ino(),
+        size: meta.size(),
+        mtime: meta.mtime(),
+        mtime_nsec: meta.mtime_nsec(),
+        ctime_sec: meta.ctime(),
+        ctime_nsec: meta.ctime_nsec(),
+        nlink: meta.nlink(),
+    })
 }
 
 /// Everything a confirmation needs, quoted from one plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanDigest {
     pub counts: Vec<(ActionKind, usize)>,
     pub samples: Vec<(ActionKind, PathBuf)>,
@@ -797,6 +1026,356 @@ pub struct PlanDigest {
 
 impl PlanDigest {
     pub const SAMPLES: usize = 5;
+}
+
+/// One allocation of the plan as the disk reports it right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectState {
+    identity: LiveIdentity,
+    /// Where this allocation's pathnames are — the manifest's locations at preflight time, and the
+    /// quarantine locations the batch itself moves them to afterwards.
+    paths: Vec<PathBuf>,
+}
+
+impl ObjectState {
+    /// The eight fields, as the last reading of this allocation left them.
+    #[cfg(test)]
+    pub fn identity(&self) -> LiveIdentity {
+        self.identity
+    }
+
+    /// Where this allocation's pathnames are now.
+    #[cfg(test)]
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+}
+
+/// What one whole-plan preflight established, in plan-object order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanLiveState {
+    objects: Vec<ObjectState>,
+}
+
+impl PlanLiveState {
+    #[cfg(test)]
+    pub fn objects(&self) -> &[ObjectState] {
+        &self.objects
+    }
+}
+
+/// The live state of the plan's allocations as the batch itself has driven them.
+///
+/// The point of the type is the difference between a change this program made and a change somebody
+/// else made. Both look identical in a `stat`: applying a hardlink raises the keeper's link count
+/// and moves its `ctime`, and so does an outsider linking the same file. So every transition below
+/// predicts exactly what the kernel does and adopts only the fields the kernel picks — anything else
+/// that moved is external drift and refuses the next action on that allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeLedger {
+    objects: Vec<ObjectState>,
+}
+
+impl RuntimeLedger {
+    /// Opens the ledger on the reading of the second successful whole-plan preflight — the last
+    /// moment before the first mutation, and the only reading that is not already stale.
+    pub fn open(state: PlanLiveState) -> Self {
+        Self {
+            objects: state.objects,
+        }
+    }
+
+    /// The allocations as the ledger currently believes them to stand.
+    #[cfg(test)]
+    pub fn objects(&self) -> &[ObjectState] {
+        &self.objects
+    }
+
+    /// Every pathname of this allocation is where the ledger put it, and still the same inode with
+    /// the same eight fields. Called for the target's allocation and the keeper's alike before every
+    /// action — a keeper nobody checked is how a batch links to a file that was replaced underneath
+    /// it.
+    pub fn check(&self, object: usize) -> PlanResult<()> {
+        let entry = self.entry(object)?;
+        for path in &entry.paths {
+            let live = live_identity(path)?;
+            if let Some(field) = drift_between(&entry.identity, &live) {
+                return Err(PlanRefusal::ExternalChange {
+                    path: path.clone(),
+                    field,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// A pathname of `object` was renamed into quarantine by this batch.
+    ///
+    /// A rename does not touch the inode's contents or its link count; it does move `ctime`. So the
+    /// other seven fields are a prediction — a mismatch is somebody else's change — and `ctime` is
+    /// adopted from the file at its new location.
+    pub fn quarantined(&mut self, object: usize, from: &Path, to: &Path) -> PlanResult<()> {
+        let entry = self.entry_mut(object)?;
+        let live = live_identity(to)?;
+        let expected = LiveIdentity {
+            ctime_sec: live.ctime_sec,
+            ctime_nsec: live.ctime_nsec,
+            ..entry.identity
+        };
+        if let Some(field) = drift_between(&expected, &live) {
+            return Err(PlanRefusal::ExternalChange {
+                path: to.to_path_buf(),
+                field,
+            });
+        }
+        entry.identity = live;
+        replace_path(&mut entry.paths, from, to.to_path_buf());
+        Ok(())
+    }
+
+    /// This batch touched `object` and left it structurally as it was.
+    ///
+    /// A hardlink attempt that fails after its temporary link was made and unmade moves the
+    /// keeper's `ctime` twice by our own hand; a rollback moves the original's `ctime` by moving it
+    /// out and back. Nothing else about either allocation changed, and refusing the NEXT action
+    /// over a `ctime` this batch caused itself is exactly the false alarm the ledger exists to
+    /// avoid. Anything but `ctime` having moved is left unadopted, so the next check refuses.
+    pub fn settled(&mut self, object: usize, path: &Path) -> PlanResult<()> {
+        let entry = self.entry_mut(object)?;
+        let live = live_identity(path)?;
+        let expected = LiveIdentity {
+            ctime_sec: live.ctime_sec,
+            ctime_nsec: live.ctime_nsec,
+            ..entry.identity
+        };
+        if let Some(field) = drift_between(&expected, &live) {
+            return Err(PlanRefusal::ExternalChange {
+                path: path.to_path_buf(),
+                field,
+            });
+        }
+        entry.identity = live;
+        Ok(())
+    }
+
+    /// A hardlink to `keeper_path` was published at `published`.
+    ///
+    /// The keeper's allocation gains exactly one link and a new `ctime`; nothing else about it may
+    /// move. The published pathname now belongs to that allocation, so a later action that checks
+    /// the keeper checks it too.
+    pub fn linked(
+        &mut self,
+        object: usize,
+        keeper_path: &Path,
+        published: &Path,
+    ) -> PlanResult<()> {
+        let entry = self.entry_mut(object)?;
+        let live = live_identity(keeper_path)?;
+        let expected = LiveIdentity {
+            nlink: entry.identity.nlink.saturating_add(1),
+            ctime_sec: live.ctime_sec,
+            ctime_nsec: live.ctime_nsec,
+            ..entry.identity
+        };
+        if let Some(field) = drift_between(&expected, &live) {
+            return Err(PlanRefusal::ExternalChange {
+                path: keeper_path.to_path_buf(),
+                field,
+            });
+        }
+        entry.identity = live;
+        entry.paths.push(published.to_path_buf());
+        Ok(())
+    }
+
+    /// A block clone of `keeper_path` was published at `published`.
+    ///
+    /// A clone reads the keeper and writes a new inode, so the keeper's allocation must come back
+    /// bit for bit identical — including its link count and `ctime`. The published pathname is a
+    /// fresh, independently stated allocation and gets its own ledger entry; the original stays
+    /// wherever quarantine put it.
+    pub fn cloned(
+        &mut self,
+        object: usize,
+        keeper_path: &Path,
+        published: &Path,
+    ) -> PlanResult<()> {
+        let entry = self.entry(object)?;
+        let live = live_identity(keeper_path)?;
+        if let Some(field) = drift_between(&entry.identity, &live) {
+            return Err(PlanRefusal::ExternalChange {
+                path: keeper_path.to_path_buf(),
+                field,
+            });
+        }
+        let identity = live_identity(published)?;
+        self.objects.push(ObjectState {
+            identity,
+            paths: vec![published.to_path_buf()],
+        });
+        Ok(())
+    }
+
+    fn entry(&self, object: usize) -> PlanResult<&ObjectState> {
+        self.objects
+            .get(object)
+            .ok_or_else(|| PlanRefusal::Arithmetic {
+                detail: format!("the plan has no allocation {object}"),
+            })
+    }
+
+    fn entry_mut(&mut self, object: usize) -> PlanResult<&mut ObjectState> {
+        self.objects
+            .get_mut(object)
+            .ok_or_else(|| PlanRefusal::Arithmetic {
+                detail: format!("the plan has no allocation {object}"),
+            })
+    }
+}
+
+/// The first of the eight fields where two live readings of one allocation disagree.
+fn drift_between(expected: &LiveIdentity, live: &LiveIdentity) -> Option<&'static str> {
+    let fields: [(&'static str, bool); 8] = [
+        ("device", expected.device == live.device),
+        ("inode", expected.inode == live.inode),
+        ("size", expected.size == live.size),
+        ("mtime", expected.mtime == live.mtime),
+        ("mtime_nsec", expected.mtime_nsec == live.mtime_nsec),
+        ("ctime", expected.ctime_sec == live.ctime_sec),
+        ("ctime_nsec", expected.ctime_nsec == live.ctime_nsec),
+        ("link count", expected.nlink == live.nlink),
+    ];
+    fields
+        .into_iter()
+        .find(|(_, agrees)| !agrees)
+        .map(|(name, _)| name)
+}
+
+/// Moves one pathname of an allocation to its new location, keeping the rest.
+fn replace_path(paths: &mut Vec<PathBuf>, from: &Path, to: PathBuf) {
+    match paths.iter().position(|path| path == from) {
+        Some(index) => paths[index] = to,
+        None => paths.push(to),
+    }
+}
+
+/// What one action did, in the terms object accounting needs — never a parsed error string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionResult {
+    /// The target pathname no longer holds this allocation: it is in quarantine, and whatever was
+    /// meant to replace it is published.
+    Removed,
+    /// Nothing was published. `rolled_back` — the original had been evacuated and was put back.
+    Refused { rolled_back: bool },
+    /// The original is neither where it was nor back again; it is at this exact quarantine path.
+    Stranded { quarantine: PathBuf, detail: String },
+}
+
+/// Why an allocation is worth nothing after the batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZeroReason {
+    /// A pathname of it was never in the plan, so it keeps every block whatever the plan did.
+    NotFullyCovered,
+    /// Links outside this scan keep it alive.
+    ExternalLinks,
+    /// Some of its pathnames went and some did not.
+    PartialCoverage,
+    /// The batch stopped before its last action.
+    Cancelled,
+    /// It was the keeper's own allocation.
+    AlreadyLinked,
+    /// A publication failed and the original was restored.
+    RolledBack,
+    /// Every action on it was refused before anything moved.
+    Refused,
+}
+
+impl ZeroReason {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::NotFullyCovered => "a pathname of this allocation was never in the plan",
+            Self::ExternalLinks => "links outside this scan keep this allocation alive",
+            Self::PartialCoverage => "some pathnames of this allocation were not removed",
+            Self::Cancelled => "the batch was stopped before this allocation was finished",
+            Self::AlreadyLinked => "it is the keeper's own allocation",
+            Self::RolledBack => "the action was undone and the original restored",
+            Self::Refused => "the action was refused before anything moved",
+        }
+    }
+}
+
+/// What one allocation is worth after the batch, as opposed to what it was planned to be worth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectRealization {
+    /// Fully covered, every action succeeded, and no link keeps it alive.
+    Completed { guaranteed_bytes: u64 },
+    /// Nothing is guaranteed, and this is why.
+    Zero { reason: ZeroReason },
+    /// The final allocation state cannot be settled from here — the original is neither in place
+    /// nor restored.
+    Unknown {
+        reason: String,
+        quarantine: Option<PathBuf>,
+    },
+}
+
+impl ObjectRealization {
+    /// What this allocation really releases once the quarantine is purged.
+    pub fn guaranteed_bytes(&self) -> u64 {
+        match self {
+            Self::Completed { guaranteed_bytes } => *guaranteed_bytes,
+            _ => 0,
+        }
+    }
+}
+
+/// The checked total over the realizations — folded, never re-derived from pathnames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RealizedSummary {
+    guaranteed_bytes: u64,
+    completed_objects: usize,
+    zero_objects: usize,
+    unknown_objects: usize,
+}
+
+impl RealizedSummary {
+    /// Sums what was achieved. Overflow fails closed for the same reason the plan's own arithmetic
+    /// does: a wrapped byte count is a number the filesystem will not honour.
+    pub fn fold<'a>(states: impl IntoIterator<Item = &'a ObjectRealization>) -> PlanResult<Self> {
+        let mut out = Self::default();
+        for state in states {
+            match state {
+                ObjectRealization::Completed { guaranteed_bytes } => {
+                    out.guaranteed_bytes = out
+                        .guaranteed_bytes
+                        .checked_add(*guaranteed_bytes)
+                        .ok_or_else(|| PlanRefusal::Arithmetic {
+                            detail: "the realized total does not fit an integer".to_string(),
+                        })?;
+                    out.completed_objects += 1;
+                }
+                ObjectRealization::Zero { .. } => out.zero_objects += 1,
+                ObjectRealization::Unknown { .. } => out.unknown_objects += 1,
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn guaranteed_bytes(&self) -> u64 {
+        self.guaranteed_bytes
+    }
+
+    pub fn completed_objects(&self) -> usize {
+        self.completed_objects
+    }
+
+    pub fn zero_objects(&self) -> usize {
+        self.zero_objects
+    }
+
+    pub fn unknown_objects(&self) -> usize {
+        self.unknown_objects
+    }
 }
 
 /// Folds one group's members into objects and appends them in a stable order.

@@ -19,8 +19,8 @@
 #
 # Usage:
 #   sudo DEDCOM_G5_E2E=1 DEDCOM=/path/to/dedcom scripts/e2e-g5.sh [scenario]
-#     scenarios: hardlink reflink delete-restore revalidate snapshot interrupt dir-dedup all
-#                (default: all)
+#     scenarios: hardlink reflink two-alias preflight script-preflight delete-restore
+#                revalidate snapshot interrupt dir-dedup all   (default: all)
 #   sudo DEDCOM_G5_E2E=1 scripts/e2e-g5.sh clean-stale   # tear down leftover dedcom-g5-* pools
 #
 # shellcheck disable=SC2015
@@ -146,6 +146,38 @@ except OSError: pass' "$1" "$2"
 }
 quarantined() { find "/$POOL" -path '*/.dedcom-quarantine/*' -name "$1" 2>/dev/null | grep -q .; }
 
+# Data-block addresses of one file, sorted and de-duplicated (R2D-C5-2).
+#
+# `bcloneused` is a pool-wide counter and says nothing about WHICH blocks two files share, so it
+# cannot tell a clone from a fresh copy written into free space. The DVAs can: a block clone makes
+# the published file point at the keeper's own vdev offsets.
+dvas_of() {  # dataset abspath -> "vdev:offset:size" per line
+    local ds="$1" path="$2" obj
+    obj="$(stat -c '%i' -- "$path")" || return 1
+    sync; zpool sync "$POOL" 2>/dev/null || true
+    zdb -dddd "$ds" "$obj" 2>/dev/null \
+        | grep -oE 'DVA\[0\]=<[0-9]+:[0-9a-fA-F]+:[0-9a-fA-F]+>' \
+        | sed 's/DVA\[0\]=<//; s/>//' | sort -u
+}
+
+# Allocated bytes of a dataset, for a before/after delta that can be compared with a claim.
+used_of() { zfs get -Hp -o value used "$1"; }
+
+# Both halves of the release the summary screen names: destroy the safety snapshots, then purge
+# the quarantine.
+#
+# Purging alone releases nothing measurable, and that is not a bug in the tool: the safety snapshot
+# taken before the batch still references the old blocks, which is the whole point of taking it. So
+# a check that only removes the quarantine measures the snapshot, not the plan.
+purge_and_release() {
+    zfs list -H -t snapshot -o name -r "$POOL" 2>/dev/null \
+        | grep '@dedcom-' \
+        | while read -r snap; do zfs destroy "$snap"; done
+    find "/$POOL" -type d -name '.dedcom-quarantine' -prune -print0 2>/dev/null \
+        | xargs -0 -r rm -rf --
+    sync; zpool sync "$POOL" 2>/dev/null || true
+}
+
 # 0 if the latest scan row is observably in-progress (walking/hashing); needs python3.
 scan_in_progress() {
     [ -f "$STATE/dedcom.db" ] && command -v python3 >/dev/null 2>&1 || return 1
@@ -201,9 +233,30 @@ and keeps its own 0600 / 12345:12345 / user.dedcom_e2e."
     [ "$i_dup" != "$i_keep" ] && ok "dup.bin keeps a separate inode ($i_dup)" \
                               || fail "dup.bin inode == keeper inode ($i_keep) — that's a hardlink, not reflink"
     cmp -s "$d/keeper.bin" "$d/dup.bin" && ok "content identical" || fail "content differs"
-    info "block sharing: confirm via 'zpool get bcloneused $POOL' or 'filefrag -v' (shared extents)"
+    # R2D-C5-2: the blocks, by address. A pool-wide `bcloneused` counter cannot say which file
+    # shares which block, and a fresh copy written into free space would satisfy it just as well.
+    local keeper_dvas dup_dvas shared
+    keeper_dvas="$(dvas_of "$POOL/ds_a" "$d/keeper.bin")"
+    dup_dvas="$(dvas_of "$POOL/ds_a" "$d/dup.bin")"
+    if [ -z "$keeper_dvas" ] || [ -z "$dup_dvas" ]; then
+        fail "zdb produced no DVAs — block sharing is UNPROVEN (do not call this scenario green)"
+    else
+        shared="$(comm -12 <(printf '%s\n' "$keeper_dvas") <(printf '%s\n' "$dup_dvas") | wc -l)"
+        [ "$shared" -gt 0 ] && ok "published clone shares $shared block address(es) with the keeper" \
+                            || fail "no DVA in common — the published file is a COPY, not a clone"
+    fi
     quarantined "dup.bin" && ok "original dup.bin evacuated to quarantine" \
                           || info "note: original dup.bin not seen in quarantine — verify manually"
+    # And the old target really was its own allocation before it was replaced: purging the
+    # quarantine has to give the space back.
+    local before after freed
+    before="$(used_of "$POOL/ds_a")"
+    purge_and_release
+    after="$(used_of "$POOL/ds_a")"
+    freed=$((before - after))
+    info "post-purge allocation delta on $POOL/ds_a: $freed bytes (fixture is 512 KiB)"
+    [ "$freed" -ge 262144 ] && ok "purging the quarantine released the old allocation" \
+                            || fail "delta $freed is too small — the old target was not a separate allocation"
     # D-1 proper: on the filesystem the feature exists for.
     local mode owner xa
     mode="$(stat -c '%a' -- "$d/dup.bin")"
@@ -364,6 +417,136 @@ PY
     rm -rf "$d"
 }
 
+# R2D-C5-2: two pathnames of ONE allocation. The whole point of the checkpoint is that they are
+# one allocation's worth of space, and that covering only one of them is worth nothing at all.
+scenario_two_alias() {
+    banner "two aliases of one allocation — one allocation's worth, or nothing"
+    local d="$G5ROOT/twoalias"; rm -rf "$d"; mkdir -p "$d"
+    head -c 1M /dev/urandom > "$d/keeper.bin"
+    cp "$d/keeper.bin" "$d/alias_a.bin"
+    ln "$d/alias_a.bin" "$d/alias_b.bin"
+    info "fixture: keeper.bin, plus alias_a.bin and alias_b.bin — two names, ONE inode"
+    scan "$d"
+
+    # Part 1: cover only one of the two names. The plan is allowed and it is worth zero.
+    operator "Group: keeper.bin + alias_a.bin + alias_b.bin.
+Mark keeper.bin = Keeper (F7) and alias_a.bin = Delete (F8). Leave alias_b.bin UNMARKED.
+Before pressing F11, read the confirmation: it must say guaranteed 0 and explain that a
+pathname of this allocation stays outside the plan. Then apply (F11 → Y)."
+    banner "verify partial coverage realizes zero"
+    [ -e "$d/alias_a.bin" ] && fail "alias_a.bin still at its original path" \
+                            || ok "alias_a.bin removed from its original path"
+    [ -f "$d/alias_b.bin" ] && ok "alias_b.bin still holds the allocation" \
+                            || fail "alias_b.bin is gone — the fixture no longer proves anything"
+    local before after freed
+    before="$(used_of "$POOL/ds_a")"
+    purge_and_release
+    after="$(used_of "$POOL/ds_a")"
+    freed=$((before - after))
+    info "post-purge allocation delta: $freed bytes"
+    [ "$freed" -lt 524288 ] && ok "partial coverage really did free (next to) nothing: $freed bytes" \
+                            || fail "delta $freed — a half-covered allocation cannot release its blocks"
+
+    # Part 2: cover the remaining name too. One allocation goes, once.
+    scan "$d"
+    operator "Group: keeper.bin + alias_b.bin (alias_a.bin is gone).
+Mark keeper.bin = Keeper (F7), alias_b.bin = Delete (F8), then F11 → Y.
+The confirmation must now claim ONE allocation's worth (about 1 MiB), not two."
+    banner "verify full coverage releases exactly one allocation"
+    before="$(used_of "$POOL/ds_a")"
+    purge_and_release
+    after="$(used_of "$POOL/ds_a")"
+    freed=$((before - after))
+    info "post-purge allocation delta: $freed bytes (one 1 MiB allocation)"
+    [ "$freed" -ge 786432 ] && [ "$freed" -lt 1572864 ] \
+        && ok "exactly one allocation was released: $freed bytes" \
+        || fail "delta $freed is not one allocation's worth — the accounting counts pathnames"
+    rm -rf "$d"
+}
+
+# R2D-C5-2: the second whole-plan preflight. Between the confirmation and the first change the
+# plan is checked again — a covered pathname that moved in that window must stop the batch after
+# the safety snapshot and before anything is touched.
+scenario_preflight() {
+    banner "second preflight — drift after the confirmation stops the batch"
+    local d="$G5ROOT/preflight"; rm -rf "$d"; mkdir -p "$d"
+    head -c 256K /dev/urandom > "$d/keeper.bin"
+    cp "$d/keeper.bin" "$d/alias_a.bin"
+    ln "$d/alias_a.bin" "$d/alias_b.bin"
+    info "fixture: keeper.bin + alias_a.bin/alias_b.bin (one inode, two names)"
+    scan "$d"
+    local snaps_before; snaps_before="$(zfs list -H -t snapshot -o name -r "$POOL" | wc -l)"
+
+    printf '\n  >>> OPERATOR STEP 1 of 2 <<<\n'
+    printf '      Open the TUI: %s --state-dir %s\n' "$DEDCOM" "$STATE"
+    printf '      Mark keeper.bin = Keeper (F7), alias_a.bin AND alias_b.bin = Delete (F8).\n'
+    printf '      Press F11 to open the confirmation, then LEAVE IT OPEN and press ENTER here.\n'
+    read -r _ || true
+    # The drift: one covered pathname goes away while the operator is looking at the plan.
+    rm -f -- "$d/alias_b.bin"
+    info "drift injected: alias_b.bin removed while the confirmation was open"
+    printf '\n  >>> OPERATOR STEP 2 of 2 <<<\n'
+    printf '      Now press Y in the confirmation, then leave the TUI and press ENTER here.\n'
+    read -r _ || true
+
+    banner "verify the batch refused itself before touching anything"
+    [ -f "$d/alias_a.bin" ] && ok "alias_a.bin untouched — no file was mutated" \
+                            || fail "alias_a.bin moved: the batch ran past a plan that no longer held"
+    quarantined "alias_a.bin" && fail "alias_a.bin reached the quarantine — a mutation happened" \
+                              || ok "nothing was moved to quarantine"
+    local snaps_after; snaps_after="$(zfs list -H -t snapshot -o name -r "$POOL" | wc -l)"
+    info "snapshots before=$snaps_before after=$snaps_after (a safety snapshot may exist; it must be reported)"
+    info "the summary screen must name every snapshot it created and say the batch was refused"
+    rm -rf "$d"
+}
+
+# R2D-C5-2: the saved ScanScript is a real apply route, so it carries the same whole-plan
+# preflight — twice, and the first one runs before the snapshot section.
+scenario_script_preflight() {
+    banner "saved ScanScript — structural preflight before the snapshot"
+    local d="$G5ROOT/script"; rm -rf "$d"; mkdir -p "$d"
+    head -c 256K /dev/urandom > "$d/keeper.bin"
+    cp "$d/keeper.bin" "$d/alias_a.bin"
+    ln "$d/alias_a.bin" "$d/alias_b.bin"
+    info "fixture: keeper.bin + alias_a.bin/alias_b.bin (one inode, two names)"
+    scan "$d"
+    operator "Group: keeper.bin + alias_a.bin + alias_b.bin.
+Mark keeper.bin = Keeper (F7), alias_a.bin AND alias_b.bin = Delete (F8), press F11,
+switch to the Commands tab (Tab) and SAVE the script with S. Do NOT press Y. Exit the TUI."
+    banner "verify the saved script"
+    local sh; sh="$(find "$STATE/plans" -name '*.sh' 2>/dev/null | sort | tail -1 || true)"
+    [ -n "$sh" ] || { fail "no saved script under $STATE/plans"; return; }
+    info "script: $sh"
+    grep -q 'dedcom_preflight' "$sh" && ok "the script carries a whole-plan preflight" \
+                                     || { fail "no preflight in the saved script"; return; }
+    local calls; calls="$(grep -c '^dedcom_preflight$' "$sh")"
+    [ "$calls" -eq 2 ] && ok "it is called twice" || fail "preflight called $calls time(s), expected 2"
+    local first_call snapshot_line
+    first_call="$(grep -n '^dedcom_preflight$' "$sh" | head -1 | cut -d: -f1)"
+    snapshot_line="$(grep -n 'zfs snapshot' "$sh" | head -1 | cut -d: -f1)"
+    [ -n "$snapshot_line" ] && [ "$first_call" -lt "$snapshot_line" ] \
+        && ok "the first call precedes the snapshot section" \
+        || fail "preflight at line $first_call does not precede the snapshot at line ${snapshot_line:-none}"
+    bash -n "$sh" && ok "the script parses" || fail "the generated script does not parse"
+
+    # Now drift the plan and run it: it must exit non-zero before the snapshot and before any mv.
+    rm -f -- "$d/alias_b.bin"
+    local snaps_before; snaps_before="$(zfs list -H -t snapshot -o name -r "$POOL" | wc -l)"
+    if bash "$sh" >/tmp/$POOL-script.out 2>/tmp/$POOL-script.err; then
+        fail "the drifted script ran to completion"
+    else
+        ok "the drifted script exited non-zero"
+    fi
+    grep -q 'since the plan' /tmp/$POOL-script.err && ok "and said what moved" \
+        || fail "no preflight message: $(head -2 /tmp/$POOL-script.err)"
+    local snaps_after; snaps_after="$(zfs list -H -t snapshot -o name -r "$POOL" | wc -l)"
+    [ "$snaps_after" -eq "$snaps_before" ] && ok "no snapshot was taken" \
+                                           || fail "the script reached the snapshot section"
+    [ -f "$d/alias_a.bin" ] && ok "no file was moved" || fail "alias_a.bin moved"
+    rm -f "/tmp/$POOL-script.out" "/tmp/$POOL-script.err"
+    rm -rf "$d"
+}
+
 scenario_dir_dedup() {
     banner "dir-dedup — identical directory trees grouped (Old and Merkle agree)"
     local d="$G5ROOT/dirdedup"; rm -rf "$d"; mkdir -p "$d/twinA" "$d/twinB" "$d/lone"
@@ -401,7 +584,7 @@ PY
 }
 
 # --------------------------------------------------------------------- main
-SCENARIOS="hardlink reflink delete-restore revalidate snapshot interrupt dir-dedup"
+SCENARIOS="hardlink reflink two-alias preflight script-preflight delete-restore revalidate snapshot interrupt dir-dedup"
 want="${1:-all}"
 # Validate the requested scenario BEFORE creating a pool — a typo must abort, not
 # create a pool, run nothing, and report "all checks passed".
@@ -423,6 +606,9 @@ G5_RAN=0
 run() { case "$want" in all|"$1") "scenario_${1//-/_}"; G5_RAN=$((G5_RAN + 1));; esac; }
 run hardlink
 run reflink
+run two-alias
+run preflight
+run script-preflight
 run delete-restore
 run revalidate
 run snapshot

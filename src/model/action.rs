@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::path::PathBuf;
 
+use crate::model::plan::{ObjectRealization, PlanObjectKey, PlanSummary, RealizedSummary};
+
 /// Type of action on a duplicate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
@@ -38,28 +40,18 @@ impl ActionKind {
     }
 }
 
-/// A planned action — pure data; nothing happens until it is applied.
-#[derive(Debug, Clone)]
-pub struct PlannedAction {
-    pub kind: ActionKind,
-    /// The file being deleted/replaced.
-    pub target: PathBuf,
-    /// The keeper file (for hardlink/reflink).
-    pub keeper: PathBuf,
-    pub target_device: u64,
-    pub keeper_device: u64,
-    pub size: u64,
-    /// blake3 hash of the duplicate group in hex — for the final re-check of the
-    /// contents of `target`/`keeper` before the destructive action.
-    pub expected_hash: String,
-}
-
 /// Outcome of a single applied action.
+///
+/// It carries no byte figure. One file size per successful pathname is exactly the claim R2D exists
+/// to remove: a pathname is not an allocation, and two aliases of one inode would be counted twice.
+/// What space was really released is decided per allocation, in `BatchResult::realized`.
 #[derive(Debug, Clone)]
 pub struct ActionOutcome {
     pub kind: ActionKind,
     pub target: PathBuf,
-    pub bytes: u64,
+    /// Where the original went, when it was moved. The exact path, because it is what a recovery
+    /// needs — a directory name is not enough to find one file among a batch of them.
+    pub quarantine: Option<PathBuf>,
     pub result: std::result::Result<(), String>,
 }
 
@@ -69,13 +61,23 @@ pub struct BatchResult {
     pub outcomes: Vec<ActionOutcome>,
     pub snapshots: Vec<String>,
     pub quarantine_dirs: Vec<PathBuf>,
-    pub bytes_planned: u64,
     /// How many actions the batch set out to apply. With `cancelled` it is the other half of
     /// «applied N of M» — `outcomes` only ever holds the ones that were reached.
     pub planned: usize,
     /// The operator stopped the batch (Esc, or a shutdown signal) before it ran out of actions.
     /// A partial result is not a finished one, and the untouched marks must survive it.
     pub cancelled: bool,
+    /// The batch refused itself as a whole after the safety snapshots existed — the second
+    /// whole-plan preflight found the plan no longer described the disk. No action ran; the
+    /// snapshots above are still there and still have to be reported.
+    pub aborted: Option<String>,
+    /// What the plan promised, carried from the `ActionPlan` the batch was given.
+    pub plan: PlanSummary,
+    /// What each covered allocation is actually worth now.
+    pub realized: Vec<(PlanObjectKey, ObjectRealization)>,
+    pub realized_summary: RealizedSummary,
+    /// Bytes re-read during revalidation. A progress metric for the bar, never a reclaim figure.
+    pub bytes_read: u64,
 }
 
 impl BatchResult {
@@ -87,12 +89,26 @@ impl BatchResult {
         self.outcomes.iter().filter(|o| o.result.is_err()).count()
     }
 
-    pub fn bytes_reclaimed(&self) -> u64 {
+    /// Every exact quarantine path this batch produced, in the order the actions ran — the list a
+    /// recovery works from.
+    pub fn quarantined_paths(&self) -> Vec<&PathBuf> {
         self.outcomes
             .iter()
-            .filter(|o| o.result.is_ok())
-            .map(|o| o.bytes)
-            .sum()
+            .filter_map(|outcome| outcome.quarantine.as_ref())
+            .collect()
+    }
+
+    /// The allocations whose final state could not be settled, with where their original is.
+    pub fn unknown_objects(&self) -> Vec<(&String, Option<&PathBuf>)> {
+        self.realized
+            .iter()
+            .filter_map(|(_, state)| match state {
+                ObjectRealization::Unknown { reason, quarantine } => {
+                    Some((reason, quarantine.as_ref()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 }
 

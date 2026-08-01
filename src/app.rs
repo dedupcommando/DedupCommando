@@ -12,9 +12,10 @@ use ratatui::widgets::ListState;
 use std::time::{Duration, Instant};
 
 use crate::actions;
-use crate::model::action::{ActionKind, BatchResult, PlannedAction, RevalidationMode};
+use crate::model::action::{ActionKind, BatchResult, RevalidationMode};
 use crate::model::dataset::Dataset;
 use crate::model::duplicate::{DirSigAlgo, DuplicateGroup, FileEntry};
+use crate::model::plan::{ActionPlan, MarkIntent, PlanRefusal, RequestedMark};
 use crate::model::preset::Preset;
 use crate::model::scan::{
     HashProfile, ResumeInfo, ScanConfig, ScanPhase, ScanProgress, ScanSummary,
@@ -274,9 +275,13 @@ pub struct BrowserState {
 }
 
 /// State of the action-review screen.
+///
+/// The plan is owned whole. Everything the screen prints — the rows, the count, the guaranteed and
+/// potential figures, the warnings — is read out of this one value, so the review, the confirmation
+/// and the batch that follows cannot describe different things.
 #[derive(Default)]
 pub struct ReviewState {
-    pub actions: Vec<PlannedAction>,
+    pub plan: Option<ActionPlan>,
     pub confirming: bool,
     /// Cursor and scroll offset of the action list. The plan can hold every
     /// duplicate of a scan, so without this the rows past the first screen
@@ -2074,7 +2079,11 @@ impl App {
             }
             return;
         }
-        let len = self.review.actions.len();
+        let len = self
+            .review
+            .plan
+            .as_ref()
+            .map_or(0, |plan| plan.actions().len());
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
             KeyCode::Char('y') | KeyCode::Char('Y') => self.review.confirming = true,
@@ -2093,6 +2102,9 @@ impl App {
             KeyCode::Home => step(&mut self.review.list, len, i32::MIN / 2),
             KeyCode::End => step(&mut self.review.list, len, i32::MAX / 2),
             KeyCode::Esc => {
+                // Leaving the review drops the plan: coming back rebuilds it from the database, so
+                // a stale value can never be the thing a later [Y] executes.
+                self.review.plan = None;
                 self.screen = Screen::Browser;
                 self.status.clear();
             }
@@ -2480,6 +2492,7 @@ impl App {
             self.status = "This is the keeper file — no action is applied to it".to_string();
             return;
         }
+        let before = self.open_group_marks();
         if let Some(open) = self.browser.open_group.as_mut() {
             // Before an action in the group a keeper is needed — so the plan from the DB sees the
             // target→keeper pair. No keeper → assign a default one (any, except the target).
@@ -2491,10 +2504,17 @@ impl App {
             open.files[file_index].action = action;
         }
         // Persist the whole group: keeper + marked; default rows are cleared.
-        if let Some(open) = self.browser.open_group.as_ref() {
-            self.persist_marks(open.files.iter());
-        }
+        self.settle_open_group(before);
         self.refresh_marked_count();
+    }
+
+    /// The open group's rows as they stand — the state to fall back to when a write is refused.
+    fn open_group_marks(&self) -> Vec<FileEntry> {
+        self.browser
+            .open_group
+            .as_ref()
+            .map(|open| open.files.clone())
+            .unwrap_or_default()
     }
 
     /// Makes the current file the keeper of the open group.
@@ -2505,6 +2525,7 @@ impl App {
         let Some((_, file_index)) = self.current_group_file() else {
             return;
         };
+        let before = self.open_group_marks();
         if let Some(open) = self.browser.open_group.as_mut() {
             for (index, file) in open.files.iter_mut().enumerate() {
                 file.is_keeper = index == file_index;
@@ -2513,9 +2534,7 @@ impl App {
                 }
             }
         }
-        if let Some(open) = self.browser.open_group.as_ref() {
-            self.persist_marks(open.files.iter());
-        }
+        self.settle_open_group(before);
         self.refresh_marked_count();
     }
 
@@ -2577,37 +2596,93 @@ impl App {
     }
 
     /// Saves the marks of the specified files of the current scan to the DB (Feature 6B).
-    /// Opens the DB in place; the error is not critical — the mark stays in RAM.
-    fn persist_marks<'a>(&self, files: impl Iterator<Item = &'a FileEntry>) {
+    ///
+    /// Fail-closed: a write the database refused is reported, and the caller puts the group back
+    /// the way the database still has it. A mark that lives only in RAM is a screen that says
+    /// DELETE over a database that says nothing — and the plan is built from the database.
+    fn persist_marks<'a>(
+        &self,
+        files: impl Iterator<Item = &'a FileEntry>,
+    ) -> crate::error::Result<()> {
         let Some(scan_id) = self.current_scan_id else {
-            return;
+            return Ok(());
         };
-        let result =
-            ScanStore::open(&self.db_path).and_then(|mut store| store.save_marks(scan_id, files));
+        ScanStore::open(&self.db_path).and_then(|mut store| store.save_marks(scan_id, files))
+    }
+
+    /// Writes the open group's marks, or puts the group back as it was and says why.
+    fn settle_open_group(&mut self, before: Vec<FileEntry>) {
+        let result = match self.browser.open_group.as_ref() {
+            Some(open) => self.persist_marks(open.files.iter()),
+            None => Ok(()),
+        };
         if let Err(err) = result {
             tracing::warn!("failed to save action marks: {err}");
+            if let Some(open) = self.browser.open_group.as_mut() {
+                open.files = before;
+            }
+            self.status = format!("The mark was not saved — dedcom.db refused it: {err}");
         }
     }
 
-    /// Transition to the action review (if there are marked files). The plan
-    /// is built DIRECTLY from the DB (`file` + `file_mark`), without materializing all groups.
-    fn open_review(&mut self) {
-        let plan = self
-            .current_scan_id
-            .and_then(|scan_id| {
-                ScanStore::open(&self.db_path)
-                    .ok()
-                    .and_then(|store| actions::plan_actions_from_db(&store, scan_id).ok())
+    /// The marks this window believes it holds right now — the group open in the browser.
+    ///
+    /// The store reconciles them against the database rather than trusting them, so a mark whose
+    /// write failed cannot be quietly replaced by the older meaning it was supposed to overwrite.
+    /// Durable marks made elsewhere stay in the plan; they are the operator's earlier work.
+    fn requested_marks(&self) -> Vec<RequestedMark> {
+        let Some(open) = self.browser.open_group.as_ref() else {
+            return Vec::new();
+        };
+        open.files
+            .iter()
+            .filter_map(|file| {
+                let intent = match (file.is_keeper, file.action) {
+                    (true, _) => MarkIntent::Keeper,
+                    (false, Some(kind)) => MarkIntent::Act(kind),
+                    (false, None) => return None,
+                };
+                Some(RequestedMark {
+                    path: file.path.clone(),
+                    intent,
+                })
             })
-            .unwrap_or_default();
-        if plan.is_empty() {
-            self.status = "No marked actions — mark files: d delete, h hardlink".to_string();
+            .collect()
+    }
+
+    /// Transition to the action review. The plan comes from the one store authority, over the
+    /// complete persisted evidence of every referenced group — never from the pathnames on screen.
+    ///
+    /// A refusal is shown, not swallowed. «No marked actions» used to be printed for an unreadable
+    /// database too, which told the operator their marks were gone when the truth was that nothing
+    /// could be read at all.
+    fn open_review(&mut self) {
+        let Some(scan_id) = self.current_scan_id else {
+            self.status = "No scan is loaded — run or open a scan first".to_string();
             return;
-        }
+        };
+        let store = match ScanStore::open(&self.db_path) {
+            Ok(store) => store,
+            Err(err) => {
+                self.status = format!("dedcom.db could not be opened: {err}");
+                return;
+            }
+        };
+        let plan = match store.build_action_plan(scan_id, &self.requested_marks()) {
+            Ok(plan) => plan,
+            Err(PlanRefusal::NoMarks) => {
+                self.status = "No marked actions — mark files: d delete, h hardlink".to_string();
+                return;
+            }
+            Err(refusal) => {
+                self.status = refusal.to_string();
+                return;
+            }
+        };
         let mut list = ListState::default();
         list.select(Some(0));
         self.review = ReviewState {
-            actions: plan,
+            plan: Some(plan),
             confirming: false,
             list,
             visible_rows: 0,
@@ -2616,20 +2691,25 @@ impl App {
         self.screen = Screen::ActionReview;
     }
 
-    /// Applies the batch of actions (snapshot -> application) and transitions to the summary.
+    /// Applies the reviewed plan (snapshot -> application) and transitions to the summary.
+    ///
+    /// The plan is MOVED into the worker: what was confirmed is exactly what runs, and the screen
+    /// is left without a plan it could confirm a second time.
     fn apply_actions(&mut self) {
         if self.deny_if_read_only("performing actions") {
             return;
         }
-        let plan = self.review.actions.clone();
+        let Some(plan) = self.review.plan.take() else {
+            return;
+        };
         self.start_apply(plan);
     }
 
     /// Launches applying the batch in a background worker: the UI does not freeze,
     /// progress and summary come as `ApplyProgress`/`ApplyFinished` events. A single path
     /// for the wizard (`apply_actions`) and the commander (`confirm_execution`).
-    pub fn start_apply(&mut self, plan: Vec<PlannedAction>) {
-        if plan.is_empty() {
+    pub fn start_apply(&mut self, plan: ActionPlan) {
+        if plan.actions().is_empty() {
             return;
         }
         let datasets: Vec<Dataset> = self
@@ -2638,11 +2718,15 @@ impl App {
             .iter()
             .flat_map(|pool| pool.datasets.iter().cloned())
             .collect();
-        self.apply_affected = plan.iter().map(|action| action.target.clone()).collect();
+        self.apply_affected = plan
+            .actions()
+            .iter()
+            .map(|action| action.target().to_path_buf())
+            .collect();
         // The warning belongs to the batch that raised it, not to the session.
         self.marks_unsettled = false;
         self.applying = ApplyingState {
-            total: plan.len(),
+            total: plan.actions().len(),
             bytes_total: actions::verify_bytes_total(&plan, self.reval_mode),
             mode: self.reval_mode,
             ..ApplyingState::default()
@@ -2980,21 +3064,48 @@ pub(crate) fn test_app_with_db(db_path: PathBuf) -> (App, crossbeam_channel::Rec
     (app, rx)
 }
 
-/// `count` planned deletions, distinguishable by path. Module level because the
-/// ActionReview screen's own render test plans the same batch.
+/// A plan of `count` deletions of independent twins, distinguishable by path. Module level because
+/// the ActionReview screen's own render test plans the same batch. `None` for `count == 0`: a plan
+/// with nothing in it is a shape `ActionPlan` refuses to hold.
 #[cfg(test)]
-pub(crate) fn test_plan(count: usize) -> Vec<PlannedAction> {
-    (0..count)
-        .map(|index| PlannedAction {
-            kind: ActionKind::Delete,
-            target: PathBuf::from(format!("/x/dup{index}.bin")),
-            keeper: PathBuf::from("/x/keeper.bin"),
-            target_device: 1,
-            keeper_device: 1,
-            size: 1024,
-            expected_hash: String::new(),
-        })
-        .collect()
+pub(crate) fn test_plan(count: usize) -> Option<ActionPlan> {
+    use crate::model::plan::{PlanGroupInput, PlanMemberEvidence, PlanObjectKey};
+    use crate::model::reclaim::LinkCount;
+
+    let key = |inode: u64| PlanObjectKey {
+        device: 1,
+        inode,
+        size: 1024,
+        mtime: 1_700_000_000,
+        mtime_nsec: 0,
+        ctime_sec: 1_700_000_001,
+        ctime_nsec: 0,
+        identity_version: 1,
+    };
+    let member = |path: PathBuf, inode: u64, intent| {
+        PlanMemberEvidence::new(path, key(inode), LinkCount::Known(1), Some(intent))
+            .expect("a well-formed fixture member")
+    };
+    let mut members = vec![member(
+        PathBuf::from("/x/keeper.bin"),
+        10,
+        MarkIntent::Keeper,
+    )];
+    for index in 0..count {
+        members.push(member(
+            PathBuf::from(format!("/x/dup{index:02}.bin")),
+            100 + index as u64,
+            MarkIntent::Act(ActionKind::Delete),
+        ));
+    }
+    ActionPlan::try_new(
+        1,
+        vec![PlanGroupInput {
+            hash: "ab".repeat(32),
+            members,
+        }],
+    )
+    .ok()
 }
 
 #[cfg(test)]
@@ -3154,13 +3265,7 @@ mod cancel_tests {
     }
 
     fn plan_targets(db_path: &Path, scan_id: i64) -> Vec<PathBuf> {
-        let store = ScanStore::open(db_path).unwrap();
-        store
-            .planned_action_rows(scan_id)
-            .unwrap()
-            .into_iter()
-            .map(|row| row.target)
-            .collect()
+        crate::state::store::marked_action_paths(db_path, scan_id)
     }
 
     fn finished(outcomes: Vec<ActionOutcome>, planned: usize, cancelled: bool) -> AppEvent {
@@ -3313,7 +3418,7 @@ mod cancel_tests {
         ActionOutcome {
             kind: ActionKind::Delete,
             target: target.to_path_buf(),
-            bytes: 10,
+            quarantine: None,
             result: Ok(()),
         }
     }
@@ -3391,6 +3496,161 @@ mod cancel_tests {
     }
 }
 
+/// R2D-C5-2: the classic window's half of the switch — the review is built by the one authority
+/// and refuses out loud, and a mark the database would not take does not stay on screen.
+#[cfg(test)]
+mod classic_switch_tests {
+    use super::*;
+    use crate::model::duplicate::DuplicateGroup;
+    use crate::testfixtures::PlanScenario;
+
+    /// The classic browser sitting on a real scenario's group, marks and all.
+    fn browsing(tag: &str) -> (PlanScenario, App, crossbeam_channel::Receiver<AppEvent>) {
+        let scenario = PlanScenario::new(tag);
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &twin, false, Some(ActionKind::Delete));
+        let files = store
+            .group_files(scan_id, &"07".repeat(32))
+            .unwrap_or_default();
+        drop(store);
+
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        app.show_disclaimer = false;
+        app.mode = AppMode::Wizard;
+        app.screen = Screen::Browser;
+        app.current_scan_id = Some(scan_id);
+        let files = if files.is_empty() {
+            let store = scenario.store();
+            let mut rows = Vec::new();
+            for path in [&keeper, &twin] {
+                let meta = std::fs::symlink_metadata(path).unwrap();
+                rows.push(FileEntry {
+                    path: path.clone(),
+                    size: std::os::unix::fs::MetadataExt::size(&meta),
+                    is_keeper: path == &keeper,
+                    action: (path == &twin).then_some(ActionKind::Delete),
+                    ..Default::default()
+                });
+            }
+            drop(store);
+            rows
+        } else {
+            files
+        };
+        app.browser.open_group = Some(DuplicateGroup {
+            id: 0,
+            size_bytes: 0,
+            hash: String::new(),
+            files,
+        });
+        app.browser.group_state.select(Some(0));
+        app.browser.file_state.select(Some(1));
+        (scenario, app, rx)
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_event(AppEvent::Key(KeyEvent::from(code)));
+    }
+
+    /// `open_review` used to swallow a store failure and print «No marked actions», which tells
+    /// the operator their marking work is gone when the truth is that nothing could be read.
+    #[test]
+    fn an_unreadable_store_refuses_the_review_out_loud() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, mut app, _rx) = browsing("classic_store_error");
+        let blocker = scenario.outside.join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        app.db_path = blocker.join("dedcom.db");
+
+        press(&mut app, KeyCode::Char('r'));
+
+        assert_eq!(app.screen, Screen::Browser, "no review may open");
+        assert!(app.review.plan.is_none(), "and nothing is left pending");
+        assert!(app.apply.is_none());
+        assert!(
+            app.status.contains("could not be opened"),
+            "the operator is told what happened: {}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("No marked actions"),
+            "a store failure is not an absence of marks: {}",
+            app.status
+        );
+    }
+
+    /// A mark the database refuses must not stay on screen: the panel and the DB have to keep
+    /// saying the same thing, because the plan is built from the DB.
+    #[test]
+    fn a_refused_mark_does_not_stay_in_the_window() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, mut app, _rx) = browsing("classic_mark_refused");
+        let before: Vec<Option<ActionKind>> = app
+            .browser
+            .open_group
+            .as_ref()
+            .unwrap()
+            .files
+            .iter()
+            .map(|file| file.action)
+            .collect();
+        let blocker = scenario.outside.join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        app.db_path = blocker.join("dedcom.db");
+
+        press(&mut app, KeyCode::Char('h'));
+
+        let after: Vec<Option<ActionKind>> = app
+            .browser
+            .open_group
+            .as_ref()
+            .unwrap()
+            .files
+            .iter()
+            .map(|file| file.action)
+            .collect();
+        assert_eq!(
+            after, before,
+            "the window shows what the database still holds"
+        );
+        assert!(
+            app.status.contains("was not saved"),
+            "and says the write was refused: {}",
+            app.status
+        );
+    }
+
+    /// Clearing a mark is the same durable write, and it fails closed the same way.
+    #[test]
+    fn a_refused_unmark_does_not_stay_in_the_window_either() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, mut app, _rx) = browsing("classic_unmark_refused");
+        let blocker = scenario.outside.join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        app.db_path = blocker.join("dedcom.db");
+
+        press(&mut app, KeyCode::Char(' '));
+
+        let still_marked = app
+            .browser
+            .open_group
+            .as_ref()
+            .unwrap()
+            .files
+            .iter()
+            .any(|file| file.action == Some(ActionKind::Delete));
+        assert!(
+            still_marked,
+            "the DELETE the database still holds must stay on screen"
+        );
+        assert!(app.status.contains("was not saved"), "{}", app.status);
+    }
+}
+
 /// U-3: the action review lists the whole plan, so it has to scroll. The keys go in through
 /// `handle_event` — the screen used to swallow them one level below, in `on_key_action_review`.
 #[cfg(test)]
@@ -3407,7 +3667,7 @@ mod action_review_scroll_tests {
         let mut list = ListState::default();
         list.select(Some(0));
         app.review = ReviewState {
-            actions: test_plan(count),
+            plan: test_plan(count),
             confirming: false,
             list,
             visible_rows: rows,

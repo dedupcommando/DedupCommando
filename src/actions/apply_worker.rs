@@ -12,8 +12,9 @@ use std::time::Duration;
 use crossbeam_channel::Sender;
 
 use crate::error::Result;
-use crate::model::action::{BatchResult, PlannedAction, RevalidationMode};
+use crate::model::action::{BatchResult, RevalidationMode};
 use crate::model::dataset::Dataset;
+use crate::model::plan::ActionPlan;
 use crate::panics;
 use crate::tui::event::AppEvent;
 
@@ -32,9 +33,13 @@ impl ApplyHandle {
     }
 }
 
-/// Starts applying a batch in the background. Progress and result go to `events`.
+/// Starts applying a plan in the background. Progress and result go to `events`.
+///
+/// The worker takes the whole owning [`ActionPlan`], not a vector of actions: the evidence that
+/// justifies an action is what the preflights, the ledger and the post-run accounting all read, and
+/// a worker handed the actions alone could not check any of it.
 pub fn spawn(
-    plan: Vec<PlannedAction>,
+    plan: ActionPlan,
     datasets: Vec<Dataset>,
     reflink_safe: bool,
     mode: RevalidationMode,
@@ -84,14 +89,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::action::{BatchResult, RevalidationMode};
+    use crate::model::action::{ActionKind, BatchResult, RevalidationMode};
+    use crate::testfixtures::PlanScenario;
 
-    /// spawn → applying an empty plan → `ApplyFinished(Ok(BatchResult))` arrives.
-    /// (An empty plan doesn't touch the FS/ZFS — safe in Docker without a pool.)
+    /// A real one-action plan over real files. Handed no datasets, so the action is refused for
+    /// want of a mountpoint and nothing on the filesystem is touched — safe in Docker without a
+    /// pool, while still exercising the whole preflight/ledger path.
+    fn one_action_plan(tag: &str) -> (PlanScenario, ActionPlan) {
+        let scenario = PlanScenario::new(tag);
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &twin, false, Some(ActionKind::Delete));
+        drop(store);
+        let plan = crate::actions::tests::plan_of(&scenario, scan_id);
+        (scenario, plan)
+    }
+
+    /// spawn → applying a plan → `ApplyFinished(Ok(BatchResult))` arrives.
     #[test]
-    fn spawn_empty_plan_sends_finished() {
+    fn spawn_sends_finished() {
+        let (_scenario, plan) = one_action_plan("worker_finished");
         let (tx, rx) = crossbeam_channel::unbounded();
-        let _handle = spawn(Vec::new(), Vec::new(), false, RevalidationMode::Hybrid, tx);
+        let _handle = spawn(plan, Vec::new(), false, RevalidationMode::Hybrid, tx);
 
         let mut finished: Option<std::result::Result<BatchResult, String>> = None;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -106,15 +128,17 @@ mod tests {
             }
         }
         let result = finished.expect("ApplyFinished must arrive");
-        let batch = result.expect("empty plan — Ok");
-        assert_eq!(batch.outcomes.len(), 0);
+        let batch = result.expect("a plan the preflight accepts — Ok");
+        assert_eq!(batch.outcomes.len(), 1);
+        assert_eq!(batch.failed(), 1, "no dataset, so nothing is applied");
     }
 
     /// Progress arrives and the phase reaches Done (the poller sends at least one snapshot).
     #[test]
     fn progress_reaches_done() {
+        let (_scenario, plan) = one_action_plan("worker_progress");
         let (tx, rx) = crossbeam_channel::unbounded();
-        let _handle = spawn(Vec::new(), Vec::new(), false, RevalidationMode::Hybrid, tx);
+        let _handle = spawn(plan, Vec::new(), false, RevalidationMode::Hybrid, tx);
 
         let mut saw_done = false;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

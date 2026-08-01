@@ -23,6 +23,7 @@ use ratatui::{
 };
 
 use crate::app::{App, Screen};
+use crate::error::AppError;
 use crate::model::duplicate::{DirGroup, DuplicateGroup, FileEntry};
 use crate::state::ScanStore;
 use crate::tui::centered;
@@ -122,14 +123,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             let labels: Vec<&str> = MENU.iter().map(|(label, _)| *label).collect();
             overlay::render_menu(frame, cursor, &labels);
         }
-        Overlay::Confirm {
-            files,
-            reclaim,
-            tab,
-        } => overlay::render_confirm(
+        Overlay::Confirm { tab } => overlay::render_confirm(
             frame,
-            files,
-            reclaim,
             tab,
             &app.commander.confirm_script,
             &app.commander.confirm_digest,
@@ -1241,21 +1236,12 @@ fn scroll_confirm_commands(app: &mut App, code: KeyCode) {
 
 /// `Tab` in the F11 confirmation: switches the Summary ↔ Commands tab.
 fn toggle_confirm_tab(app: &mut App) {
-    if let Overlay::Confirm {
-        files,
-        reclaim,
-        tab,
-    } = app.commander.overlay
-    {
+    if let Overlay::Confirm { tab } = app.commander.overlay {
         let tab = match tab {
             ConfirmTab::Summary => ConfirmTab::Commands,
             ConfirmTab::Commands => ConfirmTab::Summary,
         };
-        app.commander.overlay = Overlay::Confirm {
-            files,
-            reclaim,
-            tab,
-        };
+        app.commander.overlay = Overlay::Confirm { tab };
     }
 }
 
@@ -2028,9 +2014,23 @@ fn mark_cursor(app: &mut App, mark: Mark) {
             return;
         }
     };
-    panel.marks.insert(entry.path.clone(), mark);
+    let previous = panel.marks.insert(entry.path.clone(), mark);
     panel.move_cursor(1);
-    persist_mark(app, &entry, Some(mark));
+    if let Err(err) = persist_mark(app, &entry, Some(mark)) {
+        // The database refused, so the panel does not get to claim it. The cursor goes back too:
+        // the operator has to see the row their keystroke did not change.
+        let panel = app.commander.active_panel_mut();
+        match previous {
+            Some(previous) => {
+                panel.marks.insert(entry.path.clone(), previous);
+            }
+            None => {
+                panel.marks.remove(&entry.path);
+            }
+        }
+        panel.move_cursor(-1);
+        app.commander.status = format!("The mark was not saved: {err}");
+    }
 }
 
 /// Space: removes the mark from the entry under the cursor or sets «selected» (a file or
@@ -2045,14 +2045,29 @@ fn toggle_mark_cursor(app: &mut App) {
         Some(entry) if matches!(entry.kind, EntryKind::File | EntryKind::Dir) => entry.clone(),
         _ => return,
     };
-    let new_mark = if panel.marks.remove(&entry.path).is_some() {
+    let previous = panel.marks.remove(&entry.path);
+    let new_mark = if previous.is_some() {
         None
     } else {
         panel.marks.insert(entry.path.clone(), Mark::Selected);
         Some(Mark::Selected)
     };
     panel.move_cursor(1);
-    persist_mark(app, &entry, new_mark);
+    if let Err(err) = persist_mark(app, &entry, new_mark) {
+        // Clearing a mark is a durable write like setting one: if it did not land, the panel
+        // still holds what the database still holds.
+        let panel = app.commander.active_panel_mut();
+        match previous {
+            Some(previous) => {
+                panel.marks.insert(entry.path.clone(), previous);
+            }
+            None => {
+                panel.marks.remove(&entry.path);
+            }
+        }
+        panel.move_cursor(-1);
+        app.commander.status = format!("The mark was not cleared: {err}");
+    }
 }
 
 /// Insert: selects/deselects the entry under the cursor into the batch (`Mark::Selected`) and
@@ -2816,10 +2831,27 @@ fn dup_dest(dir: &Path, src: &Path) -> PathBuf {
     }
 }
 
-/// Persists the file's mark to the DB, if the file belongs to the current scan.
-fn persist_mark(app: &mut App, entry: &PanelEntry, mark: Option<Mark>) {
+/// Persists the file's mark to the DB. `Err` — the panel must not keep it.
+///
+/// Fail-closed, in both directions: a mark and an unmark are the same write, and a panel that
+/// shows DELETE over a database that never accepted it is a window the plan cannot be built from.
+/// A pathname outside the scan's manifest is refused rather than ignored — it used to keep a
+/// pretend mark that nothing durable stood behind.
+fn persist_mark(app: &mut App, entry: &PanelEntry, mark: Option<Mark>) -> crate::error::Result<()> {
+    // `Selected` and «no mark» both mean the database holds nothing for this pathname. Without a
+    // loaded scan there is nothing durable to clear, so the panel's own selection stays a panel
+    // matter; a mark that WOULD have to be durable is refused instead.
+    let durable = matches!(
+        mark,
+        Some(Mark::Keeper | Mark::Delete | Mark::Hardlink | Mark::Reflink)
+    );
     let Some(scan_id) = app.commander.dedup_scan_id else {
-        return;
+        if durable {
+            return Err(AppError::msg(
+                "no scan is loaded — load one (F2/F12) before marking files",
+            ));
+        }
+        return Ok(());
     };
     // `save_marks` persists only path/is_keeper/action; the rest of the identity is not known
     // here and is deliberately left at its default rather than half-filled.
@@ -2833,19 +2865,19 @@ fn persist_mark(app: &mut App, entry: &PanelEntry, mark: Option<Mark>) {
         action: mark.and_then(|mark| mark.action()),
         ..Default::default()
     };
-    if let Ok(mut store) = ScanStore::open(&app.db_path) {
-        // We write the mark only for a file that is part of the scan (a pinpoint DB lookup
-        // instead of reading the RAM index).
-        match store.is_in_manifest(scan_id, &entry.path) {
-            Ok(true) => {
-                if let Err(err) = store.save_marks(scan_id, std::iter::once(&file)) {
-                    tracing::warn!("commander: failed to save mark: {err}");
-                }
-            }
-            Ok(false) => {}
-            Err(err) => tracing::warn!("commander: manifest check failed: {err}"),
+    let mut store = ScanStore::open(&app.db_path)?;
+    // We write the mark only for a file that is part of the scan (a pinpoint DB lookup
+    // instead of reading the RAM index).
+    if !store.is_in_manifest(scan_id, &entry.path)? {
+        if durable {
+            return Err(AppError::msg(format!(
+                "{} is not part of the loaded scan — it cannot be marked",
+                entry.path.display()
+            )));
         }
+        return Ok(());
     }
+    store.save_marks(scan_id, std::iter::once(&file))
 }
 
 /// The commander's help overlay.
@@ -2981,11 +3013,7 @@ mod u4b_commands_scroll_tests {
             total: lines,
             rows,
         };
-        app.commander.overlay = Overlay::Confirm {
-            files: 1,
-            reclaim: 1024,
-            tab,
-        };
+        app.commander.overlay = Overlay::Confirm { tab };
         app
     }
 
@@ -3139,41 +3167,151 @@ mod u4b_commands_scroll_tests {
     }
 }
 
+/// R2D-C5-2: a mark the database did not take must not stay in a panel. The plan is built from
+/// the database, so a panel that disagrees with it is a screen describing a plan that will not run.
+#[cfg(test)]
+mod mark_is_fail_closed_tests {
+    use super::*;
+    use crate::testfixtures::PlanScenario;
+
+    /// A commander whose active panel holds `path` under the cursor.
+    fn panel_over(app: &mut App, path: &Path) {
+        let panel = app.commander.active_panel_mut();
+        panel.entries = vec![PanelEntry {
+            path: path.to_path_buf(),
+            name: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            kind: EntryKind::File,
+            size: 0,
+            mtime: 0,
+            device: 0,
+            inode: 0,
+        }];
+        panel.list.select(Some(0));
+    }
+
+    /// The scenario, its scan, and one of its files.
+    fn scenario_with_scan(tag: &str) -> (PlanScenario, i64, PathBuf) {
+        let scenario = PlanScenario::new(tag);
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper, twin.clone()]);
+        drop(store);
+        (scenario, scan_id, twin)
+    }
+
+    /// A pathname the loaded scan never saw cannot acquire a mark that looks durable.
+    #[test]
+    fn a_pathname_outside_the_scan_cannot_be_marked() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, scan_id, _twin) = scenario_with_scan("commander_outside");
+        let stranger = scenario.outside.join("stranger.bin");
+        std::fs::write(&stranger, b"not in this scan").unwrap();
+
+        let (mut app, _rx) = crate::app::test_app_with_db(scenario.db_path.clone());
+        app.commander.dedup_scan_id = Some(scan_id);
+        panel_over(&mut app, &stranger);
+
+        mark_cursor(&mut app, Mark::Delete);
+
+        assert!(
+            !app.commander.panels[app.commander.active]
+                .marks
+                .contains_key(&stranger),
+            "a pretend durable mark is exactly what this refuses"
+        );
+        assert!(
+            app.commander.status.contains("not part of the loaded scan"),
+            "and it says why: {}",
+            app.commander.status
+        );
+    }
+
+    /// A refused write leaves the panel showing what the database still holds.
+    #[test]
+    fn a_refused_mark_is_not_kept_in_the_panel() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, scan_id, twin) = scenario_with_scan("commander_mark_refused");
+        let blocker = scenario.outside.join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+
+        let (mut app, _rx) = crate::app::test_app_with_db(blocker.join("dedcom.db"));
+        app.commander.dedup_scan_id = Some(scan_id);
+        panel_over(&mut app, &twin);
+
+        mark_cursor(&mut app, Mark::Delete);
+
+        assert!(
+            !app.commander.panels[app.commander.active]
+                .marks
+                .contains_key(&twin),
+            "the panel must not claim a state the database rejected"
+        );
+        assert!(
+            app.commander.status.contains("was not saved"),
+            "{}",
+            app.commander.status
+        );
+    }
+
+    /// Clearing a mark is the same durable write, and fails closed the same way.
+    #[test]
+    fn a_refused_unmark_leaves_the_mark_in_place() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, scan_id, twin) = scenario_with_scan("commander_unmark_refused");
+        let (mut app, _rx) = crate::app::test_app_with_db(scenario.db_path.clone());
+        app.commander.dedup_scan_id = Some(scan_id);
+        panel_over(&mut app, &twin);
+        mark_cursor(&mut app, Mark::Delete);
+        assert!(
+            app.commander.panels[app.commander.active]
+                .marks
+                .contains_key(&twin),
+            "the fixture only means something if the mark landed: {}",
+            app.commander.status
+        );
+
+        // Now the database goes out of reach and the operator presses Space.
+        let blocker = scenario.outside.join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        app.db_path = blocker.join("dedcom.db");
+        app.commander.active_panel_mut().list.select(Some(0));
+        toggle_mark_cursor(&mut app);
+
+        assert_eq!(
+            app.commander.panels[app.commander.active].marks.get(&twin),
+            Some(&Mark::Delete),
+            "the DELETE the database still holds stays on screen"
+        );
+        assert!(
+            app.commander.status.contains("was not cleared"),
+            "{}",
+            app.commander.status
+        );
+    }
+}
+
 /// U-4c: Enter used to mean Y. The one irreversible step in the tool was reachable by the key
 /// people press to get a dialog off the screen.
 #[cfg(test)]
 mod u4c_enter_is_not_execute_tests {
     use super::state::ConfirmScroll;
     use super::*;
-    use crate::model::action::{ActionKind, PlannedAction};
-    use std::path::PathBuf;
 
     /// An app with the F11 confirmation open over a two-action plan.
     fn confirming(tab: ConfirmTab) -> App {
         let (mut app, _rx) = crate::app::test_app();
-        app.commander.pending_actions = ["/x/dup1.bin", "/x/dup2.bin"]
-            .iter()
-            .map(|target| PlannedAction {
-                kind: ActionKind::Delete,
-                target: PathBuf::from(target),
-                keeper: PathBuf::from("/x/keeper.bin"),
-                target_device: 1,
-                keeper_device: 1,
-                size: 1024,
-                expected_hash: String::new(),
-            })
-            .collect();
+        app.commander.pending_plan = crate::app::test_plan(2);
         app.commander.confirm_script = "echo one\necho two".to_string();
         app.commander.confirm_scroll = ConfirmScroll {
             offset: 0,
             total: 2,
             rows: 1,
         };
-        app.commander.overlay = Overlay::Confirm {
-            files: 2,
-            reclaim: 2048,
-            tab,
-        };
+        app.commander.overlay = Overlay::Confirm { tab };
         app
     }
 
@@ -3195,8 +3333,11 @@ mod u4c_enter_is_not_execute_tests {
                 "{tab:?}: the confirmation must stay open"
             );
             assert_eq!(
-                app.commander.pending_actions.len(),
-                2,
+                app.commander
+                    .pending_plan
+                    .as_ref()
+                    .map(|plan| plan.actions().len()),
+                Some(2),
                 "{tab:?}: the plan must be untouched"
             );
             assert!(app.apply.is_none(), "{tab:?}: no batch may have started");
@@ -3219,7 +3360,7 @@ mod u4c_enter_is_not_execute_tests {
             // The handover is synchronous; the batch itself has its own tests.
             assert!(matches!(app.commander.overlay, Overlay::None), "{code:?}");
             assert!(
-                app.commander.pending_actions.is_empty(),
+                app.commander.pending_plan.is_none(),
                 "{code:?}: the plan was taken"
             );
             assert_eq!(app.applying.total, 2, "{code:?}: both actions handed over");
@@ -3236,7 +3377,7 @@ mod u4c_enter_is_not_execute_tests {
             press(&mut app, code);
 
             assert!(matches!(app.commander.overlay, Overlay::None), "{code:?}");
-            assert!(app.commander.pending_actions.is_empty(), "{code:?}");
+            assert!(app.commander.pending_plan.is_none(), "{code:?}");
             assert!(app.apply.is_none(), "{code:?}: cancelling starts nothing");
         }
     }

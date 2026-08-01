@@ -13,8 +13,8 @@ use crate::model::duplicate::{
     FileEntry,
 };
 use crate::model::plan::{
-    ActionPlan, LiveIdentity, MarkIntent, PlanGroupInput, PlanMemberEvidence, PlanObjectKey,
-    PlanRefusal, PlanResult, RequestedMark,
+    ActionPlan, MarkIntent, PlanGroupInput, PlanMemberEvidence, PlanObjectKey, PlanRefusal,
+    PlanResult, RequestedMark,
 };
 use crate::model::reclaim::{
     DestructivePlanVerdict, GroupReclaim, LinkCount, ReclaimEstimate, ReclaimState,
@@ -172,22 +172,6 @@ impl DirGroupSummary {
     }
 }
 
-/// An action-plan row assembled from the DB (`planned_action_rows`): the target
-/// (marked for an action, not a keeper) + the deterministic keeper of its group. Raw material
-/// for `actions::plan_actions_from_db` — without materializing all groups into RAM.
-#[derive(Debug, Clone)]
-pub struct PlannedActionRow {
-    /// The action identifier from `file_mark.action` (delete/hardlink/reflink).
-    pub action: String,
-    pub target: PathBuf,
-    pub keeper: PathBuf,
-    pub target_device: u64,
-    pub keeper_device: u64,
-    pub size: u64,
-    /// hex hash of the group — for the final re-check (`revalidate`) before the action.
-    pub expected_hash: String,
-}
-
 /// Checkpoint store: a SQLite DB with the scan state and the file manifest.
 pub struct ScanStore {
     conn: Connection,
@@ -228,6 +212,27 @@ pub(crate) fn role_guard() -> std::sync::MutexGuard<'static, ()> {
     ROLE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The pathnames of `scan_id` still marked for an action, in path order.
+///
+/// The plan itself is built from real files on disk, so a test about what SURVIVES in the database
+/// after a batch asks the database, not the planner.
+#[cfg(test)]
+pub(crate) fn marked_action_paths(db: &Path, scan_id: i64) -> Vec<PathBuf> {
+    let store = ScanStore::open(db).unwrap();
+    let mut stmt = store
+        .conn
+        .prepare(
+            "SELECT path FROM file_mark
+              WHERE scan_id = ?1 AND is_keeper = 0 AND action IS NOT NULL
+              ORDER BY path",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map(params![scan_id], |row| row.get::<_, String>(0))
+        .unwrap();
+    rows.map(|row| PathBuf::from(row.unwrap())).collect()
 }
 
 /// Seeds `db` with one duplicate group — keeper `/x/a`, targets `/x/b` and `/x/c`, all marked —
@@ -3057,88 +3062,6 @@ impl ScanStore {
         }
         Ok(done)
     }
-
-    /// Action-plan rows from `file` + `file_mark` — without materializing
-    /// all groups. The target: a NON-keeper file marked for an action with a known hash;
-    /// the keeper — the DETERMINISTIC single one (first by path among the keepers of the
-    /// same group). Targets without a resolved keeper are DISCARDED (fail-safe: we delete
-    /// nothing without a keeper). Exactly reproduces the pair selection of `actions::plan_actions`.
-    pub fn planned_action_rows(&self, scan_id: i64) -> Result<Vec<PlannedActionRow>> {
-        // The former version (a single SELECT with TWO correlated subqueries per
-        // target) froze the UI for seconds: the SQLite planner drove the outer query over the
-        // `file` table (hundreds of thousands of rows). Now — two queries, DRIVEN by the small `file_mark`
-        // (dozens of marked rows; `file` is taken by PK `(scan_id,path)`), and assembling pairs
-        // in memory. O(marks), not O(all files). The keeper semantics (first by path) are
-        // preserved → the central test `plan_from_db_equals_plan_from_ram` is green.
-
-        // 1. Keeper for each hash: the first by path among marked keepers with a hash.
-        // The inode comes along so a target that is already the keeper's own physical file can
-        // be dropped, exactly as `plan_actions` does.
-        let mut keeper_stmt = self.conn.prepare(
-            "SELECT f.hash, f.path, f.device, f.inode
-               FROM file_mark m
-               JOIN file f ON f.scan_id = m.scan_id AND f.path = m.path
-              WHERE m.scan_id = ?1 AND m.is_keeper = 1 AND f.hash IS NOT NULL
-              ORDER BY f.path",
-        )?;
-        let keeper_rows = keeper_stmt.query_map(params![scan_id], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                PathBuf::from(row.get::<_, String>(1)?),
-                row.get::<_, i64>(2)? as u64,
-                row.get::<_, i64>(3)? as u64,
-            ))
-        })?;
-        let mut keepers: std::collections::HashMap<Vec<u8>, (PathBuf, u64, u64)> =
-            std::collections::HashMap::new();
-        for row in keeper_rows {
-            let (hash, path, device, inode) = row?;
-            // Queries by path → the first (minimal by path) wins.
-            keepers.entry(hash).or_insert((path, device, inode));
-        }
-
-        // 2. Targets: marked NON-keepers with an action and a known hash.
-        let mut target_stmt = self.conn.prepare(
-            "SELECT f.path, f.size, f.device, f.hash, m.action, f.inode
-               FROM file_mark m
-               JOIN file f ON f.scan_id = m.scan_id AND f.path = m.path
-              WHERE m.scan_id = ?1 AND m.is_keeper = 0 AND m.action IS NOT NULL
-                AND f.hash IS NOT NULL
-              ORDER BY f.hash, f.path",
-        )?;
-        let target_rows = target_stmt.query_map(params![scan_id], |row| {
-            Ok((
-                PathBuf::from(row.get::<_, String>(0)?),
-                row.get::<_, i64>(1)? as u64,
-                row.get::<_, i64>(2)? as u64,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)? as u64,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in target_rows {
-            let (target, size, target_device, hash, action, target_inode) = row?;
-            // The group has no keeper → we do not touch the target (fail-safe, like plan_actions).
-            let Some((keeper, keeper_device, keeper_inode)) = keepers.get(&hash) else {
-                continue;
-            };
-            // Already the keeper's own physical file: the action would free nothing.
-            if target_device == *keeper_device && target_inode == *keeper_inode {
-                continue;
-            }
-            out.push(PlannedActionRow {
-                action,
-                target,
-                keeper: keeper.clone(),
-                target_device,
-                keeper_device: *keeper_device,
-                size,
-                expected_hash: hex_encode(&hash),
-            });
-        }
-        Ok(out)
-    }
 }
 
 // Test seam: fires once, after the requested marks have been reconciled with the durable ones and
@@ -3168,11 +3091,8 @@ fn fire_after_reconcile() {
 
 /// The destructive-plan authority.
 ///
-/// Inert in R2D-C5-1: no production entry point reaches this block, so the whole of it is
-/// unreachable code until R2D-C5-2 switches classic and the commander onto it and retires
-/// `plan_actions` / `plan_actions_from_db`. It lives in its own `impl` so that one `allow` covers
-/// the feature instead of one per item.
-#[allow(dead_code)]
+/// Since R2D-C5-2 this is the only way into a plan: classic and the commander both call
+/// `build_action_plan`, and the pathname-based builders it replaced are gone.
 impl ScanStore {
     /// Builds the one destructive plan from durable evidence, or refuses.
     ///
@@ -3272,11 +3192,12 @@ impl ScanStore {
 
         // The model decides what becomes an action and what the plan may claim.
         let plan = ActionPlan::try_new(scan_id, groups)?;
-        // And the files have to still be the files the manifest describes. Done here rather than
-        // left to the caller: a plan that can be returned unvalidated is a plan someone forgets to
-        // validate. Still inside the snapshot — the evidence it compares against must be the
-        // evidence the plan was folded from.
-        Self::validate_live(&plan)?;
+        // And the files have to still be the files the manifest describes. The same structural
+        // check `apply_batch` runs twice more, called here rather than left to the caller: a plan
+        // that can be returned unvalidated is a plan someone forgets to validate. Still inside the
+        // snapshot — the evidence it compares against must be the evidence the plan was folded
+        // from.
+        plan.preflight()?;
         // Nothing was written, so this only ends the read. It is not left to `Drop`: a failure here
         // means the snapshot did not last the whole way, and that refuses the plan like any other
         // unreadable evidence.
@@ -3466,40 +3387,6 @@ impl ScanStore {
             hash: hex_encode(digest),
             members,
         })
-    }
-
-    /// Every pathname the plan rests on must still be the file the manifest describes.
-    ///
-    /// Not only targets and keepers: an unmarked alias is what makes a target's figure a zero or a
-    /// size, so a plan whose bystander moved is a plan whose arithmetic no longer holds.
-    fn validate_live(plan: &ActionPlan) -> PlanResult<()> {
-        use std::os::unix::fs::MetadataExt;
-        for object in plan.objects() {
-            for path in object.members() {
-                let meta = std::fs::symlink_metadata(path)
-                    .map_err(|_| PlanRefusal::Vanished { path: path.clone() })?;
-                if meta.file_type().is_symlink() {
-                    return Err(PlanRefusal::Symlink { path: path.clone() });
-                }
-                let live = LiveIdentity {
-                    device: meta.dev(),
-                    inode: meta.ino(),
-                    size: meta.size(),
-                    mtime: meta.mtime(),
-                    mtime_nsec: meta.mtime_nsec(),
-                    ctime_sec: meta.ctime(),
-                    ctime_nsec: meta.ctime_nsec(),
-                    nlink: meta.nlink(),
-                };
-                if let Some(field) = object.key().first_drift(&live, object.links()) {
-                    return Err(PlanRefusal::Drifted {
-                        path: path.clone(),
-                        field,
-                    });
-                }
-            }
-        }
-        Ok(())
     }
 
     /// A read that failed is a refusal like any other — the plan is not built on a half-read
@@ -6951,16 +6838,6 @@ mod tests {
         }
     }
 
-    /// A mark for save_marks (uses only path/is_keeper/action).
-    fn mark_fe(path: &str, keeper: bool, action: Option<ActionKind>) -> FileEntry {
-        FileEntry {
-            path: PathBuf::from(path),
-            is_keeper: keeper,
-            action,
-            ..Default::default()
-        }
-    }
-
     /// Restores the operator role no matter how the test ends.
     struct RoleReset;
     impl Drop for RoleReset {
@@ -7415,58 +7292,6 @@ mod tests {
         );
     }
 
-    /// planned_action_rows skips groups without an action and without a keeper (fail-safe).
-    #[test]
-    fn planned_action_rows_skips_actionless_and_keeperless() {
-        let mut store = ScanStore::open_in_memory().unwrap();
-        let id = store
-            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
-            .unwrap();
-        store
-            .record_files(
-                id,
-                &[
-                    row("/a1", 10, 1),
-                    row("/a2", 10, 2),
-                    row("/b1", 20, 3),
-                    row("/b2", 20, 4),
-                    row("/c1", 30, 5),
-                    row("/c2", 30, 6),
-                ],
-            )
-            .unwrap();
-        store
-            .record_hashes(
-                id,
-                &[
-                    (PathBuf::from("/a1"), [1u8; 32]),
-                    (PathBuf::from("/a2"), [1u8; 32]),
-                    (PathBuf::from("/b1"), [2u8; 32]),
-                    (PathBuf::from("/b2"), [2u8; 32]),
-                    (PathBuf::from("/c1"), [3u8; 32]),
-                    (PathBuf::from("/c2"), [3u8; 32]),
-                ],
-            )
-            .unwrap();
-        store
-            .save_marks(
-                id,
-                [
-                    mark_fe("/a1", true, None),                      // A: keeper
-                    mark_fe("/a2", false, Some(ActionKind::Delete)), // A: target
-                    mark_fe("/b1", true, None),                      // B: keeper only
-                    mark_fe("/c2", false, Some(ActionKind::Delete)), // C: delete without keeper
-                ]
-                .iter(),
-            )
-            .unwrap();
-
-        let rows = store.planned_action_rows(id).unwrap();
-        assert_eq!(rows.len(), 1, "only group A with keeper+action");
-        assert_eq!(rows[0].target, PathBuf::from("/a2"));
-        assert_eq!(rows[0].keeper, PathBuf::from("/a1"));
-    }
-
     /// A real DB on disk with one group: keeper `/x/a`, targets `/x/b` and `/x/c`. Marks outlive
     /// the process, so the post-batch reconciliation has to be checked against the file, not
     /// against a map in RAM.
@@ -7501,14 +7326,6 @@ mod tests {
             vec!["/x/a".to_string(), "/x/c".to_string()],
             "the attempted target is gone; the keeper the rest of the plan needs stays"
         );
-        let plan = crate::actions::plan_actions_from_db(&store, id).unwrap();
-        assert_eq!(
-            plan.len(),
-            1,
-            "a fresh plan holds only what was not reached"
-        );
-        assert_eq!(plan[0].target, PathBuf::from("/x/c"));
-        assert_eq!(plan[0].keeper, PathBuf::from("/x/a"));
 
         drop(store);
         std::fs::remove_dir_all(&dir).ok();
@@ -7524,12 +7341,6 @@ mod tests {
         assert!(
             marked_paths(&store, id).is_empty(),
             "a spent plan leaves nothing marked, keepers included"
-        );
-        assert!(
-            crate::actions::plan_actions_from_db(&store, id)
-                .unwrap()
-                .is_empty(),
-            "the applied actions must not come back after a restart"
         );
 
         drop(store);

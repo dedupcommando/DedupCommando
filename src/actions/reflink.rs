@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::error::{AppError, Result};
 
-use super::meta;
+use super::{meta, ApplyOps, Publication};
 
 /// Replaces `target` with a reflink copy (CoW clone) of `keeper` WITHOUT destroy-in-place.
 ///
@@ -13,12 +13,14 @@ use super::meta;
 /// is evacuated to quarantine (recoverable) before the clone is published, with restoration
 /// on failure. See [`super::evacuate_then_publish`].
 pub fn reflink(
+    ops: &dyn ApplyOps,
     target: &Path,
     keeper: &Path,
     mountpoint: &Path,
     quarantine_dir: &Path,
-) -> Result<()> {
+) -> Publication {
     publish_clone(
+        ops,
         target,
         keeper,
         mountpoint,
@@ -41,14 +43,23 @@ pub fn reflink(
 /// hand in a plain copy: it produces the same fresh inode with this process's identity, which is
 /// exactly what the carry-over is about.
 fn publish_clone(
+    ops: &dyn ApplyOps,
     target: &Path,
     keeper: &Path,
     mountpoint: &Path,
     quarantine_dir: &Path,
     clone: impl FnOnce(&Path, &Path) -> Result<()>,
-) -> Result<()> {
-    let metadata = meta::read(target)?;
+) -> Publication {
+    let metadata = match meta::read(target) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            return Publication::NotMoved {
+                detail: err.to_string(),
+            }
+        }
+    };
     super::evacuate_then_publish(
+        ops,
         target,
         |temp| {
             clone(keeper, temp)?;
@@ -57,7 +68,6 @@ fn publish_clone(
         mountpoint,
         quarantine_dir,
     )
-    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -140,7 +150,8 @@ mod tests {
         let (mtime, mtime_nsec) = (before.mtime(), before.mtime_nsec());
         let original_inode = before.ino();
 
-        publish_clone(
+        let published = publish_clone(
+            &super::super::RealOps,
             &target,
             &keeper,
             &mountpoint,
@@ -149,8 +160,11 @@ mod tests {
                 std::fs::copy(keeper, temp)?;
                 Ok(())
             },
-        )
-        .unwrap();
+        );
+        assert!(
+            matches!(published, Publication::Published { .. }),
+            "{published:?}"
+        );
 
         let after = std::fs::symlink_metadata(&target).unwrap();
         assert_ne!(
@@ -195,7 +209,8 @@ mod tests {
         // SAFETY: the path string lives across the call.
         assert_eq!(unsafe { libc::lchown(target_c.as_ptr(), 12345, 12345) }, 0);
 
-        publish_clone(
+        let published = publish_clone(
+            &super::super::RealOps,
             &target,
             &keeper,
             &mountpoint,
@@ -204,8 +219,11 @@ mod tests {
                 std::fs::copy(keeper, temp)?;
                 Ok(())
             },
-        )
-        .unwrap();
+        );
+        assert!(
+            matches!(published, Publication::Published { .. }),
+            "{published:?}"
+        );
 
         let after = std::fs::symlink_metadata(&target).unwrap();
         assert_eq!(
@@ -238,17 +256,26 @@ mod tests {
         std::fs::write(&keeper, b"duplicate content").unwrap();
         let before = std::fs::symlink_metadata(&target).unwrap().ino();
 
-        let result = publish_clone(&target, &keeper, &mountpoint, &quarantine, |_, temp| {
-            // A fifo stands in for a "clone" that is not a plain file: it opens, so only the
-            // regular-file check can catch it.
-            let temp_c = std::ffi::CString::new(temp.as_os_str().as_bytes()).unwrap();
-            // SAFETY: the path string lives across the call.
-            assert_eq!(unsafe { libc::mkfifo(temp_c.as_ptr(), 0o600) }, 0);
-            Ok(())
-        });
+        let published = publish_clone(
+            &super::super::RealOps,
+            &target,
+            &keeper,
+            &mountpoint,
+            &quarantine,
+            |_, temp| {
+                // A fifo stands in for a "clone" that is not a plain file: it opens, so only the
+                // regular-file check can catch it.
+                let temp_c = std::ffi::CString::new(temp.as_os_str().as_bytes()).unwrap();
+                // SAFETY: the path string lives across the call.
+                assert_eq!(unsafe { libc::mkfifo(temp_c.as_ptr(), 0o600) }, 0);
+                Ok(())
+            },
+        );
 
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("not a regular file"), "{err}");
+        let Publication::NotMoved { detail } = &published else {
+            panic!("nothing may be published: {published:?}");
+        };
+        assert!(detail.contains("not a regular file"), "{detail}");
         assert_eq!(std::fs::symlink_metadata(&target).unwrap().ino(), before);
         assert!(!quarantine.exists(), "nothing was evacuated");
         assert_eq!(
@@ -276,7 +303,8 @@ mod tests {
         let before = std::fs::symlink_metadata(&target).unwrap().ino();
 
         let bystander_for_clone = bystander.clone();
-        let result = publish_clone(
+        let published = publish_clone(
+            &super::super::RealOps,
             &target,
             &keeper,
             &mountpoint,
@@ -287,7 +315,10 @@ mod tests {
             },
         );
 
-        assert!(result.is_err());
+        assert!(
+            matches!(published, Publication::NotMoved { .. }),
+            "{published:?}"
+        );
         let after = std::fs::symlink_metadata(&bystander).unwrap();
         assert_eq!(
             after.permissions().mode() & 0o7777,
@@ -325,11 +356,19 @@ mod tests {
         std::fs::write(&keeper, b"duplicate content").unwrap();
         let before = std::fs::symlink_metadata(&target).unwrap().ino();
 
-        let result = publish_clone(&target, &keeper, &mountpoint, &quarantine, |_, _| {
-            Err(AppError::msg("reflink failed: no block cloning here"))
-        });
+        let published = publish_clone(
+            &super::super::RealOps,
+            &target,
+            &keeper,
+            &mountpoint,
+            &quarantine,
+            |_, _| Err(AppError::msg("reflink failed: no block cloning here")),
+        );
 
-        assert!(result.is_err());
+        assert!(
+            matches!(published, Publication::NotMoved { .. }),
+            "{published:?}"
+        );
         assert_eq!(
             std::fs::symlink_metadata(&target).unwrap().ino(),
             before,

@@ -12,7 +12,7 @@ use ratatui::{
 use super::panel::ellipsize_left;
 use super::state::{ConfirmScroll, ConfirmTab, PlanDigest};
 use crate::model::scan::ResumeInfo;
-use crate::tui::{centered, human_bytes};
+use crate::tui::centered;
 
 /// Draws the F9 dropdown menu; the cursor is on item `cursor`.
 pub fn render_menu(frame: &mut Frame, cursor: usize, labels: &[&str]) {
@@ -48,8 +48,6 @@ pub fn render_menu(frame: &mut Frame, cursor: usize, labels: &[&str]) {
 /// "Summary" (what and how much) and "Commands" (the plan's full shell-script).
 pub fn render_confirm(
     frame: &mut Frame,
-    files: usize,
-    reclaim: u64,
     tab: ConfirmTab,
     script: &str,
     digest: &PlanDigest,
@@ -72,7 +70,7 @@ pub fn render_confirm(
             let fixed = CHROME_FIXED + hint.len();
             let gaps = avail >= fixed + 2 + SUMMARY_MIN_BODY;
             let chrome = fixed + if gaps { 2 } else { 0 };
-            let lines = summary_lines(files, reclaim, digest, avail.saturating_sub(chrome));
+            let lines = summary_lines(digest, avail.saturating_sub(chrome));
             let height = (lines.len() + chrome) as u16;
             let body: Vec<Line> = lines.into_iter().map(Line::from).collect();
             (
@@ -216,12 +214,14 @@ impl Shed {
 /// The [Y]/[N] hint is not part of this body and is never shed — the operator has to be able
 /// to read their way out of a confirmation they did not mean to open. What goes, in order:
 /// the quoted paths, then the blank spacing, then the snapshot note, then the size estimate.
-/// The count, the `By type` composition and «… and N more» are what remain.
-fn summary_lines(files: usize, reclaim: u64, digest: &PlanDigest, max_rows: usize) -> Vec<String> {
+/// The count, the `By type` composition, the warnings and «… and N more» are what remain: a
+/// warning explains why a figure is a zero, and a zero without its explanation is what an
+/// operator reads as a bug in the tool.
+fn summary_lines(digest: &PlanDigest, max_rows: usize) -> Vec<String> {
     let mut shed = Shed::new(digest.samples.len());
-    let mut lines = compose(files, reclaim, digest, shed);
+    let mut lines = compose(digest, shed);
     while lines.len() > max_rows && shed.shrink() {
-        lines = compose(files, reclaim, digest, shed);
+        lines = compose(digest, shed);
     }
     // Below the essentials there is nothing left to trade; cut rather than push the hint off.
     lines.truncate(max_rows);
@@ -229,8 +229,12 @@ fn summary_lines(files: usize, reclaim: u64, digest: &PlanDigest, max_rows: usiz
 }
 
 /// The Summary body at one particular level of shedding.
-fn compose(files: usize, reclaim: u64, digest: &PlanDigest, shed: Shed) -> Vec<String> {
-    let mut lines = vec![format!("  Actions to be executed: {files}")];
+fn compose(digest: &PlanDigest, shed: Shed) -> Vec<String> {
+    let actions: usize = digest.counts.iter().map(|(_, count)| count).sum();
+    let mut lines = vec![format!(
+        "  Actions to be executed: {actions} over {} allocation(s)",
+        digest.covered_objects,
+    )];
     if !digest.counts.is_empty() {
         let by_kind: Vec<String> = digest
             .counts
@@ -240,7 +244,16 @@ fn compose(files: usize, reclaim: u64, digest: &PlanDigest, shed: Shed) -> Vec<S
         lines.push(format!("  By type: {}", by_kind.join(" · ")));
     }
     if shed.size {
-        lines.push(format!("  Approximately freed: {}", human_bytes(reclaim)));
+        lines.push(format!("  {}", crate::tui::reclaim_phrase(digest.estimate)));
+    }
+    // Never shed: this is the sentence that makes a zero make sense. It wraps rather than being
+    // cut at the box edge — the tail is the half that explains the figure.
+    for warning in &digest.warnings {
+        for line in
+            crate::tui::screens::browser::wrap_words(&warning.reason(), SUMMARY_WIDTH as usize - 2)
+        {
+            lines.push(format!("  {line}"));
+        }
     }
 
     let shown = digest.samples.len().min(shed.samples);
@@ -492,48 +505,62 @@ pub fn render_info(frame: &mut Frame, lines: &[String]) {
 #[cfg(test)]
 mod confirm_summary_tests {
     use super::*;
-    use crate::model::action::{ActionKind, PlannedAction};
+    use crate::model::action::ActionKind;
+    use crate::model::plan::{
+        ActionPlan, MarkIntent, PlanGroupInput, PlanMemberEvidence, PlanObjectKey,
+    };
+    use crate::model::reclaim::LinkCount;
     use ratatui::{backend::TestBackend, Terminal};
     use std::path::PathBuf;
 
+    /// One keeper plus the given targets, each an independent allocation — the digest is read out
+    /// of the model plan, exactly as the overlay reads it.
     fn digest_of(actions: &[(ActionKind, &str)]) -> PlanDigest {
-        let plan: Vec<PlannedAction> = actions
-            .iter()
-            .map(|(kind, target)| PlannedAction {
-                kind: *kind,
-                target: PathBuf::from(target),
-                keeper: PathBuf::from("/tank/keeper.bin"),
-                target_device: 1,
-                keeper_device: 1,
-                size: 1024,
-                expected_hash: String::new(),
-            })
-            .collect();
-        PlanDigest::of(&plan)
+        let key = |inode: u64| PlanObjectKey {
+            device: 1,
+            inode,
+            size: 1024,
+            mtime: 1_700_000_000,
+            mtime_nsec: 0,
+            ctime_sec: 1_700_000_001,
+            ctime_nsec: 0,
+            identity_version: 1,
+        };
+        let member = |path: &str, inode: u64, intent| {
+            PlanMemberEvidence::new(
+                PathBuf::from(path),
+                key(inode),
+                LinkCount::Known(1),
+                Some(intent),
+            )
+            .expect("a well-formed fixture member")
+        };
+        let mut members = vec![member("/tank/keeper.bin", 10, MarkIntent::Keeper)];
+        for (index, (kind, target)) in actions.iter().enumerate() {
+            members.push(member(target, 100 + index as u64, MarkIntent::Act(*kind)));
+        }
+        ActionPlan::try_new(
+            1,
+            vec![PlanGroupInput {
+                hash: "ab".repeat(32),
+                members,
+            }],
+        )
+        .expect("a well-formed fixture plan")
+        .digest()
     }
 
     /// The Summary body with room to spare — what a normal terminal shows.
     fn joined(digest: &PlanDigest, rows: usize) -> String {
-        summary_lines(digest.samples.len() + digest.hidden, 1024, digest, rows).join("\n")
+        summary_lines(digest, rows).join("\n")
     }
 
     /// Everything actually painted by `render_confirm` on a `width`x`height` terminal.
     fn drawn(digest: &PlanDigest, width: u16, height: u16) -> String {
-        let files = digest.samples.len() + digest.hidden;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut scroll = ConfirmScroll::default();
         terminal
-            .draw(|frame| {
-                render_confirm(
-                    frame,
-                    files,
-                    1024,
-                    ConfirmTab::Summary,
-                    "",
-                    digest,
-                    &mut scroll,
-                )
-            })
+            .draw(|frame| render_confirm(frame, ConfirmTab::Summary, "", digest, &mut scroll))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..height)
@@ -547,7 +574,7 @@ mod confirm_summary_tests {
     }
 
     fn long_plan(count: usize) -> PlanDigest {
-        let paths: Vec<String> = (0..count).map(|i| format!("/tank/f{i}.bin")).collect();
+        let paths: Vec<String> = (0..count).map(|i| format!("/tank/f{i:02}.bin")).collect();
         let actions: Vec<(ActionKind, &str)> = paths
             .iter()
             .map(|path| (ActionKind::Delete, path.as_str()))
@@ -583,8 +610,8 @@ mod confirm_summary_tests {
         let text = joined(&long_plan(12), 20);
 
         assert!(text.contains("By type: delete 12"));
-        assert!(text.contains("/tank/f0.bin") && text.contains("/tank/f4.bin"));
-        assert!(!text.contains("/tank/f5.bin"), "only five are quoted");
+        assert!(text.contains("/tank/f00.bin") && text.contains("/tank/f04.bin"));
+        assert!(!text.contains("/tank/f05.bin"), "only five are quoted");
         assert!(text.contains("… and 7 more"), "{text}");
     }
 
@@ -619,10 +646,10 @@ mod confirm_summary_tests {
         let digest = long_plan(12);
 
         let roomy = joined(&digest, 20);
-        assert!(roomy.contains("/tank/f0.bin") && roomy.contains("A ZFS snapshot"));
+        assert!(roomy.contains("/tank/f00.bin") && roomy.contains("A ZFS snapshot"));
 
         let tight = joined(&digest, 5);
-        assert!(!tight.contains("/tank/f0.bin"), "paths go first:\n{tight}");
+        assert!(!tight.contains("/tank/f00.bin"), "paths go first:\n{tight}");
         assert!(
             tight.contains("A ZFS snapshot"),
             "prose outlives them:\n{tight}"
@@ -633,11 +660,12 @@ mod confirm_summary_tests {
             !tighter.contains("A ZFS snapshot"),
             "then the note:\n{tighter}"
         );
-        assert!(tighter.contains("Approximately freed"));
+        assert!(tighter.contains("guaranteed after quarantine purge"));
 
         let essentials = joined(&digest, 3);
         assert_eq!(
-            essentials, "  Actions to be executed: 12\n  By type: delete 12\n  … and 12 more",
+            essentials,
+            "  Actions to be executed: 12 over 12 allocation(s)\n  By type: delete 12\n  … and 12 more",
             "what is left is what the operator cannot decide without"
         );
     }
@@ -675,12 +703,10 @@ mod confirm_summary_tests {
 
     /// The Commands tab as actually painted, with the scroll state the frame leaves behind.
     fn drawn_commands(text: &str, scroll: &mut ConfirmScroll, width: u16, height: u16) -> String {
-        let digest = PlanDigest::default();
+        let digest = digest_of(&[(ActionKind::Delete, "/tank/dup.bin")]);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| {
-                render_confirm(frame, 1, 1024, ConfirmTab::Commands, text, &digest, scroll)
-            })
+            .draw(|frame| render_confirm(frame, ConfirmTab::Commands, text, &digest, scroll))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..height)

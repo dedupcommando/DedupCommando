@@ -722,6 +722,118 @@ mod format_tests {
     }
 }
 
+/// R2D-C5-2 row 4: one plan, four places it is shown. A warning that explains a zero is worth
+/// nothing if the operator meets the zero on a screen that does not carry it.
+#[cfg(test)]
+mod plan_surface_parity_tests {
+    use crate::actions::script_preview::render_script;
+    use crate::model::action::{ActionKind, ActionOutcome, BatchResult};
+    use crate::model::dataset::Dataset;
+    use crate::model::plan::{ActionPlan, ActionResult};
+    use crate::testfixtures::PlanScenario;
+    use crate::tui::commander::state::{ConfirmScroll, ConfirmTab};
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::os::unix::fs::MetadataExt;
+
+    /// The sentence every surface owes the operator when an allocation has links this scan never
+    /// saw: nothing is guaranteed, and this is why.
+    const OUTSIDE: &str = "link(s) outside this scan keep this allocation alive";
+
+    fn screen<F: FnOnce(&mut ratatui::Frame)>(width: u16, height: u16, draw: F) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(draw).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_outside_link_warning_reaches_every_surface() {
+        let _role = crate::state::store::role_guard();
+        let scenario = PlanScenario::new("parity_outside");
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let _elsewhere = scenario.outside_link(&twin, "elsewhere.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &twin, false, Some(ActionKind::Delete));
+        drop(store);
+        let plan: ActionPlan = crate::actions::tests::plan_of(&scenario, scan_id);
+        let size = std::fs::metadata(&keeper).unwrap().size();
+        assert_eq!(plan.summary().guaranteed_bytes(), 0);
+        assert_eq!(plan.summary().potential_bytes(), Some(size));
+
+        // 1. The classic review.
+        let (mut app, _rx) = crate::app::test_app();
+        app.review.plan = Some(plan.clone());
+        let review = screen(120, 24, |frame| {
+            crate::tui::screens::action_review::render(frame, &mut app)
+        });
+        assert!(review.contains(OUTSIDE), "classic review:\n{review}");
+
+        // 2. The commander's confirmation.
+        let digest = plan.digest();
+        let mut scroll = ConfirmScroll::default();
+        let confirm = screen(120, 30, |frame| {
+            crate::tui::commander::overlay::render_confirm(
+                frame,
+                ConfirmTab::Summary,
+                "",
+                &digest,
+                &mut scroll,
+            )
+        });
+        assert!(
+            confirm.contains("outside this scan"),
+            "commander:\n{confirm}"
+        );
+
+        // 3. The saved script's header.
+        let datasets = vec![Dataset {
+            name: "tank".to_string(),
+            mountpoint: scenario.root.clone(),
+            device_id: Some(std::fs::symlink_metadata(&scenario.root).unwrap().dev()),
+            snapdir_visible: false,
+        }];
+        let script = render_script(&plan, &datasets, Some("/usr/sbin/zfs"));
+        assert!(script.contains(OUTSIDE), "script header:\n{script}");
+
+        // 4. The final summary, after the action succeeded and freed nothing.
+        let (realized, realized_summary) = plan.realize(&[ActionResult::Removed]).unwrap();
+        app.summary_result = Some(BatchResult {
+            outcomes: vec![ActionOutcome {
+                kind: ActionKind::Delete,
+                target: twin.clone(),
+                quarantine: None,
+                result: Ok(()),
+            }],
+            planned: 1,
+            plan: plan.summary().clone(),
+            realized,
+            realized_summary,
+            ..Default::default()
+        });
+        let summary = screen(120, 30, |frame| {
+            crate::tui::screens::summary::render(frame, &app)
+        });
+        assert!(
+            summary.contains("links outside this scan"),
+            "final summary:\n{summary}"
+        );
+        assert!(
+            summary.contains("realized: guaranteed after quarantine purge: 0"),
+            "and it says the realized figure is zero:\n{summary}"
+        );
+    }
+}
+
 /// Two-line footer: status (if non-empty) and the always-visible key hints.
 pub fn render_footer(frame: &mut Frame, area: Rect, status: &str, hints: &str) {
     let lines = Text::from(vec![
