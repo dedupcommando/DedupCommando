@@ -3141,6 +3141,31 @@ impl ScanStore {
     }
 }
 
+// Test seam: fires once, after the requested marks have been reconciled with the durable ones and
+// before any group is loaded.
+//
+// It exists so a test can commit a change from a SECOND connection at exactly the moment that used
+// to matter, and prove deterministically — no sleeps, no racing threads — that the builder reads one
+// database snapshot from end to end. Not compiled into a production build at all.
+#[cfg(test)]
+thread_local! {
+    static AFTER_RECONCILE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms the seam above for the current thread.
+#[cfg(test)]
+pub(crate) fn arm_after_reconcile(hook: impl FnOnce() + 'static) {
+    AFTER_RECONCILE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn fire_after_reconcile() {
+    if let Some(hook) = AFTER_RECONCILE.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+}
+
 /// The destructive-plan authority.
 ///
 /// Inert in R2D-C5-1: no production entry point reaches this block, so the whole of it is
@@ -3165,6 +3190,20 @@ impl ScanStore {
         scan_id: i64,
         requested: &[RequestedMark],
     ) -> PlanResult<ActionPlan> {
+        // One snapshot for the whole plan, opened before the first read and held until the plan
+        // exists and has been validated against the disk.
+        //
+        // The checkpoint DB runs in WAL and more than one connection writes to it, so between two
+        // autocommit reads a second copy of the program can commit. Reconciling the request against
+        // the marks and then loading the groups as separate reads is exactly that window: the
+        // request is checked against the old meaning and the plan is assembled from the new one.
+        // A deferred transaction on this connection covers every statement made on it, including
+        // the ones inside `destructive_plan_verdict`, so nothing here has to be threaded by hand.
+        let snapshot = self
+            .conn
+            .unchecked_transaction()
+            .map_err(Self::store_refusal)?;
+
         // The coarse gate first: a scan nobody could measure is not planned against at all.
         let verdict = self
             .destructive_plan_verdict(scan_id)
@@ -3218,6 +3257,11 @@ impl ScanStore {
             }
         }
 
+        // The request has been checked against the marks as they stood. Everything the plan is
+        // built from below must come from that same state.
+        #[cfg(test)]
+        fire_after_reconcile();
+
         let mut digests: Vec<Vec<u8>> = marks.iter().map(|(_, _, digest)| digest.clone()).collect();
         digests.sort();
         digests.dedup();
@@ -3230,8 +3274,13 @@ impl ScanStore {
         let plan = ActionPlan::try_new(scan_id, groups)?;
         // And the files have to still be the files the manifest describes. Done here rather than
         // left to the caller: a plan that can be returned unvalidated is a plan someone forgets to
-        // validate.
+        // validate. Still inside the snapshot — the evidence it compares against must be the
+        // evidence the plan was folded from.
         Self::validate_live(&plan)?;
+        // Nothing was written, so this only ends the read. It is not left to `Drop`: a failure here
+        // means the snapshot did not last the whole way, and that refuses the plan like any other
+        // unreadable evidence.
+        snapshot.finish().map_err(Self::store_refusal)?;
         Ok(plan)
     }
 
@@ -3267,10 +3316,11 @@ impl ScanStore {
         let mut out = Vec::new();
         for row in rows {
             let (path, is_keeper, action, manifest, digest) = row.map_err(Self::store_refusal)?;
+            // Every row here came out of `file_mark` itself, so it is present by construction.
             // `save_marks` deletes a row that means neither, so one that says neither was not
             // written by this program.
             let intent =
-                Self::mark_intent_from_sql(&path, &is_keeper, &action)?.ok_or_else(|| {
+                Self::mark_intent_from_sql(&path, true, &is_keeper, &action)?.ok_or_else(|| {
                     PlanRefusal::CorruptMark {
                         path: path.clone(),
                         field: "mark",
@@ -3288,17 +3338,23 @@ impl ScanStore {
         Ok(out)
     }
 
-    /// Decodes one mark, or refuses. `None` — the row carries no mark at all (the `LEFT JOIN` of a
-    /// member nobody marked).
+    /// Decodes one mark, or refuses. `None` — this pathname carries no mark at all.
+    ///
+    /// `present` is the row-presence bit, and it is the difference between two things that look
+    /// identical in a `LEFT JOIN` result: no `file_mark` row at all, whose columns are `NULL`
+    /// because there is nothing to read, and a row that exists with a `NULL` in a column declared
+    /// `INTEGER NOT NULL`. The first is an ordinary unmarked member. The second is damaged
+    /// evidence, and reading it as «not the keeper» would turn it into whatever its `action` says.
     ///
     /// Strict where the rest of the program can afford not to be. `and_then(ActionKind::parse)`
     /// turns an identifier this build does not know into «no action», and the marked row then
     /// disappears from the plan while the rest of it is accepted — the operator confirms a screen
-    /// that is missing something they marked. `is_keeper` is a flag, so only SQLite's integer `0`
-    /// and `1` are that flag. A row that is both a keeper and an action states two incompatible
-    /// fates for one pathname and is not something to normalise.
+    /// that is missing something they marked. `is_keeper` is a flag, so on a present row only
+    /// SQLite's integer `0` and `1` are that flag. A row that is both a keeper and an action states
+    /// two incompatible fates for one pathname and is not something to normalise.
     fn mark_intent_from_sql(
         path: &Path,
+        present: bool,
         is_keeper: &Value,
         action: &Value,
     ) -> PlanResult<Option<MarkIntent>> {
@@ -3307,8 +3363,17 @@ impl ScanStore {
             field,
             detail: Self::describe_value(value),
         };
+        if !present {
+            // Nothing was joined. Any value here would mean the query handed us columns of a row it
+            // says does not exist.
+            return match (is_keeper, action) {
+                (Value::Null, Value::Null) => Ok(None),
+                (Value::Null, other) => Err(corrupt("action", other)),
+                (other, _) => Err(corrupt("is_keeper", other)),
+            };
+        }
         let keeper = match is_keeper {
-            Value::Null | Value::Integer(0) => false,
+            Value::Integer(0) => false,
             Value::Integer(1) => true,
             other => return Err(corrupt("is_keeper", other)),
         };
@@ -3351,9 +3416,12 @@ impl ScanStore {
         let mut stmt = self
             .conn
             .prepare(
+                // `m.rowid` is the row-presence bit: a joined row always has one, and no column of
+                // it can be `NULL` by accident the way `m.is_keeper` can. Without it a damaged
+                // `NULL` in a `NOT NULL` column is indistinguishable from no mark at all.
                 "SELECT f.path, f.size, f.mtime, f.mtime_nsec, f.ctime_sec, f.ctime_nsec,
                         f.device, f.inode, f.nlink, f.identity_version,
-                        m.is_keeper, m.action
+                        m.is_keeper, m.action, m.rowid
                    FROM file f
                    LEFT JOIN file_mark m ON m.scan_id = f.scan_id AND m.path = f.path
                   WHERE f.scan_id = ?1 AND f.hash = ?2
@@ -3377,12 +3445,13 @@ impl ScanStore {
                     row.get::<_, Value>(8)?,
                     row.get::<_, Value>(10)?,
                     row.get::<_, Value>(11)?,
+                    row.get::<_, Option<i64>>(12)?.is_some(),
                 ))
             })
             .map_err(Self::store_refusal)?;
         let mut members = Vec::new();
         for row in rows {
-            let (path, key, nlink, is_keeper, action) = row.map_err(Self::store_refusal)?;
+            let (path, key, nlink, is_keeper, action, marked) = row.map_err(Self::store_refusal)?;
             // Strict, unlike `group_file_row`: browsing may show a group whose counts cannot be
             // read, a destructive plan may not be built on one.
             let links =
@@ -3390,7 +3459,7 @@ impl ScanStore {
                     path: path.clone(),
                     detail: err.to_string(),
                 })?;
-            let mark = Self::mark_intent_from_sql(&path, &is_keeper, &action)?;
+            let mark = Self::mark_intent_from_sql(&path, marked, &is_keeper, &action)?;
             members.push(PlanMemberEvidence::new(path, key, links, mark)?);
         }
         Ok(PlanGroupInput {
@@ -5926,6 +5995,112 @@ mod tests {
         let commander = store.build_action_plan(scan_id, &[del(&alias_0)]).unwrap();
         assert_eq!(classic, commander, "the database is the only authority");
         assert_eq!(classic.digest(), commander.digest());
+    }
+
+    /// The row-presence bit, straight at the decoder.
+    ///
+    /// `file_mark.is_keeper` is declared `INTEGER NOT NULL`, so SQLite itself will not hand out a
+    /// present row with a `NULL` in that column — this guard is for a file that was not maintained
+    /// by SQLite. That is also why the coverage is here rather than end to end: the case cannot be
+    /// written through the schema it violates.
+    #[test]
+    fn a_present_mark_row_may_not_carry_a_null_flag() {
+        let path = Path::new("/x/twin.bin");
+        let delete = Value::Text("delete".to_string());
+
+        assert_eq!(
+            ScanStore::mark_intent_from_sql(path, false, &Value::Null, &Value::Null).unwrap(),
+            None,
+            "nothing was joined: an ordinary unmarked member"
+        );
+        assert_eq!(
+            ScanStore::mark_intent_from_sql(path, true, &Value::Null, &delete)
+                .expect_err("a present row whose flag is null"),
+            PlanRefusal::CorruptMark {
+                path: path.to_path_buf(),
+                field: "is_keeper",
+                detail: "null".to_string(),
+            },
+            "a damaged flag must not be read as «not the keeper» and become its action"
+        );
+        assert_eq!(
+            ScanStore::mark_intent_from_sql(path, true, &Value::Integer(0), &delete).unwrap(),
+            Some(MarkIntent::Act(ActionKind::Delete))
+        );
+        assert_eq!(
+            ScanStore::mark_intent_from_sql(path, true, &Value::Integer(1), &Value::Null).unwrap(),
+            Some(MarkIntent::Keeper)
+        );
+        assert_eq!(
+            ScanStore::mark_intent_from_sql(path, true, &Value::Integer(0), &Value::Null).unwrap(),
+            None,
+            "the decoder reports «neither»; `durable_marks` is where a present row may not mean it"
+        );
+        assert!(
+            matches!(
+                ScanStore::mark_intent_from_sql(path, false, &Value::Null, &delete),
+                Err(PlanRefusal::CorruptMark {
+                    field: "action",
+                    ..
+                })
+            ),
+            "a row the join says is absent cannot bring values along"
+        );
+    }
+
+    /// Every read that builds one plan sees one database.
+    ///
+    /// This project runs in WAL with more than one connection, so a second copy of the program can
+    /// commit between two autocommit reads. Without one snapshot the typed request check is
+    /// bypassed: the marks are reconciled, the meaning changes underneath, and the plan comes back
+    /// carrying an action the operator's window never showed.
+    #[test]
+    fn the_whole_plan_is_read_from_one_snapshot() {
+        let _role = role_guard();
+        let scenario = PlanScenario::new("snapshot");
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &twin, false, Some(ActionKind::Delete));
+
+        // A second connection commits the newer meaning at exactly the moment between the
+        // reconciliation and the group load — deterministically, not by racing.
+        let db_path = scenario.db_path.clone();
+        let target = twin.clone();
+        arm_after_reconcile(move || {
+            let other = ScanStore::open_writable(&db_path).expect("a second connection");
+            other
+                .conn
+                .execute(
+                    "UPDATE file_mark SET action = 'hardlink' WHERE path = ?1",
+                    params![target.to_string_lossy()],
+                )
+                .expect("the other copy of the program commits");
+        });
+
+        let plan = store
+            .build_action_plan(scan_id, &[del(&twin)])
+            .expect("the snapshot the request was checked against");
+        assert_eq!(
+            plan.actions()[0].kind(),
+            ActionKind::Delete,
+            "the plan may not carry a meaning that arrived after the request was reconciled"
+        );
+
+        // The change is committed, so the next build sees it — and refuses, because the window is
+        // still asking for the older meaning.
+        assert_eq!(
+            store
+                .build_action_plan(scan_id, &[del(&twin)])
+                .expect_err("the newer meaning is durable now"),
+            PlanRefusal::MarkDisagrees {
+                path: twin,
+                requested: MarkIntent::Act(ActionKind::Delete),
+                durable: MarkIntent::Act(ActionKind::Hardlink),
+            }
+        );
     }
 
     /// A mark whose write never landed leaves the older meaning in the database. Proving the
