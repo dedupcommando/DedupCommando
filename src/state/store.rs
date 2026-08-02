@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rusqlite::types::Value;
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, Transaction};
 
 use crate::error::{AppError, Result};
 use crate::model::action::{ActionKind, MoveEvent};
 use crate::model::duplicate::{
     build_dir_signatures_streaming, hex_encode, signature_of, DirGroup, DirSigAlgo, DuplicateGroup,
     FileEntry,
+};
+use crate::model::omission::{
+    AuthorityUnavailable, DirCompleteness, EventCount, OmissionCounts, OmissionReason,
+    OmissionSummary, PathKey, RootRegistration,
 };
 use crate::model::plan::{
     ActionPlan, MarkIntent, PlanGroupInput, PlanMemberEvidence, PlanObjectKey, PlanRefusal,
@@ -996,9 +1000,14 @@ impl ScanStore {
     }
 
     /// Hard and IRREVERSIBLY deletes the session from ALL scan_id tables:
-    /// scan/scan_stats/file/file_mark/dir_dedup/file_group/file_dedup. We do NOT touch `hash_cache`
+    /// scan/scan_stats/file/file_mark/dir_dedup/file_group/file_dedup/dir_omission/scan_root.
+    /// We do NOT touch `hash_cache`
     /// — it is keyed by (device,inode) and shared across all scans. Metadata ≠ pool data
     /// (recreated by a re-scan). The heavy DELETE over `file` (millions of rows) should be called in the background.
+    ///
+    /// `dir_omission` comes before `scan_root`, and both before `scan`: the declared foreign keys
+    /// enforce nothing while `PRAGMA foreign_keys` is off, so this order IS the enforcement. A
+    /// ledger row that outlived its authority would be read against a root that no longer exists.
     pub fn purge_scan(&mut self, scan_id: i64) -> Result<()> {
         let tx = self.conn.transaction()?;
         for table in [
@@ -1008,6 +1017,8 @@ impl ScanStore {
             "dir_dedup",
             "file_group",
             "file_dedup",
+            "dir_omission",
+            "scan_root",
         ] {
             // The table names are internal constants, not user input.
             tx.execute(
@@ -1027,22 +1038,32 @@ impl ScanStore {
         Ok(())
     }
 
-    /// Begins a new scan: creates a `scan` row and a `scan_stats` row.
-    /// Previous sessions are preserved — they can be selected on the sessions screen.
+    /// Begins a new scan: creates a `scan` row, a `scan_stats` row and the scan's `scan_root`
+    /// authority rows. Previous sessions are preserved — they can be selected on the sessions
+    /// screen.
+    ///
+    /// One transaction, so a scan can never exist without the statistics row or with half its
+    /// roots registered. Registration reads the config back out of the row just written rather
+    /// than from the argument: the persisted value is the one every later reader sees, and a
+    /// second path to the same fact is a second answer waiting to disagree.
     pub fn begin_scan(&mut self, config: &ScanConfig) -> Result<i64> {
         let config_json = serde_json::to_string(config)?;
         let now = now_string();
 
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "INSERT INTO scan(created_at, updated_at, status, config_json)
              VALUES (?1, ?1, ?2, ?3)",
             params![now, ScanStatus::Walking.as_str(), config_json],
         )?;
-        let scan_id = self.conn.last_insert_rowid();
-        self.conn.execute(
+        let scan_id = tx.last_insert_rowid();
+        tx.execute(
             "INSERT INTO scan_stats(scan_id) VALUES (?1)",
             params![scan_id],
         )?;
+        let registration = ensure_roots_tx(&tx, scan_id)?;
+        tx.commit()?;
+        log_registration(scan_id, &registration);
         Ok(scan_id)
     }
 
@@ -1102,10 +1123,26 @@ impl ScanStore {
         Ok(())
     }
 
-    /// Deletes the scan's file manifest (before a re-walk).
-    pub fn clear_files(&self, scan_id: i64) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM file WHERE scan_id = ?1", params![scan_id])?;
+    /// Deletes the scan's file manifest (before a re-walk), together with everything the previous
+    /// walk claimed about completeness.
+    ///
+    /// One transaction, and that is the whole point: a ledger that outlived its manifest would let
+    /// the next walk inherit the previous one's omissions, and an authority left standing over a
+    /// deleted ledger would read as «nothing was omitted». Manifest, ledger and every root
+    /// generation go together or not at all.
+    ///
+    /// Root registration runs here too, so a scan that predates the ledger — its `scan_root` rows
+    /// were never written, because `begin_scan` is not called on resume — can earn an authority by
+    /// re-walking. Idempotent: a scan whose roots are already registered keeps their rows, and
+    /// their generations have just been zeroed anyway.
+    pub fn clear_files(&mut self, scan_id: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM file WHERE scan_id = ?1", params![scan_id])?;
+        delete_ledger_tx(&tx, scan_id, &ClearScope::WholeScan)?;
+        zero_generations_tx(&tx, scan_id, None)?;
+        let registration = ensure_roots_tx(&tx, scan_id)?;
+        tx.commit()?;
+        log_registration(scan_id, &registration);
         Ok(())
     }
 
@@ -3521,6 +3558,533 @@ fn prefix_bounds(dir: &Path) -> (String, String) {
         return (String::from("/"), String::from("0"));
     }
     (format!("{s}/"), format!("{s}0"))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The omission ledger.
+//
+// Inert in R3A: the schema and this API exist, but nothing in a production build records an
+// omission or asks for a verdict yet. R3B starts producing, R3D starts consuming, and the
+// `allow(dead_code)` goes away with them — the same shape `model::plan` shipped in with R2D-C5-1.
+// ---------------------------------------------------------------------------------------------
+
+/// What a clear operation covers.
+enum ClearScope {
+    /// Every root of the scan.
+    WholeScan,
+    /// One root and everything under it.
+    Root(PathKey),
+    /// One directory of one root, and everything under that directory.
+    Subtree { root: PathKey, directory: PathKey },
+}
+
+// Test-only: fail the Nth row insert of a ledger commit, from INSIDE the transaction.
+//
+// Thread-local and one-shot, the same design the walk's fault injection uses and for the same
+// reason: a rollback assertion has to be about a failure that happens after real rows were
+// written, not about validation refusing the call before it ever opened a transaction. Absent
+// from every non-test build.
+#[cfg(test)]
+thread_local! {
+    static LEDGER_INSERT_FAULT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Arms the insert fault for this thread and disarms it on drop.
+#[cfg(test)]
+struct LedgerInsertFault;
+
+#[cfg(test)]
+impl LedgerInsertFault {
+    /// Fails the insert that follows `survivors` successful ones.
+    fn after(survivors: u32) -> Self {
+        LEDGER_INSERT_FAULT.with(|slot| slot.set(Some(survivors)));
+        LedgerInsertFault
+    }
+
+    /// Whether the armed fault is still waiting — a fault that never fired means the test proved
+    /// nothing about rollback.
+    fn pending(&self) -> bool {
+        LEDGER_INSERT_FAULT.with(|slot| slot.get().is_some())
+    }
+}
+
+#[cfg(test)]
+impl Drop for LedgerInsertFault {
+    fn drop(&mut self) {
+        LEDGER_INSERT_FAULT.with(|slot| slot.set(None));
+    }
+}
+
+/// Consumes one step of an armed insert fault, if any.
+#[cfg(test)]
+fn take_insert_fault() -> bool {
+    LEDGER_INSERT_FAULT.with(|slot| match slot.get() {
+        Some(0) => {
+            slot.set(None);
+            true
+        }
+        Some(remaining) => {
+            slot.set(Some(remaining - 1));
+            false
+        }
+        None => false,
+    })
+}
+
+/// Reports a registration outcome once, where an operator can see it. An unavailable authority is
+/// an expected state of the operator's own configuration, not a failure — the scan runs exactly as
+/// it always did and simply cannot claim anything about completeness.
+fn log_registration(scan_id: i64, registration: &RootRegistration) {
+    match registration {
+        RootRegistration::Registered { roots } => {
+            tracing::debug!("scan {scan_id}: {roots} completeness root(s) registered")
+        }
+        RootRegistration::Unavailable(why) => tracing::info!(
+            "scan {scan_id}: directory completeness will be reported as unknown — {}",
+            why.explain()
+        ),
+    }
+}
+
+/// The scan's roots, as persisted in its own configuration.
+fn persisted_roots_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<Vec<PathBuf>> {
+    let json: String = tx.query_row(
+        "SELECT config_json FROM scan WHERE id = ?1",
+        params![scan_id],
+        |row| row.get(0),
+    )?;
+    let config: ScanConfig = serde_json::from_str(&json)?;
+    Ok(config.roots)
+}
+
+/// The scan's registered authorities: normalized root key and its generation.
+fn registered_roots_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<Vec<(PathKey, i64)>> {
+    let mut stmt = tx.prepare(
+        "SELECT root_key, generation FROM scan_root WHERE scan_id = ?1 ORDER BY root_key",
+    )?;
+    let rows = stmt.query_map(params![scan_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (raw, generation) = row?;
+        if generation < 0 {
+            return Err(AppError::msg(format!(
+                "dedcom.db holds a corrupt completeness generation ({generation}); rescan, or move the old dedcom.db aside."
+            )));
+        }
+        out.push((PathKey::from_stored(&raw)?, generation));
+    }
+    Ok(out)
+}
+
+/// Registers the scan's roots as completeness authorities, idempotently.
+///
+/// All-or-nothing: if any configured root has no lexical key, or two keys overlap once normalized,
+/// nothing is written and the scan simply has no authority. Refusing to start the scan instead
+/// would turn a configuration that works today into a hard error, and this is a verdict about
+/// completeness, not a gate on scanning.
+///
+/// Existing rows keep their generation — re-registration must not silently re-trust or re-doubt a
+/// root. A row for a root that is no longer configured is removed together with its ledger rows;
+/// the configuration cannot change today, but a row nothing can validate is worse than no row.
+fn ensure_roots_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<RootRegistration> {
+    let roots = persisted_roots_tx(tx, scan_id)?;
+    if roots.is_empty() {
+        return Ok(RootRegistration::Unavailable(AuthorityUnavailable::NoRoots));
+    }
+
+    let mut keys: Vec<PathKey> = Vec::with_capacity(roots.len());
+    for root in &roots {
+        match PathKey::new(root) {
+            Some(key) => keys.push(key),
+            None => {
+                return Ok(RootRegistration::Unavailable(
+                    AuthorityUnavailable::UnkeyableRoot {
+                        given: root.display().to_string(),
+                    },
+                ))
+            }
+        }
+    }
+    // Root validation compares canonicalized paths and skips the comparison entirely when either
+    // path cannot be resolved, so a pair that does not exist yet reaches this point undetected.
+    // Lexically overlapping keys would attribute one directory to two roots, so they get no
+    // authority at all.
+    for (index, outer) in keys.iter().enumerate() {
+        for inner in keys.iter().skip(index + 1) {
+            if inner.is_at_or_under(outer) || outer.is_at_or_under(inner) {
+                let (outer, inner) = if inner.is_at_or_under(outer) {
+                    (outer, inner)
+                } else {
+                    (inner, outer)
+                };
+                return Ok(RootRegistration::Unavailable(
+                    AuthorityUnavailable::AmbiguousRoots {
+                        outer: outer.as_str().to_string(),
+                        inner: inner.as_str().to_string(),
+                    },
+                ));
+            }
+        }
+    }
+
+    for (stored, _) in registered_roots_tx(tx, scan_id)? {
+        if !keys.contains(&stored) {
+            tx.execute(
+                "DELETE FROM dir_omission WHERE scan_id = ?1 AND root_key = ?2",
+                params![scan_id, stored.as_str()],
+            )?;
+            tx.execute(
+                "DELETE FROM scan_root WHERE scan_id = ?1 AND root_key = ?2",
+                params![scan_id, stored.as_str()],
+            )?;
+        }
+    }
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR IGNORE INTO scan_root(scan_id, root_key, generation) VALUES (?1, ?2, 0)",
+        )?;
+        for key in &keys {
+            stmt.execute(params![scan_id, key.as_str()])?;
+        }
+    }
+    Ok(RootRegistration::Registered { roots: keys.len() })
+}
+
+/// Zeroes the generation of one root, or of every root of the scan. Always issued in the same
+/// transaction as the delete it accompanies: an authority left standing over deleted rows is
+/// exactly the window that reads as «nothing was omitted here».
+fn zero_generations_tx(tx: &Transaction<'_>, scan_id: i64, root: Option<&PathKey>) -> Result<()> {
+    match root {
+        Some(key) => tx.execute(
+            "UPDATE scan_root SET generation = 0 WHERE scan_id = ?1 AND root_key = ?2",
+            params![scan_id, key.as_str()],
+        )?,
+        None => tx.execute(
+            "UPDATE scan_root SET generation = 0 WHERE scan_id = ?1",
+            params![scan_id],
+        )?,
+    };
+    Ok(())
+}
+
+/// Deletes ledger rows in one scope.
+fn delete_ledger_tx(tx: &Transaction<'_>, scan_id: i64, scope: &ClearScope) -> Result<()> {
+    match scope {
+        ClearScope::WholeScan => {
+            tx.execute(
+                "DELETE FROM dir_omission WHERE scan_id = ?1",
+                params![scan_id],
+            )?;
+        }
+        ClearScope::Root(root) => {
+            tx.execute(
+                "DELETE FROM dir_omission WHERE scan_id = ?1 AND root_key = ?2",
+                params![scan_id, root.as_str()],
+            )?;
+        }
+        ClearScope::Subtree { root, directory } => {
+            let (lo, hi) = directory.subtree_bounds();
+            tx.execute(
+                "DELETE FROM dir_omission
+                  WHERE scan_id = ?1 AND root_key = ?2
+                    AND (dir_key = ?3 OR (dir_key >= ?4 AND dir_key < ?5))",
+                params![scan_id, root.as_str(), directory.as_str(), lo, hi],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The generation a new snapshot takes: one above anything the scan has ever used.
+///
+/// Reads both tables, because a row must never be able to claim a generation the authority has
+/// already left behind. Checked — an authority sitting at `i64::MAX` refuses to advance rather
+/// than wrapping into a generation some older row already carries.
+fn next_generation_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<i64> {
+    let highest: i64 = tx.query_row(
+        "SELECT MAX(used) FROM (
+             SELECT COALESCE(MAX(generation), 0) AS used FROM scan_root    WHERE scan_id = ?1
+             UNION ALL
+             SELECT COALESCE(MAX(generation), 0) AS used FROM dir_omission WHERE scan_id = ?1
+         )",
+        params![scan_id],
+        |row| row.get(0),
+    )?;
+    highest.checked_add(1).ok_or_else(|| {
+        AppError::msg(
+            "this scan's completeness generation cannot advance any further; rescan into a fresh session",
+        )
+    })
+}
+
+/// Reads the verdicts for `dirs` from an open transaction.
+///
+/// The production query helper: the public method is this function plus the transaction that
+/// makes it a snapshot, and the concurrency test drives exactly this, so a passing test cannot be
+/// about a query that merely resembles the real one.
+fn directory_completeness_tx(
+    tx: &Transaction<'_>,
+    scan_id: i64,
+    dirs: &[&Path],
+) -> Result<HashMap<PathBuf, DirCompleteness>> {
+    let roots = registered_roots_tx(tx, scan_id)?;
+    let mut stmt = tx.prepare(
+        "SELECT reason, SUM(event_count) FROM dir_omission
+          WHERE scan_id = ?1 AND root_key = ?2 AND generation = ?3
+            AND (dir_key = ?4 OR (dir_key >= ?5 AND dir_key < ?6))
+          GROUP BY reason
+          ORDER BY reason",
+    )?;
+
+    let mut out = HashMap::with_capacity(dirs.len());
+    for dir in dirs {
+        let verdict = match PathKey::new(dir) {
+            None => DirCompleteness::Unknown,
+            Some(key) => {
+                // Exactly one root may own a directory. Registration refuses an overlapping set,
+                // so a second match cannot arise from a scan this build wrote; if one is there
+                // anyway, refusing to choose is the only safe answer.
+                let mut owning = roots.iter().filter(|(root, _)| key.is_at_or_under(root));
+                match (owning.next(), owning.next()) {
+                    (Some((root, generation)), None) if *generation > 0 => {
+                        let (lo, hi) = key.subtree_bounds();
+                        let rows = stmt.query_map(
+                            params![scan_id, root.as_str(), generation, key.as_str(), lo, hi],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                        )?;
+                        let mut summary = OmissionSummary::default();
+                        for row in rows {
+                            let (raw, total) = row?;
+                            // An unrecognized reason is never folded into «complete»: the public
+                            // result is an error, so a future value cannot make a directory look
+                            // whole to a build that does not understand it.
+                            let reason = OmissionReason::parse(&raw).ok_or_else(|| {
+                                AppError::msg(format!(
+                                    "dedcom.db records an omission reason this build does not know ({}); upgrade dedcom, or move the old dedcom.db aside.",
+                                    crate::textsan::terminal(&raw)
+                                ))
+                            })?;
+                            summary.add(reason, EventCount::from_i64(total)?)?;
+                        }
+                        if summary.is_empty() {
+                            DirCompleteness::Complete
+                        } else {
+                            DirCompleteness::Incomplete(summary)
+                        }
+                    }
+                    _ => DirCompleteness::Unknown,
+                }
+            }
+        };
+        out.insert(dir.to_path_buf(), verdict);
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
+impl ScanStore {
+    /// Registers the scan's roots as completeness authorities and reports what happened.
+    ///
+    /// The outcome is typed rather than an error: `Unavailable` is an expected state of the
+    /// operator's configuration, while a SQLite, I/O or constraint failure stays an `Err`. Folding
+    /// the two together would let a broken checkpoint pass for a merely unkeyable one.
+    pub fn ensure_scan_roots(&mut self, scan_id: i64) -> Result<RootRegistration> {
+        let tx = self.conn.transaction()?;
+        let registration = ensure_roots_tx(&tx, scan_id)?;
+        tx.commit()?;
+        log_registration(scan_id, &registration);
+        Ok(registration)
+    }
+
+    /// Whether this root currently carries a trusted ledger, and at which generation. `None` when
+    /// the root is not registered at all.
+    pub fn root_generation(&self, scan_id: i64, root: &Path) -> Result<Option<i64>> {
+        let Some(key) = PathKey::new(root) else {
+            return Ok(None);
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        let found = registered_roots_tx(&tx, scan_id)?
+            .into_iter()
+            .find(|(stored, _)| *stored == key)
+            .map(|(_, generation)| generation);
+        Ok(found)
+    }
+
+    /// Writes the whole scan's omission ledger and advances every root's generation, in ONE
+    /// transaction.
+    ///
+    /// `per_root` must carry EXACTLY the scan's registered root keys. A root that omitted nothing
+    /// must still appear, with an empty count map: that explicit entry is the only thing proving
+    /// the root was walked under the contract at all. A missing root, an extra root, or a scan
+    /// with no registered roots refuses the whole call and writes nothing — a subset could
+    /// otherwise buy trust for roots nobody looked at.
+    ///
+    /// Idempotent: the scan's previous rows are replaced wholesale, so committing the same walk
+    /// twice leaves the same ledger (at a new generation).
+    pub fn commit_omissions(
+        &mut self,
+        scan_id: i64,
+        per_root: &BTreeMap<PathKey, OmissionCounts>,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+
+        let registered: Vec<PathKey> = registered_roots_tx(&tx, scan_id)?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        if registered.is_empty() {
+            return Err(AppError::msg(format!(
+                "scan {scan_id} has no registered completeness roots, so its omission ledger cannot be committed"
+            )));
+        }
+        for key in &registered {
+            if !per_root.contains_key(key) {
+                return Err(AppError::msg(format!(
+                    "the omission ledger is missing scan root {}; every selected root must be reported, with an empty count when nothing was omitted",
+                    crate::textsan::terminal(key.as_str())
+                )));
+            }
+        }
+        for key in per_root.keys() {
+            if !registered.contains(key) {
+                return Err(AppError::msg(format!(
+                    "the omission ledger names {}, which is not a selected root of scan {scan_id}",
+                    crate::textsan::terminal(key.as_str())
+                )));
+            }
+        }
+        for (root, counts) in per_root {
+            for (directory, _, _) in counts.iter() {
+                if !directory.is_at_or_under(root) {
+                    return Err(AppError::msg(format!(
+                        "the omission ledger places {} outside its scan root {}",
+                        crate::textsan::terminal(directory.as_str()),
+                        crate::textsan::terminal(root.as_str())
+                    )));
+                }
+            }
+        }
+
+        let generation = next_generation_tx(&tx, scan_id)?;
+        delete_ledger_tx(&tx, scan_id, &ClearScope::WholeScan)?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO dir_omission
+                     (scan_id, root_key, dir_key, reason, event_count, generation)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for (root, counts) in per_root {
+                for (directory, reason, count) in counts.iter() {
+                    #[cfg(test)]
+                    if take_insert_fault() {
+                        return Err(AppError::msg("injected ledger insert fault"));
+                    }
+                    stmt.execute(params![
+                        scan_id,
+                        root.as_str(),
+                        directory.as_str(),
+                        reason.as_str(),
+                        count.to_i64()?,
+                        generation,
+                    ])?;
+                }
+            }
+        }
+        tx.execute(
+            "UPDATE scan_root SET generation = ?2 WHERE scan_id = ?1",
+            params![scan_id, generation],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Invalidates one subtree before it is re-walked: its rows go, and so does its root's
+    /// authority. The subtree is part of that root's snapshot, so once a piece is missing the
+    /// snapshot is no longer whole — leaving the generation alone would publish the remaining
+    /// rows as a complete answer.
+    pub fn clear_omissions_under(&mut self, scan_id: i64, directory: &Path) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let key = PathKey::new(directory).ok_or_else(|| {
+            AppError::msg(format!(
+                "{} cannot be used as a completeness key",
+                crate::textsan::terminal(&directory.display().to_string())
+            ))
+        })?;
+        let root = registered_roots_tx(&tx, scan_id)?
+            .into_iter()
+            .map(|(root, _)| root)
+            .find(|root| key.is_at_or_under(root))
+            .ok_or_else(|| {
+                AppError::msg(format!(
+                    "{} is not inside any selected root of scan {scan_id}",
+                    crate::textsan::terminal(key.as_str())
+                ))
+            })?;
+        delete_ledger_tx(
+            &tx,
+            scan_id,
+            &ClearScope::Subtree {
+                root: root.clone(),
+                directory: key,
+            },
+        )?;
+        zero_generations_tx(&tx, scan_id, Some(&root))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Invalidates one root entirely — the replacement case. Other roots keep their authority,
+    /// which is why the authority is per root at all.
+    pub fn clear_root_omissions(&mut self, scan_id: i64, root: &Path) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let key = PathKey::new(root).ok_or_else(|| {
+            AppError::msg(format!(
+                "{} cannot be used as a completeness key",
+                crate::textsan::terminal(&root.display().to_string())
+            ))
+        })?;
+        if !registered_roots_tx(&tx, scan_id)?
+            .iter()
+            .any(|(stored, _)| *stored == key)
+        {
+            return Err(AppError::msg(format!(
+                "{} is not a selected root of scan {scan_id}",
+                crate::textsan::terminal(key.as_str())
+            )));
+        }
+        delete_ledger_tx(&tx, scan_id, &ClearScope::Root(key.clone()))?;
+        zero_generations_tx(&tx, scan_id, Some(&key))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Invalidates the whole scan's ledger: every row goes and every root loses its authority.
+    pub fn clear_scan_omissions(&mut self, scan_id: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        delete_ledger_tx(&tx, scan_id, &ClearScope::WholeScan)?;
+        zero_generations_tx(&tx, scan_id, None)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// What the checkpoint knows about each of `dirs`.
+    ///
+    /// Takes no root set: it reads the scan's own registered roots, so a consumer cannot supply
+    /// the wrong ones. Everything — the roots, their generations and every requested directory —
+    /// is read inside ONE deferred transaction, which in WAL is a real snapshot; preparing
+    /// statements in a shared scope is not. Between two autocommit reads another copy of the
+    /// program can commit a whole new generation, and an answer assembled half from each is an
+    /// answer no state of the checkpoint ever had.
+    pub fn directory_completeness(
+        &self,
+        scan_id: i64,
+        dirs: &[&Path],
+    ) -> Result<HashMap<PathBuf, DirCompleteness>> {
+        let snapshot = self.conn.unchecked_transaction()?;
+        directory_completeness_tx(&snapshot, scan_id, dirs)
+    }
 }
 
 #[cfg(test)]
@@ -8762,5 +9326,1085 @@ mod tests {
             LinkCount::Known(4)
         );
         assert!(link_count_from_sql(&Value::Integer(-1)).is_err());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The omission ledger.
+    // -----------------------------------------------------------------------------------------
+
+    fn key(path: &str) -> PathKey {
+        PathKey::new(Path::new(path)).expect("a keyable path")
+    }
+
+    /// A store with one scan rooted at the given paths.
+    fn ledger_store(roots: &[&str]) -> (ScanStore, i64) {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let config = ScanConfig::new(roots.iter().map(PathBuf::from).collect());
+        let scan_id = store.begin_scan(&config).unwrap();
+        (store, scan_id)
+    }
+
+    /// One root's counts, from a list of `(directory, reason)` events.
+    fn counts(events: &[(&str, OmissionReason)]) -> OmissionCounts {
+        let mut out = OmissionCounts::new();
+        for (dir, reason) in events {
+            out.bump(key(dir), *reason).unwrap();
+        }
+        out
+    }
+
+    /// A whole-scan ledger for one root.
+    fn one_root(
+        root: &str,
+        events: &[(&str, OmissionReason)],
+    ) -> BTreeMap<PathKey, OmissionCounts> {
+        BTreeMap::from([(key(root), counts(events))])
+    }
+
+    fn verdict(store: &ScanStore, scan_id: i64, dir: &str) -> DirCompleteness {
+        store
+            .directory_completeness(scan_id, &[Path::new(dir)])
+            .unwrap()
+            .remove(Path::new(dir))
+            .expect("every requested directory gets a verdict")
+    }
+
+    /// A root that omitted nothing is `Complete` — but only because it was reported explicitly.
+    #[test]
+    fn an_explicitly_empty_root_is_complete() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(scan_id, &one_root("/tank", &[]))
+            .unwrap();
+        assert_eq!(verdict(&store, scan_id, "/tank"), DirCompleteness::Complete);
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/a"),
+            DirCompleteness::Complete
+        );
+    }
+
+    /// The same empty ledger, before any commit, is NOT complete. Emptiness is never the signal:
+    /// the authority is.
+    #[test]
+    fn an_uncommitted_scan_is_unknown_not_complete() {
+        let (store, scan_id) = ledger_store(&["/tank"]);
+        assert_eq!(verdict(&store, scan_id, "/tank"), DirCompleteness::Unknown);
+        assert_eq!(
+            store.root_generation(scan_id, Path::new("/tank")).unwrap(),
+            Some(0)
+        );
+    }
+
+    /// An empty map proves nothing about any root, so it cannot buy an authority.
+    #[test]
+    fn an_empty_ledger_map_is_refused() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        let err = store
+            .commit_omissions(scan_id, &BTreeMap::new())
+            .expect_err("an empty map must not set the authority");
+        assert!(err.to_string().contains("missing scan root"), "{err}");
+        assert_eq!(verdict(&store, scan_id, "/tank"), DirCompleteness::Unknown);
+    }
+
+    /// A subset of a multi-root scan is refused: reporting one root says nothing about the other.
+    #[test]
+    fn a_subset_of_the_root_set_is_refused() {
+        let (mut store, scan_id) = ledger_store(&["/tank/one", "/tank/two"]);
+        let err = store
+            .commit_omissions(scan_id, &one_root("/tank/one", &[]))
+            .expect_err("a subset must be refused");
+        assert!(err.to_string().contains("/tank/two"), "{err}");
+        for dir in ["/tank/one", "/tank/two"] {
+            assert_eq!(verdict(&store, scan_id, dir), DirCompleteness::Unknown);
+        }
+    }
+
+    /// A root nobody selected cannot join the ledger either.
+    #[test]
+    fn an_extra_root_is_refused() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        let mut per_root = one_root("/tank", &[]);
+        per_root.insert(key("/other"), OmissionCounts::new());
+        let err = store
+            .commit_omissions(scan_id, &per_root)
+            .expect_err("an unselected root must be refused");
+        assert!(err.to_string().contains("/other"), "{err}");
+        assert_eq!(verdict(&store, scan_id, "/tank"), DirCompleteness::Unknown);
+    }
+
+    /// A directory outside its declared root is refused before anything is written.
+    #[test]
+    fn a_directory_outside_its_root_is_refused() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        let err = store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/elsewhere/x", OmissionReason::MinSize)]),
+            )
+            .expect_err("a directory outside the root must be refused");
+        assert!(err.to_string().contains("outside its scan root"), "{err}");
+        assert_eq!(verdict(&store, scan_id, "/tank"), DirCompleteness::Unknown);
+    }
+
+    /// A root whose spelling has no lexical key leaves the scan without an authority — and the
+    /// scan itself is created exactly as before.
+    #[test]
+    fn an_unkeyable_root_yields_no_authority_and_still_scans() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let config = ScanConfig::new(vec![PathBuf::from("/tank/../tank")]);
+        let scan_id = store.begin_scan(&config).unwrap();
+        assert_eq!(
+            store.load_config(scan_id).unwrap().roots,
+            vec![PathBuf::from("/tank/../tank")],
+            "the scan exists and keeps its configuration verbatim"
+        );
+        assert!(matches!(
+            store.ensure_scan_roots(scan_id).unwrap(),
+            RootRegistration::Unavailable(AuthorityUnavailable::UnkeyableRoot { .. })
+        ));
+        assert_eq!(verdict(&store, scan_id, "/tank"), DirCompleteness::Unknown);
+        assert!(store.commit_omissions(scan_id, &BTreeMap::new()).is_err());
+    }
+
+    /// Root validation skips its canonical comparison when a path cannot be resolved, so two
+    /// overlapping roots that do not exist yet reach the ledger. Attributing a directory to two
+    /// roots is impossible, so the scan gets no authority at all.
+    #[test]
+    fn lexically_overlapping_roots_yield_no_authority() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let config = ScanConfig::new(vec![
+            PathBuf::from("/nowhere/deep"),
+            PathBuf::from("/nowhere"),
+        ]);
+        let scan_id = store.begin_scan(&config).unwrap();
+        match store.ensure_scan_roots(scan_id).unwrap() {
+            RootRegistration::Unavailable(AuthorityUnavailable::AmbiguousRoots {
+                outer,
+                inner,
+            }) => assert_eq!(
+                (outer.as_str(), inner.as_str()),
+                ("/nowhere", "/nowhere/deep")
+            ),
+            other => panic!("overlapping roots must not register: {other:?}"),
+        }
+        assert_eq!(
+            verdict(&store, scan_id, "/nowhere/deep"),
+            DirCompleteness::Unknown
+        );
+    }
+
+    /// Two spellings that normalize to one key are the same root; the pair is ambiguous.
+    #[test]
+    fn two_spellings_of_one_root_yield_no_authority() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let config = ScanConfig::new(vec![PathBuf::from("/nowhere"), PathBuf::from("/nowhere/")]);
+        let scan_id = store.begin_scan(&config).unwrap();
+        assert!(matches!(
+            store.ensure_scan_roots(scan_id).unwrap(),
+            RootRegistration::Unavailable(AuthorityUnavailable::AmbiguousRoots { .. })
+        ));
+    }
+
+    /// A trailing slash on an ordinary root is a spelling, not a different root: it keys to the
+    /// same string the walk's directories key to, so containment works.
+    #[test]
+    fn a_trailing_slash_root_still_owns_its_directories() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let config = ScanConfig::new(vec![PathBuf::from("/tank/root/")]);
+        let scan_id = store.begin_scan(&config).unwrap();
+        assert!(store.ensure_scan_roots(scan_id).unwrap().is_registered());
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank/root", &[("/tank/root/sub", OmissionReason::MinSize)]),
+            )
+            .unwrap();
+        assert!(matches!(
+            verdict(&store, scan_id, "/tank/root/sub"),
+            DirCompleteness::Incomplete(_)
+        ));
+        assert_eq!(
+            store
+                .root_generation(scan_id, Path::new("/tank/root/"))
+                .unwrap(),
+            Some(1),
+            "both spellings resolve to the one authority"
+        );
+    }
+
+    /// Every reason round-trips through storage and comes back typed.
+    #[test]
+    fn each_reason_round_trips_through_the_ledger() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        let events: Vec<(String, OmissionReason)> = OmissionReason::ALL
+            .into_iter()
+            .map(|reason| (format!("/tank/{}", reason.as_str()), reason))
+            .collect();
+        let mut per_dir = OmissionCounts::new();
+        for (dir, reason) in &events {
+            per_dir.bump(key(dir), *reason).unwrap();
+        }
+        store
+            .commit_omissions(scan_id, &BTreeMap::from([(key("/tank"), per_dir)]))
+            .unwrap();
+
+        for (dir, reason) in &events {
+            match verdict(&store, scan_id, dir) {
+                DirCompleteness::Incomplete(summary) => {
+                    let recorded: Vec<_> = summary.per_reason().collect();
+                    assert_eq!(
+                        recorded,
+                        vec![(*reason, EventCount::ONE)],
+                        "{dir} must record exactly its own reason"
+                    );
+                }
+                other => panic!("{dir} must be incomplete, got {other:?}"),
+            }
+        }
+    }
+
+    /// Repeated events of one reason aggregate into one row with a count; two reasons in one
+    /// directory stay two rows.
+    #[test]
+    fn repeated_events_aggregate_per_directory_and_reason() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root(
+                    "/tank",
+                    &[
+                        ("/tank/a", OmissionReason::MinSize),
+                        ("/tank/a", OmissionReason::MinSize),
+                        ("/tank/a", OmissionReason::MinSize),
+                        ("/tank/a", OmissionReason::NonUtf8),
+                    ],
+                ),
+            )
+            .unwrap();
+
+        let rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM dir_omission WHERE scan_id = ?1",
+                params![scan_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2, "one row per (directory, reason)");
+
+        match verdict(&store, scan_id, "/tank/a") {
+            DirCompleteness::Incomplete(summary) => {
+                assert_eq!(
+                    summary.per_reason().collect::<Vec<_>>(),
+                    vec![
+                        (OmissionReason::MinSize, EventCount::new(3).unwrap()),
+                        (OmissionReason::NonUtf8, EventCount::ONE),
+                    ]
+                );
+                assert_eq!(summary.known_omitted_files().unwrap(), 4);
+                assert!(!summary.has_unknown_cardinality());
+            }
+            other => panic!("expected incomplete, got {other:?}"),
+        }
+    }
+
+    /// Two disjoint roots are judged independently: one root's omission never reaches the other.
+    #[test]
+    fn two_independent_roots_do_not_see_each_other() {
+        let (mut store, scan_id) = ledger_store(&["/tank/one", "/tank/two"]);
+        let mut per_root = one_root("/tank/one", &[("/tank/one/a", OmissionReason::MinSize)]);
+        per_root.insert(key("/tank/two"), OmissionCounts::new());
+        store.commit_omissions(scan_id, &per_root).unwrap();
+
+        assert!(matches!(
+            verdict(&store, scan_id, "/tank/one"),
+            DirCompleteness::Incomplete(_)
+        ));
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/two"),
+            DirCompleteness::Complete
+        );
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/two/a"),
+            DirCompleteness::Complete
+        );
+    }
+
+    /// Propagation reaches every ancestor up to and including the root, and stops there: the
+    /// directory above the root belongs to no root and has no verdict.
+    #[test]
+    fn an_omission_propagates_up_to_the_root_and_no_further() {
+        let (mut store, scan_id) = ledger_store(&["/tank/root"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root(
+                    "/tank/root",
+                    &[("/tank/root/a/b/c/d", OmissionReason::MinSize)],
+                ),
+            )
+            .unwrap();
+
+        for dir in [
+            "/tank/root/a/b/c/d",
+            "/tank/root/a/b/c",
+            "/tank/root/a/b",
+            "/tank/root/a",
+            "/tank/root",
+        ] {
+            assert!(
+                matches!(
+                    verdict(&store, scan_id, dir),
+                    DirCompleteness::Incomplete(_)
+                ),
+                "{dir} must see the omission"
+            );
+        }
+        // Above the root, and a sibling that merely shares a prefix.
+        assert_eq!(verdict(&store, scan_id, "/tank"), DirCompleteness::Unknown);
+        assert_eq!(verdict(&store, scan_id, "/"), DirCompleteness::Unknown);
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/rootless"),
+            DirCompleteness::Unknown
+        );
+        // And a sibling INSIDE the root is complete, not tainted by its neighbour.
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/root/a/b/c/d-other"),
+            DirCompleteness::Complete
+        );
+    }
+
+    /// A walk error attributed to the root itself — the case where the iterator error carried no
+    /// pathname at all. Every directory of that root becomes incomplete, and the count is never
+    /// presented as a number of files.
+    #[test]
+    fn an_unattributable_walk_error_is_recorded_at_the_root() {
+        let (mut store, scan_id) = ledger_store(&["/tank/root"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank/root", &[("/tank/root", OmissionReason::WalkError)]),
+            )
+            .unwrap();
+
+        match verdict(&store, scan_id, "/tank/root") {
+            DirCompleteness::Incomplete(summary) => {
+                assert!(summary.has_unknown_cardinality());
+                assert_eq!(summary.known_omitted_files().unwrap(), 0);
+                assert_eq!(summary.unknown_cardinality_events(), 1);
+            }
+            other => panic!("expected incomplete, got {other:?}"),
+        }
+        // A directory below it is complete on its own evidence: the error sits at the root, which
+        // is not under the child.
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/root/sub"),
+            DirCompleteness::Complete
+        );
+    }
+
+    /// Clearing a subtree invalidates that root — and only that root.
+    #[test]
+    fn a_subtree_clear_invalidates_its_root_and_leaves_the_other_alone() {
+        let (mut store, scan_id) = ledger_store(&["/tank/one", "/tank/two"]);
+        let mut per_root = one_root("/tank/one", &[("/tank/one/a", OmissionReason::MinSize)]);
+        per_root.insert(
+            key("/tank/two"),
+            counts(&[("/tank/two/b", OmissionReason::NonUtf8)]),
+        );
+        store.commit_omissions(scan_id, &per_root).unwrap();
+
+        store
+            .clear_omissions_under(scan_id, Path::new("/tank/one/a"))
+            .unwrap();
+
+        // The cleared root is unknown, NOT complete: the rows went and the authority went with
+        // them, in one transaction.
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/one"),
+            DirCompleteness::Unknown
+        );
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/one/a"),
+            DirCompleteness::Unknown
+        );
+        assert_eq!(
+            store
+                .root_generation(scan_id, Path::new("/tank/one"))
+                .unwrap(),
+            Some(0)
+        );
+        // The untouched root keeps both its rows and its trust.
+        assert!(matches!(
+            verdict(&store, scan_id, "/tank/two/b"),
+            DirCompleteness::Incomplete(_)
+        ));
+        assert_eq!(
+            store
+                .root_generation(scan_id, Path::new("/tank/two"))
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    /// The same guarantee across a reopen: a crash right after a partial clear cannot leave a
+    /// trusted-empty window, because the zeroed generation was committed with the delete.
+    #[test]
+    fn a_crash_after_a_partial_clear_leaves_no_trusted_empty_window() {
+        let _role = role_guard();
+        let dir = temp_state_dir("ledger_clear_crash");
+        let db = dir.join("dedcom.db");
+        let scan_id = {
+            let mut store = ScanStore::open_writable(&db).unwrap();
+            let (scan_id, _) = (
+                store
+                    .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank")]))
+                    .unwrap(),
+                (),
+            );
+            store
+                .commit_omissions(
+                    scan_id,
+                    &one_root("/tank", &[("/tank/a", OmissionReason::MinSize)]),
+                )
+                .unwrap();
+            store
+                .clear_omissions_under(scan_id, Path::new("/tank/a"))
+                .unwrap();
+            scan_id // the process ends here, as abruptly as a crash
+        };
+
+        let reopened = ScanStore::open_writable(&db).unwrap();
+        assert_eq!(
+            verdict(&reopened, scan_id, "/tank"),
+            DirCompleteness::Unknown,
+            "an empty ledger after a clear must never read as complete"
+        );
+        let rows: i64 = reopened
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM dir_omission WHERE scan_id = ?1",
+                params![scan_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "the rows really are gone");
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Replacing one root of a multi-root scan leaves the others trusted.
+    #[test]
+    fn a_root_clear_is_independent() {
+        let (mut store, scan_id) = ledger_store(&["/tank/one", "/tank/two"]);
+        let mut per_root = one_root("/tank/one", &[("/tank/one/a", OmissionReason::MinSize)]);
+        per_root.insert(key("/tank/two"), OmissionCounts::new());
+        store.commit_omissions(scan_id, &per_root).unwrap();
+
+        store
+            .clear_root_omissions(scan_id, Path::new("/tank/one"))
+            .unwrap();
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/one"),
+            DirCompleteness::Unknown
+        );
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/two"),
+            DirCompleteness::Complete
+        );
+    }
+
+    /// A whole-scan clear takes every row and every authority.
+    #[test]
+    fn a_scan_clear_invalidates_every_root() {
+        let (mut store, scan_id) = ledger_store(&["/tank/one", "/tank/two"]);
+        let mut per_root = one_root("/tank/one", &[("/tank/one/a", OmissionReason::MinSize)]);
+        per_root.insert(key("/tank/two"), OmissionCounts::new());
+        store.commit_omissions(scan_id, &per_root).unwrap();
+
+        store.clear_scan_omissions(scan_id).unwrap();
+        for dir in ["/tank/one", "/tank/two", "/tank/one/a"] {
+            assert_eq!(verdict(&store, scan_id, dir), DirCompleteness::Unknown);
+        }
+    }
+
+    /// `clear_files` is the re-walk hook: manifest and ledger go together, so the next walk cannot
+    /// inherit the previous one's omissions.
+    #[test]
+    fn clear_files_clears_the_ledger_with_the_manifest() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .record_files(scan_id, &[row("/tank/a.bin", 100, 1)])
+            .unwrap();
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/a", OmissionReason::MinSize)]),
+            )
+            .unwrap();
+
+        store.clear_files(scan_id).unwrap();
+
+        assert_eq!(store.manifest_count(scan_id).unwrap(), 0);
+        assert_eq!(verdict(&store, scan_id, "/tank"), DirCompleteness::Unknown);
+        // The root stays registered, so the next walk can earn trust again.
+        assert_eq!(
+            store.root_generation(scan_id, Path::new("/tank")).unwrap(),
+            Some(0)
+        );
+        store
+            .commit_omissions(scan_id, &one_root("/tank", &[]))
+            .unwrap();
+        assert_eq!(verdict(&store, scan_id, "/tank"), DirCompleteness::Complete);
+    }
+
+    /// A scan that predates the ledger has no `scan_root` row at all — `begin_scan` is not called
+    /// on resume. Re-walking it registers the roots, so a full re-walk can earn an authority.
+    #[test]
+    fn clear_files_registers_the_roots_of_a_scan_that_predates_the_ledger() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        // Rewind to a pre-ledger scan: the row exists, the authority never did.
+        store
+            .conn
+            .execute("DELETE FROM scan_root WHERE scan_id = ?1", params![scan_id])
+            .unwrap();
+        assert_eq!(
+            store.root_generation(scan_id, Path::new("/tank")).unwrap(),
+            None
+        );
+        assert!(
+            store
+                .commit_omissions(scan_id, &one_root("/tank", &[]))
+                .is_err(),
+            "with no authority there is nothing to commit against"
+        );
+
+        store.clear_files(scan_id).unwrap();
+
+        assert_eq!(
+            store.root_generation(scan_id, Path::new("/tank")).unwrap(),
+            Some(0)
+        );
+        store
+            .commit_omissions(scan_id, &one_root("/tank", &[]))
+            .unwrap();
+        assert_eq!(verdict(&store, scan_id, "/tank"), DirCompleteness::Complete);
+    }
+
+    /// A second commit replaces the first wholesale and advances the generation; no row of the
+    /// superseded generation survives to be read as evidence.
+    #[test]
+    fn a_second_commit_replaces_the_ledger_and_advances_the_generation() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/a", OmissionReason::MinSize)]),
+            )
+            .unwrap();
+        assert_eq!(
+            store.root_generation(scan_id, Path::new("/tank")).unwrap(),
+            Some(1)
+        );
+
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/b", OmissionReason::NonUtf8)]),
+            )
+            .unwrap();
+        assert_eq!(
+            store.root_generation(scan_id, Path::new("/tank")).unwrap(),
+            Some(2)
+        );
+
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/a"),
+            DirCompleteness::Complete,
+            "the first generation's row is gone, not merely outvoted"
+        );
+        assert!(matches!(
+            verdict(&store, scan_id, "/tank/b"),
+            DirCompleteness::Incomplete(_)
+        ));
+        let generations: Vec<i64> = store
+            .conn
+            .prepare("SELECT DISTINCT generation FROM dir_omission WHERE scan_id = ?1")
+            .unwrap()
+            .query_map(params![scan_id], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(generations, vec![2]);
+    }
+
+    /// Committing the same walk twice leaves the same ledger.
+    #[test]
+    fn committing_the_same_walk_twice_is_idempotent() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        let ledger = one_root(
+            "/tank",
+            &[
+                ("/tank/a", OmissionReason::MinSize),
+                ("/tank/a", OmissionReason::MinSize),
+                ("/tank/b", OmissionReason::WalkError),
+            ],
+        );
+        store.commit_omissions(scan_id, &ledger).unwrap();
+        let first = verdict(&store, scan_id, "/tank");
+        store.commit_omissions(scan_id, &ledger).unwrap();
+        assert_eq!(verdict(&store, scan_id, "/tank"), first);
+    }
+
+    /// An authority that cannot advance refuses, and rolls back without touching the snapshot it
+    /// already holds. Wrapping would hand a new snapshot a generation an old row already carries.
+    #[test]
+    fn a_generation_at_the_ceiling_refuses_to_advance() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/a", OmissionReason::MinSize)]),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE scan_root SET generation = ?2 WHERE scan_id = ?1",
+                params![scan_id, i64::MAX],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE dir_omission SET generation = ?2 WHERE scan_id = ?1",
+                params![scan_id, i64::MAX],
+            )
+            .unwrap();
+
+        let err = store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/b", OmissionReason::NonUtf8)]),
+            )
+            .expect_err("the generation must not wrap");
+        assert!(err.to_string().contains("cannot advance"), "{err}");
+
+        // The previous snapshot survives untouched: rows, generation and verdict.
+        assert_eq!(
+            store.root_generation(scan_id, Path::new("/tank")).unwrap(),
+            Some(i64::MAX)
+        );
+        let rows: Vec<(String, String)> = store
+            .conn
+            .prepare("SELECT dir_key, reason FROM dir_omission WHERE scan_id = ?1")
+            .unwrap()
+            .query_map(params![scan_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("/tank/a".to_string(), "min_size".to_string())],
+            "the refused commit deleted nothing"
+        );
+    }
+
+    /// The rollback is real: the fault fires INSIDE the transaction, after a row was already
+    /// inserted, so what the test proves is that the transaction unwound — not that validation
+    /// refused the call before it started.
+    #[test]
+    fn a_failure_after_the_first_insert_rolls_the_whole_commit_back() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/kept", OmissionReason::MinSize)]),
+            )
+            .unwrap();
+        let before: Vec<(String, String, i64)> = store
+            .conn
+            .prepare("SELECT dir_key, reason, generation FROM dir_omission WHERE scan_id = ?1")
+            .unwrap()
+            .query_map(params![scan_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(before.len(), 1);
+
+        let fault = LedgerInsertFault::after(1);
+        let err = store
+            .commit_omissions(
+                scan_id,
+                &one_root(
+                    "/tank",
+                    &[
+                        ("/tank/a", OmissionReason::MinSize),
+                        ("/tank/b", OmissionReason::NonUtf8),
+                        ("/tank/c", OmissionReason::WalkError),
+                    ],
+                ),
+            )
+            .expect_err("the injected fault must fail the commit");
+        assert!(err.to_string().contains("injected"), "{err}");
+        assert!(
+            !fault.pending(),
+            "the fault must have fired — an unfired fault proves nothing about rollback"
+        );
+
+        let after: Vec<(String, String, i64)> = store
+            .conn
+            .prepare("SELECT dir_key, reason, generation FROM dir_omission WHERE scan_id = ?1")
+            .unwrap()
+            .query_map(params![scan_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            after, before,
+            "the previous generation survives the rolled-back commit whole"
+        );
+        assert_eq!(
+            store.root_generation(scan_id, Path::new("/tank")).unwrap(),
+            Some(1),
+            "and the authority never advanced"
+        );
+    }
+
+    /// `purge_scan` removes the ledger and the authority with everything else, and leaves another
+    /// scan alone.
+    #[test]
+    fn purge_scan_removes_the_ledger_and_the_authority() {
+        let (mut store, doomed) = ledger_store(&["/tank/one"]);
+        let survivor = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank/two")]))
+            .unwrap();
+        store
+            .commit_omissions(
+                doomed,
+                &one_root("/tank/one", &[("/tank/one/a", OmissionReason::MinSize)]),
+            )
+            .unwrap();
+        store
+            .commit_omissions(
+                survivor,
+                &one_root("/tank/two", &[("/tank/two/b", OmissionReason::NonUtf8)]),
+            )
+            .unwrap();
+
+        store.purge_scan(doomed).unwrap();
+
+        for (table, count) in [("dir_omission", 0i64), ("scan_root", 0)] {
+            let found: i64 = store
+                .conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE scan_id = ?1"),
+                    params![doomed],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, count, "{table} must be empty for the purged scan");
+        }
+        assert!(matches!(
+            verdict(&store, survivor, "/tank/two/b"),
+            DirCompleteness::Incomplete(_)
+        ));
+    }
+
+    /// A count no real row can hold is refused twice over: by SQLite on every write path, and by
+    /// the typed decoder if one is in the file anyway.
+    ///
+    /// The second half needs `PRAGMA ignore_check_constraints`, because the constraint really does
+    /// hold on `UPDATE` as well as `INSERT`. That pragma is exactly how a value like this arrives
+    /// in practice — an external editor or a damaged file, the same threat model `LinkCount`
+    /// guards `file.nlink` against.
+    #[test]
+    fn a_corrupt_event_count_is_refused_at_both_ends() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/a", OmissionReason::MinSize)]),
+            )
+            .unwrap();
+
+        for bad in [0i64, -1] {
+            let inserted = store.conn.execute(
+                "INSERT INTO dir_omission
+                     (scan_id, root_key, dir_key, reason, event_count, generation)
+                 VALUES (?1, '/tank', '/tank/z', 'min_size', ?2, 1)",
+                params![scan_id, bad],
+            );
+            assert!(
+                inserted.is_err(),
+                "the CHECK must refuse an inserted event_count of {bad}"
+            );
+            let updated = store.conn.execute(
+                "UPDATE dir_omission SET event_count = ?2 WHERE scan_id = ?1",
+                params![scan_id, bad],
+            );
+            assert!(
+                updated.is_err(),
+                "and an updated event_count of {bad} just the same"
+            );
+        }
+
+        // Past the constraint, as a damaged file would be: the read refuses rather than reporting
+        // a nonsense summary.
+        store
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE dir_omission SET event_count = -5 WHERE scan_id = ?1",
+                params![scan_id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .unwrap();
+
+        let err = store
+            .directory_completeness(scan_id, &[Path::new("/tank/a")])
+            .expect_err("a corrupt count must not be summarised");
+        assert!(err.to_string().contains("corrupt omission count"), "{err}");
+    }
+
+    /// A reason this build does not know keeps the directory incomplete — never complete — and the
+    /// public result is an error rather than a summary that quietly drops it.
+    #[test]
+    fn an_unknown_reason_is_an_error_not_a_complete_directory() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/a", OmissionReason::MinSize)]),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE dir_omission SET reason = 'quota_error' WHERE scan_id = ?1",
+                params![scan_id],
+            )
+            .unwrap();
+
+        let err = store
+            .directory_completeness(scan_id, &[Path::new("/tank/a")])
+            .expect_err("an unknown reason must not be summarised");
+        assert!(
+            err.to_string().contains("does not know"),
+            "the message must name the problem: {err}"
+        );
+        // The row is still there — the refusal is a read-side refusal, not a silent deletion.
+        let rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM dir_omission WHERE scan_id = ?1",
+                params![scan_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    /// A row above its root, or under a root it does not belong to, cannot be written; and a
+    /// root-keyed read would not return it in any case.
+    #[test]
+    fn a_row_outside_its_root_cannot_be_stored() {
+        let (mut store, scan_id) = ledger_store(&["/tank/one", "/tank/two"]);
+        // Above the root.
+        assert!(
+            store
+                .conn
+                .execute(
+                    "INSERT INTO dir_omission
+                         (scan_id, root_key, dir_key, reason, event_count, generation)
+                     VALUES (?1, '/tank/one', '/tank', 'min_size', 1, 1)",
+                    params![scan_id],
+                )
+                .is_err(),
+            "the CHECK must refuse a directory above its root"
+        );
+        // A prefix sibling of the root is not under it either.
+        assert!(
+            store
+                .conn
+                .execute(
+                    "INSERT INTO dir_omission
+                         (scan_id, root_key, dir_key, reason, event_count, generation)
+                     VALUES (?1, '/tank/one', '/tank/oneself/x', 'min_size', 1, 1)",
+                    params![scan_id],
+                )
+                .is_err(),
+            "the CHECK must refuse a prefix sibling"
+        );
+
+        // A row correctly under the OTHER root is invisible to a read keyed on the first.
+        let mut per_root = one_root("/tank/one", &[]);
+        per_root.insert(
+            key("/tank/two"),
+            counts(&[("/tank/two/x", OmissionReason::MinSize)]),
+        );
+        store.commit_omissions(scan_id, &per_root).unwrap();
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/one"),
+            DirCompleteness::Complete
+        );
+    }
+
+    /// SQLite's integer `sum()` raises `integer overflow` rather than returning a smaller number
+    /// or a float, so an aggregate that cannot be represented surfaces as an error.
+    #[test]
+    fn an_aggregate_that_overflows_is_an_error_not_a_wrong_number() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root(
+                    "/tank",
+                    &[
+                        ("/tank/a", OmissionReason::MinSize),
+                        ("/tank/b", OmissionReason::MinSize),
+                    ],
+                ),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE dir_omission SET event_count = ?2 WHERE scan_id = ?1",
+                params![scan_id, i64::MAX],
+            )
+            .unwrap();
+
+        let err = store
+            .directory_completeness(scan_id, &[Path::new("/tank")])
+            .expect_err("the aggregate must not silently wrap");
+        assert!(
+            err.to_string().to_lowercase().contains("overflow"),
+            "the error must name the overflow: {err}"
+        );
+    }
+
+    /// The reader really is one snapshot. Connection A opens it, reads one directory, and only
+    /// then does connection B replace the whole ledger and commit. A's second read must still be
+    /// the generation it started with — an answer half from each is an answer the checkpoint never
+    /// held.
+    ///
+    /// Drives `directory_completeness_tx`, the exact helper the public method uses: a hand-written
+    /// parallel query would prove something about the test, not about production.
+    #[test]
+    fn one_reader_snapshot_cannot_mix_two_generations() {
+        let _role = role_guard();
+        let dir = temp_state_dir("ledger_snapshot");
+        let db = dir.join("dedcom.db");
+
+        let mut writer = ScanStore::open_writable(&db).unwrap();
+        let journal: String = writer
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            journal.to_lowercase(),
+            "wal",
+            "without WAL the second connection would block instead of committing, and this test \
+             would hang rather than prove anything"
+        );
+        let scan_id = writer
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank")]))
+            .unwrap();
+        writer
+            .commit_omissions(scan_id, &one_root("/tank", &[]))
+            .unwrap();
+
+        let reader = ScanStore::open_writable(&db).unwrap();
+        let snapshot = reader.conn.unchecked_transaction().unwrap();
+        let first =
+            directory_completeness_tx(&snapshot, scan_id, &[Path::new("/tank/one")]).unwrap();
+        assert_eq!(
+            first.get(Path::new("/tank/one")),
+            Some(&DirCompleteness::Complete),
+            "generation 1 says nothing was omitted"
+        );
+
+        // A whole new generation lands between the reader's two queries.
+        writer
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/two", OmissionReason::MinSize)]),
+            )
+            .unwrap();
+        assert_eq!(
+            writer.root_generation(scan_id, Path::new("/tank")).unwrap(),
+            Some(2)
+        );
+
+        let second =
+            directory_completeness_tx(&snapshot, scan_id, &[Path::new("/tank/two")]).unwrap();
+        assert_eq!(
+            second.get(Path::new("/tank/two")),
+            Some(&DirCompleteness::Complete),
+            "inside one snapshot both answers come from generation 1"
+        );
+
+        // Closing the snapshot moves the reader forward, so the test would notice a snapshot that
+        // was simply stale forever.
+        drop(snapshot);
+        assert!(
+            matches!(
+                verdict(&reader, scan_id, "/tank/two"),
+                DirCompleteness::Incomplete(_)
+            ),
+            "a fresh read must see generation 2"
+        );
+
+        drop(reader);
+        drop(writer);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A directory that has no lexical key gets no verdict — and certainly not a complete one.
+    #[test]
+    fn an_unkeyable_directory_is_unknown() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(scan_id, &one_root("/tank", &[]))
+            .unwrap();
+        for dir in ["/tank/../tank/a", "relative/dir"] {
+            assert_eq!(
+                verdict(&store, scan_id, dir),
+                DirCompleteness::Unknown,
+                "{dir} must not receive a verdict"
+            );
+        }
+    }
+
+    /// Every requested directory appears in the result, so a caller cannot mistake an absent key
+    /// for anything at all.
+    #[test]
+    fn every_requested_directory_gets_an_answer() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/a", OmissionReason::MinSize)]),
+            )
+            .unwrap();
+        let dirs = [
+            Path::new("/tank"),
+            Path::new("/tank/a"),
+            Path::new("/tank/b"),
+            Path::new("/elsewhere"),
+        ];
+        let answers = store.directory_completeness(scan_id, &dirs).unwrap();
+        assert_eq!(answers.len(), dirs.len());
+        for dir in dirs {
+            assert!(answers.contains_key(dir), "{} is missing", dir.display());
+        }
     }
 }

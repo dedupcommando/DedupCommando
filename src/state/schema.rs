@@ -134,6 +134,68 @@ CREATE TABLE IF NOT EXISTS move_event (
     hash        BLOB,
     duplicate   INTEGER NOT NULL
 );
+-- The scan's selected roots, in the one normalized representation the omission ledger uses
+-- (`model::omission::PathKey`), each carrying its own completeness authority.
+--
+-- `generation` = 0 means this root's ledger is NOT trusted — never committed, or invalidated by a
+-- clear. A positive value is the generation of the snapshot that produced the rows currently
+-- stored for it. There is deliberately no scan-wide trust marker: a scan-wide flag would stay
+-- «trusted» while a per-root clear removed that root's rows, and a reader in that window would
+-- see an empty ledger and call the root complete.
+--
+-- Absent entirely for every scan migrated from an older schema, and for any scan whose roots
+-- could not all be keyed. No row means no authority, which reads as «unknown» — never «complete».
+CREATE TABLE IF NOT EXISTS scan_root (
+    scan_id    INTEGER NOT NULL,
+    root_key   TEXT    NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (scan_id, root_key),
+    CHECK (generation >= 0),
+    -- Shape only. Normalization itself is a Rust invariant (`PathKey` is the sole constructor);
+    -- SQL cannot verify it.
+    CHECK (root_key = '/'
+           OR (substr(root_key, 1, 1) = '/' AND substr(root_key, -1, 1) <> '/')),
+    -- Declared for intent and for a future `PRAGMA foreign_keys=ON`. The pragma is OFF
+    -- project-wide, so this enforces nothing today; deletion is enforced by purge_scan's explicit
+    -- table order, as for every other table here.
+    FOREIGN KEY (scan_id) REFERENCES scan(id) ON DELETE CASCADE
+);
+-- Directories that lost at least one file, or suffered at least one walk error, with the typed
+-- reason and how many EVENTS. Events, not files: the iterator-error branch is reached before the
+-- entry's type is known, so one such event may stand for a file, a directory, or an entire
+-- unreadable subtree.
+--
+-- A dedicated table rather than synthetic `file` rows: a fake manifest row would become a hash
+-- candidate and corrupt the physical-object model, and it could not carry a count at all.
+--
+-- `dir_key` is the nearest keyable ancestor of the omitted child — its parent in every ordinary
+-- case. No child pathname is stored anywhere, so a name that cannot be represented as UTF-8 costs
+-- the ledger nothing and no lossy pathname is ever written.
+CREATE TABLE IF NOT EXISTS dir_omission (
+    scan_id     INTEGER NOT NULL,
+    root_key    TEXT    NOT NULL,
+    dir_key     TEXT    NOT NULL,
+    reason      TEXT    NOT NULL,
+    event_count INTEGER NOT NULL,
+    generation  INTEGER NOT NULL,
+    -- `root_key` is deliberately NOT in the key: including it would let one directory hold rows
+    -- under two roots and double every aggregate.
+    PRIMARY KEY (scan_id, dir_key, reason),
+    CHECK (event_count > 0),
+    CHECK (generation > 0),
+    CHECK (reason <> ''),
+    -- Never above the root. Equivalent to component containment ONLY because both operands are
+    -- PathKeys; SQL cannot check that, so this is a backstop against a hand-written row, not the
+    -- enforcement. The writer validates containment in Rust.
+    CHECK (dir_key = root_key
+           OR root_key = '/'
+           OR substr(dir_key, 1, length(root_key) + 1) = root_key || '/'),
+    FOREIGN KEY (scan_id, root_key) REFERENCES scan_root(scan_id, root_key) ON DELETE CASCADE
+);
+-- Root-keyed lookup: a whole-root clear is `scan_id`+`root_key`, and the subtree queries add a
+-- `dir_key` range. The PK's own index already covers (scan_id, dir_key).
+CREATE INDEX IF NOT EXISTS dir_omission_by_root
+    ON dir_omission(scan_id, root_key, dir_key);
 ";
 
 /// Current on-disk schema version, stamped into `PRAGMA user_version`. Bump this (and add a
@@ -149,7 +211,14 @@ CREATE TABLE IF NOT EXISTS move_event (
 /// v3 DB: it cannot see `nlink`, and re-materializing `file_group` with its pathname formula
 /// (`store::materialize_file_groups`) would silently re-inflate reclaim. There is no down
 /// migration; the escape is the one the refusal message already names — move `dedcom.db` aside.
-pub const SCHEMA_VERSION: i64 = 3;
+///
+/// v4 adds the omission ledger: `scan_root` (the per-root completeness authority) and
+/// `dir_omission` (what each directory lost, and why). Purely additive — two new tables and no
+/// column on any existing one, so the migration reads no data and rewrites no row. A v3 build must
+/// not open a v4 DB: it cannot see `scan_root`, so it would judge a v4 scan's directories by the
+/// hash-only completeness rule alone and hand back exactly the false twins the ledger exists to
+/// suppress.
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// The version refusal itself, parameterized by the maximum schema a *reading build* supports.
 ///
@@ -261,6 +330,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS file_scan_identity ON file(scan_id, device, inode);
          CREATE INDEX IF NOT EXISTS file_hash_identity ON file(scan_id, hash, device, inode);",
     )?;
+    // v4, the omission ledger, needs nothing here: `scan_root` and `dir_omission` are whole new
+    // tables, so the `CREATE TABLE IF NOT EXISTS` batch above already brought them into an
+    // existing DB. No column is added to any existing table, no row is read and none is rewritten
+    // — a migrated scan simply has no `scan_root` row, which is exactly «completeness unknown».
     // Stamp the current schema version (also upgrades a pre-versioning DB from 0).
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
@@ -350,12 +423,48 @@ mod tests {
         rows
     }
 
-    /// A genuinely v2-shaped DB: the current schema with every v3 addition taken away again and
-    /// the stamp rewound. Built rather than pasted from a frozen DDL, so whatever v3 adds is
-    /// exactly what this removes — a v2 shape that cannot drift out of date.
+    /// Names of every table in the DB.
+    fn table_names(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    }
+
+    /// Strips what v4 adds. Shared by both rewind fixtures below, so «what v4 adds» is written
+    /// once and neither shape can drift away from it.
+    fn strip_v4(conn: &Connection) {
+        conn.execute_batch(
+            "DROP TABLE dir_omission;
+             DROP TABLE scan_root;",
+        )
+        .unwrap();
+        let tables = table_names(conn);
+        assert!(!tables.contains(&"scan_root".to_string()));
+        assert!(!tables.contains(&"dir_omission".to_string()));
+        assert!(!index_names(conn).contains(&"dir_omission_by_root".to_string()));
+    }
+
+    /// A genuinely v3-shaped DB: the current schema with every v4 addition taken away again and
+    /// the stamp rewound. Built rather than pasted from a frozen DDL, so whatever v4 adds is
+    /// exactly what this removes.
+    fn v3_shaped_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        strip_v4(&conn);
+        conn.pragma_update(None, "user_version", 3i64).unwrap();
+        conn
+    }
+
+    /// A genuinely v2-shaped DB: the current schema with every v3 and v4 addition taken away again
+    /// and the stamp rewound. Built rather than pasted from a frozen DDL, so whatever those
+    /// versions add is exactly what this removes — a v2 shape that cannot drift out of date.
     fn v2_shaped_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
+        strip_v4(&conn);
         conn.execute_batch(
             "DROP INDEX file_scan_identity;
              DROP INDEX file_hash_identity;
@@ -587,18 +696,52 @@ mod tests {
         assert_eq!((groups, prepared), (4, 0));
     }
 
-    /// A fresh writable DB is exactly schema v3: every new column and both identity indexes come
-    /// from `CREATE TABLE`/`CREATE INDEX`, not only from the `ALTER` path a migrated DB takes.
+    /// A fresh writable DB is exactly schema v4: every new column, table and index comes from
+    /// `CREATE TABLE`/`CREATE INDEX`, not only from the `ALTER` path a migrated DB takes.
     #[test]
-    fn fresh_db_is_schema_v3_with_every_new_column_and_index() {
+    fn fresh_db_is_schema_v4_with_every_new_column_table_and_index() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
 
-        assert_eq!(SCHEMA_VERSION, 3, "v3 is the schema this build writes");
+        assert_eq!(SCHEMA_VERSION, 4, "v4 is the schema this build writes");
         let stamped: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(stamped, 3, "a fresh DB is stamped v3");
+        assert_eq!(stamped, 4, "a fresh DB is stamped v4");
+
+        // v4: the omission ledger, both tables and the root-keyed index.
+        let tables = table_names(&conn);
+        for table in ["scan_root", "dir_omission"] {
+            assert!(
+                tables.contains(&table.to_string()),
+                "no table {table} in a fresh DB"
+            );
+        }
+        assert_eq!(
+            columns_of(&conn, "scan_root"),
+            vec!["scan_id", "root_key", "generation"],
+            "the per-root authority's shape is part of the contract"
+        );
+        assert_eq!(
+            columns_of(&conn, "dir_omission"),
+            vec![
+                "scan_id",
+                "root_key",
+                "dir_key",
+                "reason",
+                "event_count",
+                "generation"
+            ]
+        );
+        assert!(
+            index_names(&conn).contains(&"dir_omission_by_root".to_string()),
+            "no index dir_omission_by_root"
+        );
+        // The rejected scan-wide marker must not exist: the authority is per root.
+        assert!(
+            !columns_of(&conn, "scan_stats").contains(&"omissions_recorded".to_string()),
+            "a scan-wide completeness marker would reintroduce the trusted-empty window"
+        );
 
         assert!(
             columns_of(&conn, "file").contains(&"nlink".to_string()),
@@ -621,18 +764,23 @@ mod tests {
         }
     }
 
-    /// A real v2-shaped DB carrying real results migrates to v3 in the one existing transaction:
-    /// every row that made the result browseable survives unchanged — including the old positive
-    /// reclaim — while everything v3 introduces stays at «unknown». Nothing rewrites the manifest,
-    /// and the pathname formula is never promoted to a trusted figure.
+    /// A real v2-shaped DB carrying real results migrates to the current schema in the one
+    /// existing transaction: every row that made the result browseable survives unchanged —
+    /// including the old positive reclaim — while everything v3 introduces stays at «unknown».
+    /// Nothing rewrites the manifest, and the pathname formula is never promoted to a trusted
+    /// figure.
     #[test]
-    fn a_v2_db_migrates_to_v3_and_keeps_its_results_untrusted() {
+    fn a_v2_db_migrates_and_keeps_its_results_untrusted() {
         let conn = v2_shaped_db();
         seed_completed_scan(&conn);
         assert_eq!(user_version(&conn), 2, "the fixture really is a v2 DB");
 
         migrate(&conn).unwrap();
-        assert_eq!(user_version(&conn), 3, "the stamp moves to v3");
+        assert_eq!(
+            user_version(&conn),
+            4,
+            "the stamp moves to the current schema"
+        );
 
         // The manifest: both pathnames, both hashes, and a link count that is honestly unknown.
         let files: Vec<(String, i64, Vec<u8>, i64)> = conn
@@ -727,12 +875,75 @@ mod tests {
             .query_row("SELECT status FROM scan WHERE id = 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(status, "completed");
+
+        // v4: the migrated scan gains no completeness authority. The tables exist, but this scan
+        // has no root row and no ledger row — which is «unknown», the only honest answer. An empty
+        // ledger is NOT what makes it unknown; the absent authority is. Nothing was backfilled,
+        // and no old scan was rewritten as trusted.
+        let roots: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM scan_root WHERE scan_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let omissions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dir_omission WHERE scan_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            (roots, omissions),
+            (0, 0),
+            "a migrated scan has no authority and no ledger — it is unknown, not complete"
+        );
     }
 
-    /// Reopening a v3 DB changes neither schema nor data: `migrate` is the function every start
-    /// runs, and a checkpoint must survive being opened as many times as the operator likes.
+    /// The v3→v4 step on its own, on a DB whose shape really is v3: two tables and one index
+    /// appear, the stamp moves, and the existing result is untouched.
     #[test]
-    fn reopening_a_v3_db_changes_neither_schema_nor_data() {
+    fn a_v3_db_migrates_to_v4_and_gains_no_authority() {
+        let conn = v3_shaped_db();
+        seed_completed_scan(&conn);
+        assert_eq!(user_version(&conn), 3, "the fixture really is a v3 DB");
+        let data_before = representative_data(&conn);
+        assert!(!data_before.is_empty(), "there must be data to preserve");
+
+        // A v3 DB is readable by this build, and migrating brings it to v4.
+        assert!(ensure_version_supported(&conn).is_ok());
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap(); // idempotent
+
+        assert_eq!(user_version(&conn), 4, "the stamp moves to v4");
+        let tables = table_names(&conn);
+        for table in ["scan_root", "dir_omission"] {
+            assert!(
+                tables.contains(&table.to_string()),
+                "no table {table} after the v3→v4 migration"
+            );
+        }
+        assert!(index_names(&conn).contains(&"dir_omission_by_root".to_string()));
+        assert_eq!(
+            representative_data(&conn),
+            data_before,
+            "the migration reads no data and rewrites no row"
+        );
+
+        let roots: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scan_root", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            roots, 0,
+            "nothing is backfilled: the old scan stays unknown"
+        );
+    }
+
+    /// Reopening a migrated DB changes neither schema nor data: `migrate` is the function every
+    /// start runs, and a checkpoint must survive being opened as many times as the operator likes.
+    #[test]
+    fn reopening_a_migrated_db_changes_neither_schema_nor_data() {
         let conn = v2_shaped_db();
         seed_completed_scan(&conn);
         migrate(&conn).unwrap();
@@ -752,7 +963,7 @@ mod tests {
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
 
-        assert_eq!(user_version(&conn), 3);
+        assert_eq!(user_version(&conn), SCHEMA_VERSION);
         assert_eq!(schema_fingerprint(&conn), schema_before, "schema drifted");
         let rows_after: Vec<String> = conn
             .prepare(
@@ -770,22 +981,74 @@ mod tests {
     /// A DB from a future build is refused and left exactly as it was — no migration, no stamp
     /// rewrite, nothing an older build could damage.
     ///
+    /// The stamp is `SCHEMA_VERSION + 1` rather than a literal, so this keeps meaning «a future
+    /// DB» after every bump. With a literal it would silently become «the current DB», and the
+    /// refusal it asserts would stop existing.
+    ///
     /// Goes through the production entry point `ensure_version_supported`, which is
-    /// `ensure_version_at_most(conn, SCHEMA_VERSION)` — the same comparison the v2-aware test below
-    /// drives with a different maximum. One implementation, both directions.
+    /// `ensure_version_at_most(conn, SCHEMA_VERSION)` — the same comparison the older-build tests
+    /// below drive with a different maximum. One implementation, both directions.
     #[test]
-    fn a_v4_db_is_refused_without_writing_to_it() {
+    fn a_future_db_is_refused_without_writing_to_it() {
         let conn = v2_shaped_db();
-        conn.pragma_update(None, "user_version", 4i64).unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
         let before = schema_fingerprint(&conn);
 
-        let err = ensure_version_supported(&conn).expect_err("v4 must be refused");
+        let err = ensure_version_supported(&conn).expect_err("a future schema must be refused");
         assert!(
             err.to_string().contains("newer version"),
             "the message must say why: {err}"
         );
-        assert_eq!(user_version(&conn), 4, "the future stamp is left alone");
+        assert_eq!(
+            user_version(&conn),
+            SCHEMA_VERSION + 1,
+            "the future stamp is left alone"
+        );
         assert_eq!(schema_fingerprint(&conn), before, "nothing was migrated");
+    }
+
+    /// The v4 half of the same guarantee, executed rather than asserted: a build that only knows
+    /// v3 must refuse a v4 DB rather than judge its directories by the hash-only completeness rule
+    /// and hand back the false twins the ledger exists to suppress.
+    ///
+    /// For this purpose a v3 build differs from this one in exactly one number — the maximum
+    /// schema it supports — so calling the same comparison production calls, with that maximum,
+    /// *is* what a v3 build does to a v4 DB.
+    #[test]
+    fn a_v3_aware_build_refuses_a_v4_db() {
+        // A real v4 DB with real results, produced by the actual migration.
+        let conn = v3_shaped_db();
+        seed_completed_scan(&conn);
+        migrate(&conn).unwrap();
+        assert_eq!(user_version(&conn), 4, "the subject really is a v4 DB");
+
+        let schema_before = schema_fingerprint(&conn);
+        let data_before = representative_data(&conn);
+        assert!(!data_before.is_empty(), "there must be data to compare");
+
+        // This build's own maximum accepts it; that is the control.
+        assert!(ensure_version_supported(&conn).is_ok());
+
+        let err =
+            ensure_version_at_most(&conn, 3).expect_err("a v3-aware build must refuse a v4 DB");
+        let text = err.to_string();
+        assert!(
+            text.contains("schema v4"),
+            "the database's own version must be named: {text}"
+        );
+        assert!(
+            text.contains("supports v3"),
+            "and the maximum the refusing build supports: {text}"
+        );
+
+        assert_eq!(user_version(&conn), 4, "a refusal must not restamp");
+        assert_eq!(schema_fingerprint(&conn), schema_before, "nor migrate");
+        assert_eq!(
+            representative_data(&conn),
+            data_before,
+            "nor touch the data"
+        );
     }
 
     /// The other direction, executed rather than asserted: a build that only knows v2 must refuse a
@@ -798,10 +1061,9 @@ mod tests {
     /// version, schema and data are compared across it.
     #[test]
     fn a_v2_aware_build_refuses_a_v3_db() {
-        // A real v3 DB with real results, produced by the actual migration.
-        let conn = v2_shaped_db();
+        // A real v3-shaped DB with real results.
+        let conn = v3_shaped_db();
         seed_completed_scan(&conn);
-        migrate(&conn).unwrap();
         assert_eq!(user_version(&conn), 3, "the subject really is a v3 DB");
 
         let version_before = user_version(&conn);
