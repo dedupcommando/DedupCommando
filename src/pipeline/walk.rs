@@ -89,6 +89,16 @@ pub enum SnapshotUnavailable {
         directory: PathKey,
         reason: OmissionReason,
     },
+    /// An event arrived for a root the collector was never seeded with. Today's wiring builds both
+    /// from the same key slice, so nothing can produce it — but the alternative to naming it is
+    /// dropping the event, and a snapshot that is short one omission while still calling itself
+    /// publishable is a false claim of completeness. A wiring regression must surface here rather
+    /// than as a directory that quietly looks whole.
+    UnregisteredRoot {
+        root: PathKey,
+        directory: PathKey,
+        reason: OmissionReason,
+    },
 }
 
 /// Accumulates one walk's omissions, one entry per selected root.
@@ -110,11 +120,22 @@ impl Collector {
         }
     }
 
+    /// Records one event.
+    ///
+    /// Every way this can fail is a reason the SNAPSHOT is unavailable, never a reason to drop the
+    /// event or to stop walking files. Returning early once a failure is held is safe only because
+    /// `finish` is then structurally forced to return `Unavailable`: there is no path back to
+    /// `Publishable` for a collector that has recorded a failure.
     fn record(&mut self, root: &PathKey, directory: PathKey, reason: OmissionReason) {
         if self.failure.is_some() {
             return;
         }
         let Some(counts) = self.per_root.get_mut(root) else {
+            self.failure = Some(SnapshotUnavailable::UnregisteredRoot {
+                root: root.clone(),
+                directory,
+                reason,
+            });
             return;
         };
         if counts.bump(directory.clone(), reason).is_err() {
@@ -335,8 +356,13 @@ fn configure(
         .overrides(overrides.clone());
 }
 
-/// Handles one item from a walk iterator. `Err` aborts the whole walk — the alias-guard refusals,
-/// which are not omissions.
+/// Handles one item from a walk iterator.
+///
+/// A yielded `Err` does NOT abort anything: it is recorded as one `walk_error` event and this
+/// returns `Ok(())`, because a file the walk could not reach is an omission like any other. The
+/// two cases that do return `Err` are the ones that are not omissions at all — a directory whose
+/// physical identity cannot be read, and a `DirAliasGuard` refusal. Both mean the walk can no
+/// longer tell one tree from two, which is not a result worth publishing at any size.
 fn absorb(
     result: std::result::Result<ignore::DirEntry, ignore::Error>,
     config: &ScanConfig,
@@ -1715,6 +1741,70 @@ mod tests {
             collector.finish(),
             OmissionSnapshot::Unavailable(SnapshotUnavailable::CountOverflow { .. })
         ));
+    }
+
+    /// An event for a root the collector was never seeded with cannot be dropped.
+    ///
+    /// Today's wiring builds `Ledger.root` from the same key slice that seeds the collector, so
+    /// nothing reaches this branch — which is exactly why it needs a test. A future wiring mistake
+    /// must surface as an unavailable snapshot naming the root, not as a directory that quietly
+    /// looks whole because its omission went missing.
+    #[test]
+    fn an_event_under_an_unregistered_root_makes_the_snapshot_unavailable() {
+        let a = key(Path::new("/tank/a"));
+        let b = key(Path::new("/tank/b"));
+        let inner = key(Path::new("/tank/b/inner"));
+
+        // Control: the same collector without the mismatched event is publishable, and the seeded
+        // root is present with an explicitly empty map.
+        match Collector::new(std::slice::from_ref(&a)).finish() {
+            OmissionSnapshot::Publishable(map) => {
+                assert_eq!(map.len(), 1, "exactly the seeded root");
+                assert!(map[&a].is_empty(), "A is present and explicitly empty");
+            }
+            OmissionSnapshot::Unavailable(_) => panic!("a clean collector must be publishable"),
+        }
+
+        let mut mismatched = Collector::new(std::slice::from_ref(&a));
+        mismatched.record(&b, inner.clone(), OmissionReason::MinSize);
+        match mismatched.finish() {
+            OmissionSnapshot::Unavailable(SnapshotUnavailable::UnregisteredRoot {
+                root,
+                directory,
+                reason,
+            }) => {
+                assert_eq!(root, b, "the missing root must be named");
+                assert_eq!(directory, inner, "and the event that could not be placed");
+                assert_eq!(reason, OmissionReason::MinSize);
+            }
+            OmissionSnapshot::Publishable(_) => panic!(
+                "an event under an unregistered root was dropped and the snapshot still claims \
+                 to be publishable"
+            ),
+            OmissionSnapshot::Unavailable(_) => panic!("the wrong unavailable state"),
+        }
+    }
+
+    /// First failure wins, and nothing recovers a failed collector: a later, perfectly ordinary
+    /// event may be ignored only because `finish` can no longer return `Publishable`.
+    #[test]
+    fn a_failed_collector_never_becomes_publishable_again() {
+        let a = key(Path::new("/tank/a"));
+        let b = key(Path::new("/tank/b"));
+
+        let mut collector = Collector::new(std::slice::from_ref(&a));
+        collector.record(&b, key(Path::new("/tank/b/x")), OmissionReason::MinSize);
+        // A valid event afterwards must not paper over the failure.
+        collector.record(&a, key(Path::new("/tank/a/y")), OmissionReason::NonUtf8);
+        match collector.finish() {
+            OmissionSnapshot::Unavailable(SnapshotUnavailable::UnregisteredRoot {
+                root, ..
+            }) => {
+                assert_eq!(root, b, "the FIRST failure is the one reported")
+            }
+            OmissionSnapshot::Publishable(_) => panic!("a failed collector must stay unavailable"),
+            OmissionSnapshot::Unavailable(_) => panic!("the wrong unavailable state"),
+        }
     }
 
     /// The wrapper is exactly what the accepted parent produced: same files, same order, same
