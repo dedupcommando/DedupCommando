@@ -99,10 +99,23 @@ pub fn walk(
             Some(file_type) if file_type.is_file() => {}
             // A directory: the only place an alias inside a root can be caught. Its metadata is the
             // one extra `stat` this guard costs, and only for directories.
+            //
+            // A failure here is fatal. It costs no file — the walker could still descend — but it
+            // is the guard losing its evidence: without `(device, inode)` this directory is no
+            // longer known NOT to be a second pathname for a tree already walked, and a manifest
+            // holding one file under two pathnames is not a result worth publishing. The scan
+            // stops for the same reason `DirAliasGuard::note` stops it.
             Some(file_type) if file_type.is_dir() => {
-                if let Ok(meta) = entry.metadata() {
-                    dirs.note(entry.path(), meta.dev(), meta.ino())?;
+                // Test-only: reach the failure outcome below for a nominated directory, without a
+                // filesystem that has to misbehave. Absent from every non-test build.
+                #[cfg(test)]
+                if crate::testfixtures::take_metadata_fault(entry.path()) {
+                    return Err(unverifiable_directory(entry.path(), None));
                 }
+                let meta = entry
+                    .metadata()
+                    .map_err(|err| unverifiable_directory(entry.path(), Some(&err)))?;
+                dirs.note(entry.path(), meta.dev(), meta.ino())?;
                 continue;
             }
             _ => continue,
@@ -167,9 +180,29 @@ pub fn walk(
     Ok((files, skipped_non_utf8))
 }
 
+/// A directory whose physical identity could not be read.
+///
+/// Names the directory and says what was lost, carrying the underlying error as context rather
+/// than inspecting or re-parsing its text. Deliberately not an omission: no file went missing, and
+/// calling it one would put a count on something that never happened.
+fn unverifiable_directory(path: &Path, cause: Option<&ignore::Error>) -> AppError {
+    let context = match cause {
+        Some(err) => format!(" ({err})"),
+        None => String::new(),
+    };
+    AppError::msg(format!(
+        "scan aborted: cannot read the physical identity of directory {}{context} — without its \
+         device and inode the same-directory guard cannot tell whether this tree has already been \
+         walked under another pathname, and one tree counted twice is not a result worth \
+         publishing. Fix access to the directory or exclude it, then rescan.",
+        crate::textsan::terminal(&path.display().to_string()),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testfixtures::{WalkFault, WalkFaults};
     use std::ffi::OsStr;
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
@@ -223,6 +256,131 @@ mod tests {
             walk(&config, &cancel, |_, _, _| {}).expect("no alias when links are not followed");
         assert_eq!(files.len(), 1, "exactly the one real file");
         assert_eq!(skipped, 0);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory holding one child, plus a file beside it. `sub` is the directory whose metadata
+    /// the fault removes; `sub/inner.bin` is what shows whether the walk descended into it anyway.
+    fn guard_tree(tag: &str) -> (PathBuf, PathBuf) {
+        let root = temp_dir(tag);
+        fs::write(root.join("keep.bin"), b"beside").unwrap();
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("inner.bin"), b"inside").unwrap();
+        (root, sub)
+    }
+
+    fn guard_config(root: &Path) -> ScanConfig {
+        let mut config = ScanConfig::new(vec![root.to_path_buf()]);
+        config.min_size = 0; // don't filter the small fixtures out by size
+        config.exclude_globs.clear(); // no default exclusions — determinism
+        config
+    }
+
+    /// Manifest pathnames relative to `root`, in the order the walk produced them.
+    fn walked_names(files: &[WalkedFile], root: &Path) -> Vec<String> {
+        files
+            .iter()
+            .map(|file| {
+                file.path
+                    .strip_prefix(root)
+                    .expect("under the root")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    /// A directory whose physical identity cannot be read stops the scan.
+    ///
+    /// It costs no file — the walker could descend perfectly well — but `DirAliasGuard` has lost
+    /// the one piece of evidence that tells a real directory from a second pathname for a tree
+    /// already walked. Before this, the failure was swallowed by `if let Ok(meta)` and the walk
+    /// carried on into the child with a blind guard.
+    #[test]
+    fn a_directory_whose_metadata_fails_aborts_the_walk() {
+        let (root, sub) = guard_tree("dirmeta");
+        let faults = WalkFaults::arm(&[(sub.clone(), WalkFault::Metadata)]);
+        let cancel = AtomicBool::new(false);
+
+        let text = match walk(&guard_config(&root), &cancel, |_, _, _| {}) {
+            Err(err) => err.to_string(),
+            Ok((files, _)) => panic!(
+                "a directory whose identity cannot be read must abort the walk, got {} files",
+                files.len()
+            ),
+        };
+
+        assert_eq!(
+            faults.fired(),
+            vec![(sub.clone(), WalkFault::Metadata)],
+            "the fault must fire exactly once, at the directory branch"
+        );
+        assert!(
+            faults.pending().is_empty(),
+            "nothing may stay armed: an unfired fault would mean the branch never looked"
+        );
+        assert!(
+            text.contains(&sub.display().to_string()),
+            "the directory must be named: {text}"
+        );
+        assert!(
+            text.contains("physical identity"),
+            "and what was lost must be plain: {text}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Positive control: the identical tree with nothing armed walks exactly as before — same
+    /// manifest, same order. Without this the test above could be passing because the tree itself
+    /// is unwalkable.
+    #[test]
+    fn without_injection_the_same_tree_walks_unchanged() {
+        let (root, _) = guard_tree("dirmeta_control");
+        let cancel = AtomicBool::new(false);
+
+        let (files, skipped) =
+            walk(&guard_config(&root), &cancel, |_, _, _| {}).expect("no fault, no abort");
+        assert_eq!(
+            walked_names(&files, &root),
+            vec!["keep.bin".to_string(), "sub/inner.bin".to_string()],
+            "both files, in traversal order"
+        );
+        assert_eq!(skipped, 0);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The regular-file branch is untouched: an injected metadata fault on a known regular file
+    /// still fires once and still only removes that file. Turning THAT into an abort is R3B-B's
+    /// business — it becomes a typed `metadata_error` event, not a stopped scan.
+    #[test]
+    fn a_regular_file_metadata_fault_still_only_skips_that_file() {
+        let (root, sub) = guard_tree("filemeta");
+        let victim = sub.join("inner.bin");
+        let faults = WalkFaults::arm(&[(victim.clone(), WalkFault::Metadata)]);
+        let cancel = AtomicBool::new(false);
+
+        let (files, skipped) = walk(&guard_config(&root), &cancel, |_, _, _| {})
+            .expect("a file's metadata failure must not abort the walk");
+
+        assert_eq!(
+            faults.fired(),
+            vec![(victim, WalkFault::Metadata)],
+            "the fault fired once, at the file branch"
+        );
+        assert!(faults.pending().is_empty());
+        assert_eq!(
+            walked_names(&files, &root),
+            vec!["keep.bin".to_string()],
+            "only the nominated file is gone"
+        );
+        assert_eq!(
+            skipped, 0,
+            "and the non-UTF8 compatibility counter is unaffected"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
