@@ -600,8 +600,12 @@ pub struct CompletenessSnapshot {
     registered: BTreeMap<PathKey, i64>,
     /// Current-generation rows, keyed by the normalized directory string for range lookup.
     rows: BTreeMap<String, (PathKey, OmissionSummary)>,
-    /// Roots holding a current-generation `walk_error` row at `dir_key == root_key`.
-    sentinels: std::collections::BTreeSet<PathKey>,
+    /// Roots holding a current-generation `walk_error` row at `dir_key == root_key`, with that
+    /// row's checked event count. A root here means the walk may have missed entries anywhere
+    /// under it, so membership suppresses the whole root and the count reaches every strict
+    /// descendant's detailed verdict. A query OF the root folds the same cell through its exact
+    /// row in `rows` instead — one or the other, never both.
+    sentinels: BTreeMap<PathKey, EventCount>,
     /// Whether the configured and registered root sets are the same. False ⇒ nothing is trusted,
     /// but the scan stays root-bounded: a drifted registration is not an unbounded scan.
     agrees: bool,
@@ -666,7 +670,7 @@ impl CompletenessSnapshot {
             && configured.iter().all(|root| generations.contains_key(root));
 
         let mut summaries: BTreeMap<String, (PathKey, OmissionSummary)> = BTreeMap::new();
-        let mut sentinels = std::collections::BTreeSet::new();
+        let mut sentinels: BTreeMap<PathKey, EventCount> = BTreeMap::new();
         for row in rows {
             let root = PathKey::from_stored(&row.root_key)?;
             // A superseded or unregistered row is ignored, never validated into an error and never
@@ -691,7 +695,11 @@ impl CompletenessSnapshot {
             })?;
             let count = EventCount::from_i64(row.event_count)?;
             if reason == OmissionReason::WalkError && directory == root {
-                sentinels.insert(root.clone());
+                let total = match sentinels.get(&root) {
+                    Some(existing) => existing.checked_add(count)?,
+                    None => count,
+                };
+                sentinels.insert(root.clone(), total);
             }
             let slot = summaries
                 .entry(directory.as_str().to_string())
@@ -724,7 +732,7 @@ impl CompletenessSnapshot {
     /// Whether an omission lies at or under `key`, within `root`. Existence only: construction has
     /// already rejected malformed current data, so a verdict needs no re-validation.
     fn omitted_at_or_under(&self, root: &PathKey, key: &PathKey) -> bool {
-        if self.sentinels.contains(root) {
+        if self.sentinels.contains_key(root) {
             return true;
         }
         if let Some((stored, _)) = self.rows.get(key.as_str()) {
@@ -739,7 +747,8 @@ impl CompletenessSnapshot {
     }
 
     /// The full tri-state with its summary — for a reader that wants the detail, never once per
-    /// candidate. Total over paths.
+    /// candidate. Total over paths, and in agreement with [`SignatureContext::disposition`]: both
+    /// classifiers fold the same rows and the same root sentinel.
     pub fn verdict(&self, path: &Path) -> Result<DirCompleteness> {
         let Some(key) = PathKey::new(path) else {
             return Ok(DirCompleteness::Unknown);
@@ -766,6 +775,16 @@ impl CompletenessSnapshot {
         let (lo, hi) = key.subtree_bounds();
         for (_, (stored, found)) in self.rows.range(lo..hi) {
             fold(stored, found)?;
+        }
+        // A current root sentinel is root-wide: the walk may have missed entries anywhere under
+        // this root, so its `walk_error` count reaches every descendant — while the root's other
+        // reasons stay ordinary local rows that travel only by containment. A query OF the root
+        // has already folded that same cell through its exact row, so only a strict descendant
+        // adds it here.
+        if key != *root {
+            if let Some(count) = self.sentinels.get(root) {
+                summary.add(OmissionReason::WalkError, *count)?;
+            }
         }
         if summary.is_empty() {
             Ok(DirCompleteness::Complete)
@@ -1534,6 +1553,103 @@ mod tests {
         assert!(
             root.is_at_or_under(&above),
             "sanity: the base really is an ancestor of the root"
+        );
+    }
+
+    /// A current root sentinel reaches every descendant's detailed verdict — exactly once, and
+    /// alone. The compact classifier already suppressed the whole root; the R3C `verdict` still
+    /// answered `Complete` below the root, and R3C-C1 pins both classifiers to one contract: the
+    /// sentinel's `walk_error` count arrives in a descendant verdict once, the root's other,
+    /// root-local reasons do not travel down with it, a local omission below the queried
+    /// directory composes with the sentinel through the same checked aggregation, and the other
+    /// root hears nothing.
+    #[test]
+    fn a_root_sentinel_reaches_every_descendant_verdict() {
+        let snapshot = bounded(
+            &["/a", "/b"],
+            &[("/a", 1), ("/b", 1)],
+            vec![
+                // The sentinel: a walk error AT `/a` hides an unknown amount anywhere below.
+                stored("/a", "/a", "walk_error", 3, 1),
+                // A root-local reason on the same directory; it stays where it was stored.
+                stored("/a", "/a", "min_size", 7, 1),
+                // A local omission deep under one branch, to compose with the sentinel.
+                stored("/a", "/a/x/y/z", "walk_error", 10, 1),
+            ],
+        );
+
+        // The blocker itself, as one comparison: on the defective parent `/a/q` answered
+        // `(Complete, Suppressed)` — trusted in detail, suppressed in compact form. The fixed
+        // pair is incomplete by exactly the sentinel's own count.
+        let mut sentinel_only = OmissionSummary::default();
+        sentinel_only
+            .add(OmissionReason::WalkError, EventCount::new(3).unwrap())
+            .unwrap();
+        assert_eq!(
+            (
+                snapshot.verdict(Path::new("/a/q")).unwrap(),
+                snapshot.disposition(Path::new("/a/q")),
+            ),
+            (
+                DirCompleteness::Incomplete(sentinel_only),
+                DirDisposition::Suppressed,
+            )
+        );
+
+        // Per-reason cells, so «exactly once» is a number rather than a mood.
+        let cells = |path: &str| match snapshot.verdict(Path::new(path)).unwrap() {
+            DirCompleteness::Incomplete(summary) => summary
+                .per_reason()
+                .map(|(reason, count)| (reason, count.get()))
+                .collect::<Vec<_>>(),
+            other => panic!("{path} expected incomplete, got {other:?}"),
+        };
+        // The root folds each stored cell once: 3 + 10 walk errors and 7 min_size — its own
+        // sentinel must not be added a second time on top of the exact row.
+        assert_eq!(
+            cells("/a"),
+            vec![
+                (OmissionReason::MinSize, 7),
+                (OmissionReason::WalkError, 13)
+            ]
+        );
+        // A descendant above the local row: 3 root-wide + 10 at or under it — and no min_size,
+        // which is the root's own business.
+        assert_eq!(cells("/a/x/y"), vec![(OmissionReason::WalkError, 13)]);
+
+        // The other root never hears about `/a`'s sentinel.
+        assert_eq!(
+            snapshot.verdict(Path::new("/b/keep")).unwrap(),
+            DirCompleteness::Complete
+        );
+
+        // The one mapping agrees with the compact classifier for every asserted path.
+        for dir in ["/a", "/a/q", "/a/x/y", "/a/x/y/z", "/b", "/b/keep"] {
+            let path = Path::new(dir);
+            assert_eq!(
+                snapshot.verdict(path).unwrap().disposition(),
+                snapshot.disposition(path),
+                "{dir}"
+            );
+        }
+
+        // The sentinel travels through the same checked aggregation as every other cell: two
+        // `i64::MAX` rows under the queried child still fit a `u64`, the sentinel's own maximum
+        // is the third cell that cannot, and that is an error — never a saturated figure. The
+        // compact classifier needs no sum and still suppresses.
+        let maxed = bounded(
+            &["/a"],
+            &[("/a", 1)],
+            vec![
+                stored("/a", "/a", "walk_error", i64::MAX, 1),
+                stored("/a", "/a/q/one", "walk_error", i64::MAX, 1),
+                stored("/a", "/a/q/two", "walk_error", i64::MAX, 1),
+            ],
+        );
+        assert!(maxed.verdict(Path::new("/a/q")).is_err());
+        assert_eq!(
+            maxed.disposition(Path::new("/a/q")),
+            DirDisposition::Suppressed
         );
     }
 }
