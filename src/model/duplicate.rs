@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, Result};
 use crate::model::action::ActionKind;
+use crate::model::omission::{DirDisposition, DirScope, LegacyContext, SignatureContext};
 use crate::model::reclaim::{GroupReclaim, LinkCount, ObjectLinks};
 
 /// A file that is part of a duplicate group.
@@ -177,16 +178,187 @@ impl DirGroup {
     }
 }
 
+/// The one benefit ordering, shared by the plain and the marker-aware sorters so they cannot drift.
+fn by_benefit(a: &DirGroup, b: &DirGroup) -> std::cmp::Ordering {
+    b.reclaimable_bytes()
+        .cmp(&a.reclaimable_bytes())
+        .then_with(|| a.signature.cmp(&b.signature))
+}
+
 /// Sorts directory groups by descending benefit and reassigns `id`.
 pub fn sort_dir_groups_by_benefit(groups: &mut [DirGroup]) {
-    groups.sort_by(|a, b| {
-        b.reclaimable_bytes()
-            .cmp(&a.reclaimable_bytes())
-            .then_with(|| a.signature.cmp(&b.signature))
-    });
+    groups.sort_by(by_benefit);
     for (index, group) in groups.iter_mut().enumerate() {
         group.id = index as u32;
     }
+}
+
+/// Trust in an emitted signature. `Suppressed` never reaches here — it produces no signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum DirTrust {
+    Trusted,
+    Untrusted,
+}
+
+/// A directory group plus the trust the ledger vouched for at build time.
+///
+/// Transient: nothing persists it, and `dir_dedup` has no column for it. A later decision
+/// revalidates against the ledger's current state rather than trusting a stored value. `DirGroup`
+/// itself is unchanged, so every existing constructor and every database reader is untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct AttributedDirGroup {
+    pub group: DirGroup,
+    /// One entry per member, in exactly `group.paths` order.
+    pub member_trust: Vec<DirTrust>,
+    /// Trusted only when every member is: a directory whose ledger cannot vouch for it may not be
+    /// vouched for by a sibling that happens to sit under a trusted root.
+    pub trust: DirTrust,
+}
+
+/// What the marker-aware streaming build emits.
+///
+/// A struct rather than a fifth positional argument, so the existing four-argument producer in
+/// `store::materialize_dir_groups` needs no change in this commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct DirSignature {
+    pub path: PathBuf,
+    pub signature: String,
+    pub size: u64,
+    pub file_count: u32,
+    pub trust: DirTrust,
+}
+
+/// Sorts marker-aware groups by the same benefit ordering, carrying each member's trust with its
+/// path so the two vectors cannot fall out of step.
+#[allow(dead_code)]
+fn sort_attributed_by_benefit(groups: &mut [AttributedDirGroup]) {
+    groups.sort_by(|a, b| by_benefit(&a.group, &b.group));
+    for (index, attributed) in groups.iter_mut().enumerate() {
+        attributed.group.id = index as u32;
+    }
+}
+
+/// The ancestors of `path` that a build may account for, deepest first.
+///
+/// Under `Root` the chain stops at the selected root — component-wise, so a spelling with `.` or a
+/// trailing separator still matches. Under `Unbounded` it is exactly `path.ancestors().skip(1)`,
+/// which is what a pre-ledger build walks, including for a relative or `..`-spelled pathname.
+#[allow(dead_code)]
+fn accountable_ancestors<'p>(path: &'p Path, scope: DirScope<'_>) -> Vec<&'p Path> {
+    match scope {
+        DirScope::Outside => Vec::new(),
+        DirScope::Unbounded => path.ancestors().skip(1).collect(),
+        DirScope::Root(root) => {
+            let bound = Path::new(root.as_str());
+            path.ancestors()
+                .skip(1)
+                .take_while(|dir| dir.starts_with(bound))
+                .collect()
+        }
+    }
+}
+
+/// The error a manifest file under no selected root produces. Unreachable when the manifest and
+/// the configured roots come from the same scan, which is exactly why it must be loud rather than
+/// a silent skip.
+#[allow(dead_code)]
+fn outside_every_root(path: &Path) -> AppError {
+    AppError::msg(format!(
+        "{} is not inside any selected scan root, so its directories cannot be attributed",
+        crate::textsan::terminal(&path.display().to_string())
+    ))
+}
+
+/// Marker-aware Old: the same top-down accumulation, with the context deciding scope and
+/// suppression.
+///
+/// Under a valid snapshot the ledger's own subtree aggregation already marks every ancestor
+/// through the owning root, so there is deliberately no second upward pass — the unhashed-file
+/// rule still propagates by its own file row, exactly as before.
+#[allow(dead_code)]
+pub fn build_dir_groups_in_context(
+    files: &[(PathBuf, u64, Option<String>)],
+    ctx: &dyn SignatureContext,
+) -> Result<Vec<AttributedDirGroup>> {
+    use std::collections::HashMap;
+
+    type DirAccum = (Vec<(String, String)>, u64, u32, bool);
+    let mut by_dir: HashMap<PathBuf, DirAccum> = HashMap::new();
+    for (path, size, hash) in files {
+        let scope = ctx.scope(path);
+        if matches!(scope, DirScope::Outside) {
+            return Err(outside_every_root(path));
+        }
+        for dir in accountable_ancestors(path, scope) {
+            if let Ok(rel) = path.strip_prefix(dir) {
+                let entry = by_dir.entry(dir.to_path_buf()).or_default();
+                match hash {
+                    Some(h) => {
+                        entry
+                            .0
+                            .push((rel.to_string_lossy().into_owned(), h.clone()));
+                        entry.1 += size;
+                        entry.2 += 1;
+                    }
+                    None => entry.3 = true,
+                }
+            }
+        }
+    }
+
+    let mut by_sig: HashMap<String, Vec<(PathBuf, u64, u32, DirTrust)>> = HashMap::new();
+    for (dir, (entries, total, count, incomplete)) in by_dir {
+        if incomplete {
+            continue;
+        }
+        let trust = match ctx.disposition(&dir) {
+            DirDisposition::Suppressed => continue,
+            DirDisposition::Trusted => DirTrust::Trusted,
+            DirDisposition::Untrusted => DirTrust::Untrusted,
+        };
+        let sig = signature_of(&entries);
+        by_sig
+            .entry(sig)
+            .or_default()
+            .push((dir, total, count, trust));
+    }
+
+    let mut groups: Vec<AttributedDirGroup> = by_sig
+        .into_iter()
+        .filter(|(_, dirs)| dirs.len() >= 2)
+        .map(|(signature, dirs)| {
+            let size_per_dir = dirs[0].1;
+            let file_count = dirs[0].2;
+            // Sorted as pairs, so each member's trust travels with its own pathname.
+            let mut members: Vec<(PathBuf, DirTrust)> = dirs
+                .into_iter()
+                .map(|(dir, _, _, trust)| (dir, trust))
+                .collect();
+            members.sort_by(|a, b| a.0.cmp(&b.0));
+            let trust = if members.iter().all(|(_, t)| *t == DirTrust::Trusted) {
+                DirTrust::Trusted
+            } else {
+                DirTrust::Untrusted
+            };
+            let (paths, member_trust): (Vec<PathBuf>, Vec<DirTrust>) = members.into_iter().unzip();
+            AttributedDirGroup {
+                group: DirGroup {
+                    id: 0,
+                    signature,
+                    paths,
+                    file_count,
+                    size_per_dir,
+                },
+                member_trust,
+                trust,
+            }
+        })
+        .collect();
+    sort_attributed_by_benefit(&mut groups);
+    Ok(groups)
 }
 
 /// hex-encoding of hash bytes (the single source for the whole project).
@@ -220,67 +392,15 @@ pub fn signature_of(entries: &[(String, String)]) -> String {
 /// `(path, size, hex hash)`. A directory gets a signature from its subtree;
 /// directories with the same signature and count >= 2 form a group.
 /// A pure function — tested without a DB.
+/// Compatibility wrapper: today's signature and today's output, delegating through the explicit
+/// unbounded, nothing-trusted context. Byte-, membership- and order-identical to the pre-R3C
+/// build, including its above-root output and relative or `..`-spelled inputs.
 pub fn build_dir_groups(files: &[(PathBuf, u64, Option<String>)]) -> Vec<DirGroup> {
-    use std::collections::HashMap;
-
-    // Directory → (list of (rel_path, hash), total size, file count, INCOMPLETENESS).
-    // A directory is INCOMPLETE if (recursively) under it there is a scanned
-    // regular file without a committed hash — unique-size (not hashed) OR a hash failure.
-    // Incomplete directories do NOT get a signature and are not grouped: otherwise an extra
-    // unique-size file is invisible to the signature, and two directories differing only by it
-    // would produce a false "twin" (the original defect — the input took only `hash IS NOT NULL`).
-    type DirAccum = (Vec<(String, String)>, u64, u32, bool);
-    let mut by_dir: HashMap<PathBuf, DirAccum> = HashMap::new();
-    for (path, size, hash) in files {
-        for dir in path.ancestors().skip(1) {
-            if let Ok(rel) = path.strip_prefix(dir) {
-                let entry = by_dir.entry(dir.to_path_buf()).or_default();
-                match hash {
-                    Some(h) => {
-                        entry
-                            .0
-                            .push((rel.to_string_lossy().into_owned(), h.clone()));
-                        entry.1 += size;
-                        entry.2 += 1;
-                    }
-                    // A file without a hash makes THIS directory (and, via the ancestors loop, all
-                    // ancestors) incomplete.
-                    None => entry.3 = true,
-                }
-            }
-        }
-    }
-
-    // Directory signature → list of (path, size, file count). Incomplete ones — we skip.
-    let mut by_sig: HashMap<String, Vec<(PathBuf, u64, u32)>> = HashMap::new();
-    for (dir, (entries, total, count, incomplete)) in by_dir {
-        if incomplete {
-            continue;
-        }
-        let sig = signature_of(&entries);
-        by_sig.entry(sig).or_default().push((dir, total, count));
-    }
-
-    let mut groups: Vec<DirGroup> = by_sig
+    build_dir_groups_in_context(files, &LegacyContext)
+        .expect("the unbounded context puts no file outside a root")
         .into_iter()
-        .filter(|(_, dirs)| dirs.len() >= 2)
-        .map(|(signature, dirs)| {
-            // For all directories in the group the size and file count are identical.
-            let size_per_dir = dirs[0].1;
-            let file_count = dirs[0].2;
-            let mut paths: Vec<PathBuf> = dirs.into_iter().map(|(dir, _, _)| dir).collect();
-            paths.sort();
-            DirGroup {
-                id: 0,
-                signature,
-                paths,
-                file_count,
-                size_per_dir,
-            }
-        })
-        .collect();
-    sort_dir_groups_by_benefit(&mut groups);
-    groups
+        .map(|attributed| attributed.group)
+        .collect()
 }
 
 /// Directory-signature algorithm (the `ScanConfig.dir_sig_algo` field).
@@ -323,29 +443,78 @@ where
     I: IntoIterator<Item = (PathBuf, u64, Option<String>)>,
     F: FnMut(PathBuf, String, u64, u32) -> Result<()>,
 {
+    // The unbounded, nothing-trusted context reproduces the pre-R3C walk exactly, including the
+    // ancestors it opens up to the filesystem root. The trust value is dropped here, deliberately
+    // and in one named place, so the existing four-argument producer is unaffected.
+    build_dir_signatures_streaming_in_context(files, &LegacyContext, |signature| {
+        emit(
+            signature.path,
+            signature.signature,
+            signature.size,
+            signature.file_count,
+        )
+    })
+}
+
+/// Marker-aware streaming Merkle: the same bottom-up walk, bounded to the selected roots.
+///
+/// Frames are opened from the owning root downward and never from the filesystem root. That is
+/// deliberate rather than filtering at emit time: an above-root frame, once created, still absorbs
+/// its children's `(basename, signature)` pairs and their incompleteness, so filtering it later
+/// would leave it contaminating exactly what root bounding exists to prevent.
+///
+/// Moving between roots flushes every frame first, so no frame is ever shared and neither
+/// suppression nor trust can leak from one root into another. Sorted input keeps a root's files
+/// contiguous, so this happens at most once per root.
+///
+/// Retained directory state is the frame stack plus whatever the supplied context owns — there is
+/// no candidate-directory index anywhere in this function or its signature.
+#[allow(dead_code)]
+pub fn build_dir_signatures_streaming_in_context<I, F>(
+    files: I,
+    ctx: &dyn SignatureContext,
+    mut emit: F,
+) -> Result<()>
+where
+    I: IntoIterator<Item = (PathBuf, u64, Option<String>)>,
+    F: FnMut(DirSignature) -> Result<()>,
+{
     struct Frame {
         path: PathBuf,
         entries: Vec<(String, String)>,
         size: u64,
         count: u32,
-        // The directory is incomplete — under it there is a file without a hash (unique-size / failure).
-        // An incomplete frame is NOT emitted, and on closing it marks the parent incomplete (ancestors too).
         incomplete: bool,
     }
     let mut stack: Vec<Frame> = Vec::new();
+    // The bound the open frames belong to. `None` is unbounded, which only `LegacyContext` gives.
+    let mut bound: Option<PathBuf> = None;
+    let mut bound_set = false;
 
-    // Closing a frame (shared code for closings during the walk and at EOF): an incomplete
-    // directory is NOT emitted and marks the parent incomplete (this is how incompleteness rises to
-    // ancestors); a complete one — emits the signature and mixes `(basename, sig)` into the parent.
+    // A frame that is NOT emitted always marks its parent incomplete, whatever kept it from being
+    // emitted. That is an invariant of the algorithm rather than a policy: the parent's signature
+    // is built from its children's signatures, so a missing child would otherwise make the parent
+    // hash as if that subtree had never existed.
     let mut close = |stack: &mut Vec<Frame>, popped: Frame| -> Result<()> {
-        if popped.incomplete {
+        let trust = match ctx.disposition(&popped.path) {
+            DirDisposition::Suppressed => None,
+            DirDisposition::Trusted => Some(DirTrust::Trusted),
+            DirDisposition::Untrusted => Some(DirTrust::Untrusted),
+        };
+        let Some(trust) = trust.filter(|_| !popped.incomplete) else {
             if let Some(parent) = stack.last_mut() {
                 parent.incomplete = true;
             }
             return Ok(());
-        }
+        };
         let sig = signature_of(&popped.entries);
-        emit(popped.path.clone(), sig.clone(), popped.size, popped.count)?;
+        emit(DirSignature {
+            path: popped.path.clone(),
+            signature: sig.clone(),
+            size: popped.size,
+            file_count: popped.count,
+            trust,
+        })?;
         if let Some(parent) = stack.last_mut() {
             let basename = popped
                 .path
@@ -360,9 +529,23 @@ where
     };
 
     for (path, size, hash_hex) in files {
-        // Close frames that are NOT ancestors of the current file. Lexicographic vs.
-        // component-order of paths: `Path::starts_with` checks component-wise,
-        // and `/a/b0/foo` does not start_with `/a/b` — the frame `/a/b` closes correctly.
+        let scope = ctx.scope(&path);
+        if matches!(scope, DirScope::Outside) {
+            return Err(outside_every_root(&path));
+        }
+        let file_bound = match scope {
+            DirScope::Root(root) => Some(PathBuf::from(root.as_str())),
+            _ => None,
+        };
+        // Root transition: everything open belongs to the previous root, so it all closes first.
+        if bound_set && file_bound != bound {
+            while let Some(popped) = stack.pop() {
+                close(&mut stack, popped)?;
+            }
+        }
+        bound = file_bound;
+        bound_set = true;
+
         while let Some(top) = stack.last() {
             if path.starts_with(&top.path) {
                 break;
@@ -370,19 +553,16 @@ where
             let popped = stack.pop().expect("non-empty by the while condition");
             close(&mut stack, popped)?;
         }
-        // Open the missing ancestors (from the root downward).
-        let parent_dirs: Vec<PathBuf> = path
-            .ancestors()
-            .skip(1) // the file itself is not a directory
-            .map(|p| p.to_path_buf())
-            .collect::<Vec<_>>()
+        let mut parent_dirs: Vec<PathBuf> = accountable_ancestors(&path, scope)
             .into_iter()
-            .rev() // root first
+            .map(|p| p.to_path_buf())
             .collect();
+        parent_dirs.reverse(); // root first
         for dir in parent_dirs {
             if stack.iter().any(|frame| frame.path == dir) {
                 continue;
             }
+            note_frame(&dir);
             stack.push(Frame {
                 path: dir,
                 entries: Vec::new(),
@@ -391,8 +571,6 @@ where
                 incomplete: false,
             });
         }
-        // The file — into the top frame. Without a hash (unique-size / failure) — the frame is incomplete,
-        // we do not add it to entries (the signature of such a directory is not emitted anyway).
         if let Some(top) = stack.last_mut() {
             match hash_hex {
                 Some(h) => {
@@ -408,11 +586,51 @@ where
             }
         }
     }
-    // EOF: merge the stack bottom-up (from the top frame — that is, the deepest — to the root).
     while let Some(popped) = stack.pop() {
         close(&mut stack, popped)?;
     }
     Ok(())
+}
+
+// Test-only: which frames the streaming build ever opened. «No above-root frame» is a claim about
+// creation, not about emission — a frame that exists absorbs its children's signatures and their
+// incompleteness even if it is never emitted — so proving it needs the frames themselves. Absent
+// from every non-test build.
+#[cfg(test)]
+thread_local! {
+    static FRAMES_OPENED: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(not(test))]
+fn note_frame(_dir: &Path) {}
+
+#[cfg(test)]
+fn note_frame(dir: &Path) {
+    FRAMES_OPENED.with(|opened| opened.borrow_mut().push(dir.to_path_buf()));
+}
+
+/// Records every frame the next build opens, clearing on construction and on drop.
+#[cfg(test)]
+struct FrameLog;
+
+#[cfg(test)]
+impl FrameLog {
+    fn start() -> Self {
+        FRAMES_OPENED.with(|opened| opened.borrow_mut().clear());
+        FrameLog
+    }
+
+    fn opened(&self) -> Vec<PathBuf> {
+        FRAMES_OPENED.with(|opened| opened.borrow().clone())
+    }
+}
+
+#[cfg(test)]
+impl Drop for FrameLog {
+    fn drop(&mut self) {
+        FRAMES_OPENED.with(|opened| opened.borrow_mut().clear());
+    }
 }
 
 #[cfg(test)]
@@ -585,6 +803,443 @@ mod tests {
         };
         // keep one of three → free 2 × 100.
         assert_eq!(g.reclaimable_bytes(), 200);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // R3C: marker-aware builds.
+    // ---------------------------------------------------------------------------------------
+
+    use crate::model::omission::{
+        CompletenessSnapshot, OmissionReason, SnapshotOutcome, StoredOmission,
+    };
+
+    fn files(spec: &[(&str, u64, Option<&str>)]) -> Vec<(PathBuf, u64, Option<String>)> {
+        spec.iter()
+            .map(|(p, s, h)| (PathBuf::from(p), *s, h.map(str::to_string)))
+            .collect()
+    }
+
+    fn row(root: &str, dir: &str, reason: &str, count: i64, generation: i64) -> StoredOmission {
+        StoredOmission {
+            root_key: root.to_string(),
+            dir_key: dir.to_string(),
+            reason: reason.to_string(),
+            event_count: count,
+            generation,
+        }
+    }
+
+    /// A bounded snapshot, or a panic naming the unavailable reason.
+    fn snap(
+        roots: &[&str],
+        gens: &[(&str, i64)],
+        rows: Vec<StoredOmission>,
+    ) -> CompletenessSnapshot {
+        let configured: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
+        let registered = gens.iter().map(|(k, g)| (k.to_string(), *g)).collect();
+        match CompletenessSnapshot::build(&configured, registered, rows).unwrap() {
+            SnapshotOutcome::Bounded(snapshot) => snapshot,
+            SnapshotOutcome::Unavailable(why) => panic!("expected a bounded snapshot: {why:?}"),
+        }
+    }
+
+    /// Every directory the streaming build emitted, with its trust, sorted.
+    fn merkle(
+        input: Vec<(PathBuf, u64, Option<String>)>,
+        ctx: &dyn SignatureContext,
+    ) -> Result<Vec<(String, DirTrust)>> {
+        let mut out = Vec::new();
+        build_dir_signatures_streaming_in_context(input, ctx, |sig| {
+            out.push((sig.path.to_string_lossy().into_owned(), sig.trust));
+            Ok(())
+        })?;
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    fn emitted_paths(rows: &[(String, DirTrust)]) -> Vec<&str> {
+        rows.iter().map(|(p, _)| p.as_str()).collect()
+    }
+
+    /// Group memberships, sorted — the equivalence classes both algorithms must agree on.
+    fn old_memberships(groups: &[AttributedDirGroup]) -> Vec<Vec<String>> {
+        let mut out: Vec<Vec<String>> = groups
+            .iter()
+            .map(|g| {
+                g.group
+                    .paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    const TWINS: &[(&str, u64, Option<&str>)] = &[
+        ("/r/left/a.bin", 10, Some("aa")),
+        ("/r/left/b.bin", 20, Some("bb")),
+        ("/r/right/a.bin", 10, Some("aa")),
+        ("/r/right/b.bin", 20, Some("bb")),
+    ];
+
+    /// Positive control: complete twins under a trusted root group, and are trusted.
+    #[test]
+    fn complete_twins_group_and_are_trusted() {
+        let ctx = snap(&["/r"], &[("/r", 1)], Vec::new());
+        let groups = build_dir_groups_in_context(&files(TWINS), &ctx).unwrap();
+        assert_eq!(
+            old_memberships(&groups),
+            vec![vec!["/r/left".to_string(), "/r/right".to_string()]]
+        );
+        assert_eq!(groups[0].trust, DirTrust::Trusted);
+        assert_eq!(
+            groups[0].member_trust,
+            vec![DirTrust::Trusted, DirTrust::Trusted]
+        );
+        let emitted = merkle(files(TWINS), &ctx).unwrap();
+        assert_eq!(emitted_paths(&emitted), vec!["/r", "/r/left", "/r/right"]);
+        assert!(emitted.iter().all(|(_, t)| *t == DirTrust::Trusted));
+    }
+
+    /// Every reason suppresses its own directory and every ancestor through the root — from the
+    /// ledger's own subtree aggregation, with no second upward pass.
+    #[test]
+    fn every_reason_suppresses_through_the_root() {
+        for reason in OmissionReason::ALL {
+            let ctx = snap(
+                &["/r"],
+                &[("/r", 1)],
+                vec![row("/r", "/r/left", reason.as_str(), 1, 1)],
+            );
+            let groups = build_dir_groups_in_context(&files(TWINS), &ctx).unwrap();
+            assert!(
+                groups.is_empty(),
+                "{reason:?}: the left side must lose its twin claim"
+            );
+            let emitted = merkle(files(TWINS), &ctx).unwrap();
+            assert_eq!(
+                emitted_paths(&emitted),
+                vec!["/r/right"],
+                "{reason:?}: only the untouched sibling survives; the root is suppressed too"
+            );
+        }
+    }
+
+    /// A root-wide `walk_error` sentinel suppresses the whole root and leaves a second root alone.
+    #[test]
+    fn a_root_sentinel_suppresses_its_whole_root_only() {
+        let input = files(&[
+            ("/a/one/x.bin", 10, Some("aa")),
+            ("/a/two/x.bin", 10, Some("aa")),
+            ("/b/one/x.bin", 10, Some("aa")),
+            ("/b/two/x.bin", 10, Some("aa")),
+        ]);
+        let ctx = snap(
+            &["/a", "/b"],
+            &[("/a", 1), ("/b", 1)],
+            vec![row("/a", "/a", "walk_error", 1, 1)],
+        );
+        let emitted = merkle(input.clone(), &ctx).unwrap();
+        assert!(
+            emitted.iter().all(|(p, _)| p.starts_with("/b")),
+            "nothing of root /a may be emitted: {emitted:?}"
+        );
+        let groups = build_dir_groups_in_context(&input, &ctx).unwrap();
+        assert_eq!(
+            old_memberships(&groups),
+            vec![vec!["/b/one".to_string(), "/b/two".to_string()]]
+        );
+    }
+
+    /// No frame is ever CREATED above a selected root, which is stronger than not emitting one: a
+    /// created frame would still absorb its children's signatures and their incompleteness.
+    #[test]
+    fn no_above_root_frame_is_ever_created() {
+        let ctx = snap(&["/r/inner"], &[("/r/inner", 1)], Vec::new());
+        let input = files(&[
+            ("/r/inner/a/x.bin", 10, Some("aa")),
+            ("/r/inner/b/x.bin", 10, Some("aa")),
+        ]);
+        let log = FrameLog::start();
+        let emitted = merkle(input, &ctx).unwrap();
+        let opened: Vec<String> = log
+            .opened()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            opened,
+            vec![
+                "/r/inner".to_string(),
+                "/r/inner/a".to_string(),
+                "/r/inner/b".to_string()
+            ],
+            "frames open from the root downward only"
+        );
+        assert!(emitted.iter().all(|(p, _)| p.starts_with("/r/inner")));
+    }
+
+    /// Two disjoint roots: every frame of the first closes before the second opens, no common
+    /// frame exists above them, and neither suppression nor trust crosses.
+    #[test]
+    fn multiple_roots_flush_between_transitions() {
+        let input = files(&[
+            ("/a/one/x.bin", 10, Some("aa")),
+            ("/a/two/x.bin", 10, Some("aa")),
+            ("/b/one/x.bin", 10, Some("aa")),
+            ("/b/two/x.bin", 10, Some("aa")),
+        ]);
+        let ctx = snap(
+            &["/a", "/b"],
+            &[("/a", 1), ("/b", 1)],
+            vec![row("/a", "/a/one", "min_size", 1, 1)],
+        );
+        let log = FrameLog::start();
+        let emitted = merkle(input.clone(), &ctx).unwrap();
+        let opened: Vec<String> = log
+            .opened()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !opened.iter().any(|p| p == "/"),
+            "no common frame above the two roots: {opened:?}"
+        );
+        assert_eq!(
+            emitted_paths(&emitted),
+            vec!["/a/two", "/b", "/b/one", "/b/two"],
+            "/a and /a/one are suppressed; root /b is untouched"
+        );
+        let groups = build_dir_groups_in_context(&input, &ctx).unwrap();
+        assert_eq!(
+            old_memberships(&groups),
+            vec![vec![
+                "/a/two".to_string(),
+                "/b/one".to_string(),
+                "/b/two".to_string()
+            ]],
+            "the survivors group by content, and Old agrees with Merkle"
+        );
+    }
+
+    /// A manifest file under no selected root is refused by BOTH builders, never silently dropped.
+    #[test]
+    fn a_file_outside_every_root_is_refused() {
+        let ctx = snap(&["/r"], &[("/r", 1)], Vec::new());
+        let input = files(&[
+            ("/r/a.bin", 10, Some("aa")),
+            ("/elsewhere/b.bin", 10, Some("bb")),
+        ]);
+        let old = build_dir_groups_in_context(&input, &ctx)
+            .expect_err("Old must refuse an outside file")
+            .to_string();
+        assert!(old.contains("/elsewhere/b.bin"), "{old}");
+        let streamed = match merkle(input, &ctx) {
+            Err(err) => err.to_string(),
+            Ok(rows) => panic!("Merkle must refuse an outside file, got {rows:?}"),
+        };
+        assert!(streamed.contains("/elsewhere/b.bin"), "{streamed}");
+    }
+
+    /// A selected regular-file root is valid input and yields no directory at all.
+    #[test]
+    fn a_regular_file_root_yields_no_directory() {
+        let ctx = snap(&["/r/only.bin"], &[("/r/only.bin", 1)], Vec::new());
+        let input = files(&[("/r/only.bin", 10, Some("aa"))]);
+        assert!(build_dir_groups_in_context(&input, &ctx)
+            .unwrap()
+            .is_empty());
+        let log = FrameLog::start();
+        assert!(merkle(input, &ctx).unwrap().is_empty());
+        assert!(log.opened().is_empty(), "no frame for a file root");
+    }
+
+    /// Root `/` keeps the absolute-path behavior: everything is in scope, nothing is above it.
+    #[test]
+    fn the_filesystem_root_bounds_everything() {
+        let ctx = snap(&["/"], &[("/", 1)], Vec::new());
+        let emitted = merkle(files(TWINS), &ctx).unwrap();
+        assert_eq!(
+            emitted_paths(&emitted),
+            vec!["/", "/r", "/r/left", "/r/right"]
+        );
+    }
+
+    /// A drifted registration and a generation of 0 stay ROOT-BOUNDED and answer untrusted — they
+    /// do not become unbounded, so no above-root directory reappears.
+    #[test]
+    fn drift_and_generation_zero_stay_bounded_and_untrusted() {
+        for ctx in [
+            snap(&["/r"], &[("/r", 0)], Vec::new()),
+            snap(&["/r"], &[("/other", 3)], Vec::new()),
+        ] {
+            let emitted = merkle(files(TWINS), &ctx).unwrap();
+            assert_eq!(
+                emitted_paths(&emitted),
+                vec!["/r", "/r/left", "/r/right"],
+                "still bounded to /r — nothing above it"
+            );
+            assert!(
+                emitted.iter().all(|(_, t)| *t == DirTrust::Untrusted),
+                "and nothing is trusted"
+            );
+            let groups = build_dir_groups_in_context(&files(TWINS), &ctx).unwrap();
+            assert_eq!(groups[0].trust, DirTrust::Untrusted);
+        }
+    }
+
+    /// Mixed member trust: the aggregate is conservative, and each member's trust travels with its
+    /// own pathname through the sort.
+    #[test]
+    fn mixed_member_trust_is_conservatively_aggregated_and_ordered() {
+        let input = files(&[("/zz/x.bin", 10, Some("aa")), ("/aa/x.bin", 10, Some("aa"))]);
+        let ctx = snap(&["/aa", "/zz"], &[("/aa", 0), ("/zz", 1)], Vec::new());
+        let groups = build_dir_groups_in_context(&input, &ctx).unwrap();
+        assert_eq!(groups.len(), 1);
+        let group = &groups[0];
+        assert_eq!(
+            group.group.paths,
+            vec![PathBuf::from("/aa"), PathBuf::from("/zz")],
+            "paths are sorted"
+        );
+        assert_eq!(
+            group.member_trust,
+            vec![DirTrust::Untrusted, DirTrust::Trusted],
+            "and each member's trust followed its own path through the sort"
+        );
+        assert_eq!(
+            group.member_trust.len(),
+            group.group.paths.len(),
+            "one trust per member, always"
+        );
+        assert_eq!(
+            group.trust,
+            DirTrust::Untrusted,
+            "trusted only when every member is"
+        );
+    }
+
+    /// The unhashed-file rule and the ledger compose as a union; neither undoes the other.
+    #[test]
+    fn unhashed_and_ledger_incompleteness_compose() {
+        let unhashed = files(&[
+            ("/r/left/a.bin", 10, Some("aa")),
+            ("/r/left/u.bin", 10, None),
+            ("/r/right/a.bin", 10, Some("aa")),
+        ]);
+        let clean = snap(&["/r"], &[("/r", 1)], Vec::new());
+        assert!(
+            build_dir_groups_in_context(&unhashed, &clean)
+                .unwrap()
+                .is_empty(),
+            "an unhashed file still suppresses under a trusted ledger"
+        );
+        let both = snap(
+            &["/r"],
+            &[("/r", 1)],
+            vec![row("/r", "/r/left", "min_size", 1, 1)],
+        );
+        assert!(build_dir_groups_in_context(&unhashed, &both)
+            .unwrap()
+            .is_empty());
+        assert!(build_dir_groups_in_context(&files(TWINS), &both)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The compatibility wrappers keep the unbounded behavior, including for spellings a `PathKey`
+    /// would refuse — a relative path and a `..`-spelled one. A fake root of `/` could not model
+    /// this: neither spelling is under `/` component-wise.
+    #[test]
+    fn the_wrappers_stay_unbounded_for_relative_and_dotdot_spellings() {
+        let awkward = files(&[
+            ("rel/left/a.bin", 10, Some("aa")),
+            ("rel/right/a.bin", 10, Some("aa")),
+            ("/x/../x/left/a.bin", 10, Some("bb")),
+            ("/x/../x/right/a.bin", 10, Some("bb")),
+        ]);
+        let groups = build_dir_groups(&awkward);
+        let mut members: Vec<Vec<String>> = groups
+            .iter()
+            .map(|g| {
+                g.paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .collect();
+        members.sort();
+        assert_eq!(
+            members,
+            vec![
+                vec!["/x/../x/left".to_string(), "/x/../x/right".to_string()],
+                vec!["rel/left".to_string(), "rel/right".to_string()],
+            ],
+            "both spellings still group, exactly as a pre-R3C build does"
+        );
+
+        let attributed = build_dir_groups_in_context(&awkward, &LegacyContext).unwrap();
+        assert_eq!(old_memberships(&attributed), members);
+        assert!(attributed.iter().all(|g| g.trust == DirTrust::Untrusted));
+
+        let mut emitted = Vec::new();
+        build_dir_signatures_streaming(awkward, |path, _, _, _| {
+            emitted.push(path.to_string_lossy().into_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            emitted.iter().any(|p| p == "rel/left"),
+            "the relative tree is walked: {emitted:?}"
+        );
+    }
+
+    /// Old and Merkle agree on equivalence classes under an authoritative snapshot.
+    #[test]
+    fn old_and_merkle_agree_under_a_snapshot() {
+        let input = files(&[
+            ("/r/one/x.bin", 10, Some("aa")),
+            ("/r/two/x.bin", 10, Some("aa")),
+            ("/r/three/x.bin", 10, Some("bb")),
+            ("/r/deep/a/b/x.bin", 10, Some("cc")),
+        ]);
+        let ctx = snap(
+            &["/r"],
+            &[("/r", 1)],
+            vec![row("/r", "/r/deep/a/b", "unsupported_entry", 2, 1)],
+        );
+        let groups = build_dir_groups_in_context(&input, &ctx).unwrap();
+        let emitted: Vec<String> = merkle(input, &ctx)
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(
+            old_memberships(&groups),
+            vec![vec!["/r/one".to_string(), "/r/two".to_string()]]
+        );
+        assert_eq!(
+            emitted,
+            vec![
+                "/r/one".to_string(),
+                "/r/three".to_string(),
+                "/r/two".to_string()
+            ],
+            "the deep chain and the root are suppressed; untouched siblings survive"
+        );
+    }
+
+    /// Degenerate inputs stay quiet.
+    #[test]
+    fn degenerate_inputs_are_quiet() {
+        let ctx = snap(&["/r"], &[("/r", 1)], Vec::new());
+        assert!(build_dir_groups_in_context(&[], &ctx).unwrap().is_empty());
+        assert!(merkle(Vec::new(), &ctx).unwrap().is_empty());
+        let one = files(&[("/r/only/x.bin", 10, Some("aa"))]);
+        assert!(build_dir_groups_in_context(&one, &ctx).unwrap().is_empty());
+        assert_eq!(merkle(one, &ctx).unwrap().len(), 2, "/r and /r/only");
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //! so those decisions are made in one place rather than three.
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::{AppError, Result};
 
@@ -486,6 +486,321 @@ impl RootRegistration {
     }
 }
 
+// -------------------------------------------------------------------------------------------
+// Signature policy: what a completeness verdict means for a directory signature, and the one
+// context a signature build consults for it.
+//
+// Inert here as everywhere else in this module — nothing in production builds a context or asks
+// for a disposition until R3D.
+// -------------------------------------------------------------------------------------------
+
+/// What a completeness verdict means for a directory signature.
+///
+/// Three values, not a boolean: `Trusted` and `Untrusted` both emit a signature, and collapsing
+/// them would destroy exactly the distinction a destructive gate needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirDisposition {
+    /// The ledger vouches for this directory: emit a signature, and a group built from it may be
+    /// acted on.
+    Trusted,
+    /// Emit no signature and no group. The scan did not see all of this directory, so it is not
+    /// an exact twin of anything.
+    Suppressed,
+    /// No trusted ledger covers it. Emit exactly as a pre-ledger build would, so nothing an
+    /// operator can browse disappears, but carry «not trusted» so a destructive path can say
+    /// `rescan required` rather than a saving.
+    Untrusted,
+}
+
+impl DirCompleteness {
+    /// The ONE mapping from a verdict to a signature disposition. Both the live and the
+    /// materialized paths go through it, so they cannot answer differently.
+    pub fn disposition(&self) -> DirDisposition {
+        match self {
+            Self::Complete => DirDisposition::Trusted,
+            Self::Incomplete(_) => DirDisposition::Suppressed,
+            Self::Unknown => DirDisposition::Untrusted,
+        }
+    }
+}
+
+/// Where a path sits relative to the scan's selected roots.
+///
+/// `Unbounded` is explicit rather than modelled as a root of `/`: a relative or `..`-spelled
+/// manifest pathname is not under `/` in the component sense, so a fake `/` root would classify
+/// exactly the spellings that need legacy treatment as `Outside`. Unboundedness is a state, not a
+/// wide root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirScope<'a> {
+    /// Inside this selected root; frames and accumulators start there and go no higher.
+    Root(&'a PathKey),
+    /// No root bounding at all — the pre-ledger behavior, ancestors to the filesystem root.
+    Unbounded,
+    /// Under no selected root. A manifest file here is a wiring failure, not something to drop.
+    Outside,
+}
+
+/// Everything a signature build needs to know about scope and completeness, from one load.
+///
+/// One object, because scope and completeness supplied separately can be built from different
+/// configurations or generations and disagree about the same directory.
+pub trait SignatureContext {
+    fn scope(&self, path: &Path) -> DirScope<'_>;
+    /// Total: every path has an answer.
+    fn disposition(&self, path: &Path) -> DirDisposition;
+}
+
+/// The pre-ledger context: no bounding, nothing trusted.
+///
+/// The only other implementation of [`SignatureContext`], and the one the compatibility wrappers
+/// use, so today's behavior is the general path with different data rather than a special branch.
+pub struct LegacyContext;
+
+impl SignatureContext for LegacyContext {
+    fn scope(&self, _path: &Path) -> DirScope<'_> {
+        DirScope::Unbounded
+    }
+
+    fn disposition(&self, _path: &Path) -> DirDisposition {
+        DirDisposition::Untrusted
+    }
+}
+
+/// One stored omission row, as a bounded loader hands it over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredOmission {
+    pub root_key: String,
+    pub dir_key: String,
+    pub reason: String,
+    pub event_count: i64,
+    pub generation: i64,
+}
+
+/// The result of building a snapshot: a usable authority, or the typed reason there is none.
+///
+/// Typed so a caller selects [`LegacyContext`] by matching this, never by inspecting private
+/// fields, parsing an error string or guessing from a `None` scope.
+#[derive(Debug)]
+pub enum SnapshotOutcome {
+    Bounded(CompletenessSnapshot),
+    Unavailable(AuthorityUnavailable),
+}
+
+/// One scan's completeness authority, loaded once and answerable offline.
+///
+/// Holds the scan's own persisted configured roots, the registered generations, the checked
+/// current-generation omission summaries and the root-wide sentinels. It is the total classifier:
+/// once built, any path can be answered without touching the database, which is what removes both
+/// the per-directory SQL and the need for a caller to enumerate candidates in advance.
+#[derive(Debug)]
+pub struct CompletenessSnapshot {
+    /// Normalized, sorted, mutually disjoint.
+    configured: Vec<PathKey>,
+    /// Registered authority: root key → generation (>= 0).
+    registered: BTreeMap<PathKey, i64>,
+    /// Current-generation rows, keyed by the normalized directory string for range lookup.
+    rows: BTreeMap<String, (PathKey, OmissionSummary)>,
+    /// Roots holding a current-generation `walk_error` row at `dir_key == root_key`.
+    sentinels: std::collections::BTreeSet<PathKey>,
+    /// Whether the configured and registered root sets are the same. False ⇒ nothing is trusted,
+    /// but the scan stays root-bounded: a drifted registration is not an unbounded scan.
+    agrees: bool,
+}
+
+impl CompletenessSnapshot {
+    /// Validates and owns one bounded load. Pure — no SQLite.
+    ///
+    /// A configuration this build cannot speak for is an expected outcome; malformed stored data
+    /// is an error. The two never swap places. Stale-generation rows are ignored rather than
+    /// allowed to reach a verdict, so a superseded row can never be read as evidence.
+    pub fn build(
+        configured_roots: &[PathBuf],
+        registered: Vec<(String, i64)>,
+        rows: Vec<StoredOmission>,
+    ) -> Result<SnapshotOutcome> {
+        if configured_roots.is_empty() {
+            return Ok(SnapshotOutcome::Unavailable(AuthorityUnavailable::NoRoots));
+        }
+        let mut configured: Vec<PathKey> = Vec::with_capacity(configured_roots.len());
+        for root in configured_roots {
+            match PathKey::new(root) {
+                Some(key) => configured.push(key),
+                None => {
+                    return Ok(SnapshotOutcome::Unavailable(
+                        AuthorityUnavailable::UnkeyableRoot {
+                            given: root.display().to_string(),
+                        },
+                    ))
+                }
+            }
+        }
+        for (index, outer) in configured.iter().enumerate() {
+            for inner in configured.iter().skip(index + 1) {
+                if inner.is_at_or_under(outer) || outer.is_at_or_under(inner) {
+                    let (outer, inner) = if inner.is_at_or_under(outer) {
+                        (outer, inner)
+                    } else {
+                        (inner, outer)
+                    };
+                    return Ok(SnapshotOutcome::Unavailable(
+                        AuthorityUnavailable::AmbiguousRoots {
+                            outer: outer.as_str().to_string(),
+                            inner: inner.as_str().to_string(),
+                        },
+                    ));
+                }
+            }
+        }
+        configured.sort();
+
+        let mut generations: BTreeMap<PathKey, i64> = BTreeMap::new();
+        for (raw, generation) in registered {
+            if generation < 0 {
+                return Err(AppError::msg(format!(
+                    "dedcom.db holds a corrupt completeness generation ({generation}); rescan, or move the old dedcom.db aside."
+                )));
+            }
+            generations.insert(PathKey::from_stored(&raw)?, generation);
+        }
+        let agrees = generations.len() == configured.len()
+            && configured.iter().all(|root| generations.contains_key(root));
+
+        let mut summaries: BTreeMap<String, (PathKey, OmissionSummary)> = BTreeMap::new();
+        let mut sentinels = std::collections::BTreeSet::new();
+        for row in rows {
+            let root = PathKey::from_stored(&row.root_key)?;
+            // A superseded or unregistered row is ignored, never validated into an error and never
+            // allowed to reach a verdict.
+            match generations.get(&root) {
+                Some(current) if *current > 0 && *current == row.generation => {}
+                _ => continue,
+            }
+            let directory = PathKey::from_stored(&row.dir_key)?;
+            if !directory.is_at_or_under(&root) {
+                return Err(AppError::msg(format!(
+                    "dedcom.db places {} outside its scan root {}; rescan, or move the old dedcom.db aside.",
+                    crate::textsan::terminal(directory.as_str()),
+                    crate::textsan::terminal(root.as_str())
+                )));
+            }
+            let reason = OmissionReason::parse(&row.reason).ok_or_else(|| {
+                AppError::msg(format!(
+                    "dedcom.db records an omission reason this build does not know ({}); upgrade dedcom, or move the old dedcom.db aside.",
+                    crate::textsan::terminal(&row.reason)
+                ))
+            })?;
+            let count = EventCount::from_i64(row.event_count)?;
+            if reason == OmissionReason::WalkError && directory == root {
+                sentinels.insert(root.clone());
+            }
+            let slot = summaries
+                .entry(directory.as_str().to_string())
+                .or_insert_with(|| (root.clone(), OmissionSummary::default()));
+            slot.1.add(reason, count)?;
+        }
+
+        Ok(SnapshotOutcome::Bounded(Self {
+            configured,
+            registered: generations,
+            rows: summaries,
+            sentinels,
+            agrees,
+        }))
+    }
+
+    /// The selected root containing `path`, if any. Component-wise, so `/tank/ab` is not under
+    /// `/tank/a`.
+    fn owning_root(&self, path: &Path) -> Option<&PathKey> {
+        self.configured
+            .iter()
+            .find(|root| path.starts_with(Path::new(root.as_str())))
+    }
+
+    /// Whether this root's ledger may be trusted at all.
+    fn trusted_root(&self, root: &PathKey) -> bool {
+        self.agrees && self.registered.get(root).copied().unwrap_or(0) > 0
+    }
+
+    /// Whether an omission lies at or under `key`, within `root`. Existence only: construction has
+    /// already rejected malformed current data, so a verdict needs no re-validation.
+    fn omitted_at_or_under(&self, root: &PathKey, key: &PathKey) -> bool {
+        if self.sentinels.contains(root) {
+            return true;
+        }
+        if let Some((stored, _)) = self.rows.get(key.as_str()) {
+            if stored == root {
+                return true;
+            }
+        }
+        let (lo, hi) = key.subtree_bounds();
+        self.rows
+            .range(lo..hi)
+            .any(|(_, (stored, _))| stored == root)
+    }
+
+    /// The full tri-state with its summary — for a reader that wants the detail, never once per
+    /// candidate. Total over paths.
+    pub fn verdict(&self, path: &Path) -> Result<DirCompleteness> {
+        let Some(key) = PathKey::new(path) else {
+            return Ok(DirCompleteness::Unknown);
+        };
+        let Some(root) = self.owning_root(path) else {
+            return Ok(DirCompleteness::Unknown);
+        };
+        if !self.trusted_root(root) {
+            return Ok(DirCompleteness::Unknown);
+        }
+        let mut summary = OmissionSummary::default();
+        let mut fold = |stored: &PathKey, found: &OmissionSummary| -> Result<()> {
+            if stored != root {
+                return Ok(());
+            }
+            for (reason, count) in found.per_reason() {
+                summary.add(reason, count)?;
+            }
+            Ok(())
+        };
+        if let Some((stored, found)) = self.rows.get(key.as_str()) {
+            fold(stored, found)?;
+        }
+        let (lo, hi) = key.subtree_bounds();
+        for (_, (stored, found)) in self.rows.range(lo..hi) {
+            fold(stored, found)?;
+        }
+        if summary.is_empty() {
+            Ok(DirCompleteness::Complete)
+        } else {
+            Ok(DirCompleteness::Incomplete(summary))
+        }
+    }
+}
+
+impl SignatureContext for CompletenessSnapshot {
+    fn scope(&self, path: &Path) -> DirScope<'_> {
+        match self.owning_root(path) {
+            Some(root) => DirScope::Root(root),
+            None => DirScope::Outside,
+        }
+    }
+
+    fn disposition(&self, path: &Path) -> DirDisposition {
+        let Some(key) = PathKey::new(path) else {
+            return DirDisposition::Untrusted;
+        };
+        let Some(root) = self.owning_root(path) else {
+            return DirDisposition::Untrusted;
+        };
+        if !self.trusted_root(root) {
+            return DirDisposition::Untrusted;
+        }
+        if self.omitted_at_or_under(root, &key) {
+            DirDisposition::Suppressed
+        } else {
+            DirDisposition::Trusted
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,6 +1190,312 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // R3C: the signature context.
+    // ---------------------------------------------------------------------------------------
+
+    fn stored(root: &str, dir: &str, reason: &str, count: i64, generation: i64) -> StoredOmission {
+        StoredOmission {
+            root_key: root.to_string(),
+            dir_key: dir.to_string(),
+            reason: reason.to_string(),
+            event_count: count,
+            generation,
+        }
+    }
+
+    fn built(
+        roots: &[&str],
+        gens: &[(&str, i64)],
+        rows: Vec<StoredOmission>,
+    ) -> Result<SnapshotOutcome> {
+        let configured: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
+        let registered = gens.iter().map(|(k, g)| (k.to_string(), *g)).collect();
+        CompletenessSnapshot::build(&configured, registered, rows)
+    }
+
+    fn bounded(
+        roots: &[&str],
+        gens: &[(&str, i64)],
+        rows: Vec<StoredOmission>,
+    ) -> CompletenessSnapshot {
+        match built(roots, gens, rows).unwrap() {
+            SnapshotOutcome::Bounded(snapshot) => snapshot,
+            SnapshotOutcome::Unavailable(why) => panic!("expected bounded: {why:?}"),
+        }
+    }
+
+    /// The one mapping from a verdict to a disposition, exhaustively.
+    #[test]
+    fn every_verdict_maps_to_one_disposition() {
+        assert_eq!(
+            DirCompleteness::Complete.disposition(),
+            DirDisposition::Trusted
+        );
+        assert_eq!(
+            DirCompleteness::Incomplete(OmissionSummary::default()).disposition(),
+            DirDisposition::Suppressed
+        );
+        assert_eq!(
+            DirCompleteness::Unknown.disposition(),
+            DirDisposition::Untrusted
+        );
+    }
+
+    /// A configuration this build cannot speak for is a typed outcome a caller can match on —
+    /// never an error string to parse and never a guess from an absent scope.
+    #[test]
+    fn an_unusable_configuration_is_a_typed_outcome() {
+        for (roots, expected) in [
+            (vec![], "no roots"),
+            (vec!["relative/root"], "unkeyable"),
+            (vec!["/tank/../tank"], "unkeyable"),
+            (vec!["/a", "/a/inner"], "ambiguous"),
+        ] {
+            match built(&roots, &[], Vec::new()).unwrap() {
+                SnapshotOutcome::Unavailable(why) => assert!(
+                    matches!(
+                        (&why, expected),
+                        (AuthorityUnavailable::NoRoots, "no roots")
+                            | (AuthorityUnavailable::UnkeyableRoot { .. }, "unkeyable")
+                            | (AuthorityUnavailable::AmbiguousRoots { .. }, "ambiguous")
+                    ),
+                    "{roots:?} expected {expected}, got {why:?}"
+                ),
+                SnapshotOutcome::Bounded(_) => panic!("{roots:?} must not be usable"),
+            }
+        }
+    }
+
+    /// Malformed stored data is an error, never a quiet degradation to legacy.
+    #[test]
+    fn malformed_stored_data_is_an_error() {
+        // A stored key that is not in normalized form.
+        assert!(built(&["/r"], &[("/r/", 1)], Vec::new()).is_err());
+        // A negative generation.
+        assert!(built(&["/r"], &[("/r", -1)], Vec::new()).is_err());
+        // A reason this build does not know, at the current generation.
+        let err = built(
+            &["/r"],
+            &[("/r", 1)],
+            vec![stored("/r", "/r/a", "quota_error", 1, 1)],
+        )
+        .expect_err("an unknown reason must not be summarised")
+        .to_string();
+        assert!(err.contains("does not know"), "{err}");
+        // An impossible count.
+        assert!(built(
+            &["/r"],
+            &[("/r", 1)],
+            vec![stored("/r", "/r/a", "min_size", 0, 1)]
+        )
+        .is_err());
+        // A row placed outside its own root.
+        assert!(built(
+            &["/r"],
+            &[("/r", 1)],
+            vec![stored("/r", "/elsewhere", "min_size", 1, 1)]
+        )
+        .is_err());
+    }
+
+    /// A superseded row is ignored rather than allowed to reach a verdict — and ignoring it means
+    /// its contents are never validated into an error either.
+    #[test]
+    fn stale_generation_rows_are_ignored() {
+        let snapshot = bounded(
+            &["/r"],
+            &[("/r", 2)],
+            vec![
+                stored("/r", "/r/old", "min_size", 1, 1),
+                stored("/r", "/r/gone", "quota_error", -5, 1),
+            ],
+        );
+        assert_eq!(
+            snapshot.disposition(Path::new("/r/old")),
+            DirDisposition::Trusted,
+            "a generation-1 row says nothing about generation 2"
+        );
+        assert_eq!(
+            snapshot.disposition(Path::new("/r")),
+            DirDisposition::Trusted
+        );
+    }
+
+    /// Aggregation across a subtree is checked.
+    #[test]
+    fn subtree_aggregation_is_checked() {
+        // Two `i64::MAX` cells still fit a `u64` — barely, one short of its maximum — so it takes
+        // three to leave the domain. Pinning the boundary rather than assuming it.
+        let two = bounded(
+            &["/r"],
+            &[("/r", 1)],
+            vec![
+                stored("/r", "/r/a", "min_size", i64::MAX, 1),
+                stored("/r", "/r/b", "min_size", i64::MAX, 1),
+            ],
+        );
+        match two.verdict(Path::new("/r")).unwrap() {
+            DirCompleteness::Incomplete(summary) => assert_eq!(
+                summary.known_omitted_files().unwrap(),
+                (i64::MAX as u64) * 2,
+                "two maxima still fit"
+            ),
+            other => panic!("expected incomplete, got {other:?}"),
+        }
+
+        let snapshot = bounded(
+            &["/r"],
+            &[("/r", 1)],
+            vec![
+                stored("/r", "/r/a", "min_size", i64::MAX, 1),
+                stored("/r", "/r/b", "min_size", i64::MAX, 1),
+                stored("/r", "/r/c", "min_size", i64::MAX, 1),
+            ],
+        );
+        assert!(
+            snapshot.verdict(Path::new("/r")).is_err(),
+            "three i64::MAX cells cannot be summed into one figure"
+        );
+        // The disposition needs no sum, so suppression still answers.
+        assert_eq!(
+            snapshot.disposition(Path::new("/r")),
+            DirDisposition::Suppressed
+        );
+    }
+
+    /// Scope and disposition come from the one object, and every path has an answer.
+    #[test]
+    fn scope_and_disposition_are_total() {
+        let snapshot = bounded(
+            &["/a", "/b"],
+            &[("/a", 1), ("/b", 1)],
+            vec![stored("/a", "/a/deep/x", "non_utf8", 1, 1)],
+        );
+        assert!(matches!(
+            snapshot.scope(Path::new("/a/deep/x")),
+            DirScope::Root(_)
+        ));
+        assert_eq!(snapshot.scope(Path::new("/elsewhere")), DirScope::Outside);
+        assert_eq!(snapshot.scope(Path::new("relative")), DirScope::Outside);
+
+        // Suppression reaches every ancestor through the root, from the ledger alone.
+        for dir in ["/a/deep/x", "/a/deep", "/a"] {
+            assert_eq!(
+                snapshot.disposition(Path::new(dir)),
+                DirDisposition::Suppressed,
+                "{dir}"
+            );
+        }
+        // A sibling and the other root are untouched.
+        assert_eq!(
+            snapshot.disposition(Path::new("/a/other")),
+            DirDisposition::Trusted
+        );
+        assert_eq!(
+            snapshot.disposition(Path::new("/b")),
+            DirDisposition::Trusted
+        );
+        // Outside every root, and unkeyable: untrusted, never trusted.
+        assert_eq!(
+            snapshot.disposition(Path::new("/elsewhere")),
+            DirDisposition::Untrusted
+        );
+        assert_eq!(
+            snapshot.disposition(Path::new("relative")),
+            DirDisposition::Untrusted
+        );
+
+        // The detailed verdict agrees and carries the reason.
+        match snapshot.verdict(Path::new("/a")).unwrap() {
+            DirCompleteness::Incomplete(summary) => {
+                assert_eq!(summary.known_omitted_files().unwrap(), 1)
+            }
+            other => panic!("expected incomplete, got {other:?}"),
+        }
+        assert_eq!(
+            snapshot.verdict(Path::new("/b")).unwrap(),
+            DirCompleteness::Complete
+        );
+        assert_eq!(
+            snapshot.verdict(Path::new("/elsewhere")).unwrap(),
+            DirCompleteness::Unknown
+        );
+    }
+
+    /// Drift and a generation of 0 keep the root bounds and answer untrusted.
+    #[test]
+    fn drift_and_generation_zero_are_bounded_but_untrusted() {
+        for snapshot in [
+            bounded(&["/r"], &[("/r", 0)], Vec::new()),
+            bounded(&["/r"], &[("/other", 3)], Vec::new()),
+        ] {
+            assert!(matches!(
+                snapshot.scope(Path::new("/r/a")),
+                DirScope::Root(_)
+            ));
+            assert_eq!(
+                snapshot.disposition(Path::new("/r/a")),
+                DirDisposition::Untrusted
+            );
+            assert_eq!(
+                snapshot.verdict(Path::new("/r/a")).unwrap(),
+                DirCompleteness::Unknown
+            );
+        }
+    }
+
+    /// The legacy context is unbounded and trusts nothing — and unboundedness is its own state,
+    /// not a root of `/`, so a relative pathname is in scope rather than outside it.
+    #[test]
+    fn the_legacy_context_is_unbounded_not_a_root() {
+        let ctx = LegacyContext;
+        for path in ["/a/b", "relative/x", "/x/../x/y"] {
+            assert_eq!(ctx.scope(Path::new(path)), DirScope::Unbounded, "{path}");
+            assert_eq!(
+                ctx.disposition(Path::new(path)),
+                DirDisposition::Untrusted,
+                "{path}"
+            );
+        }
+        // The distinction that matters, and the reason unboundedness is its own state rather than
+        // a root of `/`: a real `/` root puts a relative pathname OUTSIDE, which would make the
+        // compatibility wrapper refuse a manifest a pre-R3C build walks happily.
+        let rooted = bounded(&["/"], &[("/", 1)], Vec::new());
+        assert_eq!(rooted.scope(Path::new("relative/x")), DirScope::Outside);
+        // A `..`-spelled ABSOLUTE path is in scope under `/` — components put it below the root —
+        // but it has no key, so it can never be trusted. In scope and untrusted, not outside.
+        assert!(matches!(
+            rooted.scope(Path::new("/x/../x/y")),
+            DirScope::Root(_)
+        ));
+        assert_eq!(
+            rooted.disposition(Path::new("/x/../x/y")),
+            DirDisposition::Untrusted
+        );
+    }
+
+    /// A root-wide `walk_error` sentinel suppresses every directory of its root.
+    #[test]
+    fn a_root_sentinel_suppresses_the_whole_root() {
+        let snapshot = bounded(
+            &["/a", "/b"],
+            &[("/a", 1), ("/b", 1)],
+            vec![stored("/a", "/a", "walk_error", 1, 1)],
+        );
+        for dir in ["/a", "/a/deep", "/a/deep/deeper"] {
+            assert_eq!(
+                snapshot.disposition(Path::new(dir)),
+                DirDisposition::Suppressed,
+                "{dir}"
+            );
+        }
+        assert_eq!(
+            snapshot.disposition(Path::new("/b/x")),
+            DirDisposition::Trusted
+        );
     }
 
     /// The deep case, against the fixture's own accepted ancestor chain: every ancestor up to and
