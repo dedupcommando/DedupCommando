@@ -57,6 +57,7 @@ pub fn render_panel(
 ) {
     let source_result = source.and_then(|e| e.result.as_ref());
     let source_empty = source.map(|e| e.empty).unwrap_or_default();
+    let source_unavailable = source.and_then(|e| e.unavailable.as_deref());
     let border = if focused {
         Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     } else {
@@ -153,6 +154,20 @@ pub fn render_panel(
             // a twin directory, InnerDupes — fallback for a directory WITHOUT a twin.
             // When there's no result — a targeted message keyed by empty.
             let title = format!(" {} · {} ", index + 1, panel.view.label());
+            // A checkpoint that could not be READ is its own state: it precedes every result and
+            // every empty message, so a store failure can never be shown as «no dupes at the
+            // cursor» or as the directory being outside the scan.
+            if let Some(err) = source_unavailable {
+                render_view_fallback(
+                    frame,
+                    area,
+                    border,
+                    index,
+                    panel.view,
+                    &format!("directory group unavailable: {err}"),
+                );
+                return;
+            }
             match (panel.view, source_result) {
                 (_, Some(WatchResult::FileGroup(group, claim))) => {
                     let colors = browser::name_palette(group);
@@ -169,13 +184,19 @@ pub fn render_panel(
                     );
                 }
                 (PanelView::DuplicatesOfCursor, Some(WatchResult::DirGroup(group))) => {
-                    // The watch navigation reads the materialized rows without attribution (the
-                    // `dir_twins` residual, named in the round report): no member markers here.
+                    // A trusted group keeps the mode's own title byte for byte. An unverified one
+                    // may not be called a duplicate of anything: it says what it is instead, and
+                    // its members carry the same `?` marker as everywhere else.
+                    let title = if group.trust == crate::model::duplicate::DirTrust::Trusted {
+                        title
+                    } else {
+                        format!(" {} · unverified candidate — rescan required ", index + 1)
+                    };
                     browser::render_dir_group_files(
                         frame,
                         area,
-                        Some(group),
-                        None,
+                        Some(&group.group),
+                        Some(&group.member_trust),
                         &mut panel.list,
                         focused,
                         &title,

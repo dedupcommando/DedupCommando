@@ -9,7 +9,7 @@ use crossbeam_channel::Sender;
 use ratatui::widgets::ListState;
 
 use crate::model::action::ActionKind;
-use crate::model::duplicate::{AttributedDirGroup, DirGroup, DuplicateGroup};
+use crate::model::duplicate::{AttributedDirGroup, DuplicateGroup};
 use crate::model::scan::ResumeInfo;
 use crate::state::GroupSummary;
 
@@ -595,11 +595,29 @@ pub enum WatchResult {
     /// The old path (GroupFiles / DupOf): a group of duplicate files, with what its materialized
     /// row claims — the panel states the claim, and a group carries the claim of its own row.
     FileGroup(DuplicateGroup, crate::state::GroupClaim),
-    /// Cursor on a directory that has a twin in `dir_dedup`.
-    DirGroup(DirGroup),
+    /// Cursor on a directory whose twins survive the CURRENT ledger. Attributed, so the panel
+    /// can mark unverified members and never call an unverified pair a twin.
+    DirGroup(AttributedDirGroup),
     /// Cursor on a directory WITHOUT a twin, but with duplicate files
     /// inside (their hash occurs SOMEWHERE in the scan).
     InnerDupes(Vec<PathBuf>),
+}
+
+/// Why a "watching" panel has no result. Emptiness and failure are different answers: the three
+/// `WatchEmpty` reasons are legitimate states of the data, while `Unavailable` means the store
+/// could not be read at all. Folding the second into the first is what lets a broken database
+/// render as «no dupes at the cursor».
+#[derive(Debug, Clone)]
+pub enum WatchMiss {
+    Empty(WatchEmpty),
+    /// A hard store/snapshot failure, already sanitized for the terminal.
+    Unavailable(String),
+}
+
+impl From<WatchEmpty> for WatchMiss {
+    fn from(empty: WatchEmpty) -> Self {
+        WatchMiss::Empty(empty)
+    }
 }
 
 /// The reason `WatchEntry.result` is empty. Before this, render lumped all
@@ -629,6 +647,9 @@ pub struct WatchEntry {
     pub key: Option<WatchKey>,
     pub result: Option<WatchResult>,
     pub empty: WatchEmpty,
+    /// The store failure behind an absent result, sanitized. While it is set the panel says so
+    /// and enters no fallback: an unreadable checkpoint is not «no duplicates».
+    pub unavailable: Option<String>,
 }
 
 impl WatchEntry {

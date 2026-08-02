@@ -2792,50 +2792,24 @@ impl ScanStore {
         attributed_dir_group_tx(&tx, scan_id, signature)
     }
 
-    /// «twin folder» — finding twins of a specific directory in
-    /// `dir_dedup`. `None` if the directory is not in a duplicate group. Otherwise `Some(group)`,
-    /// where `group.paths` contains all members (including `dir_path` itself).
-    /// Uses the index `dir_dedup_by_scan_sig` (schema.rs:58). Called from
-    /// `resolve_watch_group` on the key `WatchKey::DirOf`.
-    pub fn dir_twins(&self, scan_id: i64, dir_path: &Path) -> Result<Option<DirGroup>> {
-        use rusqlite::OptionalExtension;
-        let dir_str = dir_path.to_string_lossy();
-        let row = self
-            .conn
-            .query_row(
-                "SELECT signature, file_count, size_per_dir FROM dir_dedup
-                 WHERE scan_id = ?1 AND path = ?2 LIMIT 1",
-                params![scan_id, dir_str.as_ref()],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, i64>(1)? as u32,
-                        r.get::<_, i64>(2)? as u64,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((signature, file_count, size_per_dir)) = row else {
-            return Ok(None);
-        };
-        let mut stmt = self.conn.prepare(
-            "SELECT path FROM dir_dedup
-             WHERE scan_id = ?1 AND signature = ?2 ORDER BY path",
-        )?;
-        let mut paths: Vec<PathBuf> = Vec::new();
-        let rows = stmt.query_map(params![scan_id, &signature], |r| {
-            Ok(PathBuf::from(r.get::<_, String>(0)?))
-        })?;
-        for row in rows {
-            paths.push(row?);
-        }
-        Ok(Some(DirGroup {
-            id: 0,
-            signature,
-            paths,
-            file_count,
-            size_per_dir,
-        }))
+    /// The twin-directory group the cursor's own directory belongs to, revalidated against the
+    /// CURRENT ledger — for the watch panel of `WatchKey::DirOf`. Keyed by the path, not by a
+    /// signature the caller supplies, so the answer is about the directory the user is standing on.
+    /// One deferred transaction, exactly 4 statements: the three authority reads plus one indexed
+    /// `dir_dedup` read whose subquery resolves the cursor's signature (both halves are covered by
+    /// the PK and by `dir_dedup_by_scan_sig`, schema.rs:85).
+    ///
+    /// `None` when the directory is in no group, when the current ledger has whittled the group
+    /// below two surviving members, or when it suppresses the cursor itself — a directory whose
+    /// own contents are no longer established may not be presented as one of a pair, and the
+    /// surviving remainder is not «duplicates of this cursor» either.
+    pub fn attributed_dir_group_at(
+        &self,
+        scan_id: i64,
+        dir_path: &Path,
+    ) -> Result<Option<AttributedDirGroup>> {
+        let tx = self.conn.unchecked_transaction()?;
+        attributed_dir_group_at_tx(&tx, scan_id, dir_path)
     }
 
     /// Files under `dir_path` whose hash occurs in
@@ -4221,6 +4195,80 @@ fn attributed_dir_group_tx(
     }))
 }
 
+/// The same attributed read, keyed by the cursor's directory instead of a signature: the three
+/// authority reads plus ONE group statement whose subquery names the cursor's signature.
+fn attributed_dir_group_at_tx(
+    tx: &Transaction<'_>,
+    scan_id: i64,
+    dir_path: &Path,
+) -> Result<Option<AttributedDirGroup>> {
+    let outcome = completeness_snapshot_tx(tx, scan_id)?;
+    let legacy = LegacyContext;
+    let ctx = attribution_context(&outcome, &legacy);
+
+    note_ledger_statement();
+    // The subquery names the cursor's signature (a PK-range probe over this scan's rows, the shape
+    // the watch reader always had); the outer read then walks that signature through
+    // `dir_dedup_by_scan_sig`. `file_count` and `size_per_dir` are equal on every row of a group,
+    // so the first row carries them, and the cursor is always among the rows — it is what named
+    // the signature.
+    let mut stmt = tx.prepare(
+        "SELECT path, signature, file_count, size_per_dir FROM dir_dedup
+          WHERE scan_id = ?1 AND signature = (
+                SELECT signature FROM dir_dedup WHERE scan_id = ?1 AND path = ?2
+          )
+          ORDER BY path",
+    )?;
+    let cursor = dir_path.to_string_lossy();
+    let rows = stmt.query_map(params![scan_id, cursor.as_ref()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)? as u32,
+            row.get::<_, i64>(3)? as u64,
+        ))
+    })?;
+
+    let mut header: Option<(String, u32, u64)> = None;
+    let mut members: Vec<(PathBuf, DirTrust)> = Vec::new();
+    let mut cursor_survives = false;
+    for row in rows {
+        let (path, signature, file_count, size_per_dir) = row?;
+        header.get_or_insert((signature, file_count, size_per_dir));
+        let path = PathBuf::from(path);
+        if let Some(trust) = member_trust_of(ctx, &path) {
+            cursor_survives |= path == dir_path;
+            members.push((path, trust));
+        }
+    }
+    let Some((signature, file_count, size_per_dir)) = header else {
+        return Ok(None);
+    };
+    // The cursor's own standing is decided first: a directory the current ledger suppresses is a
+    // member of nothing, and answering with whoever survived would offer a DIFFERENT pair as
+    // «duplicates of this cursor». Then the same cardinality rule as every attributed reader.
+    if !cursor_survives || members.len() < 2 {
+        return Ok(None);
+    }
+    let trust = if members.iter().all(|(_, trust)| *trust == DirTrust::Trusted) {
+        DirTrust::Trusted
+    } else {
+        DirTrust::Untrusted
+    };
+    let (paths, member_trust): (Vec<PathBuf>, Vec<DirTrust>) = members.into_iter().unzip();
+    Ok(Some(AttributedDirGroup {
+        group: DirGroup {
+            id: 0,
+            signature,
+            paths,
+            file_count,
+            size_per_dir,
+        },
+        member_trust,
+        trust,
+    }))
+}
+
 impl ScanStore {
     /// Registers the scan's roots as completeness authorities and reports what happened.
     ///
@@ -5142,8 +5190,9 @@ mod tests {
     }
 
     #[test]
-    fn dir_twins_returns_group_for_dir_in_dir_dedup() {
-        // R6 C4: dir in a group → Some(group) with paths including the dir itself.
+    fn dir_group_at_returns_the_cursors_group_with_its_trust() {
+        // R6 C4, now attributed: a dir in a group → Some(group) with paths including the dir
+        // itself — and, on a ledger that vouches for nothing, every member `Untrusted`.
         let mut store = ScanStore::open_in_memory().unwrap();
         let scan_id = store
             .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
@@ -5160,29 +5209,36 @@ mod tests {
                 }],
             )
             .unwrap();
-        let twins = store
-            .dir_twins(scan_id, &PathBuf::from("/x/a"))
+        let group = store
+            .attributed_dir_group_at(scan_id, &PathBuf::from("/x/a"))
             .unwrap()
             .expect("/x/a in a group");
-        assert_eq!(twins.signature, "SIG_TWINS");
-        let mut paths = twins.paths.clone();
-        paths.sort();
-        assert_eq!(paths, vec![PathBuf::from("/x/a"), PathBuf::from("/x/b")]);
-        assert_eq!(twins.file_count, 3);
-        assert_eq!(twins.size_per_dir, 500);
+        assert_eq!(group.group.signature, "SIG_TWINS");
+        assert_eq!(
+            group.group.paths,
+            vec![PathBuf::from("/x/a"), PathBuf::from("/x/b")]
+        );
+        assert_eq!(group.group.file_count, 3);
+        assert_eq!(group.group.size_per_dir, 500);
+        assert_eq!(group.trust, DirTrust::Untrusted);
+        assert_eq!(
+            group.member_trust,
+            vec![DirTrust::Untrusted, DirTrust::Untrusted],
+            "a generation-zero ledger vouches for nothing"
+        );
     }
 
     #[test]
-    fn dir_twins_returns_none_for_dir_not_in_dir_dedup() {
+    fn dir_group_at_returns_none_for_dir_not_in_dir_dedup() {
         let mut store = ScanStore::open_in_memory().unwrap();
         let scan_id = store
             .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
             .unwrap();
         // dir_dedup is empty.
-        let twins = store
-            .dir_twins(scan_id, &PathBuf::from("/x/orphan"))
+        let group = store
+            .attributed_dir_group_at(scan_id, &PathBuf::from("/x/orphan"))
             .unwrap();
-        assert!(twins.is_none(), "a singleton outside groups — None");
+        assert!(group.is_none(), "a singleton outside groups — None");
     }
 
     // ---- Dir-group summaries for the browser tab ----
@@ -11219,6 +11275,16 @@ mod tests {
 
         reset_ledger_statements();
         store
+            .attributed_dir_group_at(scan_id, &PathBuf::from("/tank/x"))
+            .unwrap();
+        assert_eq!(
+            ledger_statements(),
+            4,
+            "the cursor's group: 3 + one indexed read, the signature named by its subquery"
+        );
+
+        reset_ledger_statements();
+        store
             .dir_signatures_under(scan_id, &many, DirSigAlgo::Old)
             .unwrap();
         assert_eq!(
@@ -11474,8 +11540,153 @@ mod tests {
         assert!(store.attributed_dir_groups(scan_id).is_err());
         assert!(store.attributed_dir_group(scan_id, "ANY").is_err());
         assert!(store
+            .attributed_dir_group_at(scan_id, &PathBuf::from("/tank/a"))
+            .is_err());
+        assert!(store
             .dir_signatures_under(scan_id, &[PathBuf::from("/tank/a")], DirSigAlgo::Old)
             .is_err());
+    }
+
+    /// A store with one trusted TRIO, so a single suppression can be aimed either at the cursor
+    /// or at one of its twins.
+    fn trio_store() -> (ScanStore, i64) {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(scan_id, &one_root("/tank", &[]))
+            .unwrap();
+        store
+            .record_dir_groups(
+                scan_id,
+                &[DirGroup {
+                    id: 0,
+                    signature: "TRIO".to_string(),
+                    paths: vec![
+                        PathBuf::from("/tank/t1"),
+                        PathBuf::from("/tank/t2"),
+                        PathBuf::from("/tank/t3"),
+                    ],
+                    file_count: 2,
+                    size_per_dir: 60,
+                }],
+            )
+            .unwrap();
+        (store, scan_id)
+    }
+
+    /// The watch lookup obeys the same current ledger as every other attributed reader: while it
+    /// is clean the cursor's group is answered whole and fully trusted, and a suppressed TWIN just
+    /// disappears from the membership.
+    #[test]
+    fn the_watch_lookup_removes_a_suppressed_twin() {
+        let (mut store, scan_id) = trio_store();
+        let cursor = PathBuf::from("/tank/t1");
+
+        let before = store
+            .attributed_dir_group_at(scan_id, &cursor)
+            .unwrap()
+            .expect("a clean ledger answers the whole group");
+        assert_eq!(before.trust, DirTrust::Trusted);
+        assert_eq!(
+            before.group.paths,
+            vec![
+                PathBuf::from("/tank/t1"),
+                PathBuf::from("/tank/t2"),
+                PathBuf::from("/tank/t3")
+            ],
+            "a fully trusted answer keeps the parent's order and values"
+        );
+        assert_eq!(before.member_trust, vec![DirTrust::Trusted; 3]);
+        assert_eq!(before.group.file_count, 2);
+        assert_eq!(before.group.size_per_dir, 60);
+
+        // A later walk finds an omission inside t3: that twin is suppressed, the cursor is not.
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/t3/inner", OmissionReason::NonUtf8)]),
+            )
+            .unwrap();
+        let after = store
+            .attributed_dir_group_at(scan_id, &cursor)
+            .unwrap()
+            .expect("cursor and one twin survive");
+        assert_eq!(
+            after.group.paths,
+            vec![PathBuf::from("/tank/t1"), PathBuf::from("/tank/t2")],
+            "the suppressed twin is gone, the cursor stays"
+        );
+        assert_eq!(after.trust, DirTrust::Trusted);
+    }
+
+    /// A suppressed cursor is a member of nothing — and the survivors are NOT offered in its place.
+    /// This is the resurrection the residual reader allowed: stored paths presented as duplicates
+    /// of a directory whose own contents the ledger no longer establishes.
+    #[test]
+    fn a_suppressed_cursor_has_no_directory_group() {
+        let (mut store, scan_id) = trio_store();
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/t1", OmissionReason::MetadataError)]),
+            )
+            .unwrap();
+        assert!(
+            store
+                .attributed_dir_group_at(scan_id, &PathBuf::from("/tank/t1"))
+                .unwrap()
+                .is_none(),
+            "the surviving pair is not «duplicates of this cursor»"
+        );
+        // The pair itself is untouched when asked from one of its own members.
+        let survivors = store
+            .attributed_dir_group_at(scan_id, &PathBuf::from("/tank/t2"))
+            .unwrap()
+            .expect("t2 and t3 still are twins of each other");
+        assert_eq!(
+            survivors.group.paths,
+            vec![PathBuf::from("/tank/t2"), PathBuf::from("/tank/t3")]
+        );
+    }
+
+    /// Cardinality is re-evaluated after suppression: a group whittled below two members is no
+    /// group at all, even for the member that survived.
+    #[test]
+    fn the_watch_lookup_answers_none_below_two_survivors() {
+        let (mut store, scan_id) = trio_store();
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root(
+                    "/tank",
+                    &[
+                        ("/tank/t2", OmissionReason::MetadataError),
+                        ("/tank/t3", OmissionReason::MetadataError),
+                    ],
+                ),
+            )
+            .unwrap();
+        assert!(
+            store
+                .attributed_dir_group_at(scan_id, &PathBuf::from("/tank/t1"))
+                .unwrap()
+                .is_none(),
+            "one survivor is a claim with no twin"
+        );
+    }
+
+    /// An `Unknown` member survives — inspectable — but never looks exact: it carries `Untrusted`
+    /// and drags the aggregate down with it.
+    #[test]
+    fn an_unknown_member_survives_the_watch_lookup_as_untrusted() {
+        let (mut store, scan_id) = trio_store();
+        // The authority is gone: nothing is suppressed, and nothing is vouched for either.
+        store.clear_scan_omissions(scan_id).unwrap();
+        let group = store
+            .attributed_dir_group_at(scan_id, &PathBuf::from("/tank/t1"))
+            .unwrap()
+            .expect("an unverified group stays inspectable");
+        assert_eq!(group.trust, DirTrust::Untrusted);
+        assert_eq!(group.member_trust, vec![DirTrust::Untrusted; 3]);
     }
 
     /// Typed live trust, all three states in one scan: a suppressed directory is absent, a

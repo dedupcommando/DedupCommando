@@ -1577,7 +1577,7 @@ fn panel_row_count(app: &App, index: usize) -> usize {
             .and_then(|entry| entry.result.as_ref())
         {
             Some(WatchResult::FileGroup(g, _)) => g.files.len(),
-            Some(WatchResult::DirGroup(g)) => g.paths.len(),
+            Some(WatchResult::DirGroup(g)) => g.group.paths.len(),
             Some(WatchResult::InnerDupes(paths)) => paths.len(),
             None => 0,
         },
@@ -1830,10 +1830,11 @@ fn resolve_watch_groups(app: &mut App) {
             .unwrap_or(true);
         if stale {
             // On Err(NoSource) we have no key — we pass the reason straight through;
-            // on Ok(key) we go into resolve, which distinguishes NotInScan/NoDuplicates.
-            let outcome: Result<state::WatchResult, state::WatchEmpty> = match &key_res {
+            // on Ok(key) we go into resolve, which distinguishes NotInScan/NoDuplicates and
+            // reports a hard store failure as its own outcome.
+            let outcome: Result<state::WatchResult, state::WatchMiss> = match &key_res {
                 Ok(k) => resolve_watch_group(app, scan_id, k, &mut store),
-                Err(e) => Err(*e),
+                Err(e) => Err((*e).into()),
             };
             if let Some(entry) = app.commander.watch_cache.get_mut(i) {
                 entry.key = new_key;
@@ -1841,10 +1842,17 @@ fn resolve_watch_groups(app: &mut App) {
                     Ok(result) => {
                         entry.result = Some(result);
                         entry.empty = state::WatchEmpty::default();
+                        entry.unavailable = None;
                     }
-                    Err(reason) => {
+                    Err(state::WatchMiss::Empty(reason)) => {
                         entry.result = None;
                         entry.empty = reason;
+                        entry.unavailable = None;
+                    }
+                    Err(state::WatchMiss::Unavailable(err)) => {
+                        entry.result = None;
+                        entry.empty = state::WatchEmpty::default();
+                        entry.unavailable = Some(err);
                     }
                 }
             }
@@ -1898,6 +1906,12 @@ fn compute_watch_key(app: &App, i: usize) -> Result<state::WatchKey, state::Watc
     }
 }
 
+/// A store failure on the watch path, sanitized for the terminal like every other error the
+/// commander shows.
+fn watch_unavailable(err: &crate::error::AppError) -> state::WatchMiss {
+    state::WatchMiss::Unavailable(crate::textsan::terminal(&err.to_string()))
+}
+
 /// Lazy provision of a DB connection (opened on the first access within a frame).
 fn ensure_store<'a>(app: &App, store: &'a mut Option<ScanStore>) -> Option<&'a ScanStore> {
     if store.is_none() {
@@ -1907,16 +1921,17 @@ fn ensure_store<'a>(app: &App, store: &'a mut Option<ScanStore>) -> Option<&'a S
 }
 
 /// Resolves the «watching» panel's result for the key `key`. The
-/// `WatchResult` type — FileGroup (the old GroupFiles/DupOf), DirGroup (DirOf found
-/// twins in `dir_dedup`) or InnerDupes (DirOf — fallback to duplicate files inside).
-/// On an empty result we return `Err(WatchEmpty)` so that render
-/// distinguishes «out of scan» vs «in scan, but no duplicates».
+/// `WatchResult` type — FileGroup (the old GroupFiles/DupOf), DirGroup (DirOf found the cursor's
+/// surviving twins) or InnerDupes (DirOf — fallback to duplicate files inside).
+/// On an empty result we return `Err(WatchMiss::Empty)` so that render
+/// distinguishes «out of scan» vs «in scan, but no duplicates»; a hard store failure comes back
+/// as `Err(WatchMiss::Unavailable)` and enters no fallback at all.
 fn resolve_watch_group(
     app: &App,
     scan_id: Option<i64>,
     key: &state::WatchKey,
     store: &mut Option<ScanStore>,
-) -> Result<state::WatchResult, state::WatchEmpty> {
+) -> Result<state::WatchResult, state::WatchMiss> {
     let scan_id = scan_id.ok_or(state::WatchEmpty::NotInScan)?;
     // If the connection could not be opened — we treat it as «out of scan» (the database
     // is unavailable → this scan has no visible data).
@@ -1957,13 +1972,13 @@ fn resolve_watch_group(
             // Hash_for_path = None → the file is not in the scan manifest → NotInScan.
             let hash = match store.hash_for_path(scan_id, path) {
                 Ok(Some(h)) => h,
-                Ok(None) => return Err(state::WatchEmpty::NotInScan),
-                Err(_) => return Err(state::WatchEmpty::NotInScan),
+                Ok(None) => return Err(state::WatchEmpty::NotInScan.into()),
+                Err(_) => return Err(state::WatchEmpty::NotInScan.into()),
             };
             let hex = crate::model::duplicate::hex_encode(&hash);
             // No claim → the file is in the scan, but not in a materialized duplicate group.
             let Some(claim) = store.group_claim(scan_id, &hex).ok().flatten() else {
-                return Err(state::WatchEmpty::NoDuplicates);
+                return Err(state::WatchEmpty::NoDuplicates.into());
             };
             let files = store
                 .group_files(scan_id, &hex)
@@ -1979,25 +1994,31 @@ fn resolve_watch_group(
             ))
         }
         state::WatchKey::DirOf(path) => {
-            // First we look for twins in `dir_dedup`.
-            if let Ok(Some(twins)) = store.dir_twins(scan_id, path) {
-                return Ok(state::WatchResult::DirGroup(twins));
+            // The cursor's twins, revalidated against the current ledger: a member the ledger has
+            // suppressed since materialization is gone, and a suppressed cursor has no group at
+            // all. A failure to READ that answer is not an answer — it may not become a fallback.
+            match store.attributed_dir_group_at(scan_id, path) {
+                Ok(Some(group)) => return Ok(state::WatchResult::DirGroup(group)),
+                Ok(None) => {}
+                Err(err) => return Err(watch_unavailable(&err)),
             }
             // Fallback: duplicate files INSIDE the directory.
             let inside = store
                 .dup_files_inside(scan_id, path)
-                .ok()
-                .unwrap_or_default();
+                .map_err(|err| watch_unavailable(&err))?;
             if !inside.is_empty() {
                 return Ok(state::WatchResult::InnerDupes(inside));
             }
             // Neither twins nor duplicates inside — we distinguish «out of scan»
             // (the directory was not scanned → hint the user to switch to a
             // covered subdirectory) and «in scan, but no duplicates» (everything is unique).
-            if store.is_path_in_scan(scan_id, path).unwrap_or(false) {
-                Err(state::WatchEmpty::NoDuplicates)
+            if store
+                .is_path_in_scan(scan_id, path)
+                .map_err(|err| watch_unavailable(&err))?
+            {
+                Err(state::WatchEmpty::NoDuplicates.into())
             } else {
-                Err(state::WatchEmpty::NotInScan)
+                Err(state::WatchEmpty::NotInScan.into())
             }
         }
     }
@@ -4269,5 +4290,366 @@ mod header_tests {
         // edit) → "long ago". We do not panic.
         assert_eq!(humanize_ago("not a date"), "long ago");
         assert_eq!(humanize_ago(""), "long ago");
+    }
+}
+
+#[cfg(test)]
+mod dir_watch_tests {
+    //! The `DuplicatesOfCursor` panel over a DIRECTORY cursor, driven end to end: a real database
+    //! file, the real `resolve_watch_groups` cache and the real commander render. A store helper
+    //! test alone would not show that the panel stops resurrecting a suppressed member, because
+    //! the resurrection lived in the route, not in the query.
+
+    use super::*;
+    use crate::model::duplicate::{DirGroup, DirTrust};
+    use crate::model::omission::{OmissionCounts, OmissionReason, PathKey};
+    use crate::model::scan::{ScanConfig, ScanStatus};
+    use crate::state::ScanStore;
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    /// A unique database path for one test — the commander opens the store by path, so these
+    /// cases cannot share an in-memory connection the way the store's own tests do.
+    fn db_path(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("dedcom_watch_{tag}_{}_{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("dedcom.db")
+    }
+
+    /// One root's ledger from `(directory, reason)` events.
+    fn one_root(
+        root: &str,
+        events: &[(&str, OmissionReason)],
+    ) -> BTreeMap<PathKey, OmissionCounts> {
+        let mut counts = OmissionCounts::new();
+        for (dir, reason) in events {
+            counts
+                .bump(
+                    PathKey::new(Path::new(dir)).expect("a keyable path"),
+                    *reason,
+                )
+                .unwrap();
+        }
+        BTreeMap::from([(
+            PathKey::new(Path::new(root)).expect("a keyable root"),
+            counts,
+        )])
+    }
+
+    /// A completed scan over `/tank`: three twin directories in `dir_dedup`, one file each in the
+    /// manifest so «is this path in the scan» has a truthful answer, and a committed empty ledger
+    /// — every member trusted until a test says otherwise.
+    fn seeded_db(tag: &str) -> (PathBuf, i64) {
+        let db = db_path(tag);
+        let mut store = ScanStore::open(&db).unwrap();
+        let scan_id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank")]))
+            .unwrap();
+        store
+            .record_files(
+                scan_id,
+                &["/tank/t1/f", "/tank/t2/f", "/tank/t3/f"]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, path)| crate::state::ManifestRow {
+                        path: PathBuf::from(path),
+                        size: 10,
+                        mtime: 0,
+                        device: 1,
+                        inode: i as u64 + 1,
+                        nlink: 1,
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        store
+            .record_dir_groups(
+                scan_id,
+                &[DirGroup {
+                    id: 0,
+                    signature: "TRIO".to_string(),
+                    paths: vec![
+                        PathBuf::from("/tank/t1"),
+                        PathBuf::from("/tank/t2"),
+                        PathBuf::from("/tank/t3"),
+                    ],
+                    file_count: 1,
+                    size_per_dir: 10,
+                }],
+            )
+            .unwrap();
+        store
+            .commit_omissions(scan_id, &one_root("/tank", &[]))
+            .unwrap();
+        store.set_status(scan_id, ScanStatus::Complete).unwrap();
+        (db, scan_id)
+    }
+
+    fn dir_entry(path: &str) -> PanelEntry {
+        let p = PathBuf::from(path);
+        PanelEntry {
+            name: p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            path: p,
+            kind: EntryKind::Dir,
+            size: 0,
+            mtime: 0,
+            device: 0,
+            inode: 0,
+        }
+    }
+
+    /// A two-panel commander over `db`: a `directories` panel whose cursor stands on `cursor`, and
+    /// the watching `DuplicatesOfCursor` panel beside it.
+    fn app_watching(
+        db: &Path,
+        scan_id: i64,
+        cursor: &str,
+    ) -> (
+        App,
+        crossbeam_channel::Receiver<crate::tui::event::AppEvent>,
+    ) {
+        let (mut app, events) = crate::app::test_app_with_db(db.to_path_buf());
+        app.commander = CommanderState::new(&[PathBuf::from("/")]);
+        let mut source = state::Panel::empty(PathBuf::from("/tank"));
+        source.loading = false;
+        source.view = PanelView::DirsOnly;
+        source.entries = vec![dir_entry(cursor)];
+        source.list.select(Some(0));
+        let mut watch = state::Panel::empty(PathBuf::from("/tank"));
+        watch.loading = false;
+        watch.view = PanelView::DuplicatesOfCursor;
+        app.commander.panels = vec![source, watch];
+        app.commander.active = 0;
+        app.commander.dedup_scan_id = Some(scan_id);
+        (app, events)
+    }
+
+    /// Re-resolves the watch panels from scratch — the same invalidation `apply_auto_switch` does
+    /// when the active scan changes, and the only way to see a ledger written after the first
+    /// resolve (the cache key, the cursor path, has not moved).
+    fn re_resolve(app: &mut App) {
+        app.commander.watch_cache = Vec::new();
+        resolve_watch_groups(app);
+    }
+
+    fn watch_entry(app: &App) -> &state::WatchEntry {
+        app.commander
+            .watch_cache
+            .get(1)
+            .expect("the watching panel")
+    }
+
+    /// The rows of panel `index` on the rendered screen, as plain text lines.
+    fn panel_lines(buffer: &ratatui::buffer::Buffer, area: Rect) -> Vec<String> {
+        (area.y..(area.y + area.height))
+            .map(|y| {
+                (area.x..(area.x + area.width))
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Renders the commander and returns the watching panel's lines.
+    fn render_watch_panel(app: &mut App) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let regions = layout::regions(Rect::new(0, 0, 120, 20));
+        let rects = layout::panel_rects(regions.panels, visible_panel_count(app, 120));
+        assert!(rects.len() >= 2, "the watching panel must be on screen");
+        panel_lines(&buffer, rects[1])
+    }
+
+    /// The whole point of C1: the ledger written AFTER materialization decides what the watch
+    /// panel shows. A member suppressed since then is gone, and a suppressed CURSOR gets no group
+    /// at all — the survivors are not «duplicates of this cursor».
+    #[test]
+    fn the_watch_panel_obeys_the_current_ledger() {
+        let (db, scan_id) = seeded_db("ledger");
+        let (mut app, _events) = app_watching(&db, scan_id, "/tank/t1");
+
+        resolve_watch_groups(&mut app);
+        let group = match &watch_entry(&app).result {
+            Some(state::WatchResult::DirGroup(group)) => group.clone(),
+            other => panic!("a clean ledger answers the cursor's group: {other:?}"),
+        };
+        assert_eq!(group.trust, DirTrust::Trusted);
+        assert_eq!(group.group.paths.len(), 3);
+
+        // A later walk finds an omission inside one TWIN: it leaves the membership, the cursor stays.
+        let mut store = ScanStore::open(&db).unwrap();
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/t3/inner", OmissionReason::NonUtf8)]),
+            )
+            .unwrap();
+        drop(store);
+        app.browse_store = None; // the panel's connection is reopened, like a fresh frame would
+        re_resolve(&mut app);
+        match &watch_entry(&app).result {
+            Some(state::WatchResult::DirGroup(group)) => assert_eq!(
+                group.group.paths,
+                vec![PathBuf::from("/tank/t1"), PathBuf::from("/tank/t2")],
+                "the suppressed twin left the panel"
+            ),
+            other => panic!("the cursor and one twin survive: {other:?}"),
+        }
+
+        // Now the omission is at the CURSOR itself.
+        let mut store = ScanStore::open(&db).unwrap();
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/t1", OmissionReason::MetadataError)]),
+            )
+            .unwrap();
+        drop(store);
+        app.browse_store = None;
+        re_resolve(&mut app);
+        let entry = watch_entry(&app);
+        assert!(
+            entry.result.is_none(),
+            "a suppressed cursor has no group: {:?}",
+            entry.result
+        );
+        assert!(entry.unavailable.is_none(), "this is a legitimate absence");
+        assert_eq!(
+            entry.empty,
+            state::WatchEmpty::NoDuplicates,
+            "the cursor is in the scan and simply has nothing to show"
+        );
+    }
+
+    /// A ledger this build cannot read is not «no duplicates»: it is visible, and it enters
+    /// neither the inner-dupes fallback nor either empty verdict.
+    #[test]
+    fn a_hard_snapshot_failure_is_visible_and_enters_no_fallback() {
+        let (db, scan_id) = seeded_db("corrupt");
+        // A real ledger row first — an empty ledger has nothing to corrupt — then a reason no
+        // build of this schema knows, which is how the store's own hard-error tests seed it.
+        let mut store = ScanStore::open(&db).unwrap();
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/other", OmissionReason::MinSize)]),
+            )
+            .unwrap();
+        drop(store);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let corrupted = conn
+            .execute(
+                "UPDATE dir_omission SET reason = 'quota_error' WHERE scan_id = ?1",
+                rusqlite::params![scan_id],
+            )
+            .unwrap();
+        assert_eq!(corrupted, 1, "the corruption must actually land on a row");
+        drop(conn);
+
+        let (mut app, _events) = app_watching(&db, scan_id, "/tank/t1");
+        resolve_watch_groups(&mut app);
+        let entry = watch_entry(&app);
+        let err = entry
+            .unavailable
+            .as_deref()
+            .expect("the failure to read the ledger is the answer");
+        assert!(err.contains("does not know"), "{err}");
+        assert!(entry.result.is_none(), "no group is claimed");
+        assert_ne!(entry.empty, state::WatchEmpty::NoDuplicates);
+        assert_ne!(entry.empty, state::WatchEmpty::NotInScan);
+
+        let lines = render_watch_panel(&mut app);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("directory group unavailable:"),
+            "the panel says why it is empty: {text}"
+        );
+        assert!(
+            !text.contains("no dupes at the cursor") && !text.contains("out of scan"),
+            "a broken checkpoint must not be reported as a clean result: {text}"
+        );
+    }
+
+    /// The other two reads of the `DirOf` branch lost their `.ok()`/`unwrap_or` sinks as well: with
+    /// the manifest column renamed away, `dup_files_inside` fails — and the panel says so instead
+    /// of answering «no dupes at the cursor».
+    #[test]
+    fn a_failed_inner_dupes_read_is_visible_too() {
+        let (db, scan_id) = seeded_db("inner");
+        // The cursor is a directory of the scan that is in NO dir_dedup group, so the branch
+        // reaches the inner-dupes fallback; the manifest read it makes is then broken.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("ALTER TABLE file RENAME COLUMN path TO path_gone")
+            .unwrap();
+        drop(conn);
+
+        let (mut app, _events) = app_watching(&db, scan_id, "/tank/solo");
+        resolve_watch_groups(&mut app);
+        let entry = watch_entry(&app);
+        assert!(
+            entry.unavailable.is_some(),
+            "a failed manifest read is not an empty result: {:?}",
+            entry.empty
+        );
+        assert!(entry.result.is_none());
+    }
+
+    /// The frozen wording of an unverified watch answer: it says exactly what it is, marks every
+    /// member with the `?` the rest of the UI uses, and claims no twin, no duplicate and no bytes.
+    /// The trusted rendering above it is left byte for byte as it was.
+    #[test]
+    fn an_unverified_watch_group_claims_nothing_on_screen() {
+        let (db, scan_id) = seeded_db("render");
+        let (mut app, _events) = app_watching(&db, scan_id, "/tank/t1");
+
+        let trusted = render_watch_panel(&mut app).join("\n");
+        assert!(
+            trusted.contains(" 2 · duplicates "),
+            "a trusted group keeps the mode's own title: {trusted}"
+        );
+        assert!(
+            trusted.contains("★ /tank/t1") && !trusted.contains('?'),
+            "no member of a trusted group is marked unverified: {trusted}"
+        );
+
+        // The authority is gone: the same three directories, nothing vouching for them.
+        let mut store = ScanStore::open(&db).unwrap();
+        store.clear_scan_omissions(scan_id).unwrap();
+        drop(store);
+        app.browse_store = None;
+        re_resolve(&mut app);
+        match &watch_entry(&app).result {
+            Some(state::WatchResult::DirGroup(group)) => {
+                assert_eq!(group.trust, DirTrust::Untrusted)
+            }
+            other => panic!("an unverified group stays inspectable: {other:?}"),
+        }
+
+        let unverified = render_watch_panel(&mut app).join("\n");
+        assert!(
+            unverified.contains("unverified candidate — rescan required"),
+            "the frozen qualifier must be visible: {unverified}"
+        );
+        assert!(
+            unverified.contains("★?/tank/t1") && unverified.contains("? /tank/t2"),
+            "every member carries the unverified marker: {unverified}"
+        );
+        for forbidden in ["twin", "duplicate", "dupes", "KiB", "MiB", " B "] {
+            assert!(
+                !unverified.contains(forbidden),
+                "an unverified answer may not claim «{forbidden}»: {unverified}"
+            );
+        }
     }
 }
