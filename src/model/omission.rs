@@ -98,12 +98,29 @@ impl PathKey {
     }
 }
 
-/// Why a file that exists on disk never became a manifest row.
+/// What one recorded event of a reason stands for.
 ///
-/// Exactly six, one per silently-skipping branch of the walk. There is deliberately no variant for
-/// an intentional exclusion (`.zfs`, the quarantine directory, an operator exclusion glob): those
-/// are applied before an entry is ever yielded, so they cannot reach any of these branches, and
-/// giving them a variant would let a deliberate narrowing masquerade as user-data incompleteness.
+/// Three kinds, not two: «is it a file?» and «is the count known?» are different questions, and an
+/// unsupported directory entry answers them differently. Folding it in with a walk error would
+/// forbid presenting an exact figure for a count that is exact; folding it in with the file
+/// reasons would call a socket an omitted file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EventKind {
+    /// Exactly one omitted regular file.
+    OmittedFile,
+    /// Exactly one directory entry the scan has no way to represent: a symlink it does not
+    /// follow, a FIFO, a socket, or a block or character device. Known, finite, and not a file.
+    UnsupportedEntry,
+    /// One error whose hidden file count nobody can state.
+    UnknownCardinality,
+}
+
+/// Why a directory entry that exists on disk never became a manifest row.
+///
+/// One per branch of the walk that drops something. There is deliberately no variant for an
+/// intentional exclusion (`.zfs`, the quarantine directory, an operator exclusion glob): those are
+/// applied before an entry is ever yielded, so they cannot reach any of these branches, and giving
+/// them a variant would let a deliberate narrowing masquerade as user-data incompleteness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OmissionReason {
     /// Smaller than the configured minimum size.
@@ -118,17 +135,23 @@ pub enum OmissionReason {
     WalkError,
     /// The entry arrived and was already typed as a regular file, but its metadata failed.
     MetadataError,
+    /// The entry arrived and is neither a regular file nor a directory: a symlink the scan does
+    /// not follow, a FIFO, a socket, or a block or character device. Nothing failed and nothing
+    /// was filtered by configuration — the scan simply has no way to represent it, and a directory
+    /// holding one is not an exact twin of a directory that does not.
+    UnsupportedEntry,
 }
 
 impl OmissionReason {
     /// Every reason, in the order they are stored and reported.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::MinSize,
         Self::MaxSize,
         Self::ExtensionFiltered,
         Self::NonUtf8,
         Self::WalkError,
         Self::MetadataError,
+        Self::UnsupportedEntry,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -139,6 +162,7 @@ impl OmissionReason {
             Self::NonUtf8 => "non_utf8",
             Self::WalkError => "walk_error",
             Self::MetadataError => "metadata_error",
+            Self::UnsupportedEntry => "unsupported_entry",
         }
     }
 
@@ -148,13 +172,28 @@ impl OmissionReason {
         Self::ALL.into_iter().find(|kind| kind.as_str() == text)
     }
 
-    /// Whether one recorded event of this reason stands for exactly one omitted file.
+    /// What one event of this reason stands for.
     ///
-    /// False only for [`Self::WalkError`]. That branch is reached before the entry's type is
-    /// known, so a single error may stand for one file, one directory, or an entire unreadable
-    /// subtree whose contents nobody can count.
+    /// [`Self::WalkError`] is the only unknown-cardinality reason: that branch is reached before
+    /// the entry's type is known, so a single error may stand for one file, one directory, or an
+    /// entire unreadable subtree whose contents nobody can count. An unsupported entry, by
+    /// contrast, is exactly one entry — it is simply not a file.
+    pub const fn event_kind(self) -> EventKind {
+        match self {
+            Self::MinSize
+            | Self::MaxSize
+            | Self::ExtensionFiltered
+            | Self::NonUtf8
+            | Self::MetadataError => EventKind::OmittedFile,
+            Self::UnsupportedEntry => EventKind::UnsupportedEntry,
+            Self::WalkError => EventKind::UnknownCardinality,
+        }
+    }
+
+    /// Whether one recorded event of this reason stands for exactly one omitted file. Derived from
+    /// [`Self::event_kind`], so the two can never disagree.
     pub const fn one_event_is_one_file(self) -> bool {
-        !matches!(self, Self::WalkError)
+        matches!(self.event_kind(), EventKind::OmittedFile)
     }
 
     /// Whether this reason is an operator-chosen narrowing of the scan rather than a failure to
@@ -301,9 +340,10 @@ impl OmissionCounts {
 
 /// What was omitted at or under one directory, per reason.
 ///
-/// There is deliberately no «total omitted files» accessor. A `walk_error` event can hide an
-/// unreadable subtree of unknown size, so a single number covering every reason would be a claim
-/// the scan cannot support — and a caller cannot print one it has no way to obtain.
+/// There is deliberately no combined total. The three [`EventKind`]s answer different questions —
+/// how many files went missing, how many entries could not be represented, and how many errors hid
+/// an unknowable amount — and one number covering all three would be a claim the scan cannot
+/// support. A caller cannot print one it has no way to obtain.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OmissionSummary {
     per_reason: BTreeMap<OmissionReason, EventCount>,
@@ -330,9 +370,21 @@ impl OmissionSummary {
 
     /// Files known to be omitted: the five reasons where one event is one file.
     pub fn known_omitted_files(&self) -> Result<u64> {
+        self.total_of(EventKind::OmittedFile)
+    }
+
+    /// Directory entries the scan has no way to represent — a symlink it does not follow, a FIFO,
+    /// a socket, a device. An exact count of ENTRIES, deliberately outside every file total.
+    pub fn unsupported_entries(&self) -> Result<u64> {
+        self.total_of(EventKind::UnsupportedEntry)
+    }
+
+    /// The events of one kind. Checked, so an aggregate that cannot be represented is an error
+    /// rather than a smaller number than the truth.
+    fn total_of(&self, kind: EventKind) -> Result<u64> {
         let mut total: u64 = 0;
         for (reason, count) in &self.per_reason {
-            if reason.one_event_is_one_file() {
+            if reason.event_kind() == kind {
                 total = total
                     .checked_add(count.get())
                     .ok_or_else(|| AppError::msg("omission counts overflowed while aggregating"))?;
@@ -341,11 +393,12 @@ impl OmissionSummary {
         Ok(total)
     }
 
-    /// Error events whose hidden file count is unknowable.
+    /// Error events whose hidden file count is unknowable — `walk_error` alone. An unsupported
+    /// entry is exactly one entry, so counting it here would forbid an exact figure that is exact.
     pub fn unknown_cardinality_events(&self) -> u64 {
         self.per_reason
             .iter()
-            .filter(|(reason, _)| !reason.one_event_is_one_file())
+            .filter(|(reason, _)| reason.event_kind() == EventKind::UnknownCardinality)
             .map(|(_, count)| count.get())
             .sum()
     }
@@ -561,7 +614,8 @@ mod tests {
                 "extension_filtered",
                 "non_utf8",
                 "walk_error",
-                "metadata_error"
+                "metadata_error",
+                "unsupported_entry"
             ]
         );
     }
@@ -573,17 +627,87 @@ mod tests {
         }
     }
 
-    /// Only the iterator branch can hide a subtree; the metadata branch is reached after the entry
-    /// was already typed as a regular file.
+    /// The three kinds partition every reason, and each answers a different question. Written as
+    /// an exhaustive table rather than a predicate, so adding a reason without deciding its kind
+    /// fails here instead of quietly joining whichever bucket a boolean happened to put it in.
+    #[test]
+    fn every_reason_has_exactly_one_event_kind() {
+        use EventKind::*;
+        let table = [
+            (OmissionReason::MinSize, OmittedFile),
+            (OmissionReason::MaxSize, OmittedFile),
+            (OmissionReason::ExtensionFiltered, OmittedFile),
+            (OmissionReason::NonUtf8, OmittedFile),
+            (OmissionReason::MetadataError, OmittedFile),
+            (OmissionReason::WalkError, UnknownCardinality),
+            (OmissionReason::UnsupportedEntry, UnsupportedEntry),
+        ];
+        assert_eq!(
+            table.len(),
+            OmissionReason::ALL.len(),
+            "every reason must appear exactly once"
+        );
+        for (reason, kind) in table {
+            assert_eq!(reason.event_kind(), kind, "{reason:?}");
+            assert_eq!(
+                reason.one_event_is_one_file(),
+                kind == OmittedFile,
+                "{reason:?}: the predicate must follow the kind"
+            );
+        }
+    }
+
+    /// Only the iterator branch can hide a subtree. The metadata branch is reached after the entry
+    /// was already typed as a regular file, and an unsupported entry is exactly one entry.
     #[test]
     fn only_a_walk_error_hides_an_unknown_number_of_files() {
         for reason in OmissionReason::ALL {
             assert_eq!(
-                reason.one_event_is_one_file(),
-                reason != OmissionReason::WalkError,
+                reason.event_kind() == EventKind::UnknownCardinality,
+                reason == OmissionReason::WalkError,
                 "{reason:?}"
             );
         }
+    }
+
+    /// The three counters never borrow from each other: a file total excludes entries and errors,
+    /// an entry total excludes files, and neither is allowed to make the exact count inexact.
+    #[test]
+    fn the_three_counters_stay_separate() {
+        let mut summary = OmissionSummary::default();
+        summary
+            .add(OmissionReason::MinSize, EventCount::new(2).unwrap())
+            .unwrap();
+        summary
+            .add(
+                OmissionReason::UnsupportedEntry,
+                EventCount::new(3).unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(summary.known_omitted_files().unwrap(), 2);
+        assert_eq!(summary.unsupported_entries().unwrap(), 3);
+        assert_eq!(
+            summary.unknown_cardinality_events(),
+            0,
+            "an unsupported entry is a known quantity"
+        );
+        assert!(
+            !summary.has_unknown_cardinality(),
+            "three sockets do not make a count inexact"
+        );
+
+        summary
+            .add(OmissionReason::WalkError, EventCount::ONE)
+            .unwrap();
+        assert_eq!(summary.known_omitted_files().unwrap(), 2, "still two files");
+        assert_eq!(
+            summary.unsupported_entries().unwrap(),
+            3,
+            "still three entries"
+        );
+        assert_eq!(summary.unknown_cardinality_events(), 1);
+        assert!(summary.has_unknown_cardinality());
     }
 
     #[test]

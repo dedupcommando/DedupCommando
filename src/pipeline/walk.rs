@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,6 +8,7 @@ use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 
 use crate::error::{AppError, Result};
+use crate::model::omission::{AuthorityUnavailable, OmissionCounts, OmissionReason, PathKey};
 use crate::model::scan::ScanConfig;
 
 /// A file discovered during the walk.
@@ -25,8 +27,465 @@ pub struct WalkedFile {
     pub nlink: u64,
 }
 
-/// Walks all roots from `config` and returns the matching files plus the number of files
-/// skipped because of a non-UTF8 name.
+/// Everything one walk produced.
+///
+/// `Cancelled` deliberately has no omission snapshot: a walk that stopped early saw only part of
+/// the tree, so there is no state in which a cancelled run can be published as a complete account
+/// of what was left out. The absence of the field is the guarantee — not a flag beside it.
+#[allow(dead_code)]
+pub enum WalkOutcome {
+    Finished {
+        files: Vec<WalkedFile>,
+        skipped_non_utf8: u64,
+        omissions: OmissionSnapshot,
+    },
+    Cancelled {
+        files: Vec<WalkedFile>,
+        skipped_non_utf8: u64,
+    },
+}
+
+#[cfg(test)]
+impl WalkOutcome {
+    /// A short name for a panic message, so a failing test says what it got instead.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Finished {
+                omissions: OmissionSnapshot::Publishable(_),
+                ..
+            } => "Finished(publishable)",
+            Self::Finished { .. } => "Finished(unavailable)",
+            Self::Cancelled { .. } => "Cancelled",
+        }
+    }
+}
+
+/// What the walk can say about completeness.
+#[allow(dead_code)]
+pub enum OmissionSnapshot {
+    /// Exactly one entry per selected root — including a root that omitted nothing, whose entry is
+    /// an empty map. That explicit empty entry is what `ScanStore::commit_omissions` requires as
+    /// proof the root was walked under the contract at all.
+    Publishable(BTreeMap<PathKey, OmissionCounts>),
+    /// Not publishable, typed. A consumer leaves such a scan's directories `Unknown`.
+    Unavailable(SnapshotUnavailable),
+}
+
+/// Why a walk produced no publishable omission snapshot.
+#[allow(dead_code)]
+pub enum SnapshotUnavailable {
+    /// A non-empty configured root set that cannot all be keyed, or whose keys overlap. An empty
+    /// root set is not one of these — it is still the outer `no scan root specified` error.
+    Roots(AuthorityUnavailable),
+    /// Aggregating one cell would have wrapped `u64`.
+    CountOverflow {
+        root: PathKey,
+        directory: PathKey,
+        reason: OmissionReason,
+    },
+    /// A cell holds a real number that the checkpoint's signed `INTEGER` column cannot store.
+    CountNotStorable {
+        root: PathKey,
+        directory: PathKey,
+        reason: OmissionReason,
+    },
+}
+
+/// Accumulates one walk's omissions, one entry per selected root.
+struct Collector {
+    per_root: BTreeMap<PathKey, OmissionCounts>,
+    /// The first aggregation failure. Kept rather than returned: a count that cannot be added is a
+    /// reason the SNAPSHOT is unavailable, never a reason to stop walking files.
+    failure: Option<SnapshotUnavailable>,
+}
+
+impl Collector {
+    fn new(roots: &[PathKey]) -> Self {
+        Self {
+            per_root: roots
+                .iter()
+                .map(|root| (root.clone(), OmissionCounts::new()))
+                .collect(),
+            failure: None,
+        }
+    }
+
+    fn record(&mut self, root: &PathKey, directory: PathKey, reason: OmissionReason) {
+        if self.failure.is_some() {
+            return;
+        }
+        let Some(counts) = self.per_root.get_mut(root) else {
+            return;
+        };
+        if counts.bump(directory.clone(), reason).is_err() {
+            self.failure = Some(SnapshotUnavailable::CountOverflow {
+                root: root.clone(),
+                directory,
+                reason,
+            });
+        }
+    }
+
+    /// Validates the storage domain before promising anything is publishable. `EventCount` accepts
+    /// the whole `u64` range while the checkpoint column is a signed `INTEGER`, so a cell can be a
+    /// perfectly real number the store still cannot write — and finding that out inside the
+    /// store's transaction would be finding out too late.
+    fn finish(self) -> OmissionSnapshot {
+        if let Some(why) = self.failure {
+            return OmissionSnapshot::Unavailable(why);
+        }
+        for (root, counts) in &self.per_root {
+            for (directory, reason, count) in counts.iter() {
+                if count.to_i64().is_err() {
+                    return OmissionSnapshot::Unavailable(SnapshotUnavailable::CountNotStorable {
+                        root: root.clone(),
+                        directory: directory.clone(),
+                        reason,
+                    });
+                }
+            }
+        }
+        OmissionSnapshot::Publishable(self.per_root)
+    }
+}
+
+/// One root's ledger while its tree is being walked.
+struct Ledger<'a> {
+    root: PathKey,
+    collector: &'a mut Collector,
+}
+
+/// Where one iteration's results go. `ledger` is `None` when no snapshot is being built, which is
+/// what keeps the unkeyable-roots fallback walking exactly as it always did.
+struct Sink<'a> {
+    files: &'a mut Vec<WalkedFile>,
+    skipped_non_utf8: &'a mut u64,
+    dirs: &'a mut super::roots::DirAliasGuard,
+    ledger: Option<Ledger<'a>>,
+}
+
+impl Sink<'_> {
+    /// An omission whose entry is known: attribute it to the entry's parent, inside the root.
+    fn record_child(&mut self, path: &Path, reason: OmissionReason) {
+        if let Some(ledger) = &mut self.ledger {
+            let directory = attribute_child(path, &ledger.root);
+            ledger.collector.record(&ledger.root, directory, reason);
+        }
+    }
+
+    /// An iterator error: exactly one event, at one cell.
+    fn record_error(&mut self, err: &ignore::Error) {
+        if let Some(ledger) = &mut self.ledger {
+            let cell = error_cell(err, &ledger.root);
+            ledger
+                .collector
+                .record(&ledger.root, cell, OmissionReason::WalkError);
+        }
+    }
+}
+
+/// The directory a known entry's omission belongs to: its parent, or the nearest keyable ancestor
+/// above that, never leaving the selected root.
+///
+/// Falls back to the root itself, which is what a selected root that is a regular file needs — its
+/// only entry's parent lies outside the root, and the schema's `dir_key = root_key` is a legal
+/// location. Total: the ancestor chain terminates, and the fallback always exists.
+fn attribute_child(path: &Path, root: &PathKey) -> PathKey {
+    let mut current = path.parent();
+    while let Some(candidate) = current {
+        if let Some(key) = PathKey::new(candidate) {
+            if key.is_at_or_under(root) {
+                return key;
+            }
+        }
+        current = candidate.parent();
+    }
+    root.clone()
+}
+
+/// The location an error path names, starting at the path ITSELF.
+///
+/// An iterator error is raised before the entry's type is known, so its path may name a file, a
+/// directory, a symlink or the selected root. Climbing from the parent — right for a known regular
+/// file — would step outside the root the moment the path IS the root, which is exactly what an
+/// unresolvable root produces.
+fn attribute_error_path(path: &Path, root: &PathKey) -> Option<PathKey> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if let Some(key) = PathKey::new(candidate) {
+            if key.is_at_or_under(root) {
+                return Some(key);
+            }
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+/// Every pathname an `ignore::Error` structurally carries, without going through `Display`.
+///
+/// Exhaustive on `ignore 0.4.25`, so a new variant is a compile error rather than a silently
+/// ignored path.
+fn error_paths(err: &ignore::Error, out: &mut Vec<PathBuf>) {
+    match err {
+        ignore::Error::Partial(list) => {
+            for inner in list {
+                error_paths(inner, out);
+            }
+        }
+        ignore::Error::WithPath { path, err } => {
+            out.push(path.clone());
+            error_paths(err, out);
+        }
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            error_paths(err, out)
+        }
+        ignore::Error::Loop { ancestor, child } => {
+            out.push(ancestor.clone());
+            out.push(child.clone());
+        }
+        ignore::Error::Io(_)
+        | ignore::Error::Glob { .. }
+        | ignore::Error::UnrecognizedFileType(_)
+        | ignore::Error::InvalidDefinition => {}
+    }
+}
+
+/// The single cell one yielded `Err` becomes.
+///
+/// One error is one event, so it may not be written to more than one cell — a reader sums rows,
+/// and two rows for one failure would report two failures. With several candidate locations the
+/// choice is the one that lies at-or-under every other, because the ledger propagates a row
+/// UPWARD: such a row marks each of the others on its way to the root. Where no candidate covers
+/// the rest, and where none is in-root at all, the answer is the root's own `walk_error` sentinel,
+/// which taints the whole root — deliberately coarse, and truthful about the count.
+fn error_cell(err: &ignore::Error, root: &PathKey) -> PathKey {
+    let mut paths = Vec::new();
+    error_paths(err, &mut paths);
+
+    let mut locations: Vec<PathKey> = Vec::new();
+    for path in &paths {
+        if let Some(key) = attribute_error_path(path, root) {
+            if !locations.contains(&key) {
+                locations.push(key);
+            }
+        }
+    }
+    match locations.len() {
+        0 => root.clone(),
+        1 => locations.swap_remove(0),
+        _ => locations
+            .iter()
+            .find(|candidate| {
+                locations
+                    .iter()
+                    .all(|other| candidate.is_at_or_under(other))
+            })
+            .cloned()
+            .unwrap_or_else(|| root.clone()),
+    }
+}
+
+/// The scan's roots as keys, or the typed reason there is no authority to be had. The root list is
+/// known non-empty here: an empty one is the caller's outer error, not an unavailable snapshot.
+fn root_keys(roots: &[PathBuf]) -> std::result::Result<Vec<PathKey>, AuthorityUnavailable> {
+    let mut keys: Vec<PathKey> = Vec::with_capacity(roots.len());
+    for root in roots {
+        match PathKey::new(root) {
+            Some(key) => keys.push(key),
+            None => {
+                return Err(AuthorityUnavailable::UnkeyableRoot {
+                    given: root.display().to_string(),
+                })
+            }
+        }
+    }
+    // Root validation compares canonicalized paths and skips the comparison when either path
+    // cannot be resolved, so two overlapping roots that do not exist yet arrive here undetected.
+    // A directory under both of them could not be attributed to one, so neither gets an authority.
+    for (index, outer) in keys.iter().enumerate() {
+        for inner in keys.iter().skip(index + 1) {
+            if inner.is_at_or_under(outer) || outer.is_at_or_under(inner) {
+                let (outer, inner) = if inner.is_at_or_under(outer) {
+                    (outer, inner)
+                } else {
+                    (inner, outer)
+                };
+                return Err(AuthorityUnavailable::AmbiguousRoots {
+                    outer: outer.as_str().to_string(),
+                    inner: inner.as_str().to_string(),
+                });
+            }
+        }
+    }
+    Ok(keys)
+}
+
+/// The shared builder settings. `standard_filters(false)` also turns off parent-ignore reading, so
+/// a per-root builder and the multi-root one behave identically apart from which paths they cover.
+fn configure(
+    builder: &mut WalkBuilder,
+    config: &ScanConfig,
+    overrides: &ignore::overrides::Override,
+) {
+    builder
+        .standard_filters(false)
+        .hidden(false)
+        .follow_links(config.follow_symlinks)
+        .overrides(overrides.clone());
+}
+
+/// Handles one item from a walk iterator. `Err` aborts the whole walk — the alias-guard refusals,
+/// which are not omissions.
+fn absorb(
+    result: std::result::Result<ignore::DirEntry, ignore::Error>,
+    config: &ScanConfig,
+    sink: &mut Sink<'_>,
+) -> Result<()> {
+    let entry = match result {
+        // Test-only: reach the outcome of the `Err` arm below for a nominated path, without a
+        // filesystem that has to misbehave. Absent from every non-test build. Built as the error
+        // `ignore` itself would produce, so the injected case goes through the real reduction.
+        #[cfg(test)]
+        Ok(ref entry) if crate::testfixtures::take_walk_fault(entry.path()) => {
+            let injected = ignore::Error::WithPath {
+                path: entry.path().to_path_buf(),
+                err: Box::new(ignore::Error::Io(std::io::Error::other(
+                    "injected walk fault",
+                ))),
+            };
+            sink.record_error(&injected);
+            return Ok(());
+        }
+        Ok(entry) => entry,
+        Err(err) => {
+            // No access, a broken link, a symlink loop: no file is named, and the entry type is
+            // unknown. One error, one event.
+            sink.record_error(&err);
+            return Ok(());
+        }
+    };
+
+    // Test-only stand-in for the entry types that cannot be created without privileges — a block
+    // or character device node. It diverts a real entry into the unsupported arm, so what it
+    // exercises is the recording path for a nominated entry, not a synthetic `FileType`. The real
+    // symlink, FIFO, socket and `/dev/null` cases are the primary evidence.
+    #[cfg(test)]
+    if take_special_entry_fault(entry.path()) {
+        sink.record_child(entry.path(), OmissionReason::UnsupportedEntry);
+        return Ok(());
+    }
+
+    match entry.file_type() {
+        Some(file_type) if file_type.is_file() => {}
+        // A directory: the only place an alias inside a root can be caught. Its metadata is the
+        // one extra `stat` this guard costs, and only for directories.
+        //
+        // A failure here is fatal. It costs no file — the walker could still descend — but it
+        // is the guard losing its evidence: without `(device, inode)` this directory is no
+        // longer known NOT to be a second pathname for a tree already walked, and a manifest
+        // holding one file under two pathnames is not a result worth publishing. The scan
+        // stops for the same reason `DirAliasGuard::note` stops it.
+        Some(file_type) if file_type.is_dir() => {
+            // Test-only: reach the failure outcome below for a nominated directory, without a
+            // filesystem that has to misbehave. Absent from every non-test build.
+            #[cfg(test)]
+            if crate::testfixtures::take_metadata_fault(entry.path()) {
+                return Err(unverifiable_directory(entry.path(), None));
+            }
+            let meta = entry
+                .metadata()
+                .map_err(|err| unverifiable_directory(entry.path(), Some(&err)))?;
+            sink.dirs.note(entry.path(), meta.dev(), meta.ino())?;
+            return Ok(());
+        }
+        // Neither a regular file nor a directory: a symlink this scan does not follow, a FIFO, a
+        // socket, a device — or, when links are followed, a link resolving to one of those. The
+        // manifest has no way to hold it and the signature has no way to see it, so a directory
+        // containing one is not an exact twin of a directory that does not. Nothing failed and
+        // nothing was filtered by configuration, which is why it is its own reason rather than a
+        // walk error or an extension filter.
+        _ => {
+            sink.record_child(entry.path(), OmissionReason::UnsupportedEntry);
+            return Ok(());
+        }
+    }
+    let meta = match entry.metadata() {
+        // Test-only counterpart for the metadata error below, same reasoning.
+        #[cfg(test)]
+        Ok(_) if crate::testfixtures::take_metadata_fault(entry.path()) => {
+            sink.record_child(entry.path(), OmissionReason::MetadataError);
+            return Ok(());
+        }
+        Ok(meta) => meta,
+        Err(_) => {
+            // The entry was already typed as a regular file, so this is exactly one file.
+            sink.record_child(entry.path(), OmissionReason::MetadataError);
+            return Ok(());
+        }
+    };
+
+    let size = meta.size();
+    if size < config.min_size {
+        sink.record_child(entry.path(), OmissionReason::MinSize);
+        return Ok(());
+    }
+    if let Some(max) = config.max_size {
+        if size > max {
+            sink.record_child(entry.path(), OmissionReason::MaxSize);
+            return Ok(());
+        }
+    }
+
+    if !config.include_extensions.is_empty() {
+        let ext = entry
+            .path()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase());
+        match ext {
+            Some(ext) if config.include_extensions.contains(&ext) => {}
+            _ => {
+                sink.record_child(entry.path(), OmissionReason::ExtensionFiltered);
+                return Ok(());
+            }
+        }
+    }
+
+    // Non-UTF8 guard: skip files whose path cannot be represented
+    // as UTF-8 (see the function doc comment). Count it last — after all the
+    // other filters, so the counter means "would have made it into the manifest, but the name cannot
+    // be saved without loss", not files filtered out by size/extension.
+    if entry.path().to_str().is_none() {
+        *sink.skipped_non_utf8 += 1;
+        sink.record_child(entry.path(), OmissionReason::NonUtf8);
+        return Ok(());
+    }
+
+    sink.files.push(WalkedFile {
+        path: entry.into_path(),
+        size,
+        mtime: meta.mtime(),
+        mtime_nsec: meta.mtime_nsec(),
+        ctime_sec: meta.ctime(),
+        ctime_nsec: meta.ctime_nsec(),
+        device: meta.dev(),
+        inode: meta.ino(),
+        nlink: meta.nlink(),
+    });
+    Ok(())
+}
+
+/// Walks all roots from `config` and returns the matching files, the non-UTF8 compatibility count,
+/// and — when the roots can carry one — an account of everything the walk left out.
+///
+/// Each keyable root is walked by its own `WalkBuilder`, in configured order. `ignore::Walk`
+/// already drains its paths one after another, so this changes no traversal order; what it changes
+/// is that the active root becomes a fact rather than something an error has to be guessed into.
+/// The entries counter, the files vector, the cancellation state and — most importantly — the one
+/// `DirAliasGuard` are shared across every root, because a tree reachable twice THROUGH TWO ROOTS
+/// is exactly what that guard exists to catch.
+///
 /// The `.zfs` and quarantine directories are excluded. Aborts on `cancel`.
 /// `on_progress` periodically receives (entries scanned, files found).
 ///
@@ -35,26 +494,17 @@ pub struct WalkedFile {
 /// (`a\xFFb`, `a\xFEb`) into a single `a�b` → silent loss/corruption of the string in the PK
 /// `(scan_id, path)`; and a `�`-path read back would miss the
 /// real file on the action path. It is safer not to touch such a file at all.
-pub fn walk(
+pub fn walk_collecting(
     config: &ScanConfig,
     cancel: &AtomicBool,
     mut on_progress: impl FnMut(u64, u64, Option<&Path>),
-) -> Result<(Vec<WalkedFile>, u64)> {
-    let mut roots = config.roots.iter();
-    let first = roots
-        .next()
-        .ok_or_else(|| AppError::msg("no scan root specified"))?;
-
-    let mut builder = WalkBuilder::new(first);
-    for root in roots {
-        builder.add(root);
+) -> Result<WalkOutcome> {
+    if config.roots.is_empty() {
+        return Err(AppError::msg("no scan root specified"));
     }
-    builder
-        .standard_filters(false)
-        .hidden(false)
-        .follow_links(config.follow_symlinks);
 
-    // Exclusions via Override: a glob with a "!" prefix means "ignore".
+    // Exclusions via Override: a glob with a "!" prefix means "ignore". Built once and cloned into
+    // every builder, so per-root traversal cannot change what an exclusion matches.
     let mut overrides = OverrideBuilder::new("/");
     for glob in &config.exclude_globs {
         overrides
@@ -64,7 +514,6 @@ pub fn walk(
     let overrides = overrides
         .build()
         .map_err(|err| AppError::msg(format!("error building exclusions: {err}")))?;
-    builder.overrides(overrides);
 
     let mut files: Vec<WalkedFile> = Vec::new();
     let mut entries: u64 = 0;
@@ -74,110 +523,231 @@ pub fn walk(
     // see `roots::DirAliasGuard`. Bounded by the number of directories, which is small next to the
     // file vector this walk already holds.
     let mut dirs = super::roots::DirAliasGuard::default();
-    for result in builder.build() {
-        if entries % 1024 == 0 {
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            on_progress(
-                entries,
-                files.len() as u64,
-                files.last().map(|file| file.path.as_path()),
-            );
-        }
-        entries += 1;
+    let mut cancelled = false;
 
-        let entry = match result {
-            // Test-only: reach the outcome of the `Err` arm below for a nominated path, without a
-            // filesystem that has to misbehave. Absent from every non-test build.
-            #[cfg(test)]
-            Ok(ref entry) if crate::testfixtures::take_walk_fault(entry.path()) => continue,
-            Ok(entry) => entry,
-            Err(_) => continue, // no access / broken link — skip
-        };
-        match entry.file_type() {
-            Some(file_type) if file_type.is_file() => {}
-            // A directory: the only place an alias inside a root can be caught. Its metadata is the
-            // one extra `stat` this guard costs, and only for directories.
-            //
-            // A failure here is fatal. It costs no file — the walker could still descend — but it
-            // is the guard losing its evidence: without `(device, inode)` this directory is no
-            // longer known NOT to be a second pathname for a tree already walked, and a manifest
-            // holding one file under two pathnames is not a result worth publishing. The scan
-            // stops for the same reason `DirAliasGuard::note` stops it.
-            Some(file_type) if file_type.is_dir() => {
-                // Test-only: reach the failure outcome below for a nominated directory, without a
-                // filesystem that has to misbehave. Absent from every non-test build.
-                #[cfg(test)]
-                if crate::testfixtures::take_metadata_fault(entry.path()) {
-                    return Err(unverifiable_directory(entry.path(), None));
+    let snapshot = match root_keys(&config.roots) {
+        // No authority to be had. The scan still walks exactly as it always did — this is a verdict
+        // about completeness, not a gate on scanning — so the original multi-root builder is used
+        // and no partial ledger is recorded.
+        Err(why) => {
+            let mut builder = WalkBuilder::new(&config.roots[0]);
+            for root in &config.roots[1..] {
+                builder.add(root);
+            }
+            configure(&mut builder, config, &overrides);
+            let mut sink = Sink {
+                files: &mut files,
+                skipped_non_utf8: &mut skipped_non_utf8,
+                dirs: &mut dirs,
+                ledger: None,
+            };
+            for result in builder.build() {
+                if entries % 1024 == 0 {
+                    if cancel.load(Ordering::Relaxed) {
+                        cancelled = true;
+                        break;
+                    }
+                    on_progress(
+                        entries,
+                        sink.files.len() as u64,
+                        sink.files.last().map(|file| file.path.as_path()),
+                    );
                 }
-                let meta = entry
-                    .metadata()
-                    .map_err(|err| unverifiable_directory(entry.path(), Some(&err)))?;
-                dirs.note(entry.path(), meta.dev(), meta.ino())?;
-                continue;
+                entries += 1;
+                absorb(result, config, &mut sink)?;
             }
-            _ => continue,
+            OmissionSnapshot::Unavailable(SnapshotUnavailable::Roots(why))
         }
-        let meta = match entry.metadata() {
-            // Test-only counterpart for the metadata error below, same reasoning.
-            #[cfg(test)]
-            Ok(_) if crate::testfixtures::take_metadata_fault(entry.path()) => continue,
-            Ok(meta) => meta,
-            Err(_) => continue,
-        };
-
-        let size = meta.size();
-        if size < config.min_size {
-            continue;
-        }
-        if let Some(max) = config.max_size {
-            if size > max {
-                continue;
+        Ok(keys) => {
+            let mut collector = Collector::new(&keys);
+            'roots: for (root_path, root_key) in config.roots.iter().zip(keys.iter()) {
+                let mut builder = WalkBuilder::new(root_path);
+                configure(&mut builder, config, &overrides);
+                let mut sink = Sink {
+                    files: &mut files,
+                    skipped_non_utf8: &mut skipped_non_utf8,
+                    dirs: &mut dirs,
+                    ledger: Some(Ledger {
+                        root: root_key.clone(),
+                        collector: &mut collector,
+                    }),
+                };
+                // Test-only: an iterator error this root's filesystem has no way to produce —
+                // pathless, or nested inside `Partial`. Fires once, and only for this root.
+                #[cfg(test)]
+                if let Some(injected) = take_iterator_error_fault(root_path) {
+                    sink.record_error(&injected);
+                }
+                for result in builder.build() {
+                    if entries % 1024 == 0 {
+                        if cancel.load(Ordering::Relaxed) {
+                            cancelled = true;
+                            break 'roots;
+                        }
+                        on_progress(
+                            entries,
+                            sink.files.len() as u64,
+                            sink.files.last().map(|file| file.path.as_path()),
+                        );
+                    }
+                    entries += 1;
+                    absorb(result, config, &mut sink)?;
+                }
             }
+            collector.finish()
         }
-
-        if !config.include_extensions.is_empty() {
-            let ext = entry
-                .path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.to_ascii_lowercase());
-            match ext {
-                Some(ext) if config.include_extensions.contains(&ext) => {}
-                _ => continue,
-            }
-        }
-
-        // Non-UTF8 guard: skip files whose path cannot be represented
-        // as UTF-8 (see the function doc comment). Count it last — after all the
-        // other filters, so the counter means "would have made it into the manifest, but the name cannot
-        // be saved without loss", not files filtered out by size/extension.
-        if entry.path().to_str().is_none() {
-            skipped_non_utf8 += 1;
-            continue;
-        }
-
-        files.push(WalkedFile {
-            path: entry.into_path(),
-            size,
-            mtime: meta.mtime(),
-            mtime_nsec: meta.mtime_nsec(),
-            ctime_sec: meta.ctime(),
-            ctime_nsec: meta.ctime_nsec(),
-            device: meta.dev(),
-            inode: meta.ino(),
-            nlink: meta.nlink(),
-        });
-    }
+    };
 
     on_progress(
         entries,
         files.len() as u64,
         files.last().map(|file| file.path.as_path()),
     );
-    Ok((files, skipped_non_utf8))
+    if cancelled {
+        // A partial walk saw part of the tree, so whatever was accumulated is not an account of
+        // what the scan left out. It is dropped here rather than carried: `Cancelled` has no field
+        // to put it in, which is what makes publishing it impossible rather than merely wrong.
+        drop(snapshot);
+        return Ok(WalkOutcome::Cancelled {
+            files,
+            skipped_non_utf8,
+        });
+    }
+    Ok(WalkOutcome::Finished {
+        files,
+        skipped_non_utf8,
+        omissions: snapshot,
+    })
+}
+
+/// Compatibility wrapper: today's signature and today's behavior, for the caller that does not yet
+/// consume an omission snapshot. Manifest membership and order, the progress and cancellation
+/// cadence, the final callback, the partial files a cancelled walk returns, and the non-UTF8 count
+/// are all exactly what they were.
+pub fn walk(
+    config: &ScanConfig,
+    cancel: &AtomicBool,
+    on_progress: impl FnMut(u64, u64, Option<&Path>),
+) -> Result<(Vec<WalkedFile>, u64)> {
+    match walk_collecting(config, cancel, on_progress)? {
+        WalkOutcome::Finished {
+            files,
+            skipped_non_utf8,
+            ..
+        }
+        | WalkOutcome::Cancelled {
+            files,
+            skipped_non_utf8,
+        } => Ok((files, skipped_non_utf8)),
+    }
+}
+
+// Test-only seams for the two states no fixture can create deterministically: an iterator error
+// this filesystem has no way to produce (pathless, or nested inside `Partial`), and an entry type
+// that cannot be made without privileges. Both are thread-local — the walk iterates on the
+// caller's thread, so a fault cannot leak into a parallel test and nothing has to be serialized —
+// each fires at most once, and both fired and pending are observable, so a test can prove the
+// fault was consumed rather than merely that something went missing. Absent from every non-test
+// build.
+#[cfg(test)]
+thread_local! {
+    static ITERATOR_ERROR_FAULTS: std::cell::RefCell<Vec<(PathBuf, ignore::Error)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static FIRED_ITERATOR_ERRORS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static SPECIAL_ENTRY_FAULTS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static FIRED_SPECIAL_ENTRIES: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Arms an iterator error for a nominated ROOT, disarming on drop. Keyed by root because the state
+/// worth testing is precisely an error with no path of its own.
+#[cfg(test)]
+struct IteratorErrorFaults;
+
+#[cfg(test)]
+impl IteratorErrorFaults {
+    fn arm(faults: Vec<(PathBuf, ignore::Error)>) -> Self {
+        ITERATOR_ERROR_FAULTS.with(|armed| *armed.borrow_mut() = faults);
+        FIRED_ITERATOR_ERRORS.with(|fired| fired.borrow_mut().clear());
+        IteratorErrorFaults
+    }
+
+    fn pending(&self) -> usize {
+        ITERATOR_ERROR_FAULTS.with(|armed| armed.borrow().len())
+    }
+
+    fn fired(&self) -> Vec<PathBuf> {
+        FIRED_ITERATOR_ERRORS.with(|fired| fired.borrow().clone())
+    }
+}
+
+#[cfg(test)]
+impl Drop for IteratorErrorFaults {
+    fn drop(&mut self) {
+        ITERATOR_ERROR_FAULTS.with(|armed| armed.borrow_mut().clear());
+        FIRED_ITERATOR_ERRORS.with(|fired| fired.borrow_mut().clear());
+    }
+}
+
+#[cfg(test)]
+fn take_iterator_error_fault(root: &Path) -> Option<ignore::Error> {
+    let taken = ITERATOR_ERROR_FAULTS.with(|armed| {
+        let mut armed = armed.borrow_mut();
+        let found = armed.iter().position(|(path, _)| path == root);
+        found.map(|index| armed.remove(index))
+    });
+    taken.map(|(path, err)| {
+        FIRED_ITERATOR_ERRORS.with(|fired| fired.borrow_mut().push(path));
+        err
+    })
+}
+
+/// Arms a path to be classified as an unsupported entry, disarming on drop. It stands in for a
+/// block or character device node, which cannot be created without privileges.
+#[cfg(test)]
+struct SpecialEntryFaults;
+
+#[cfg(test)]
+impl SpecialEntryFaults {
+    fn arm(paths: &[PathBuf]) -> Self {
+        SPECIAL_ENTRY_FAULTS.with(|armed| *armed.borrow_mut() = paths.to_vec());
+        FIRED_SPECIAL_ENTRIES.with(|fired| fired.borrow_mut().clear());
+        SpecialEntryFaults
+    }
+
+    fn pending(&self) -> usize {
+        SPECIAL_ENTRY_FAULTS.with(|armed| armed.borrow().len())
+    }
+
+    fn fired(&self) -> Vec<PathBuf> {
+        FIRED_SPECIAL_ENTRIES.with(|fired| fired.borrow().clone())
+    }
+}
+
+#[cfg(test)]
+impl Drop for SpecialEntryFaults {
+    fn drop(&mut self) {
+        SPECIAL_ENTRY_FAULTS.with(|armed| armed.borrow_mut().clear());
+        FIRED_SPECIAL_ENTRIES.with(|fired| fired.borrow_mut().clear());
+    }
+}
+
+#[cfg(test)]
+fn take_special_entry_fault(path: &Path) -> bool {
+    let taken = SPECIAL_ENTRY_FAULTS.with(|armed| {
+        let mut armed = armed.borrow_mut();
+        let found = armed.iter().position(|armed_path| armed_path == path);
+        found.map(|index| armed.remove(index))
+    });
+    match taken {
+        Some(path) => {
+            FIRED_SPECIAL_ENTRIES.with(|fired| fired.borrow_mut().push(path));
+            true
+        }
+        None => false,
+    }
 }
 
 /// A directory whose physical identity could not be read.
@@ -202,10 +772,87 @@ fn unverifiable_directory(path: &Path, cause: Option<&ignore::Error>) -> AppErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::omission::EventCount;
     use crate::testfixtures::{WalkFault, WalkFaults};
     use std::ffi::OsStr;
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
+
+    // -----------------------------------------------------------------------------------------
+    // Collection helpers.
+    // -----------------------------------------------------------------------------------------
+
+    fn key(path: &Path) -> PathKey {
+        PathKey::new(path).expect("a keyable path")
+    }
+
+    fn collect(config: &ScanConfig) -> WalkOutcome {
+        let cancel = AtomicBool::new(false);
+        walk_collecting(config, &cancel, |_, _, _| {}).expect("the walk must not abort")
+    }
+
+    /// The publishable per-root map, or a panic naming what came back instead.
+    fn publishable(outcome: &WalkOutcome) -> &BTreeMap<PathKey, OmissionCounts> {
+        match outcome {
+            WalkOutcome::Finished {
+                omissions: OmissionSnapshot::Publishable(map),
+                ..
+            } => map,
+            WalkOutcome::Finished { .. } => panic!("the snapshot is unavailable"),
+            WalkOutcome::Cancelled { .. } => panic!("the walk was cancelled"),
+        }
+    }
+
+    /// One root's cells as `(directory relative to the root, reason, count)`, sorted.
+    fn cells(outcome: &WalkOutcome, root: &Path) -> Vec<(String, OmissionReason, u64)> {
+        let map = publishable(outcome);
+        let root_key = key(root);
+        let counts = map
+            .get(&root_key)
+            .unwrap_or_else(|| panic!("no entry for root {}", root_key.as_str()));
+        let mut out: Vec<(String, OmissionReason, u64)> = counts
+            .iter()
+            .map(|(directory, reason, count)| {
+                let relative = directory
+                    .as_str()
+                    .strip_prefix(root_key.as_str())
+                    .map(|rest| rest.trim_start_matches('/').to_string())
+                    .unwrap_or_else(|| directory.as_str().to_string());
+                (relative, reason, count.get())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A whole root's events folded into one summary — what a reader aggregating rows would see.
+    fn summary(outcome: &WalkOutcome, root: &Path) -> crate::model::omission::OmissionSummary {
+        let mut summary = crate::model::omission::OmissionSummary::default();
+        for (_, reason, count) in cells(outcome, root) {
+            summary
+                .add(reason, EventCount::new(count).unwrap())
+                .unwrap();
+        }
+        summary
+    }
+
+    fn base_config(root: &Path) -> ScanConfig {
+        let mut config = ScanConfig::new(vec![root.to_path_buf()]);
+        config.min_size = 0;
+        config.exclude_globs.clear();
+        config
+    }
+
+    fn make_fifo(path: &Path) {
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // 0o644: a plain FIFO. Not opened, so nothing can block on it.
+        let rc = unsafe { libc::mkfifo(name.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "mkfifo failed for {}", path.display());
+    }
+
+    fn make_socket(path: &Path) -> std::os::unix::net::UnixListener {
+        std::os::unix::net::UnixListener::bind(path).expect("bind a unix socket")
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -383,6 +1030,742 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Every reason, and where it lands.
+    // -----------------------------------------------------------------------------------------
+
+    /// One tree holding every reason the filesystem can produce on its own, each recorded once, in
+    /// the directory that owns it.
+    #[test]
+    fn every_reason_lands_in_its_own_directory() {
+        let root = temp_dir("reasons");
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(root.join("ok.bin"), vec![b'k'; 20]).unwrap();
+        fs::write(root.join("small.bin"), b"x").unwrap();
+        fs::write(root.join("big.bin"), vec![b'b'; 200]).unwrap();
+        fs::write(root.join("notes.log"), vec![b'l'; 20]).unwrap();
+        fs::write(
+            root.join(OsStr::from_bytes(b"bad\xffname.bin")),
+            vec![b'n'; 20],
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(root.join("ok.bin"), root.join("link.bin")).unwrap();
+        fs::write(sub.join("tiny.bin"), b"y").unwrap();
+
+        let mut config = base_config(&root);
+        config.min_size = 4;
+        config.max_size = Some(100);
+        config.include_extensions = vec!["bin".to_string()];
+        let outcome = collect(&config);
+
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![
+                (String::new(), OmissionReason::MinSize, 1),
+                (String::new(), OmissionReason::MaxSize, 1),
+                (String::new(), OmissionReason::ExtensionFiltered, 1),
+                (String::new(), OmissionReason::NonUtf8, 1),
+                (String::new(), OmissionReason::UnsupportedEntry, 1),
+                ("sub".to_string(), OmissionReason::MinSize, 1),
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+            "each reason once, in the directory that holds it"
+        );
+
+        let whole = summary(&outcome, &root);
+        assert_eq!(whole.known_omitted_files().unwrap(), 5, "five files");
+        assert_eq!(whole.unsupported_entries().unwrap(), 1, "one symlink");
+        assert!(!whole.has_unknown_cardinality(), "no errors here");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Repeated special entries aggregate as ENTRIES: three, no files, and nothing inexact.
+    #[test]
+    fn repeated_special_entries_aggregate_as_entries() {
+        let root = temp_dir("special_many");
+        fs::write(root.join("ok.bin"), b"data").unwrap();
+        std::os::unix::fs::symlink(root.join("ok.bin"), root.join("a.link")).unwrap();
+        make_fifo(&root.join("b.fifo"));
+        let _socket = make_socket(&root.join("c.sock"));
+
+        let outcome = collect(&base_config(&root));
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![(String::new(), OmissionReason::UnsupportedEntry, 3)],
+            "one cell, three entries"
+        );
+        let whole = summary(&outcome, &root);
+        assert_eq!(whole.unsupported_entries().unwrap(), 3);
+        assert_eq!(
+            whole.known_omitted_files().unwrap(),
+            0,
+            "none of them is a file"
+        );
+        assert!(
+            !whole.has_unknown_cardinality(),
+            "three sockets are three sockets, not an unknown amount"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A special entry in one child leaves its sibling eligible.
+    #[test]
+    fn an_unsupported_entry_is_localized_to_its_own_directory() {
+        let root = temp_dir("special_local");
+        let left = root.join("left");
+        let right = root.join("right");
+        for side in [&left, &right] {
+            fs::create_dir_all(side).unwrap();
+            fs::write(side.join("a.bin"), b"same").unwrap();
+        }
+        make_fifo(&left.join("pipe"));
+
+        let outcome = collect(&base_config(&root));
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![("left".to_string(), OmissionReason::UnsupportedEntry, 1)],
+            "only the left side is marked; the right side has no cell at all"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The non-UTF8 child is attributed to its representable parent, and no lossy key is stored.
+    #[test]
+    fn a_non_utf8_child_is_attributed_to_its_parent() {
+        let root = temp_dir("nonutf8_attr");
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join(OsStr::from_bytes(b"bad\xffname.bin")), b"data").unwrap();
+
+        let outcome = collect(&base_config(&root));
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![("sub".to_string(), OmissionReason::NonUtf8, 1)]
+        );
+        // Nothing resembling the child's name is anywhere in the snapshot.
+        for (directory, _, _) in publishable(&outcome)[&key(&root)].iter() {
+            assert!(
+                !directory.as_str().contains("bad"),
+                "no child pathname may be stored: {}",
+                directory.as_str()
+            );
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A selected root that is itself a regular file: its only entry has no parent inside the
+    /// root, so the event lands on the root itself rather than escaping it.
+    #[test]
+    fn a_regular_file_root_records_at_the_root() {
+        let holder = temp_dir("file_root");
+        let root = holder.join("only.bin");
+        fs::write(&root, b"x").unwrap();
+
+        let mut config = base_config(&root);
+        config.min_size = 4096;
+        let outcome = collect(&config);
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![(String::new(), OmissionReason::MinSize, 1)],
+            "the root itself is the only in-root location"
+        );
+
+        // And the same root with the metadata fault armed on the file.
+        let _faults = WalkFaults::arm(&[(root.clone(), WalkFault::Metadata)]);
+        let outcome = collect(&base_config(&root));
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![(String::new(), OmissionReason::MetadataError, 1)]
+        );
+
+        fs::remove_dir_all(&holder).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Iterator errors: one yielded `Err`, one event.
+    // -----------------------------------------------------------------------------------------
+
+    /// An unresolvable root: the error names the root itself, so the location is the root and the
+    /// row is its `walk_error` sentinel — not an attribution that escapes upward.
+    #[test]
+    fn an_error_naming_the_root_becomes_the_root_sentinel() {
+        let holder = temp_dir("missing_root");
+        let root = holder.join("not-there");
+        let outcome = collect(&base_config(&root));
+
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![(String::new(), OmissionReason::WalkError, 1)],
+            "one event, at the root"
+        );
+        assert!(summary(&outcome, &root).has_unknown_cardinality());
+
+        fs::remove_dir_all(&holder).ok();
+    }
+
+    /// A pathless error under one root becomes that root's sentinel.
+    #[test]
+    fn a_pathless_error_becomes_the_root_sentinel() {
+        let root = temp_dir("pathless");
+        fs::write(root.join("ok.bin"), b"data").unwrap();
+
+        let faults = IteratorErrorFaults::arm(vec![(
+            root.clone(),
+            ignore::Error::Io(std::io::Error::other("no path at all")),
+        )]);
+        let outcome = collect(&base_config(&root));
+
+        assert_eq!(faults.fired(), vec![root.clone()], "the fault fired once");
+        assert_eq!(faults.pending(), 0);
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![(String::new(), OmissionReason::WalkError, 1)]
+        );
+        // The manifest is unaffected: a pathless error costs no known file.
+        match &outcome {
+            WalkOutcome::Finished { files, .. } => assert_eq!(files.len(), 1),
+            other => panic!("expected a finished walk, got {:?}", other.kind()),
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Two roots, a pathless error while walking the second: it lands on the root being walked and
+    /// leaves the other explicitly empty. Under one shared builder that root could only be guessed.
+    #[test]
+    fn a_pathless_error_lands_on_the_root_being_walked() {
+        let holder = temp_dir("pathless_two");
+        let one = holder.join("one");
+        let two = holder.join("two");
+        for root in [&one, &two] {
+            fs::create_dir_all(root).unwrap();
+            fs::write(root.join("a.bin"), b"data").unwrap();
+        }
+
+        let mut config = base_config(&one);
+        config.roots = vec![one.clone(), two.clone()];
+        let faults = IteratorErrorFaults::arm(vec![(
+            two.clone(),
+            ignore::Error::Io(std::io::Error::other("no path at all")),
+        )]);
+        let outcome = collect(&config);
+
+        assert_eq!(faults.fired(), vec![two.clone()]);
+        assert_eq!(
+            cells(&outcome, &one),
+            Vec::new(),
+            "the first root is explicitly present and empty"
+        );
+        assert_eq!(
+            cells(&outcome, &two),
+            vec![(String::new(), OmissionReason::WalkError, 1)]
+        );
+
+        fs::remove_dir_all(&holder).ok();
+    }
+
+    /// A nested `Partial` naming two unrelated in-root directories: neither covers the other, so
+    /// one root sentinel — and the summary reports ONE event for one yielded error, not two.
+    #[test]
+    fn a_partial_error_with_unrelated_paths_yields_one_root_event() {
+        let root = temp_dir("partial_wide");
+        for name in ["a", "b"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+            fs::write(root.join(name).join("f.bin"), b"data").unwrap();
+        }
+
+        let injected = ignore::Error::Partial(vec![
+            ignore::Error::WithPath {
+                path: root.join("a"),
+                err: Box::new(ignore::Error::Io(std::io::Error::other("one"))),
+            },
+            ignore::Error::WithDepth {
+                depth: 2,
+                err: Box::new(ignore::Error::WithPath {
+                    path: root.join("b"),
+                    err: Box::new(ignore::Error::Io(std::io::Error::other("two"))),
+                }),
+            },
+        ]);
+        let _faults = IteratorErrorFaults::arm(vec![(root.clone(), injected)]);
+        let outcome = collect(&base_config(&root));
+
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![(String::new(), OmissionReason::WalkError, 1)],
+            "one error is one event, at the sentinel"
+        );
+        assert_eq!(
+            summary(&outcome, &root).unknown_cardinality_events(),
+            1,
+            "a reader summing rows must see one error, not two"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `Partial` whose paths nest: the deeper location covers the shallower one on its way up,
+    /// so it is used instead of the coarser sentinel — still exactly one event.
+    #[test]
+    fn a_partial_error_with_nested_paths_uses_the_deeper_location() {
+        let root = temp_dir("partial_deep");
+        let deep = root.join("a").join("b");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("f.bin"), b"data").unwrap();
+
+        let injected = ignore::Error::Partial(vec![
+            ignore::Error::WithPath {
+                path: root.join("a"),
+                err: Box::new(ignore::Error::Io(std::io::Error::other("outer"))),
+            },
+            ignore::Error::WithPath {
+                path: deep.clone(),
+                err: Box::new(ignore::Error::Io(std::io::Error::other("inner"))),
+            },
+        ]);
+        let _faults = IteratorErrorFaults::arm(vec![(root.clone(), injected)]);
+        let outcome = collect(&base_config(&root));
+
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![("a/b".to_string(), OmissionReason::WalkError, 1)],
+            "the deeper location taints the shallower one on its way to the root"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A path the error carries that lies outside the root is context, not a location: it is
+    /// discarded rather than dragging the event out of its root.
+    #[test]
+    fn an_error_path_outside_the_root_is_discarded() {
+        let holder = temp_dir("outside");
+        let root = holder.join("root");
+        fs::create_dir_all(root.join("inside")).unwrap();
+        fs::write(root.join("inside").join("f.bin"), b"data").unwrap();
+
+        let injected = ignore::Error::Loop {
+            ancestor: holder.join("elsewhere"),
+            child: root.join("inside"),
+        };
+        let _faults = IteratorErrorFaults::arm(vec![(root.clone(), injected)]);
+        let outcome = collect(&base_config(&root));
+
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![("inside".to_string(), OmissionReason::WalkError, 1)],
+            "only the in-root path is a location"
+        );
+
+        fs::remove_dir_all(&holder).ok();
+    }
+
+    /// A real symlink loop, produced by the filesystem rather than constructed: `ignore` reports
+    /// `WithDepth{Loop{..}}`, the child lies under the ancestor, and it stays one event.
+    #[test]
+    fn a_real_loop_yields_one_event() {
+        let root = temp_dir("real_loop");
+        let inner = root.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("f.bin"), b"data").unwrap();
+        std::os::unix::fs::symlink(&inner, inner.join("loop")).unwrap();
+
+        let mut config = base_config(&root);
+        config.follow_symlinks = true;
+        let outcome = collect(&config);
+
+        let recorded = cells(&outcome, &root);
+        assert_eq!(recorded.len(), 1, "one cell: {recorded:?}");
+        assert_eq!(recorded[0].1, OmissionReason::WalkError);
+        assert_eq!(recorded[0].2, 1, "one yielded error is one event");
+        assert!(
+            recorded[0].0.starts_with("inner"),
+            "attributed inside the loop, not at the root: {recorded:?}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A broken link under `follow_symlinks` is an iterator error, not an unsupported entry: the
+    /// walker never learns what it pointed at.
+    #[test]
+    fn a_broken_link_is_a_walk_error_when_followed() {
+        let root = temp_dir("broken_link");
+        fs::write(root.join("ok.bin"), b"data").unwrap();
+        std::os::unix::fs::symlink(root.join("missing"), root.join("dangling")).unwrap();
+
+        let mut config = base_config(&root);
+        config.follow_symlinks = true;
+        let outcome = collect(&config);
+
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![("dangling".to_string(), OmissionReason::WalkError, 1)],
+            "a broken target is an error, never an unsupported entry"
+        );
+        // The location is the link itself, because an error path starts at its own path — the
+        // entry's type was never learned. A row there taints the directory holding it on its way
+        // up, which is the effect wanted.
+        assert!(summary(&outcome, &root).has_unknown_cardinality());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Following links.
+    // -----------------------------------------------------------------------------------------
+
+    /// Following links resolves the type: a link to a regular file enters the manifest and records
+    /// nothing, while a link to a character device is still an entry the scan cannot represent.
+    /// `/dev/null` is a real character device present in every Linux environment, so this needs no
+    /// privileges and no injected type.
+    #[test]
+    fn following_links_resolves_the_target_type() {
+        let root = temp_dir("followed");
+        fs::write(root.join("real.bin"), b"data").unwrap();
+        std::os::unix::fs::symlink(root.join("real.bin"), root.join("to_file")).unwrap();
+        std::os::unix::fs::symlink("/dev/null", root.join("to_device")).unwrap();
+
+        let mut config = base_config(&root);
+        config.follow_symlinks = true;
+        let outcome = collect(&config);
+
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![(String::new(), OmissionReason::UnsupportedEntry, 1)],
+            "only the device link is unrepresentable"
+        );
+        match &outcome {
+            WalkOutcome::Finished { files, .. } => {
+                let mut names: Vec<String> = files
+                    .iter()
+                    .map(|f| {
+                        f.path
+                            .strip_prefix(&root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect();
+                names.sort();
+                assert_eq!(
+                    names,
+                    vec!["real.bin".to_string(), "to_file".to_string()],
+                    "the followed regular target enters the manifest under the link's pathname"
+                );
+            }
+            other => panic!("expected a finished walk, got {:?}", other.kind()),
+        }
+
+        // The same tree without following: the links are entries, not files.
+        let outcome = collect(&base_config(&root));
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![(String::new(), OmissionReason::UnsupportedEntry, 2)],
+            "the verdict is configuration-dependent, and this pins it"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Block and character device NODES cannot be created without privileges, so the seam stands
+    /// in for one. What it proves is the recording path for a nominated entry; the real symlink,
+    /// FIFO, socket and `/dev/null` cases above are the evidence that the arm itself is reached.
+    #[test]
+    fn an_injected_device_entry_is_recorded_as_unsupported() {
+        let root = temp_dir("device");
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let node = sub.join("blk0");
+        fs::write(&node, b"stands in for a device node").unwrap();
+        fs::write(root.join("ok.bin"), b"data").unwrap();
+
+        let faults = SpecialEntryFaults::arm(std::slice::from_ref(&node));
+        let outcome = collect(&base_config(&root));
+
+        assert_eq!(faults.fired(), vec![node], "the seam fired once");
+        assert_eq!(faults.pending(), 0);
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![("sub".to_string(), OmissionReason::UnsupportedEntry, 1)]
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Roots, exclusions, cancellation and the storage domain.
+    // -----------------------------------------------------------------------------------------
+
+    /// Two roots are both present, the clean one explicitly empty, and neither sees the other.
+    #[test]
+    fn two_roots_are_both_present_and_do_not_leak() {
+        let holder = temp_dir("two_roots");
+        let one = holder.join("one");
+        let two = holder.join("two");
+        for root in [&one, &two] {
+            fs::create_dir_all(root).unwrap();
+            fs::write(root.join("a.bin"), b"data").unwrap();
+        }
+        make_fifo(&one.join("pipe"));
+
+        let mut config = base_config(&one);
+        config.roots = vec![one.clone(), two.clone()];
+        let outcome = collect(&config);
+
+        assert_eq!(publishable(&outcome).len(), 2, "both roots present");
+        assert_eq!(
+            cells(&outcome, &one),
+            vec![(String::new(), OmissionReason::UnsupportedEntry, 1)]
+        );
+        assert_eq!(
+            cells(&outcome, &two),
+            Vec::new(),
+            "explicitly empty, not absent"
+        );
+
+        fs::remove_dir_all(&holder).ok();
+    }
+
+    /// Overridden entries never reach the consumer, so they cannot produce a row — including a
+    /// special entry, which is the case that would otherwise look like a silent drop.
+    #[test]
+    fn excluded_entries_produce_no_row() {
+        let root = temp_dir("excluded");
+        fs::write(root.join("ok.bin"), vec![b'k'; 20]).unwrap();
+        // The two defaults, by their real names, plus one operator glob. Each holds exactly the
+        // shapes that WOULD be recorded anywhere else: an undersized file and a special entry.
+        for dir in [".zfs", crate::model::scan::QUARANTINE_DIR_NAME, "skipme"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("tiny.bin"), b"x").unwrap();
+            make_fifo(&root.join(dir).join("pipe"));
+        }
+
+        let mut config = ScanConfig::new(vec![root.clone()]);
+        config.min_size = 4;
+        config.exclude_globs.push("**/skipme/**".to_string());
+        let outcome = collect(&config);
+
+        assert_eq!(
+            cells(&outcome, &root),
+            Vec::new(),
+            "an excluded subtree is never yielded, so it can never be an omission"
+        );
+        // Control: the very same shapes outside an exclusion do produce rows, so the assertion
+        // above is about exclusion and not about the shapes being invisible.
+        fs::write(root.join("visible.tiny"), b"x").unwrap();
+        make_fifo(&root.join("visible.pipe"));
+        let outcome = collect(&config);
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![
+                (String::new(), OmissionReason::MinSize, 1),
+                (String::new(), OmissionReason::UnsupportedEntry, 1),
+            ]
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A cancelled walk carries no snapshot at all — the variant has nowhere to put one.
+    #[test]
+    fn cancellation_carries_no_snapshot() {
+        let root = temp_dir("cancel");
+        fs::write(root.join("ok.bin"), b"data").unwrap();
+        make_fifo(&root.join("pipe"));
+
+        let cancel = AtomicBool::new(true); // already cancelled: the first cadence check trips
+        let outcome = walk_collecting(&base_config(&root), &cancel, |_, _, _| {}).unwrap();
+        match outcome {
+            WalkOutcome::Cancelled {
+                files,
+                skipped_non_utf8,
+            } => {
+                assert!(files.is_empty());
+                assert_eq!(skipped_non_utf8, 0);
+            }
+            WalkOutcome::Finished { .. } => panic!("a cancelled walk must not finish"),
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// An empty root list is still the same outer error it always was, not an unavailable snapshot.
+    #[test]
+    fn an_empty_root_list_is_still_the_old_error() {
+        let config = ScanConfig::new(Vec::new());
+        let cancel = AtomicBool::new(false);
+        // Not `expect_err`: that needs `Debug` on the success type, and neither `WalkOutcome` nor
+        // `WalkedFile` has one.
+        let err = match walk_collecting(&config, &cancel, |_, _, _| {}) {
+            Err(err) => err.to_string(),
+            Ok(outcome) => panic!("an empty root list must not walk, got {}", outcome.kind()),
+        };
+        assert!(err.contains("no scan root specified"), "{err}");
+        // And through the compatibility wrapper, byte for byte.
+        let err = match walk(&config, &cancel, |_, _, _| {}) {
+            Err(err) => err.to_string(),
+            Ok((files, _)) => panic!("the wrapper must refuse it too, got {} files", files.len()),
+        };
+        assert!(err.contains("no scan root specified"), "{err}");
+    }
+
+    /// A root set that cannot be keyed still walks: the manifest is what it always was, and only
+    /// the snapshot is unavailable.
+    #[test]
+    fn unkeyable_roots_keep_the_manifest() {
+        let root = temp_dir("unkeyable");
+        fs::write(root.join("ok.bin"), b"data").unwrap();
+        make_fifo(&root.join("pipe"));
+
+        let mut config = base_config(&root);
+        config.roots = vec![root.join("..").join(root.file_name().unwrap())];
+        let outcome = collect(&config);
+
+        match &outcome {
+            WalkOutcome::Finished {
+                files,
+                omissions: OmissionSnapshot::Unavailable(SnapshotUnavailable::Roots(why)),
+                ..
+            } => {
+                assert!(matches!(why, AuthorityUnavailable::UnkeyableRoot { .. }));
+                assert_eq!(files.len(), 1, "the manifest is untouched");
+            }
+            other => panic!("expected an unavailable snapshot, got {:?}", other.kind()),
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Lexically overlapping roots get no authority either — and no partial one.
+    #[test]
+    fn overlapping_roots_yield_no_authority() {
+        let holder = temp_dir("overlap");
+        let outer = holder.join("outer");
+        let inner = outer.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("a.bin"), b"data").unwrap();
+
+        let mut config = base_config(&outer);
+        config.roots = vec![outer.clone(), inner.clone()];
+        let outcome = collect(&config);
+
+        match &outcome {
+            WalkOutcome::Finished {
+                omissions: OmissionSnapshot::Unavailable(SnapshotUnavailable::Roots(why)),
+                ..
+            } => assert!(matches!(why, AuthorityUnavailable::AmbiguousRoots { .. })),
+            other => panic!("expected an unavailable snapshot, got {:?}", other.kind()),
+        }
+
+        fs::remove_dir_all(&holder).ok();
+    }
+
+    /// The storage domain is checked before anything is called publishable: `i64::MAX` is a real
+    /// count the checkpoint can hold, one more is not, and a `u64` wrap is a different state again.
+    #[test]
+    fn the_count_boundaries_are_three_distinct_states() {
+        let root = key(Path::new("/tank"));
+        let directory = key(Path::new("/tank/a"));
+
+        let seeded = |count: u64| {
+            let mut collector = Collector::new(std::slice::from_ref(&root));
+            collector
+                .per_root
+                .get_mut(&root)
+                .unwrap()
+                .add(
+                    directory.clone(),
+                    OmissionReason::MinSize,
+                    EventCount::new(count).unwrap(),
+                )
+                .unwrap();
+            collector
+        };
+
+        assert!(
+            matches!(
+                seeded(i64::MAX as u64).finish(),
+                OmissionSnapshot::Publishable(_)
+            ),
+            "exactly i64::MAX is storable"
+        );
+        assert!(
+            matches!(
+                seeded(i64::MAX as u64 + 1).finish(),
+                OmissionSnapshot::Unavailable(SnapshotUnavailable::CountNotStorable { .. })
+            ),
+            "one more is a real number the column cannot hold"
+        );
+
+        // The arithmetic state is reached through the collector's own recording path.
+        let mut collector = seeded(u64::MAX);
+        collector.record(&root, directory.clone(), OmissionReason::MinSize);
+        assert!(matches!(
+            collector.finish(),
+            OmissionSnapshot::Unavailable(SnapshotUnavailable::CountOverflow { .. })
+        ));
+    }
+
+    /// The wrapper is exactly what the accepted parent produced: same files, same order, same
+    /// non-UTF8 count — over a tree that exercises the filters and both root shapes.
+    #[test]
+    fn the_compatibility_wrapper_is_unchanged() {
+        let holder = temp_dir("wrapper");
+        let one = holder.join("one");
+        let two = holder.join("two");
+        for root in [&one, &two] {
+            fs::create_dir_all(root.join("sub")).unwrap();
+            fs::write(root.join("keep.bin"), vec![b'k'; 20]).unwrap();
+            fs::write(root.join("sub").join("deep.bin"), vec![b'd'; 20]).unwrap();
+            fs::write(root.join("tiny.bin"), b"x").unwrap();
+            fs::write(
+                root.join(OsStr::from_bytes(b"bad\xffname.bin")),
+                vec![b'n'; 20],
+            )
+            .unwrap();
+            make_fifo(&root.join("pipe"));
+        }
+
+        let mut config = base_config(&one);
+        config.roots = vec![one.clone(), two.clone()];
+        config.min_size = 4;
+        let cancel = AtomicBool::new(false);
+        let (files, skipped) = walk(&config, &cancel, |_, _, _| {}).unwrap();
+
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| {
+                f.path
+                    .strip_prefix(&holder)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "one/keep.bin".to_string(),
+                "one/sub/deep.bin".to_string(),
+                "two/keep.bin".to_string(),
+                "two/sub/deep.bin".to_string(),
+            ],
+            "root order preserved, traversal order preserved"
+        );
+        assert_eq!(skipped, 2, "one non-UTF8 name per root, counted as before");
+
+        fs::remove_dir_all(&holder).ok();
     }
 
     /// Non-UTF8 guard: a file with a non-UTF8 name is skipped and counted,
