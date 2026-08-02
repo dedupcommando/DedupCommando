@@ -3568,6 +3568,15 @@ fn prefix_bounds(dir: &Path) -> (String, String) {
 // `allow(dead_code)` goes away with them — the same shape `model::plan` shipped in with R2D-C5-1.
 // ---------------------------------------------------------------------------------------------
 
+/// The scan's configured roots as normalized keys, or the typed reason there are none this build
+/// can speak for.
+enum PersistedRoots {
+    /// Every configured root has a key and the keys are mutually disjoint, sorted.
+    Keyable(Vec<PathKey>),
+    /// Expected: the configuration itself cannot carry an authority.
+    Unavailable(AuthorityUnavailable),
+}
+
 /// What a clear operation covers.
 enum ClearScope {
     /// Every root of the scan.
@@ -3678,20 +3687,18 @@ fn registered_roots_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<Vec<(PathKe
     Ok(out)
 }
 
-/// Registers the scan's roots as completeness authorities, idempotently.
+/// The scan's own configuration, reduced to normalized root keys — or the typed reason it cannot
+/// be.
 ///
-/// All-or-nothing: if any configured root has no lexical key, or two keys overlap once normalized,
-/// nothing is written and the scan simply has no authority. Refusing to start the scan instead
-/// would turn a configuration that works today into a hard error, and this is a verdict about
-/// completeness, not a gate on scanning.
-///
-/// Existing rows keep their generation — re-registration must not silently re-trust or re-doubt a
-/// root. A row for a root that is no longer configured is removed together with its ledger rows;
-/// the configuration cannot change today, but a row nothing can validate is worse than no row.
-fn ensure_roots_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<RootRegistration> {
+/// The ONE derivation of «which roots may this scan speak for». Registration, the commit and the
+/// reader all go through it, so the persisted configuration and the registered authority cannot
+/// drift apart in one path while another still trusts them. A configuration problem is an
+/// outcome; a malformed `config_json` or a storage failure is an error, and the two never swap
+/// places.
+fn persisted_root_keys_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<PersistedRoots> {
     let roots = persisted_roots_tx(tx, scan_id)?;
     if roots.is_empty() {
-        return Ok(RootRegistration::Unavailable(AuthorityUnavailable::NoRoots));
+        return Ok(PersistedRoots::Unavailable(AuthorityUnavailable::NoRoots));
     }
 
     let mut keys: Vec<PathKey> = Vec::with_capacity(roots.len());
@@ -3699,7 +3706,7 @@ fn ensure_roots_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<RootRegistratio
         match PathKey::new(root) {
             Some(key) => keys.push(key),
             None => {
-                return Ok(RootRegistration::Unavailable(
+                return Ok(PersistedRoots::Unavailable(
                     AuthorityUnavailable::UnkeyableRoot {
                         given: root.display().to_string(),
                     },
@@ -3719,7 +3726,7 @@ fn ensure_roots_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<RootRegistratio
                 } else {
                     (inner, outer)
                 };
-                return Ok(RootRegistration::Unavailable(
+                return Ok(PersistedRoots::Unavailable(
                     AuthorityUnavailable::AmbiguousRoots {
                         outer: outer.as_str().to_string(),
                         inner: inner.as_str().to_string(),
@@ -3728,6 +3735,42 @@ fn ensure_roots_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<RootRegistratio
             }
         }
     }
+    keys.sort();
+    Ok(PersistedRoots::Keyable(keys))
+}
+
+/// Deletes every ledger row and every authority row of the scan. Used where a configuration stops
+/// being one this build can speak for: the rows that survive such a moment are precisely the ones
+/// that would keep a stale positive generation alive.
+fn revoke_authority_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<()> {
+    tx.execute(
+        "DELETE FROM dir_omission WHERE scan_id = ?1",
+        params![scan_id],
+    )?;
+    tx.execute("DELETE FROM scan_root WHERE scan_id = ?1", params![scan_id])?;
+    Ok(())
+}
+
+/// Registers the scan's roots as completeness authorities, idempotently.
+///
+/// All-or-nothing: if any configured root has no lexical key, or two keys overlap once normalized,
+/// the scan gets no authority — and any authority it already had is revoked in this same
+/// transaction. Returning early instead would leave a positive generation standing for a
+/// configuration this very call has just declared unspeakable, which is a trusted answer about a
+/// root nobody can name. Refusing to start the scan is not the alternative: this is a verdict
+/// about completeness, not a gate on scanning.
+///
+/// Existing rows keep their generation while the configuration still matches — re-registration
+/// must not silently re-trust or re-doubt a root. A row for a root that is no longer configured is
+/// removed together with its ledger rows.
+fn ensure_roots_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<RootRegistration> {
+    let keys = match persisted_root_keys_tx(tx, scan_id)? {
+        PersistedRoots::Keyable(keys) => keys,
+        PersistedRoots::Unavailable(why) => {
+            revoke_authority_tx(tx, scan_id)?;
+            return Ok(RootRegistration::Unavailable(why));
+        }
+    };
 
     for (stored, _) in registered_roots_tx(tx, scan_id)? {
         if !keys.contains(&stored) {
@@ -3829,11 +3872,45 @@ fn directory_completeness_tx(
     scan_id: i64,
     dirs: &[&Path],
 ) -> Result<HashMap<PathBuf, DirCompleteness>> {
-    let roots = registered_roots_tx(tx, scan_id)?;
+    // The registered authority is only worth reading while it still describes the scan's own
+    // configuration. Checked HERE, inside the same snapshot as everything else, because an
+    // explicit re-registration is what cleans stale rows and nothing guarantees one has run yet:
+    // the interval between a configuration changing and the next `ensure_scan_roots` would
+    // otherwise be a window of trusted answers about roots the scan no longer has.
+    let registered = registered_roots_tx(tx, scan_id)?;
+    let agrees = match persisted_root_keys_tx(tx, scan_id)? {
+        PersistedRoots::Unavailable(_) => false,
+        PersistedRoots::Keyable(persisted) => {
+            let mut names: Vec<&PathKey> = registered.iter().map(|(key, _)| key).collect();
+            names.sort();
+            names.len() == persisted.len()
+                && names.into_iter().zip(persisted.iter()).all(|(a, b)| a == b)
+        }
+    };
+    // Not an error: a configuration this build cannot speak for is an expected state, and the
+    // honest answer about every directory of such a scan is «unknown». A malformed `config_json`
+    // or a storage failure already returned above, as an error.
+    let roots: &[(PathKey, i64)] = if agrees { &registered } else { &[] };
+
+    // The `dir_key = root_key` walk-error row is the root-wide sentinel: an iterator error that
+    // carried no pathname at all could stand for any part of that tree, so it is included for
+    // every directory the root owns — not only for the root and its ancestors. The ordinary range
+    // propagates a row UPWARD, which is exactly why a row parked at the root would otherwise reach
+    // no child at all.
+    //
+    // A path-known walk error that genuinely lands at the root is over-tainted by this, and that
+    // is the deliberate trade: without a scope column the two rows are indistinguishable, and
+    // over-tainting costs a twin claim while under-tainting costs the truth. Every other reason
+    // stored at the root taints the root and its ancestors only, as usual.
+    //
+    // One statement with three disjuncts rather than two queries: a row satisfying more than one
+    // of them is still one row in one `GROUP BY`, so nothing is counted twice.
     let mut stmt = tx.prepare(
         "SELECT reason, SUM(event_count) FROM dir_omission
           WHERE scan_id = ?1 AND root_key = ?2 AND generation = ?3
-            AND (dir_key = ?4 OR (dir_key >= ?5 AND dir_key < ?6))
+            AND (dir_key = ?4
+                 OR (dir_key >= ?5 AND dir_key < ?6)
+                 OR (reason = ?7 AND dir_key = ?2))
           GROUP BY reason
           ORDER BY reason",
     )?;
@@ -3851,7 +3928,15 @@ fn directory_completeness_tx(
                     (Some((root, generation)), None) if *generation > 0 => {
                         let (lo, hi) = key.subtree_bounds();
                         let rows = stmt.query_map(
-                            params![scan_id, root.as_str(), generation, key.as_str(), lo, hi],
+                            params![
+                                scan_id,
+                                root.as_str(),
+                                generation,
+                                key.as_str(),
+                                lo,
+                                hi,
+                                OmissionReason::WalkError.as_str(),
+                            ],
                             |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                         )?;
                         let mut summary = OmissionSummary::default();
@@ -3930,13 +4015,33 @@ impl ScanStore {
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
 
-        let registered: Vec<PathKey> = registered_roots_tx(&tx, scan_id)?
+        // Three sets must agree before a new generation is published: what the scan is configured
+        // to cover, what it is registered to speak for, and what the producer is reporting.
+        // Comparing the map against the registration alone would let a configuration that has
+        // moved on still buy trust, because the registration is only refreshed by an explicit
+        // call that may not have happened yet.
+        let persisted = match persisted_root_keys_tx(&tx, scan_id)? {
+            PersistedRoots::Keyable(keys) => keys,
+            PersistedRoots::Unavailable(why) => {
+                return Err(AppError::msg(format!(
+                    "scan {scan_id} cannot publish an omission ledger: {}",
+                    why.explain()
+                )))
+            }
+        };
+        let mut registered: Vec<PathKey> = registered_roots_tx(&tx, scan_id)?
             .into_iter()
             .map(|(key, _)| key)
             .collect();
+        registered.sort();
         if registered.is_empty() {
             return Err(AppError::msg(format!(
                 "scan {scan_id} has no registered completeness roots, so its omission ledger cannot be committed"
+            )));
+        }
+        if registered != persisted {
+            return Err(AppError::msg(format!(
+                "scan {scan_id} has drifted from its registered completeness roots; re-register them before committing an omission ledger"
             )));
         }
         for key in &registered {
@@ -9676,30 +9781,107 @@ mod tests {
     }
 
     /// A walk error attributed to the root itself — the case where the iterator error carried no
-    /// pathname at all. Every directory of that root becomes incomplete, and the count is never
-    /// presented as a number of files.
+    /// pathname at all — taints the WHOLE root, not just the root directory.
+    ///
+    /// The ordinary range propagates a row upward to ancestors, so a row parked at the root would
+    /// reach no child. An error that could not name a path could have swallowed any part of that
+    /// tree, so the row at `dir_key = root_key` is a root-wide sentinel instead. The count stays
+    /// an event count, never a number of files.
     #[test]
-    fn an_unattributable_walk_error_is_recorded_at_the_root() {
+    fn a_pathless_walk_error_at_the_root_taints_every_directory_under_it() {
+        let (mut store, scan_id) = ledger_store(&["/tank/root", "/tank/other"]);
+        let mut per_root = one_root("/tank/root", &[("/tank/root", OmissionReason::WalkError)]);
+        per_root.insert(key("/tank/other"), OmissionCounts::new());
+        store.commit_omissions(scan_id, &per_root).unwrap();
+
+        // The root itself, a direct child, a deep descendant and a sibling of that child: every
+        // directory the root owns is incomplete, with a cardinality nobody can state.
+        for dir in [
+            "/tank/root",
+            "/tank/root/sub",
+            "/tank/root/sub/deeper/still",
+            "/tank/root/another",
+        ] {
+            match verdict(&store, scan_id, dir) {
+                DirCompleteness::Incomplete(summary) => {
+                    assert!(
+                        summary.has_unknown_cardinality(),
+                        "{dir}: the hidden file count is unknowable"
+                    );
+                    assert_eq!(summary.known_omitted_files().unwrap(), 0, "{dir}");
+                    assert_eq!(summary.unknown_cardinality_events(), 1, "{dir}");
+                }
+                other => panic!("{dir} must be incomplete, got {other:?}"),
+            }
+        }
+
+        // The other selected root is untouched: a sentinel is root-wide, not scan-wide.
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/other"),
+            DirCompleteness::Complete
+        );
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/other/sub"),
+            DirCompleteness::Complete
+        );
+    }
+
+    /// The sentinel is `walk_error` alone. Any other reason stored at the root keeps the ordinary
+    /// upward rule, or a `min_size` filter at the top of a tree would condemn every directory in
+    /// it.
+    #[test]
+    fn another_reason_at_the_root_does_not_taint_descendants() {
         let (mut store, scan_id) = ledger_store(&["/tank/root"]);
         store
             .commit_omissions(
                 scan_id,
-                &one_root("/tank/root", &[("/tank/root", OmissionReason::WalkError)]),
+                &one_root("/tank/root", &[("/tank/root", OmissionReason::MinSize)]),
             )
             .unwrap();
 
-        match verdict(&store, scan_id, "/tank/root") {
-            DirCompleteness::Incomplete(summary) => {
-                assert!(summary.has_unknown_cardinality());
-                assert_eq!(summary.known_omitted_files().unwrap(), 0);
-                assert_eq!(summary.unknown_cardinality_events(), 1);
-            }
-            other => panic!("expected incomplete, got {other:?}"),
-        }
-        // A directory below it is complete on its own evidence: the error sits at the root, which
-        // is not under the child.
+        assert!(matches!(
+            verdict(&store, scan_id, "/tank/root"),
+            DirCompleteness::Incomplete(_)
+        ));
         assert_eq!(
             verdict(&store, scan_id, "/tank/root/sub"),
+            DirCompleteness::Complete,
+            "a root-level size filter says nothing about a child"
+        );
+    }
+
+    /// A walk error BELOW the root is an ordinary row: it taints its own directory and its
+    /// ancestors, and leaves unrelated siblings alone.
+    #[test]
+    fn a_walk_error_below_the_root_keeps_the_ordinary_rule() {
+        let (mut store, scan_id) = ledger_store(&["/tank/root"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank/root", &[("/tank/root/a", OmissionReason::WalkError)]),
+            )
+            .unwrap();
+
+        for dir in ["/tank/root/a", "/tank/root"] {
+            assert!(
+                matches!(
+                    verdict(&store, scan_id, dir),
+                    DirCompleteness::Incomplete(_)
+                ),
+                "{dir} must see the error"
+            );
+        }
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/root/b"),
+            DirCompleteness::Complete,
+            "an unrelated sibling is not tainted by a located error"
+        );
+        // A descendant of the tainted directory is not tainted either: the error was located, so
+        // it propagates upward like any other row. Where a whole subtree really is unreadable, the
+        // producer records the error against that subtree's own directory — which is R3B's
+        // attribution decision, not something this rule can make for it.
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/root/a/deeper"),
             DirCompleteness::Complete
         );
     }
@@ -10382,6 +10564,208 @@ mod tests {
                 "{dir} must not receive a verdict"
             );
         }
+    }
+
+    /// Rewrites the scan's persisted roots behind the store's back — the external-editor seam the
+    /// corrupt-count and unknown-reason tests already use, and the only way a configuration and a
+    /// registration can diverge inside one process.
+    fn repoint_config(store: &ScanStore, scan_id: i64, roots: &[&str]) {
+        let mut config = store.load_config(scan_id).unwrap();
+        config.roots = roots.iter().map(PathBuf::from).collect();
+        store
+            .conn
+            .execute(
+                "UPDATE scan SET config_json = ?2 WHERE id = ?1",
+                params![scan_id, serde_json::to_string(&config).unwrap()],
+            )
+            .unwrap();
+    }
+
+    /// A configuration that stops being keyable revokes the authority it used to carry — rows,
+    /// generation and all — rather than leaving a trusted answer standing for roots nobody can
+    /// name.
+    #[test]
+    fn a_configuration_that_becomes_unkeyable_revokes_its_authority() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/a", OmissionReason::MinSize)]),
+            )
+            .unwrap();
+        assert_eq!(
+            store.root_generation(scan_id, Path::new("/tank")).unwrap(),
+            Some(1)
+        );
+
+        repoint_config(&store, scan_id, &["/tank/../tank"]);
+
+        // The reader refuses the stale authority immediately, before any re-registration runs.
+        assert_eq!(verdict(&store, scan_id, "/tank"), DirCompleteness::Unknown);
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/a"),
+            DirCompleteness::Unknown
+        );
+
+        match store.ensure_scan_roots(scan_id).unwrap() {
+            RootRegistration::Unavailable(AuthorityUnavailable::UnkeyableRoot { .. }) => {}
+            other => panic!("an unkeyable configuration must be reported: {other:?}"),
+        }
+        assert_eq!(
+            store.root_generation(scan_id, Path::new("/tank")).unwrap(),
+            None,
+            "the stale authority row is gone, not merely ignored"
+        );
+        let rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM dir_omission WHERE scan_id = ?1",
+                params![scan_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "and so is the ledger it vouched for");
+        assert_eq!(verdict(&store, scan_id, "/tank"), DirCompleteness::Unknown);
+    }
+
+    /// A configuration repointed at a different root is untrusted by the reader at once, and a
+    /// commit naming the old root cannot publish another trusted generation.
+    #[test]
+    fn a_repointed_configuration_is_untrusted_before_re_registration() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/a", OmissionReason::MinSize)]),
+            )
+            .unwrap();
+
+        repoint_config(&store, scan_id, &["/other"]);
+
+        // The registration still says `/tank`, and its generation is still 1 — but the reader
+        // compares the two and refuses to use it.
+        assert_eq!(
+            store.root_generation(scan_id, Path::new("/tank")).unwrap(),
+            Some(1)
+        );
+        assert_eq!(verdict(&store, scan_id, "/tank"), DirCompleteness::Unknown);
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/a"),
+            DirCompleteness::Unknown
+        );
+        assert_eq!(verdict(&store, scan_id, "/other"), DirCompleteness::Unknown);
+
+        // And the producer cannot commit against the stale registration either.
+        let err = store
+            .commit_omissions(scan_id, &one_root("/tank", &[]))
+            .expect_err("a drifted configuration must not publish a generation");
+        assert!(err.to_string().contains("drifted"), "{err}");
+        assert_eq!(
+            store.root_generation(scan_id, Path::new("/tank")).unwrap(),
+            Some(1),
+            "the refused commit published nothing"
+        );
+
+        // Re-registering adopts the new root at generation 0 — untrusted until a snapshot of the
+        // new configuration earns it.
+        assert!(store.ensure_scan_roots(scan_id).unwrap().is_registered());
+        assert_eq!(
+            store.root_generation(scan_id, Path::new("/tank")).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.root_generation(scan_id, Path::new("/other")).unwrap(),
+            Some(0)
+        );
+        assert_eq!(verdict(&store, scan_id, "/other"), DirCompleteness::Unknown);
+
+        // An exact snapshot of the new configuration then earns trust normally.
+        store
+            .commit_omissions(scan_id, &one_root("/other", &[]))
+            .unwrap();
+        assert_eq!(
+            verdict(&store, scan_id, "/other"),
+            DirCompleteness::Complete
+        );
+        assert_eq!(verdict(&store, scan_id, "/tank"), DirCompleteness::Unknown);
+    }
+
+    /// The ordinary path is unaffected: an unchanged configuration commits and reads exactly as
+    /// before, so the agreement check costs nothing a working scan notices.
+    #[test]
+    fn an_unchanged_configuration_commits_and_reads_normally() {
+        let (mut store, scan_id) = ledger_store(&["/tank/one", "/tank/two"]);
+        let mut per_root = one_root("/tank/one", &[("/tank/one/a", OmissionReason::MinSize)]);
+        per_root.insert(key("/tank/two"), OmissionCounts::new());
+        store.commit_omissions(scan_id, &per_root).unwrap();
+
+        assert!(matches!(
+            verdict(&store, scan_id, "/tank/one/a"),
+            DirCompleteness::Incomplete(_)
+        ));
+        assert_eq!(
+            verdict(&store, scan_id, "/tank/two"),
+            DirCompleteness::Complete
+        );
+        // Re-registration on an unchanged configuration keeps both generations.
+        assert!(store.ensure_scan_roots(scan_id).unwrap().is_registered());
+        for root in ["/tank/one", "/tank/two"] {
+            assert_eq!(
+                store.root_generation(scan_id, Path::new(root)).unwrap(),
+                Some(1),
+                "{root} must keep its trust"
+            );
+        }
+    }
+
+    /// A configuration reduced to no roots at all is the same class of problem, and revokes just
+    /// as thoroughly.
+    #[test]
+    fn a_configuration_with_no_roots_revokes_its_authority() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(scan_id, &one_root("/tank", &[]))
+            .unwrap();
+        assert_eq!(verdict(&store, scan_id, "/tank"), DirCompleteness::Complete);
+
+        repoint_config(&store, scan_id, &[]);
+        assert_eq!(verdict(&store, scan_id, "/tank"), DirCompleteness::Unknown);
+        assert!(matches!(
+            store.ensure_scan_roots(scan_id).unwrap(),
+            RootRegistration::Unavailable(AuthorityUnavailable::NoRoots)
+        ));
+        assert_eq!(
+            store.root_generation(scan_id, Path::new("/tank")).unwrap(),
+            None
+        );
+    }
+
+    /// A `config_json` that is not a configuration at all is a storage error, never a quiet
+    /// `Unknown`: the two must not be able to swap places.
+    #[test]
+    fn malformed_config_json_is_an_error_not_an_unknown() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(scan_id, &one_root("/tank", &[]))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE scan SET config_json = 'not json' WHERE id = ?1",
+                params![scan_id],
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .directory_completeness(scan_id, &[Path::new("/tank")])
+                .is_err(),
+            "a malformed configuration must surface, not read as unknown"
+        );
+        assert!(store.ensure_scan_roots(scan_id).is_err());
+        assert!(store
+            .commit_omissions(scan_id, &one_root("/tank", &[]))
+            .is_err());
     }
 
     /// Every requested directory appears in the result, so a caller cannot mistake an absent key
