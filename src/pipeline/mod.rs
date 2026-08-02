@@ -7,11 +7,15 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 use crate::error::{AppError, Result};
+use crate::model::omission::{
+    LegacyContext, OmissionSummary, ScanAccounting, SignatureContext, SnapshotOutcome,
+};
 use crate::model::scan::{
-    HashProfile, ScanConfig, ScanPhase, ScanProgress, ScanResults, ScanStatus, ScanSummary,
-    WalkStage,
+    HashProfile, OmissionAccounting, ScanConfig, ScanPhase, ScanProgress, ScanResults, ScanStatus,
+    ScanSummary, WalkStage,
 };
 use crate::state::{ManifestRow, ScanStore};
+use walk::{OmissionSnapshot, SnapshotUnavailable, WalkOutcome};
 
 pub mod governor;
 pub mod hash;
@@ -24,6 +28,17 @@ pub mod walk;
 pub enum ScanOutcome {
     Completed(ScanResults),
     Cancelled,
+}
+
+/// What the walk phase left behind for the completion accounting.
+enum WalkPublication {
+    /// The walk or the manifest persist was cancelled; nothing was published.
+    Cancelled,
+    /// The omission ledger was committed atomically; the grouping-phase snapshot reads it back.
+    Committed,
+    /// The expected no-authority fallback: the configuration cannot carry a root authority, so
+    /// nothing was published — and these are the events the walk observed without attribution.
+    NoAuthority { observed: OmissionSummary },
 }
 
 /// Batch size for writing the manifest to the DB.
@@ -141,15 +156,28 @@ fn run_phases(
         config.clone()
     };
     let hash_profile = effective.hash_profile;
-    // The walk is needed for a new scan and for resuming an unfinished walk (it's cheap).
-    let need_walk = !is_resume || store.scan_status(scan_id)? == ScanStatus::Walking;
+    // The walk is needed for a new scan, for resuming an unfinished walk, and — since R3D — for
+    // any Hashing resume whose persisted completeness ledger is not fully authoritative. A
+    // Roots-unavailable walk holds its observed warnings only in RAM, so a process exit between
+    // `set_status(Hashing)` and completion would otherwise resume into a clean `Complete` with
+    // every counter lost; a pre-ledger, generation-zero or drifted scan re-walks for the same
+    // price and earns a fresh authority through `clear_files`. A fully authoritative ledger keeps
+    // the cheap walk-less resume. Hard snapshot corruption propagates as `Err` — it is never
+    // "solved" by re-walking over it.
+    let status = store.scan_status(scan_id)?;
+    let need_walk = !is_resume
+        || status == ScanStatus::Walking
+        || (status == ScanStatus::Hashing && !store.ledger_authoritative(scan_id)?);
+    let mut walk_publication: Option<WalkPublication> = None;
     if need_walk {
         if is_resume {
             store.clear_files(scan_id)?;
         }
-        if !walk_phase(store, scan_id, &effective, cancel, on_progress)? {
+        let publication = walk_phase(store, scan_id, &effective, cancel, on_progress)?;
+        if matches!(publication, WalkPublication::Cancelled) {
             return Ok(ScanOutcome::Cancelled);
         }
+        walk_publication = Some(publication);
         store.set_status(scan_id, ScanStatus::Hashing)?;
     }
 
@@ -191,6 +219,10 @@ fn run_phases(
     let recon = store.candidate_stats(scan_id)?;
     let hash_failures = recon.total_files - recon.hashed_files;
 
+    // The omission account this run established; the rare was_complete path reads it back from
+    // the store instead, exactly as a reopen would.
+    let mut run_accounting: Option<OmissionAccounting> = None;
+
     if !was_complete {
         // Grouping-phase memory warning — only for the Old path:
         // build_dir_groups holds transiently ~2.5 KiB per hashed file. The Merkle path
@@ -221,13 +253,23 @@ fn run_phases(
             on_progress(ScanProgress::Notice(notice));
         }
 
+        // The one completeness authority for this scan's builders and its final accounting: the
+        // persisted snapshot, loaded once. `Bounded` supplies the context; only the typed expected
+        // `Unavailable` selects `LegacyContext` — a hard error propagates and never falls back.
+        let snapshot_outcome = store.completeness_snapshot(scan_id)?;
+        let legacy = LegacyContext;
+        let ctx: &dyn SignatureContext = match &snapshot_outcome {
+            SnapshotOutcome::Bounded(snapshot) => snapshot,
+            SnapshotOutcome::Unavailable(_) => &legacy,
+        };
+
         // Groups of duplicate directories — for the DirGroupList mode.
         tracing::info!("RSS probe: before file_hash_status: {}", rss());
         // The dir-signature builders receive ALL regular manifest files (with
         // an optional hash), not just `hash IS NOT NULL`. Otherwise an unhashed file
         // (unique-size / failure) is invisible to the signature, and a directory with such an "extra"
-        // file gave a false "twin". The completeness rule (suppressing incomplete ones) is inside
-        // the builders.
+        // file gave a false "twin". The completeness rules (the unhashed-file rule and the ledger
+        // suppression) are inside the builders.
         let mut all_files: Vec<(PathBuf, u64, Option<String>)> = store
             .file_hash_status(scan_id)?
             .into_iter()
@@ -241,12 +283,17 @@ fn run_phases(
         );
         match effective.dir_sig_algo {
             crate::model::duplicate::DirSigAlgo::Old => {
-                let dir_groups = crate::model::duplicate::build_dir_groups(&all_files);
+                let attributed =
+                    crate::model::duplicate::build_dir_groups_in_context(&all_files, ctx)?;
                 tracing::info!(
-                    "RSS probe: after build_dir_groups ({} dir groups, Old): {}",
-                    dir_groups.len(),
+                    "RSS probe: after build_dir_groups_in_context ({} dir groups, Old): {}",
+                    attributed.len(),
                     rss()
                 );
+                // Trust is transient by contract: `dir_dedup` has no column for it, and every
+                // reader recomputes against the then-current snapshot.
+                let dir_groups: Vec<crate::model::duplicate::DirGroup> =
+                    attributed.into_iter().map(|group| group.group).collect();
                 store.record_dir_groups(scan_id, &dir_groups)?;
             }
             crate::model::duplicate::DirSigAlgo::Merkle => {
@@ -254,7 +301,18 @@ fn run_phases(
                 // guarantee ORDER BY). Then materialization via a temporary table.
                 all_files.sort_by(|a, b| a.0.cmp(&b.0));
                 store.materialize_dir_groups(scan_id, |emit| {
-                    crate::model::duplicate::build_dir_signatures_streaming(all_files, emit)
+                    crate::model::duplicate::build_dir_signatures_streaming_in_context(
+                        all_files,
+                        ctx,
+                        |signature| {
+                            emit(
+                                signature.path,
+                                signature.signature,
+                                signature.size,
+                                signature.file_count,
+                            )
+                        },
+                    )
                 })?;
                 tracing::info!(
                     "RSS probe: after materialize_dir_groups (Merkle): {}",
@@ -288,8 +346,51 @@ fn run_phases(
             store.materialize_file_groups(scan_id)?;
             tracing::info!("RSS probe: after materialize_file_groups (SQL): {}", rss());
         }
-        // With a warning if some candidates stayed without a hash (otherwise Complete).
-        store.set_status(scan_id, ScanStatus::on_completion(hash_failures))?;
+        // The scan-wide account, from the same snapshot the builders used. A live completion is
+        // structurally either freshly committed, an authoritative walk-less resume, or the typed
+        // Roots fallback carrying its observed events — anything else is a violated invariant of
+        // the resume rule above, and it errors loudly rather than degrading quietly.
+        let (accounting, warning_events) = match &snapshot_outcome {
+            SnapshotOutcome::Bounded(snapshot) => match snapshot.scan_accounting()? {
+                ScanAccounting::Exact(totals) => {
+                    let events = warning_events_of(&totals)?;
+                    (OmissionAccounting::Ledger(totals), events)
+                }
+                ScanAccounting::Unavailable => {
+                    return Err(AppError::msg(format!(
+                        "scan {scan_id} reached completion without an authoritative completeness \
+                         ledger; this is a wiring defect — the resume rule re-walks exactly this \
+                         state"
+                    )))
+                }
+            },
+            SnapshotOutcome::Unavailable(_) => match walk_publication.take() {
+                Some(WalkPublication::NoAuthority { observed }) => {
+                    let events = warning_events_of(&observed)?;
+                    (OmissionAccounting::Observed(observed), events)
+                }
+                _ => {
+                    return Err(AppError::msg(format!(
+                        "scan {scan_id} has no completeness authority and no observed account; \
+                         this is a wiring defect — a no-authority completion always walked in \
+                         this run"
+                    )))
+                }
+            },
+        };
+        // With a warning if some candidates stayed without a hash, or if the walk left anything
+        // out for a reason the operator did not choose (otherwise Complete).
+        store.set_status(
+            scan_id,
+            ScanStatus::on_completion(hash_failures, warning_events),
+        )?;
+        // ONE aggregate omission notice, emitted once the publication result is known. It subsumes
+        // the old standalone non-UTF8 notice: same fact, one owner, all reasons together.
+        if let Some(notice) = omission_notice(&accounting)? {
+            tracing::warn!("{notice}");
+            on_progress(ScanProgress::Notice(notice));
+        }
+        run_accounting = Some(accounting);
         // Retention: we trim the history of the same roots into the TRASH (softly,
         // recoverably) — finished ones beyond keep + stale unfinished ones.
         let db = store.db_path();
@@ -324,6 +425,10 @@ fn run_phases(
         elapsed_seconds: 0.0,
         // Candidates that stayed without a hash at completion time (reconciliation above).
         hash_failures,
+        omissions: match run_accounting {
+            Some(accounting) => accounting,
+            None => store.scan_omission_accounting(scan_id)?,
+        },
     };
     Ok(ScanOutcome::Completed(ScanResults {
         scan_id,
@@ -332,20 +437,24 @@ fn run_phases(
     }))
 }
 
-/// Walk phase: builds the file manifest. Returns `false` if cancelled.
+/// Walk phase: builds the file manifest and publishes what the walk left out.
+///
+/// Publication is the last act of the phase — after the complete manifest persist and a final
+/// cancellation check, before the caller advances the status to `Hashing` — so the ledger always
+/// describes exactly the manifest beside it, and a cancelled or failed walk can never publish.
 fn walk_phase(
     store: &mut ScanStore,
     scan_id: i64,
     config: &ScanConfig,
     cancel: &AtomicBool,
     on_progress: &mut impl FnMut(ScanProgress),
-) -> Result<bool> {
+) -> Result<WalkPublication> {
     on_progress(ScanProgress::Phase(ScanPhase::Walking(WalkStage::Scanning)));
     tracing::info!("scan roots: {:?}", config.roots);
     let mut bench = crate::bench::start("walk_phase");
 
     let mut total_entries = 0u64;
-    let (walked, skipped_non_utf8) = walk::walk(config, cancel, |entries, files, path| {
+    let outcome = walk::walk_collecting(config, cancel, |entries, files, path| {
         total_entries = entries;
         on_progress(ScanProgress::Walked {
             entries,
@@ -353,19 +462,18 @@ fn walk_phase(
             current_path: path.map(std::path::Path::to_path_buf),
         });
     })?;
+    let (walked, omissions) = match outcome {
+        WalkOutcome::Cancelled { files } => {
+            tracing::info!(
+                "walk cancelled after {} files; nothing persisted, nothing published",
+                files.len()
+            );
+            return Ok(WalkPublication::Cancelled);
+        }
+        WalkOutcome::Finished { files, omissions } => (files, omissions),
+    };
     if cancel.load(Ordering::Relaxed) {
-        return Ok(false);
-    }
-
-    // Non-UTF8 guard: we report how many files were skipped
-    // because of an undisplayable name — to the scan screen and the log (for transparency).
-    if skipped_non_utf8 > 0 {
-        let notice = format!(
-            "Files skipped due to non-UTF8 names: {skipped_non_utf8} \
-             (not scanned for data safety)"
-        );
-        tracing::warn!("{notice}");
-        on_progress(ScanProgress::Notice(notice));
+        return Ok(WalkPublication::Cancelled);
     }
 
     let rows: Vec<ManifestRow> = walked
@@ -400,7 +508,7 @@ fn walk_phase(
             current_path: chunk.last().map(|row| row.path.clone()),
         });
         if cancel.load(Ordering::Relaxed) {
-            return Ok(false);
+            return Ok(WalkPublication::Cancelled);
         }
     }
     on_progress(ScanProgress::Walked {
@@ -409,8 +517,146 @@ fn walk_phase(
         current_path: rows.last().map(|row| row.path.clone()),
     });
 
+    // Final cancellation check, then publication. Every cancel/error exit above happens before
+    // this line, which is what makes «a cancelled walk never publishes» structural.
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(WalkPublication::Cancelled);
+    }
+    let publication = publish_walk_omissions(store, scan_id, omissions)?;
+
     bench.set_entries(written);
-    Ok(true)
+    Ok(publication)
+}
+
+/// The exhaustive publication decision — one place, so a variant added later cannot be routed
+/// quietly. `Roots` is the only expected fallback; the three collector failures and the observed
+/// overflow mean the walk cannot truthfully account what it saw, and they fail the scan exactly
+/// as a refused `commit_omissions` does.
+fn publish_walk_omissions(
+    store: &mut ScanStore,
+    scan_id: i64,
+    omissions: OmissionSnapshot,
+) -> Result<WalkPublication> {
+    match omissions {
+        OmissionSnapshot::Publishable(map) => {
+            store.commit_omissions(scan_id, &map)?;
+            Ok(WalkPublication::Committed)
+        }
+        OmissionSnapshot::Unavailable(SnapshotUnavailable::Roots { why, observed }) => {
+            tracing::warn!(
+                "scan {scan_id}: directory completeness will be reported as unknown — {}",
+                why.explain()
+            );
+            Ok(WalkPublication::NoAuthority { observed })
+        }
+        OmissionSnapshot::Unavailable(
+            why @ (SnapshotUnavailable::CountOverflow { .. }
+            | SnapshotUnavailable::CountNotStorable { .. }
+            | SnapshotUnavailable::UnregisteredRoot { .. }
+            | SnapshotUnavailable::ObservedOverflow { .. }),
+        ) => Err(collector_failure(scan_id, &why)),
+    }
+}
+
+/// Names the exact cell the collector could not represent. Loud on purpose: completing the scan
+/// would publish a result whose omission account is silently short.
+fn collector_failure(scan_id: i64, why: &SnapshotUnavailable) -> AppError {
+    let cell = |root: &crate::model::omission::PathKey,
+                directory: &crate::model::omission::PathKey,
+                reason: &crate::model::omission::OmissionReason| {
+        format!(
+            "{} at {} under root {}",
+            reason.as_str(),
+            crate::textsan::terminal(directory.as_str()),
+            crate::textsan::terminal(root.as_str())
+        )
+    };
+    match why {
+        SnapshotUnavailable::CountOverflow {
+            root,
+            directory,
+            reason,
+        } => AppError::msg(format!(
+            "scan {scan_id} aborted: the omission count overflowed while aggregating {} — the \
+             walk cannot truthfully account what it left out. Rescan into a fresh session.",
+            cell(root, directory, reason)
+        )),
+        SnapshotUnavailable::CountNotStorable {
+            root,
+            directory,
+            reason,
+        } => AppError::msg(format!(
+            "scan {scan_id} aborted: the omission count for {} exceeds what the checkpoint can \
+             store, so the ledger cannot be published truthfully. Rescan into a fresh session.",
+            cell(root, directory, reason)
+        )),
+        SnapshotUnavailable::UnregisteredRoot {
+            root,
+            directory,
+            reason,
+        } => AppError::msg(format!(
+            "scan {scan_id} aborted: an omission event ({}) arrived for a root the collector was \
+             never seeded with — a wiring defect, not an operator problem. Please report it.",
+            cell(root, directory, reason)
+        )),
+        SnapshotUnavailable::ObservedOverflow { reason } => AppError::msg(format!(
+            "scan {scan_id} aborted: the global omission tally overflowed while counting {} \
+             events — the walk cannot truthfully account what it left out. Rescan into a fresh \
+             session.",
+            reason.as_str()
+        )),
+        SnapshotUnavailable::Roots { .. } => {
+            unreachable!("Roots is the expected fallback and is routed before failure construction")
+        }
+    }
+}
+
+/// Events of the reasons an operator did not choose: everything that is not an intentional
+/// min/max/extension filter, including `unsupported_entry`. Checked — a total that cannot be
+/// represented is an error, never a smaller number than the truth.
+fn warning_events_of(totals: &OmissionSummary) -> Result<u64> {
+    let mut total: u64 = 0;
+    for (reason, count) in totals.per_reason() {
+        if !reason.is_intentional_filter() {
+            total = total
+                .checked_add(count.get())
+                .ok_or_else(|| AppError::msg("omission counts overflowed while aggregating"))?;
+        }
+    }
+    Ok(total)
+}
+
+/// The one aggregate omission notice, or `None` when there is nothing to say. Zero clauses are
+/// omitted; the observed account carries the honest suffix about its own persistence.
+fn omission_notice(accounting: &OmissionAccounting) -> Result<Option<String>> {
+    let (totals, suffix) = match accounting {
+        OmissionAccounting::Ledger(totals) => (totals, ""),
+        OmissionAccounting::Observed(totals) => (
+            totals,
+            " (details not persisted: no completeness authority)",
+        ),
+        OmissionAccounting::Unavailable => return Ok(None),
+    };
+    if totals.is_empty() {
+        return Ok(None);
+    }
+    let mut clauses: Vec<String> = Vec::new();
+    let files = totals.known_omitted_files()?;
+    if files > 0 {
+        clauses.push(format!("{files} files omitted"));
+    }
+    let errors = totals.unknown_cardinality_events();
+    if errors > 0 {
+        clauses.push(format!("{errors} walk errors (unknown files hidden)"));
+    }
+    let entries = totals.unsupported_entries()?;
+    if entries > 0 {
+        clauses.push(format!("{entries} unsupported entries"));
+    }
+    Ok(Some(format!(
+        "Scan left gaps: {} — affected directories are not exact twins{suffix}",
+        clauses.join(", ")
+    )))
 }
 
 /// The open descriptor carries the same temporal identity that was recorded in the manifest
@@ -889,7 +1135,9 @@ mod hash_failures_tests {
     fn run_scan_unhashable_candidates_complete_with_warnings() {
         // negative control: candidates that cannot be hashed (the files don't exist),
         // → completion with a warning, hash_failures=2, progress NOT inflated. The resume path
-        // (Hashing status) skips the walk and hashes the directly written manifest.
+        // (Hashing status, fully authoritative ledger) skips the walk and hashes the directly
+        // written manifest — without the committed ledger the resume rule would re-walk the
+        // nonexistent root and replace this seeded manifest.
         let mut store = ScanStore::open_in_memory().unwrap();
         let cfg = ScanConfig::new(vec![PathBuf::from("/dedcom-nonexistent-root")]);
         let id = store.begin_scan(&cfg).unwrap();
@@ -910,6 +1158,12 @@ mod hash_failures_tests {
                 ],
             )
             .unwrap();
+        let empty_ledger = std::collections::BTreeMap::from([(
+            crate::model::omission::PathKey::new(std::path::Path::new("/dedcom-nonexistent-root"))
+                .unwrap(),
+            crate::model::omission::OmissionCounts::new(),
+        )]);
+        store.commit_omissions(id, &empty_ledger).unwrap();
         store.set_status(id, ScanStatus::Hashing).unwrap();
 
         let cancel = Arc::new(AtomicBool::new(false));
@@ -940,6 +1194,495 @@ mod hash_failures_tests {
             info.files_hashed, 0,
             "no file committed — the progress is honest"
         );
+    }
+
+    /// One walk fires exactly one `Walking(Scanning)` phase event, so counting those pins how
+    /// many walks a resume performed — the clean witness the accounting matrix asks for.
+    fn counting_progress(
+        walks: std::sync::Arc<AtomicU64>,
+        notices: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> impl FnMut(ScanProgress) {
+        move |progress| match progress {
+            ScanProgress::Phase(ScanPhase::Walking(WalkStage::Scanning)) => {
+                walks.fetch_add(1, Ordering::Relaxed);
+            }
+            ScanProgress::Notice(text) => notices.lock().unwrap().push(text),
+            _ => {}
+        }
+    }
+
+    fn make_fifo(path: &std::path::Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(name.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "mkfifo failed for {}", path.display());
+    }
+
+    /// Interrupts a scan at the entry into the hashing phase and returns the walk count of that
+    /// first run. The walk has committed by then; no candidate has.
+    fn interrupt_at_hashing(store: &mut ScanStore, cfg: &ScanConfig, resume: Option<i64>) -> u64 {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trip = Arc::clone(&cancel);
+        let walks = std::sync::Arc::new(AtomicU64::new(0));
+        let walked = std::sync::Arc::clone(&walks);
+        let outcome = run_scan(store, cfg, resume, false, &cancel, move |p| {
+            if matches!(
+                p,
+                ScanProgress::Phase(ScanPhase::Walking(WalkStage::Scanning))
+            ) {
+                walked.fetch_add(1, Ordering::Relaxed);
+            }
+            if matches!(p, ScanProgress::Phase(ScanPhase::Hashing)) {
+                trip.store(true, Ordering::Relaxed);
+            }
+        })
+        .unwrap();
+        assert!(matches!(outcome, ScanOutcome::Cancelled), "run 1 cancelled");
+        walks.load(Ordering::Relaxed)
+    }
+
+    /// A5/A8 of the accounting matrix, plus initial-vs-reopen parity: a Hashing resume whose
+    /// ledger is fully authoritative performs ZERO walks, keeps the committed generation, and
+    /// completes with the exact `Ledger` account a reopen then reproduces.
+    #[test]
+    fn an_authoritative_hashing_resume_performs_zero_walks() {
+        let dir = unique_temp_dir("auth_resume");
+        std::fs::write(dir.join("a.bin"), b"identical duplicate content").unwrap();
+        std::fs::write(dir.join("b.bin"), b"identical duplicate content").unwrap();
+        let mut cfg = ScanConfig::new(vec![dir.clone()]);
+        cfg.min_size = 0;
+        cfg.exclude_globs = Vec::new();
+
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store.begin_scan(&cfg).unwrap();
+        assert_eq!(interrupt_at_hashing(&mut store, &cfg, Some(id)), 1);
+        assert_eq!(store.scan_status(id).unwrap(), ScanStatus::Hashing);
+        assert!(
+            store.ledger_authoritative(id).unwrap(),
+            "the interrupted walk left a committed, fully authoritative ledger"
+        );
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let walks = std::sync::Arc::new(AtomicU64::new(0));
+        let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outcome = run_scan(
+            &mut store,
+            &cfg,
+            Some(id),
+            false,
+            &cancel,
+            counting_progress(
+                std::sync::Arc::clone(&walks),
+                std::sync::Arc::clone(&notices),
+            ),
+        )
+        .unwrap();
+        let results = match outcome {
+            ScanOutcome::Completed(results) => results,
+            ScanOutcome::Cancelled => panic!("run 2 completes"),
+        };
+        assert_eq!(
+            walks.load(Ordering::Relaxed),
+            0,
+            "an authoritative Hashing resume must not re-walk"
+        );
+        assert_eq!(store.scan_status(id).unwrap(), ScanStatus::Complete);
+        assert_eq!(
+            results.summary.omissions,
+            crate::model::scan::OmissionAccounting::Ledger(
+                crate::model::omission::OmissionSummary::default()
+            ),
+            "a clean walk's account is the exact zero"
+        );
+        // Initial-vs-reopen parity: the persisted ledger folds to the same account.
+        assert_eq!(
+            store.scan_summary(id).unwrap().omissions,
+            results.summary.omissions
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A7: a bounded generation-zero ledger forces the re-walk and earns fresh authority.
+    #[test]
+    fn a_generation_zero_hashing_resume_re_walks() {
+        let dir = unique_temp_dir("genzero_resume");
+        std::fs::write(dir.join("a.bin"), b"identical duplicate content").unwrap();
+        std::fs::write(dir.join("b.bin"), b"identical duplicate content").unwrap();
+        let mut cfg = ScanConfig::new(vec![dir.clone()]);
+        cfg.min_size = 0;
+        cfg.exclude_globs = Vec::new();
+
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store.begin_scan(&cfg).unwrap();
+        assert_eq!(interrupt_at_hashing(&mut store, &cfg, Some(id)), 1);
+        store.clear_scan_omissions(id).unwrap();
+        assert!(!store.ledger_authoritative(id).unwrap());
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let walks = std::sync::Arc::new(AtomicU64::new(0));
+        let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outcome = run_scan(
+            &mut store,
+            &cfg,
+            Some(id),
+            false,
+            &cancel,
+            counting_progress(
+                std::sync::Arc::clone(&walks),
+                std::sync::Arc::clone(&notices),
+            ),
+        )
+        .unwrap();
+        assert!(matches!(outcome, ScanOutcome::Completed(_)));
+        assert_eq!(walks.load(Ordering::Relaxed), 1, "the resume re-walked");
+        assert_eq!(store.scan_status(id).unwrap(), ScanStatus::Complete);
+        assert!(
+            store.ledger_authoritative(id).unwrap(),
+            "the re-walk earned a fresh authority"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A6, the blocker-1 window closed: a `Roots`-unavailable walk (a `..`-spelled root) is
+    /// interrupted after the status became `Hashing`; the resume re-walks, reconstructs the
+    /// session-only `Observed` account — the fifo is back on the books — and completes with the
+    /// warning status. Reopen then honestly reports the details as not retained.
+    #[test]
+    fn an_unavailable_authority_hashing_resume_re_walks_and_recovers_observed() {
+        let holder = unique_temp_dir("observed_resume");
+        let real = holder.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("a.bin"), b"identical duplicate content").unwrap();
+        std::fs::write(real.join("b.bin"), b"identical duplicate content").unwrap();
+        make_fifo(&real.join("pipe"));
+        // `real/../real`: resolvable on disk (so the disjoint preflight passes) and unkeyable
+        // for the ledger (so no authority can exist).
+        let spelled = real.join("..").join("real");
+        let mut cfg = ScanConfig::new(vec![spelled]);
+        cfg.min_size = 0;
+        cfg.exclude_globs = Vec::new();
+
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store.begin_scan(&cfg).unwrap();
+        assert_eq!(interrupt_at_hashing(&mut store, &cfg, Some(id)), 1);
+        assert_eq!(store.scan_status(id).unwrap(), ScanStatus::Hashing);
+        assert!(
+            !store.ledger_authoritative(id).unwrap(),
+            "an unkeyable configuration never has authority"
+        );
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let walks = std::sync::Arc::new(AtomicU64::new(0));
+        let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outcome = run_scan(
+            &mut store,
+            &cfg,
+            Some(id),
+            false,
+            &cancel,
+            counting_progress(
+                std::sync::Arc::clone(&walks),
+                std::sync::Arc::clone(&notices),
+            ),
+        )
+        .unwrap();
+        let results = match outcome {
+            ScanOutcome::Completed(results) => results,
+            ScanOutcome::Cancelled => panic!("run 2 completes"),
+        };
+        assert_eq!(
+            walks.load(Ordering::Relaxed),
+            1,
+            "without authority the Hashing resume MUST re-walk — this is the lost-Observed window"
+        );
+        assert_eq!(
+            store.scan_status(id).unwrap(),
+            ScanStatus::CompleteWithWarnings,
+            "the unsupported entry is warning-worthy"
+        );
+        match &results.summary.omissions {
+            crate::model::scan::OmissionAccounting::Observed(totals) => {
+                assert_eq!(totals.unsupported_entries().unwrap(), 1, "the fifo is back");
+            }
+            other => panic!("expected the reconstructed Observed account, got {other:?}"),
+        }
+        let collected = notices.lock().unwrap().join("\n");
+        assert!(
+            collected.contains("Scan left gaps: 1 unsupported entries")
+                && collected.contains("(details not persisted: no completeness authority)"),
+            "the aggregate notice names the observed account and its persistence: {collected}"
+        );
+        // Reopen: the session-only account is gone, and the summary says so rather than showing
+        // an exact zero.
+        assert_eq!(
+            store.scan_summary(id).unwrap().omissions,
+            crate::model::scan::OmissionAccounting::Unavailable
+        );
+
+        std::fs::remove_dir_all(&holder).ok();
+    }
+
+    /// The publication seam, all five variants with constructed snapshots: `Publishable` commits,
+    /// `Roots` degrades carrying its observed account, and every collector failure — including
+    /// the no-attribution overflow — is a loud error that publishes nothing.
+    #[test]
+    fn walk_publication_is_exhaustive_and_loud() {
+        use crate::model::omission::{
+            AuthorityUnavailable, EventCount, OmissionCounts, OmissionReason, OmissionSummary,
+            PathKey,
+        };
+        let key = |p: &str| PathKey::new(std::path::Path::new(p)).unwrap();
+
+        let fresh = || {
+            let mut store = ScanStore::open_in_memory().unwrap();
+            let id = store
+                .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank")]))
+                .unwrap();
+            (store, id)
+        };
+
+        // Publishable → committed, and the account is readable back as the exact ledger.
+        let (mut store, id) = fresh();
+        let mut cells = OmissionCounts::new();
+        cells.bump(key("/tank/a"), OmissionReason::MinSize).unwrap();
+        let map = std::collections::BTreeMap::from([(key("/tank"), cells)]);
+        let publication =
+            publish_walk_omissions(&mut store, id, OmissionSnapshot::Publishable(map)).unwrap();
+        assert!(matches!(publication, WalkPublication::Committed));
+        assert!(store.ledger_authoritative(id).unwrap());
+
+        // Roots → the expected fallback, observed account carried through.
+        let (mut store, id) = fresh();
+        let mut observed = OmissionSummary::default();
+        observed
+            .add(OmissionReason::UnsupportedEntry, EventCount::ONE)
+            .unwrap();
+        let publication = publish_walk_omissions(
+            &mut store,
+            id,
+            OmissionSnapshot::Unavailable(SnapshotUnavailable::Roots {
+                why: AuthorityUnavailable::NoRoots,
+                observed,
+            }),
+        )
+        .unwrap();
+        match publication {
+            WalkPublication::NoAuthority { observed } => {
+                assert_eq!(observed.unsupported_entries().unwrap(), 1)
+            }
+            _ => panic!("Roots is the expected no-authority fallback"),
+        }
+        assert!(!store.ledger_authoritative(id).unwrap());
+
+        // The four failures: loud, named, and nothing published.
+        let failures: Vec<(SnapshotUnavailable, &str)> = vec![
+            (
+                SnapshotUnavailable::CountOverflow {
+                    root: key("/tank"),
+                    directory: key("/tank/a"),
+                    reason: OmissionReason::MinSize,
+                },
+                "overflowed",
+            ),
+            (
+                SnapshotUnavailable::CountNotStorable {
+                    root: key("/tank"),
+                    directory: key("/tank/a"),
+                    reason: OmissionReason::MinSize,
+                },
+                "exceeds what the checkpoint can store",
+            ),
+            (
+                SnapshotUnavailable::UnregisteredRoot {
+                    root: key("/tank"),
+                    directory: key("/tank/a"),
+                    reason: OmissionReason::MinSize,
+                },
+                "wiring defect",
+            ),
+            (
+                SnapshotUnavailable::ObservedOverflow {
+                    reason: OmissionReason::NonUtf8,
+                },
+                "global omission tally overflowed",
+            ),
+        ];
+        for (why, fragment) in failures {
+            let (mut store, id) = fresh();
+            // Not `expect_err`: that needs `Debug` on the success type, and `WalkPublication`
+            // deliberately has none.
+            let err =
+                match publish_walk_omissions(&mut store, id, OmissionSnapshot::Unavailable(why)) {
+                    Err(err) => err.to_string(),
+                    Ok(_) => panic!("a collector failure must fail the scan"),
+                };
+            assert!(err.contains(fragment), "{err}");
+            assert!(
+                !store.ledger_authoritative(id).unwrap(),
+                "nothing may be published on the failure path"
+            );
+        }
+    }
+
+    /// G6's re-walk crash truth: `clear_files` has already destroyed the previous ledger in its
+    /// own transaction, so a commit failure later in the re-walk leaves `Unknown` — the actual
+    /// state, not the older authority P0 wrongly promised.
+    #[test]
+    fn a_failed_commit_after_clear_files_leaves_unknown_not_the_old_ledger() {
+        let dir = unique_temp_dir("rewalk_crash");
+        std::fs::write(dir.join("keep.bin"), vec![b'k'; 64]).unwrap();
+        std::fs::write(dir.join("tiny.bin"), b"x").unwrap();
+        let mut cfg = ScanConfig::new(vec![dir.clone()]);
+        cfg.min_size = 16; // tiny.bin is filtered → exactly one ledger row to fail on
+        cfg.exclude_globs = Vec::new();
+
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let outcome = run_scan(&mut store, &cfg, None, false, &cancel, |_| {}).unwrap();
+        let id = match outcome {
+            ScanOutcome::Completed(results) => results.scan_id,
+            ScanOutcome::Cancelled => panic!("run 1 completes"),
+        };
+        assert!(store.ledger_authoritative(id).unwrap(), "run 1 committed");
+
+        // Force the re-walk path and fail the very first ledger insert inside the commit.
+        store.set_status(id, ScanStatus::Walking).unwrap();
+        let fault = crate::state::store::LedgerInsertFault::after(0);
+        let err = match run_scan(&mut store, &cfg, Some(id), false, &cancel, |_| {}) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("the injected commit failure must fail the scan"),
+        };
+        assert!(err.contains("injected ledger insert fault"), "{err}");
+        assert!(!fault.pending(), "the fault fired inside the commit");
+
+        assert_eq!(
+            store.scan_status(id).unwrap(),
+            ScanStatus::Walking,
+            "no completion status was written"
+        );
+        assert!(
+            !store.ledger_authoritative(id).unwrap(),
+            "the previous authority is honestly gone — clear_files destroyed it with the manifest"
+        );
+        assert_eq!(
+            store.scan_omission_accounting(id).unwrap(),
+            crate::model::scan::OmissionAccounting::Unavailable,
+            "Unknown, not the older ledger"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// G12: `unsupported_entry` escalates to `CompleteWithWarnings`; an intentional min-size
+    /// filter never does. Both leave their exact `Ledger` account and one aggregate notice; the
+    /// old standalone non-UTF8 notice is gone from the stream.
+    #[test]
+    fn warning_events_escalate_and_intentional_filters_do_not() {
+        // A fifo beside two duplicates: nothing failed, nothing was filtered, and the scan must
+        // still warn — the directory result is incomplete.
+        let dir = unique_temp_dir("warn_fifo");
+        std::fs::write(dir.join("a.bin"), b"identical duplicate content").unwrap();
+        std::fs::write(dir.join("b.bin"), b"identical duplicate content").unwrap();
+        make_fifo(&dir.join("pipe"));
+        let mut cfg = ScanConfig::new(vec![dir.clone()]);
+        cfg.min_size = 0;
+        cfg.exclude_globs = Vec::new();
+
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let walks = std::sync::Arc::new(AtomicU64::new(0));
+        let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outcome = run_scan(
+            &mut store,
+            &cfg,
+            None,
+            false,
+            &cancel,
+            counting_progress(
+                std::sync::Arc::clone(&walks),
+                std::sync::Arc::clone(&notices),
+            ),
+        )
+        .unwrap();
+        let results = match outcome {
+            ScanOutcome::Completed(results) => results,
+            ScanOutcome::Cancelled => panic!("completes"),
+        };
+        assert_eq!(results.summary.hash_failures, 0);
+        assert_eq!(
+            store.scan_status(results.scan_id).unwrap(),
+            ScanStatus::CompleteWithWarnings,
+            "an unsupported entry is warning-worthy"
+        );
+        match &results.summary.omissions {
+            crate::model::scan::OmissionAccounting::Ledger(totals) => {
+                assert_eq!(totals.unsupported_entries().unwrap(), 1)
+            }
+            other => panic!("expected the exact ledger account, got {other:?}"),
+        }
+        let collected = notices.lock().unwrap().join("\n");
+        assert!(
+            collected.contains("Scan left gaps: 1 unsupported entries"),
+            "{collected}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        // The same shape with an intentional filter instead: incomplete twins, no warning status.
+        let dir = unique_temp_dir("warn_filter");
+        std::fs::write(dir.join("a.bin"), vec![b'a'; 64]).unwrap();
+        std::fs::write(dir.join("b.bin"), vec![b'a'; 64]).unwrap();
+        std::fs::write(dir.join("tiny.bin"), b"x").unwrap();
+        let mut cfg = ScanConfig::new(vec![dir.clone()]);
+        cfg.min_size = 16;
+        cfg.exclude_globs = Vec::new();
+
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let walks = std::sync::Arc::new(AtomicU64::new(0));
+        let outcome = run_scan(
+            &mut store,
+            &cfg,
+            None,
+            false,
+            &cancel,
+            counting_progress(
+                std::sync::Arc::clone(&walks),
+                std::sync::Arc::clone(&notices),
+            ),
+        )
+        .unwrap();
+        let results = match outcome {
+            ScanOutcome::Completed(results) => results,
+            ScanOutcome::Cancelled => panic!("completes"),
+        };
+        assert_eq!(
+            store.scan_status(results.scan_id).unwrap(),
+            ScanStatus::Complete,
+            "an operator-chosen narrowing is not a warning about the scan"
+        );
+        match &results.summary.omissions {
+            crate::model::scan::OmissionAccounting::Ledger(totals) => {
+                assert_eq!(
+                    totals.known_omitted_files().unwrap(),
+                    1,
+                    "the filtered file"
+                )
+            }
+            other => panic!("expected the exact ledger account, got {other:?}"),
+        }
+        let collected = notices.lock().unwrap().join("\n");
+        assert!(
+            collected.contains("Scan left gaps: 1 files omitted"),
+            "the filter is still accounted and announced: {collected}"
+        );
+        assert!(
+            !collected.contains("non-UTF8 names"),
+            "the old standalone notice is gone: {collected}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

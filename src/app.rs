@@ -256,19 +256,25 @@ pub struct BrowserState {
     pub last_click: Option<(Instant, u16, u16)>,
     /// Active browser tab (Files/Dirs).
     pub tab: crate::tui::screens::browser::BrowserTab,
-    /// Lightweight summaries of twin-directory groups for
+    /// Attributed summaries of twin-directory groups for
     /// the `[2] Directories` tab. Loaded synchronously in `show_results` (on /tank
     /// ≤ a few thousand rows — not hundreds of thousands like file-groups).
-    pub dir_group_summaries: Vec<crate::state::DirGroupSummary>,
-    /// Total reclaim of dir-groups — for the tab bar.
+    pub dir_group_summaries: Vec<crate::state::AttributedDirGroupSummary>,
+    /// Total reclaim of dir-groups — TRUSTED groups only, for the tab bar. An unverified
+    /// candidate contributes a count, never bytes.
     pub dir_groups_reclaim_total: u64,
+    /// How many of the loaded groups are unverified candidates.
+    pub dir_groups_unverified: u32,
+    /// The attributed load's failure, when it failed — rendered instead of the list, so a store
+    /// error can never read as «no directory groups».
+    pub dir_groups_error: Option<String>,
     /// Cursor over dir-groups (left panel of the Dirs tab).
     pub dir_group_state: ListState,
     /// Cursor over paths of the open dir-group (right).
     pub dir_file_state: ListState,
-    /// The full open dir-group with `paths` (loaded by
-    /// `store::dir_group_paths` on entry). `None` while none is open.
-    pub open_dir_group: Option<crate::model::duplicate::DirGroup>,
+    /// The full open dir-group with `paths` and member trust (loaded by
+    /// `store::attributed_dir_group` on entry). `None` while none is open.
+    pub open_dir_group: Option<crate::model::duplicate::AttributedDirGroup>,
     /// Index of the "keeper" in `open_dir_group.paths` (★).
     /// Default 0 (first path); changed with Enter on the right panel.
     pub dir_keeper_index: usize,
@@ -578,6 +584,11 @@ impl App {
                     }
                 }
                 keep.insert(cwd.clone());
+                // A failed load reaches the operator twice: the cached error renders in the
+                // panel title, and the status line names it once here.
+                if let Err(message) = &dir {
+                    self.commander.status = format!("directory status unavailable: {message}");
+                }
                 self.commander.dedup.insert_dir(cwd, dir);
                 self.commander.dedup.prune(&keep);
             }
@@ -756,25 +767,37 @@ impl App {
         self.browser.open_dir_group = None;
         self.browser.dir_keeper_index = 0;
         self.browser.dir_groups_reclaim_total = 0;
+        self.browser.dir_groups_unverified = 0;
+        self.browser.dir_groups_error = None;
         if !self.browser.group_summaries.is_empty() {
             self.browser.group_state.select(Some(0));
             // Files of the first group — loaded from the DB on entry (the default keeper is set here).
             self.open_selected_group();
         }
         // Dir-group summaries — synchronously: they are usually < 10k on /tank, unlike
-        // the 645k file-groups. If 0 — the `[2] Directories` tab stays empty, the user
-        // sees "0 groups" on the bar and won't go there.
-        if let Some(store) = self.browse_conn() {
-            if let Ok(dir_sums) = store.dir_group_summaries(scan_id) {
-                self.browser.dir_groups_reclaim_total =
-                    dir_sums.iter().map(|s| s.reclaim_bytes()).sum();
-                self.browser.dir_group_summaries = dir_sums;
+        // the 645k file-groups. Attributed against the CURRENT ledger, and fail-visible: a store
+        // error is kept and rendered, never flattened into «no directory groups».
+        match self
+            .browse_conn()
+            .map(|store| store.attributed_dir_group_summaries(scan_id))
+        {
+            Some(Ok(dir_sums)) => {
+                self.browser.dir_groups_reclaim_total = dir_sums.trusted_reclaim_total;
+                self.browser.dir_groups_unverified = dir_sums.unverified_groups;
+                self.browser.dir_group_summaries = dir_sums.groups;
                 if !self.browser.dir_group_summaries.is_empty() {
                     self.browser.dir_group_state.select(Some(0));
                     // Defer open_dir_group until the tab is actually switched —
                     // lazily, so we don't spend a query on the first
                     // opening of the scan (most users stay on Files).
                 }
+            }
+            Some(Err(err)) => {
+                self.browser.dir_groups_error = Some(crate::textsan::terminal(&err.to_string()));
+            }
+            None => {
+                self.browser.dir_groups_error =
+                    Some("checkpoint database is not available".to_string());
             }
         }
         self.refresh_marked_count();
@@ -795,13 +818,44 @@ impl App {
                 self.browser.summary.hash_failures
             ));
         }
+        // The omission account beside it: exact ledger or session-observed counters when there
+        // are any; for a warned scan whose account was not retainable, say so instead of showing
+        // nothing — an absent number must not read as a clean scan.
+        let omissions = self.browser.summary.omissions.clone();
+        match &omissions {
+            crate::model::scan::OmissionAccounting::Ledger(totals)
+            | crate::model::scan::OmissionAccounting::Observed(totals)
+                if !totals.is_empty() =>
+            {
+                if let (Ok(files), Ok(entries)) =
+                    (totals.known_omitted_files(), totals.unsupported_entries())
+                {
+                    let errors = totals.unknown_cardinality_events();
+                    self.status.push_str(&format!(
+                        " · ⚠ gaps: {files} files omitted, {errors} walk errors, {entries} unsupported entries"
+                    ));
+                }
+            }
+            crate::model::scan::OmissionAccounting::Unavailable => {
+                let warned = self
+                    .browse_conn()
+                    .and_then(|store| store.scan_status(scan_id).ok())
+                    .is_some_and(|status| {
+                        status == crate::model::scan::ScanStatus::CompleteWithWarnings
+                    });
+                if warned {
+                    self.status
+                        .push_str(" · ⚠ omission details not retained (no completeness authority)");
+                }
+            }
+            _ => {}
+        }
         self.screen = Screen::Browser;
     }
 
-    /// Opens the selected dir-group — loads the full
-    /// `paths` via `store::dir_group_paths(signature)`. The keeper defaults
-    /// to index 0 (by `paths` ASC sort order). If no
-    /// group is selected — no-op.
+    /// Opens the selected dir-group — loads the full `paths` and member trust via
+    /// `store::attributed_dir_group(signature)`, revalidated at open time. The keeper defaults
+    /// to index 0 (by `paths` ASC sort order). If no group is selected — no-op.
     fn open_selected_dir_group(&mut self) {
         let Some(idx) = self.browser.dir_group_state.selected() else {
             return;
@@ -814,7 +868,7 @@ impl App {
         };
         let group = self.browse_conn().and_then(|store| {
             store
-                .dir_group_paths(scan_id, &summary.signature)
+                .attributed_dir_group(scan_id, &summary.signature)
                 .ok()
                 .flatten()
         });
@@ -825,7 +879,7 @@ impl App {
             .browser
             .open_dir_group
             .as_ref()
-            .is_some_and(|g| !g.paths.is_empty())
+            .is_some_and(|g| !g.group.paths.is_empty())
         {
             self.browser.dir_file_state.select(Some(0));
         }
@@ -1519,7 +1573,7 @@ impl App {
                 self.browser
                     .open_dir_group
                     .as_ref()
-                    .map_or(0, |g| g.paths.len()),
+                    .map_or(0, |g| g.group.paths.len()),
             )
         } else {
             (
@@ -2336,7 +2390,7 @@ impl App {
                 .browser
                 .open_dir_group
                 .as_ref()
-                .map_or(0, |g| g.paths.len());
+                .map_or(0, |g| g.group.paths.len());
             step(&mut self.browser.dir_file_state, len, delta);
         } else {
             let prev = self.browser.dir_group_state.selected();
@@ -2366,7 +2420,7 @@ impl App {
                 .browser
                 .open_dir_group
                 .as_ref()
-                .is_some_and(|g| !g.paths.is_empty())
+                .is_some_and(|g| !g.group.paths.is_empty())
             {
                 self.browser.dir_file_state.select(Some(0));
             }
@@ -2387,7 +2441,7 @@ impl App {
                 .browser
                 .open_dir_group
                 .as_ref()
-                .map_or(0, |g| g.paths.len());
+                .map_or(0, |g| g.group.paths.len());
             if len > 0 {
                 self.browser.dir_file_state.select(Some(len - 1));
             }
@@ -2418,7 +2472,7 @@ impl App {
             .browser
             .open_dir_group
             .as_ref()
-            .is_some_and(|g| idx < g.paths.len());
+            .is_some_and(|g| idx < g.group.paths.len());
         if in_range {
             self.browser.dir_keeper_index = idx;
         }
@@ -4010,12 +4064,13 @@ mod group_list_navigation_tests {
         let (mut app, _events) = browser_with_groups(0);
         app.browser.tab = BrowserTab::Dirs;
         app.browser.dir_group_summaries = (0..40)
-            .map(|rank| crate::state::DirGroupSummary {
+            .map(|rank| crate::state::AttributedDirGroupSummary {
                 rank,
                 signature: format!("s{rank}"),
                 dir_count: 2,
                 file_count: 2,
                 size_per_dir: 100,
+                trust: crate::model::duplicate::DirTrust::Trusted,
             })
             .collect();
         app.browser.dir_group_state.select(Some(0));

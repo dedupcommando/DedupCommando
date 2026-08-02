@@ -427,17 +427,57 @@ fn non_utf8_name() -> &'static OsStr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::walk::walk;
+    use crate::model::omission::{OmissionSummary as LedgerSummary, PathKey};
+    use crate::pipeline::walk::{walk_collecting, OmissionSnapshot, WalkOutcome};
     use crate::testfixtures::WalkFaults;
     use std::collections::BTreeSet;
     use std::sync::atomic::AtomicBool;
 
-    /// Walks `config` and returns the manifest paths, plus the non-UTF8 skip counter.
-    fn walked(config: &ScanConfig) -> (BTreeSet<PathBuf>, u64) {
+    /// Walks `config` and returns the manifest paths plus the walk's omission snapshot.
+    fn walked(config: &ScanConfig) -> (BTreeSet<PathBuf>, OmissionSnapshot) {
         let cancel = AtomicBool::new(false);
-        let (files, skipped) = walk(config, &cancel, |_, _, _| {}).expect("walk the fixture");
-        (files.into_iter().map(|file| file.path).collect(), skipped)
+        match walk_collecting(config, &cancel, |_, _, _| {}).expect("walk the fixture") {
+            WalkOutcome::Finished { files, omissions } => {
+                (files.into_iter().map(|file| file.path).collect(), omissions)
+            }
+            WalkOutcome::Cancelled { .. } => panic!("the fixture walk must not be cancelled"),
+        }
     }
+
+    /// One directory's recorded events under the fixture root, as `(reason, count)` pairs.
+    fn cell(
+        snapshot: &OmissionSnapshot,
+        root: &Path,
+        directory: &Path,
+    ) -> Vec<(OmissionReasonModel, u64)> {
+        let OmissionSnapshot::Publishable(map) = snapshot else {
+            panic!("the fixture root is keyable, so the snapshot must be publishable")
+        };
+        let root_key = PathKey::new(root).expect("a keyable root");
+        let dir_key = PathKey::new(directory).expect("a keyable directory");
+        map.get(&root_key)
+            .expect("the root is present, even when empty")
+            .iter()
+            .filter(|(recorded, _, _)| **recorded == dir_key)
+            .map(|(_, reason, count)| (reason, count.get()))
+            .collect()
+    }
+
+    /// The whole fixture root's events folded into one summary — what a reader sums.
+    fn root_summary(snapshot: &OmissionSnapshot, root: &Path) -> LedgerSummary {
+        let OmissionSnapshot::Publishable(map) = snapshot else {
+            panic!("the fixture root is keyable, so the snapshot must be publishable")
+        };
+        let root_key = PathKey::new(root).expect("a keyable root");
+        let mut summary = LedgerSummary::default();
+        for (_, reason, count) in map.get(&root_key).expect("the root is present").iter() {
+            summary.add(reason, count).expect("checked aggregation");
+        }
+        summary
+    }
+
+    /// The model reason the walk records for an omission the fixture declares.
+    type OmissionReasonModel = crate::model::omission::OmissionReason;
 
     #[test]
     fn trees_hold_their_own_invariants() {
@@ -468,68 +508,116 @@ mod tests {
         }
     }
 
-    /// Every omitted file is absent from the manifest, and each `left` side is left looking exactly
-    /// like its `right` side — the false-twin precondition the ledger has to break. Pinned as
-    /// today's behavior; `R3` changes what the scan records about it, not this fixture's layout.
+    /// The R3 flip of the standing false-twin defect, end to end through the real pipeline: every
+    /// omission is published to the ledger, the affected sides are suppressed out of the
+    /// directory groups, their verdicts say `Incomplete`, and the control pair still groups. On
+    /// the pre-R3D parent this test is behaviorally red — the omission was invisible and every
+    /// `left` side grouped with its `right` side as an exact twin.
     #[test]
-    fn each_omission_is_invisible_and_leaves_a_false_twin() {
-        let trees = DirTrees::build("omissions");
-        let (paths, _) = walked(&trees.scan_config());
+    fn each_omission_now_suppresses_its_false_twin() {
+        let trees = DirTrees::build("suppress");
+        let mut store = crate::state::ScanStore::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(false);
+        let outcome = crate::pipeline::run_scan(
+            &mut store,
+            &trees.scan_config(),
+            None,
+            false,
+            &cancel,
+            |_| {},
+        )
+        .expect("the fixture scan completes");
+        let results = match outcome {
+            crate::pipeline::ScanOutcome::Completed(results) => results,
+            crate::pipeline::ScanOutcome::Cancelled => panic!("nothing cancels this scan"),
+        };
+
+        // The walk published a trusted ledger for the fixture root.
+        assert!(
+            store.ledger_authoritative(results.scan_id).unwrap(),
+            "a completed walk must leave a fully authoritative ledger"
+        );
+
+        // No suppressed side survives into the persisted directory groups; the control pair does.
+        let grouped: BTreeSet<PathBuf> = store
+            .attributed_dir_groups(results.scan_id)
+            .unwrap()
+            .into_iter()
+            .flat_map(|attributed| attributed.group.paths)
+            .collect();
+        assert!(
+            grouped.contains(&trees.control.0) && grouped.contains(&trees.control.1),
+            "the whole control pair still forms a trusted twin group: {grouped:?}"
+        );
+        for side in trees.incomplete_sides() {
+            assert!(
+                !grouped.contains(&side),
+                "{} is incomplete and must not claim a twin",
+                side.display()
+            );
+        }
+
+        // The detailed verdicts agree: every incomplete side is `Incomplete`, never `Unknown`.
+        let sides = trees.incomplete_sides();
+        let dirs: Vec<&Path> = sides.iter().map(PathBuf::as_path).collect();
+        let verdicts = store
+            .directory_completeness(results.scan_id, &dirs)
+            .unwrap();
+        for side in &sides {
+            assert!(
+                matches!(
+                    verdicts.get(side.as_path()),
+                    Some(crate::model::omission::DirCompleteness::Incomplete(_))
+                ),
+                "{} must be Incomplete, got {:?}",
+                side.display(),
+                verdicts.get(side.as_path())
+            );
+        }
+    }
+
+    /// Every declared omission is recorded in the ledger, in the directory that owns it — the
+    /// counter no longer stops at the non-UTF8 name. The two symlink shapes are inert as ERRORS
+    /// while links are not followed; they are two unsupported entries instead.
+    #[test]
+    fn every_declared_omission_is_recorded_in_the_ledger() {
+        let trees = DirTrees::build("ledger");
+        let (_, snapshot) = walked(&trees.scan_config());
 
         for (omitted, reason) in trees.expected_omissions() {
             if reason == OmissionReason::WalkError {
-                continue; // inert unless symlinks are followed
+                continue; // recorded as unsupported entries below while links are not followed
             }
+            let parent = omitted.parent().expect("every omission has a parent");
+            let expected: crate::model::omission::OmissionReason = reason.into();
+            let recorded = cell(&snapshot, &trees.root, parent);
             assert!(
-                !paths.contains(&omitted),
-                "{} must not reach the manifest ({reason:?})",
-                omitted.display()
-            );
-            assert!(
-                omitted.exists() || reason == OmissionReason::NonUtf8,
-                "but it does exist on disk"
-            );
-        }
-
-        // Left and right now hold the same scanned content: an exact-twin claim today.
-        for pair in [
-            &trees.below_min,
-            &trees.above_max,
-            &trees.extension,
-            &trees.non_utf8,
-        ] {
-            let names = |dir: &Path| -> BTreeSet<PathBuf> {
-                paths
+                recorded
                     .iter()
-                    .filter(|p| p.starts_with(dir))
-                    .map(|p| p.strip_prefix(dir).expect("under the side").to_path_buf())
-                    .collect()
-            };
-            assert_eq!(
-                names(&pair.0),
-                names(&pair.1),
-                "{} and {} look identical to the scan",
-                pair.0.display(),
-                pair.1.display()
+                    .any(|(r, count)| *r == expected && *count >= 1),
+                "{} must be recorded as {expected:?} at {}: {recorded:?}",
+                omitted.display(),
+                parent.display()
             );
-            assert_eq!(names(&pair.0).len(), 1, "one scannable file per side");
         }
-    }
-
-    /// The non-UTF8 name is the one omission the walk already counts, and the counter is exactly
-    /// one — the other cases must not inflate it.
-    #[test]
-    fn only_the_non_utf8_name_is_counted_today() {
-        let trees = DirTrees::build("nonutf8");
-        let (_, skipped) = walked(&trees.scan_config());
-        assert_eq!(skipped, 1, "one non-UTF8 name, counted once");
+        assert_eq!(
+            cell(&snapshot, &trees.root, &trees.walk_error.0)
+                .into_iter()
+                .filter(|(reason, _)| {
+                    *reason == crate::model::omission::OmissionReason::UnsupportedEntry
+                })
+                .map(|(_, count)| count)
+                .sum::<u64>(),
+            2,
+            "the dangling and looping links are two unsupported entries when not followed"
+        );
     }
 
     /// The two symlink shapes really do make the walk fail while following links — verified against
-    /// `ignore` itself, so the mechanism is proven independently of what our walk does with it. Our
-    /// walk then drops those entries with no counter and no trace: that silence is the defect.
+    /// `ignore` itself, so the mechanism is proven independently of what our walk does with it.
+    /// The silence that used to follow was the defect; the errors are recorded events now.
     #[test]
-    fn following_symlinks_produces_real_walk_errors_that_vanish() {
+    fn following_symlinks_produces_real_walk_errors_that_are_recorded() {
         let trees = DirTrees::build("walkerr");
 
         let errors = ignore::WalkBuilder::new(&trees.walk_error.0)
@@ -544,16 +632,23 @@ mod tests {
             "the dangling and looping links must make ignore report an error"
         );
 
-        let (paths, skipped) = walked(&trees.scan_config_following());
+        let (paths, snapshot) = walked(&trees.scan_config_following());
         for link in ["dangling.bin", "loop.bin"] {
             assert!(
                 !paths.contains(&trees.walk_error.0.join(link)),
                 "{link} must not reach the manifest"
             );
         }
-        assert_eq!(
-            skipped, 1,
-            "and no counter grows for them: only the non-UTF8 name is counted"
+        // The silence was the defect; the errors are now recorded events with an unknown hidden
+        // cardinality, tainting the side that holds them.
+        let summary = root_summary(&snapshot, &trees.root);
+        assert!(
+            summary.has_unknown_cardinality(),
+            "the followed links must leave walk-error events"
+        );
+        assert!(
+            summary.unknown_cardinality_events() >= 1,
+            "at least one yielded error is on the books"
         );
 
         // Pin exactly what the error side contributes while symlinks are followed, so a phantom
@@ -616,7 +711,7 @@ mod tests {
         let trees = DirTrees::build("inject_walk");
         let target = trees.walk_fault_file();
         let faults = WalkFaults::arm(&[(target.clone(), WalkFault::Iterator)]);
-        let (paths, skipped) = walked(&trees.scan_config());
+        let (paths, snapshot) = walked(&trees.scan_config());
 
         assert_eq!(
             faults.fired(),
@@ -637,9 +732,18 @@ mod tests {
             paths.contains(&trees.injected.0.join("a.bin")),
             "and so is its own directory's scannable file"
         );
+        // An iterator error's cell starts at the path the error names — the entry's type was
+        // never learned, so the file's own key is the location, tainting its directory upward.
         assert_eq!(
-            skipped, 1,
-            "no counter grows: only the non-UTF8 name is counted"
+            cell(&snapshot, &trees.root, &target)
+                .into_iter()
+                .filter(|(reason, _)| {
+                    *reason == crate::model::omission::OmissionReason::WalkError
+                })
+                .map(|(_, count)| count)
+                .sum::<u64>(),
+            1,
+            "the injected error is one recorded walk_error event at its own path"
         );
     }
 
@@ -650,7 +754,7 @@ mod tests {
         let trees = DirTrees::build("inject_meta");
         let target = trees.metadata_fault_file();
         let faults = WalkFaults::arm(&[(target.clone(), WalkFault::Metadata)]);
-        let (paths, skipped) = walked(&trees.scan_config());
+        let (paths, snapshot) = walked(&trees.scan_config());
 
         assert_eq!(
             faults.fired(),
@@ -667,7 +771,17 @@ mod tests {
             paths.contains(&trees.walk_fault_file()),
             "the walk-fault file is untouched by a metadata fault"
         );
-        assert_eq!(skipped, 1, "no counter grows for it either");
+        assert_eq!(
+            cell(&snapshot, &trees.root, &trees.injected.0)
+                .into_iter()
+                .filter(|(reason, _)| {
+                    *reason == crate::model::omission::OmissionReason::MetadataError
+                })
+                .map(|(_, count)| count)
+                .sum::<u64>(),
+            1,
+            "the injected failure is one recorded metadata_error event"
+        );
     }
 
     /// Both branches at once, alongside the real symlink errors: each fault fires exactly once, the
@@ -675,10 +789,10 @@ mod tests {
     #[test]
     fn both_injected_faults_fire_once_and_lose_nothing_else() {
         let trees = DirTrees::build("inject_both");
-        let (baseline, baseline_skipped) = walked(&trees.scan_config_following());
+        let (baseline, baseline_snapshot) = walked(&trees.scan_config_following());
 
         let faults = WalkFaults::arm(&trees.injected_faults());
-        let (paths, skipped) = walked(&trees.scan_config_following());
+        let (paths, snapshot) = walked(&trees.scan_config_following());
 
         assert_eq!(faults.fired().len(), 2, "each fault fired exactly once");
         assert!(faults.pending().is_empty(), "and neither stayed armed");
@@ -723,9 +837,17 @@ mod tests {
             paths, expected,
             "exactly the two nominated files are gone, nothing else"
         );
+        let baseline_summary = root_summary(&baseline_snapshot, &trees.root);
+        let injected_summary = root_summary(&snapshot, &trees.root);
         assert_eq!(
-            skipped, baseline_skipped,
-            "the non-UTF8 counter is unaffected by injection"
+            injected_summary.known_omitted_files().unwrap(),
+            baseline_summary.known_omitted_files().unwrap() + 1,
+            "the metadata fault adds exactly one known omitted file"
+        );
+        assert_eq!(
+            injected_summary.unknown_cardinality_events(),
+            baseline_summary.unknown_cardinality_events() + 1,
+            "the iterator fault adds exactly one walk-error event"
         );
 
         // The real symlink shapes still behave as before: no phantom descendant through the loop.

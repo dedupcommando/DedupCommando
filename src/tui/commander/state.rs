@@ -9,7 +9,7 @@ use crossbeam_channel::Sender;
 use ratatui::widgets::ListState;
 
 use crate::model::action::ActionKind;
-use crate::model::duplicate::{DirGroup, DuplicateGroup};
+use crate::model::duplicate::{AttributedDirGroup, DirGroup, DuplicateGroup};
 use crate::model::scan::ResumeInfo;
 use crate::state::GroupSummary;
 
@@ -677,8 +677,14 @@ pub struct CommanderState {
     /// Scan group summaries for the GroupList/GroupFiles modes — loaded on
     /// the first entry into a panel's groups mode (see `groups_loaded_for`).
     pub group_summaries: Vec<GroupSummary>,
-    /// Groups of duplicate directories for DirGroupList/DirGroupFiles.
-    pub dir_groups: Vec<DirGroup>,
+    /// Groups of duplicate directories for DirGroupList/DirGroupFiles, revalidated against the
+    /// current ledger at load time: member trust travels with each group, and only `Trusted`
+    /// groups may present a reclaim figure.
+    pub dir_groups: Vec<AttributedDirGroup>,
+    /// The load error of the directory groups, when the attributed read failed. Rendered in the
+    /// DirGroupList panel instead of the legitimate empty-list text — a store failure must never
+    /// look like «no directory groups».
+    pub dir_groups_error: Option<String>,
     /// scan_id for which the summaries/directory groups are loaded (`None` — not loaded).
     pub groups_loaded_for: Option<i64>,
     /// Cache of `latest_scan_covering(cwd)` for each cwd —
@@ -690,8 +696,9 @@ pub struct CommanderState {
     /// Cache of the resolved groups of "watching" panels (GroupFiles/DuplicatesOfCursor) by
     /// panel index — the DB is read only on a source change, not every frame.
     pub watch_cache: Vec<WatchEntry>,
-    /// Cache of the resolved directory groups of "watching" panels (DirGroupFiles) by panel.
-    pub watch_dir_cache: Vec<Option<DirGroup>>,
+    /// Cache of the resolved directory groups of "watching" panels (DirGroupFiles) by panel —
+    /// attributed, so the member rows can carry their unverified markers.
+    pub watch_dir_cache: Vec<Option<AttributedDirGroup>>,
     /// Cache of background sizes of directories not covered by a scan.
     pub dir_size_cache: HashMap<PathBuf, u64>,
     /// Directories with an already-started background size computation — to avoid duplication.
@@ -778,6 +785,7 @@ impl CommanderState {
             dedup_scan_id: None,
             group_summaries: Vec::new(),
             dir_groups: Vec::new(),
+            dir_groups_error: None,
             groups_loaded_for: None,
             scan_coverage_cache: HashMap::new(),
             watch_cache: Vec::new(),

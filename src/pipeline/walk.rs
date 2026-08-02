@@ -8,7 +8,9 @@ use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 
 use crate::error::{AppError, Result};
-use crate::model::omission::{AuthorityUnavailable, OmissionCounts, OmissionReason, PathKey};
+use crate::model::omission::{
+    AuthorityUnavailable, EventCount, OmissionCounts, OmissionReason, OmissionSummary, PathKey,
+};
 use crate::model::scan::ScanConfig;
 
 /// A file discovered during the walk.
@@ -32,16 +34,17 @@ pub struct WalkedFile {
 /// `Cancelled` deliberately has no omission snapshot: a walk that stopped early saw only part of
 /// the tree, so there is no state in which a cancelled run can be published as a complete account
 /// of what was left out. The absence of the field is the guarantee — not a flag beside it.
-#[allow(dead_code)]
+///
+/// There is deliberately no separate non-UTF8 counter either: the count lives in the ledger map
+/// or the observed tally like every other reason, so a third parallel tally cannot drift from
+/// them. A cancelled walk reports no counts at all, which is the same rule.
 pub enum WalkOutcome {
     Finished {
         files: Vec<WalkedFile>,
-        skipped_non_utf8: u64,
         omissions: OmissionSnapshot,
     },
     Cancelled {
         files: Vec<WalkedFile>,
-        skipped_non_utf8: u64,
     },
 }
 
@@ -61,22 +64,28 @@ impl WalkOutcome {
 }
 
 /// What the walk can say about completeness.
-#[allow(dead_code)]
 pub enum OmissionSnapshot {
     /// Exactly one entry per selected root — including a root that omitted nothing, whose entry is
     /// an empty map. That explicit empty entry is what `ScanStore::commit_omissions` requires as
     /// proof the root was walked under the contract at all.
     Publishable(BTreeMap<PathKey, OmissionCounts>),
-    /// Not publishable, typed. A consumer leaves such a scan's directories `Unknown`.
+    /// Not publishable, typed. Only the `Roots` variant is an expected state a consumer may
+    /// degrade on; every other variant means the collector could not truthfully represent what
+    /// the walk saw, and the scan must fail loudly rather than complete with the counters lost.
     Unavailable(SnapshotUnavailable),
 }
 
 /// Why a walk produced no publishable omission snapshot.
-#[allow(dead_code)]
 pub enum SnapshotUnavailable {
     /// A non-empty configured root set that cannot all be keyed, or whose keys overlap. An empty
     /// root set is not one of these — it is still the outer `no scan root specified` error.
-    Roots(AuthorityUnavailable),
+    /// `observed` is everything the walk still saw and could not ledger: per-reason checked
+    /// counts, no paths and no attribution, so a real omission survives as a warning even though
+    /// no authority can be published for it.
+    Roots {
+        why: AuthorityUnavailable,
+        observed: OmissionSummary,
+    },
     /// Aggregating one cell would have wrapped `u64`.
     CountOverflow {
         root: PathKey,
@@ -99,6 +108,47 @@ pub enum SnapshotUnavailable {
         directory: PathKey,
         reason: OmissionReason,
     },
+    /// The global no-attribution tally overflowed `u64` while counting `reason`. There is no root
+    /// or path to name — the configuration is precisely the one that cannot attribute — and
+    /// inventing one would be a false claim. Note the narrower domain than the ledgered variants:
+    /// the observed tally is never stored, so a value above `i64::MAX` is valid here and only a
+    /// real `u64` aggregation overflow is the failure.
+    ObservedOverflow { reason: OmissionReason },
+}
+
+/// The no-ledger tally: per-reason checked counts for a walk whose roots carry no completeness
+/// authority. Mirrors `Collector`'s failure discipline — the first overflow is held, later events
+/// are ignored only because `finish` is then structurally forced to report the failure, and the
+/// previous count is never silently frozen as if it were the total.
+#[derive(Default)]
+struct ObservedTally {
+    summary: OmissionSummary,
+    failure: Option<OmissionReason>,
+}
+
+impl ObservedTally {
+    fn record(&mut self, reason: OmissionReason) {
+        if self.failure.is_some() {
+            return;
+        }
+        if self.summary.add(reason, EventCount::ONE).is_err() {
+            self.failure = Some(reason);
+        }
+    }
+
+    /// The snapshot this walk can publish: the expected no-authority fallback carrying what was
+    /// observed, or the loud overflow state.
+    fn finish(self, why: AuthorityUnavailable) -> OmissionSnapshot {
+        match self.failure {
+            Some(reason) => {
+                OmissionSnapshot::Unavailable(SnapshotUnavailable::ObservedOverflow { reason })
+            }
+            None => OmissionSnapshot::Unavailable(SnapshotUnavailable::Roots {
+                why,
+                observed: self.summary,
+            }),
+        }
+    }
 }
 
 /// Accumulates one walk's omissions, one entry per selected root.
@@ -176,31 +226,44 @@ struct Ledger<'a> {
     collector: &'a mut Collector,
 }
 
-/// Where one iteration's results go. `ledger` is `None` when no snapshot is being built, which is
-/// what keeps the unkeyable-roots fallback walking exactly as it always did.
+/// Where one walk's omission events are counted: a per-root ledger, or the global observed tally
+/// of a walk whose roots carry no authority. One of the two always exists, so an event can be
+/// unattributable but never uncounted.
+enum Account<'a> {
+    Ledger(Ledger<'a>),
+    Observed(&'a mut ObservedTally),
+}
+
+/// Where one iteration's results go.
 struct Sink<'a> {
     files: &'a mut Vec<WalkedFile>,
-    skipped_non_utf8: &'a mut u64,
     dirs: &'a mut super::roots::DirAliasGuard,
-    ledger: Option<Ledger<'a>>,
+    account: Account<'a>,
 }
 
 impl Sink<'_> {
-    /// An omission whose entry is known: attribute it to the entry's parent, inside the root.
+    /// An omission whose entry is known: attribute it to the entry's parent, inside the root —
+    /// or count it without attribution when there is no root to attribute to.
     fn record_child(&mut self, path: &Path, reason: OmissionReason) {
-        if let Some(ledger) = &mut self.ledger {
-            let directory = attribute_child(path, &ledger.root);
-            ledger.collector.record(&ledger.root, directory, reason);
+        match &mut self.account {
+            Account::Ledger(ledger) => {
+                let directory = attribute_child(path, &ledger.root);
+                ledger.collector.record(&ledger.root, directory, reason);
+            }
+            Account::Observed(tally) => tally.record(reason),
         }
     }
 
     /// An iterator error: exactly one event, at one cell.
     fn record_error(&mut self, err: &ignore::Error) {
-        if let Some(ledger) = &mut self.ledger {
-            let cell = error_cell(err, &ledger.root);
-            ledger
-                .collector
-                .record(&ledger.root, cell, OmissionReason::WalkError);
+        match &mut self.account {
+            Account::Ledger(ledger) => {
+                let cell = error_cell(err, &ledger.root);
+                ledger
+                    .collector
+                    .record(&ledger.root, cell, OmissionReason::WalkError);
+            }
+            Account::Observed(tally) => tally.record(OmissionReason::WalkError),
         }
     }
 }
@@ -480,10 +543,9 @@ fn absorb(
 
     // Non-UTF8 guard: skip files whose path cannot be represented
     // as UTF-8 (see the function doc comment). Count it last — after all the
-    // other filters, so the counter means "would have made it into the manifest, but the name cannot
+    // other filters, so the event means "would have made it into the manifest, but the name cannot
     // be saved without loss", not files filtered out by size/extension.
     if entry.path().to_str().is_none() {
-        *sink.skipped_non_utf8 += 1;
         sink.record_child(entry.path(), OmissionReason::NonUtf8);
         return Ok(());
     }
@@ -543,7 +605,6 @@ pub fn walk_collecting(
 
     let mut files: Vec<WalkedFile> = Vec::new();
     let mut entries: u64 = 0;
-    let mut skipped_non_utf8: u64 = 0;
     // Directories seen so far, by physical identity. An alias inside a selected root (a bind mount,
     // or a directory symlink while following links) is only visible here, and it aborts the scan —
     // see `roots::DirAliasGuard`. Bounded by the number of directories, which is small next to the
@@ -554,8 +615,10 @@ pub fn walk_collecting(
     let snapshot = match root_keys(&config.roots) {
         // No authority to be had. The scan still walks exactly as it always did — this is a verdict
         // about completeness, not a gate on scanning — so the original multi-root builder is used
-        // and no partial ledger is recorded.
+        // and no partial ledger is recorded. Every event is still counted, without attribution,
+        // so a real omission cannot vanish just because the roots cannot be keyed.
         Err(why) => {
+            let mut tally = ObservedTally::default();
             let mut builder = WalkBuilder::new(&config.roots[0]);
             for root in &config.roots[1..] {
                 builder.add(root);
@@ -563,10 +626,17 @@ pub fn walk_collecting(
             configure(&mut builder, config, &overrides);
             let mut sink = Sink {
                 files: &mut files,
-                skipped_non_utf8: &mut skipped_non_utf8,
                 dirs: &mut dirs,
-                ledger: None,
+                account: Account::Observed(&mut tally),
             };
+            // Test-only: the same iterator-error seam the ledgered branch has, so the observed
+            // tally's walk-error counting is provable without a filesystem that misbehaves.
+            #[cfg(test)]
+            for root in &config.roots {
+                if let Some(injected) = take_iterator_error_fault(root) {
+                    sink.record_error(&injected);
+                }
+            }
             for result in builder.build() {
                 if entries % 1024 == 0 {
                     if cancel.load(Ordering::Relaxed) {
@@ -582,7 +652,7 @@ pub fn walk_collecting(
                 entries += 1;
                 absorb(result, config, &mut sink)?;
             }
-            OmissionSnapshot::Unavailable(SnapshotUnavailable::Roots(why))
+            tally.finish(why)
         }
         Ok(keys) => {
             let mut collector = Collector::new(&keys);
@@ -591,9 +661,8 @@ pub fn walk_collecting(
                 configure(&mut builder, config, &overrides);
                 let mut sink = Sink {
                     files: &mut files,
-                    skipped_non_utf8: &mut skipped_non_utf8,
                     dirs: &mut dirs,
-                    ledger: Some(Ledger {
+                    account: Account::Ledger(Ledger {
                         root: root_key.clone(),
                         collector: &mut collector,
                     }),
@@ -634,38 +703,12 @@ pub fn walk_collecting(
         // what the scan left out. It is dropped here rather than carried: `Cancelled` has no field
         // to put it in, which is what makes publishing it impossible rather than merely wrong.
         drop(snapshot);
-        return Ok(WalkOutcome::Cancelled {
-            files,
-            skipped_non_utf8,
-        });
+        return Ok(WalkOutcome::Cancelled { files });
     }
     Ok(WalkOutcome::Finished {
         files,
-        skipped_non_utf8,
         omissions: snapshot,
     })
-}
-
-/// Compatibility wrapper: today's signature and today's behavior, for the caller that does not yet
-/// consume an omission snapshot. Manifest membership and order, the progress and cancellation
-/// cadence, the final callback, the partial files a cancelled walk returns, and the non-UTF8 count
-/// are all exactly what they were.
-pub fn walk(
-    config: &ScanConfig,
-    cancel: &AtomicBool,
-    on_progress: impl FnMut(u64, u64, Option<&Path>),
-) -> Result<(Vec<WalkedFile>, u64)> {
-    match walk_collecting(config, cancel, on_progress)? {
-        WalkOutcome::Finished {
-            files,
-            skipped_non_utf8,
-            ..
-        }
-        | WalkOutcome::Cancelled {
-            files,
-            skipped_non_utf8,
-        } => Ok((files, skipped_non_utf8)),
-    }
 }
 
 // Test-only seams for the two states no fixture can create deterministically: an iterator error
@@ -829,6 +872,14 @@ mod tests {
         }
     }
 
+    /// The finished manifest, or a panic naming what came back instead.
+    fn finished(outcome: &WalkOutcome) -> &Vec<WalkedFile> {
+        match outcome {
+            WalkOutcome::Finished { files, .. } => files,
+            WalkOutcome::Cancelled { .. } => panic!("the walk was cancelled"),
+        }
+    }
+
     /// One root's cells as `(directory relative to the root, reason, count)`, sorted.
     fn cells(outcome: &WalkOutcome, root: &Path) -> Vec<(String, OmissionReason, u64)> {
         let map = publishable(outcome);
@@ -908,10 +959,10 @@ mod tests {
         config.follow_symlinks = true;
 
         let cancel = AtomicBool::new(false);
-        // Not `expect_err`: that needs `Debug` on the success type, and `WalkedFile` has none.
-        let text = match walk(&config, &cancel, |_, _, _| {}) {
+        // Not `expect_err`: that needs `Debug` on the success type, and `WalkOutcome` has none.
+        let text = match walk_collecting(&config, &cancel, |_, _, _| {}) {
             Err(err) => err.to_string(),
-            Ok((files, _)) => panic!("the alias must abort the walk, got {} files", files.len()),
+            Ok(outcome) => panic!("the alias must abort the walk, got {}", outcome.kind()),
         };
         assert!(
             text.contains("same directory"),
@@ -923,12 +974,14 @@ mod tests {
         );
 
         // Control: without following links the symlink is not a directory, and the same tree walks
-        // exactly as it did before this guard existed.
+        // exactly as it did before this guard existed — the link itself is an unsupported entry.
         config.follow_symlinks = false;
-        let (files, skipped) =
-            walk(&config, &cancel, |_, _, _| {}).expect("no alias when links are not followed");
-        assert_eq!(files.len(), 1, "exactly the one real file");
-        assert_eq!(skipped, 0);
+        let outcome = collect(&config);
+        assert_eq!(finished(&outcome).len(), 1, "exactly the one real file");
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![(String::new(), OmissionReason::UnsupportedEntry, 1)]
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -977,11 +1030,11 @@ mod tests {
         let faults = WalkFaults::arm(&[(sub.clone(), WalkFault::Metadata)]);
         let cancel = AtomicBool::new(false);
 
-        let text = match walk(&guard_config(&root), &cancel, |_, _, _| {}) {
+        let text = match walk_collecting(&guard_config(&root), &cancel, |_, _, _| {}) {
             Err(err) => err.to_string(),
-            Ok((files, _)) => panic!(
-                "a directory whose identity cannot be read must abort the walk, got {} files",
-                files.len()
+            Ok(outcome) => panic!(
+                "a directory whose identity cannot be read must abort the walk, got {}",
+                outcome.kind()
             ),
         };
 
@@ -1012,16 +1065,14 @@ mod tests {
     #[test]
     fn without_injection_the_same_tree_walks_unchanged() {
         let (root, _) = guard_tree("dirmeta_control");
-        let cancel = AtomicBool::new(false);
 
-        let (files, skipped) =
-            walk(&guard_config(&root), &cancel, |_, _, _| {}).expect("no fault, no abort");
+        let outcome = collect(&guard_config(&root));
         assert_eq!(
-            walked_names(&files, &root),
+            walked_names(finished(&outcome), &root),
             vec!["keep.bin".to_string(), "sub/inner.bin".to_string()],
             "both files, in traversal order"
         );
-        assert_eq!(skipped, 0);
+        assert_eq!(cells(&outcome, &root), Vec::new(), "and nothing omitted");
 
         fs::remove_dir_all(&root).ok();
     }
@@ -1034,10 +1085,8 @@ mod tests {
         let (root, sub) = guard_tree("filemeta");
         let victim = sub.join("inner.bin");
         let faults = WalkFaults::arm(&[(victim.clone(), WalkFault::Metadata)]);
-        let cancel = AtomicBool::new(false);
 
-        let (files, skipped) = walk(&guard_config(&root), &cancel, |_, _, _| {})
-            .expect("a file's metadata failure must not abort the walk");
+        let outcome = collect(&guard_config(&root));
 
         assert_eq!(
             faults.fired(),
@@ -1046,13 +1095,14 @@ mod tests {
         );
         assert!(faults.pending().is_empty());
         assert_eq!(
-            walked_names(&files, &root),
+            walked_names(finished(&outcome), &root),
             vec!["keep.bin".to_string()],
             "only the nominated file is gone"
         );
         assert_eq!(
-            skipped, 0,
-            "and the non-UTF8 compatibility counter is unaffected"
+            cells(&outcome, &root),
+            vec![("sub".to_string(), OmissionReason::MetadataError, 1)],
+            "and it is accounted, in the directory that holds it"
         );
 
         fs::remove_dir_all(&root).ok();
@@ -1613,13 +1663,7 @@ mod tests {
         let cancel = AtomicBool::new(true); // already cancelled: the first cadence check trips
         let outcome = walk_collecting(&base_config(&root), &cancel, |_, _, _| {}).unwrap();
         match outcome {
-            WalkOutcome::Cancelled {
-                files,
-                skipped_non_utf8,
-            } => {
-                assert!(files.is_empty());
-                assert_eq!(skipped_non_utf8, 0);
-            }
+            WalkOutcome::Cancelled { files } => assert!(files.is_empty()),
             WalkOutcome::Finished { .. } => panic!("a cancelled walk must not finish"),
         }
 
@@ -1636,12 +1680,6 @@ mod tests {
         let err = match walk_collecting(&config, &cancel, |_, _, _| {}) {
             Err(err) => err.to_string(),
             Ok(outcome) => panic!("an empty root list must not walk, got {}", outcome.kind()),
-        };
-        assert!(err.contains("no scan root specified"), "{err}");
-        // And through the compatibility wrapper, byte for byte.
-        let err = match walk(&config, &cancel, |_, _, _| {}) {
-            Err(err) => err.to_string(),
-            Ok((files, _)) => panic!("the wrapper must refuse it too, got {} files", files.len()),
         };
         assert!(err.contains("no scan root specified"), "{err}");
     }
@@ -1661,11 +1699,18 @@ mod tests {
         match &outcome {
             WalkOutcome::Finished {
                 files,
-                omissions: OmissionSnapshot::Unavailable(SnapshotUnavailable::Roots(why)),
-                ..
+                omissions:
+                    OmissionSnapshot::Unavailable(SnapshotUnavailable::Roots { why, observed }),
             } => {
                 assert!(matches!(why, AuthorityUnavailable::UnkeyableRoot { .. }));
                 assert_eq!(files.len(), 1, "the manifest is untouched");
+                // The events the ledger could not attribute are still counted, globally.
+                assert_eq!(
+                    observed.unsupported_entries().unwrap(),
+                    1,
+                    "the fifo survives as an observed event"
+                );
+                assert!(!observed.has_unknown_cardinality());
             }
             other => panic!("expected an unavailable snapshot, got {:?}", other.kind()),
         }
@@ -1688,7 +1733,7 @@ mod tests {
 
         match &outcome {
             WalkOutcome::Finished {
-                omissions: OmissionSnapshot::Unavailable(SnapshotUnavailable::Roots(why)),
+                omissions: OmissionSnapshot::Unavailable(SnapshotUnavailable::Roots { why, .. }),
                 ..
             } => assert!(matches!(why, AuthorityUnavailable::AmbiguousRoots { .. })),
             other => panic!("expected an unavailable snapshot, got {:?}", other.kind()),
@@ -1807,10 +1852,11 @@ mod tests {
         }
     }
 
-    /// The wrapper is exactly what the accepted parent produced: same files, same order, same
-    /// non-UTF8 count — over a tree that exercises the filters and both root shapes.
+    /// The manifest is exactly what the accepted parent produced: same files, same order — over a
+    /// tree that exercises the filters and both root shapes. What the wrapper used to return as a
+    /// bare count is now the ledger's own `non_utf8` cell, one per root.
     #[test]
-    fn the_compatibility_wrapper_is_unchanged() {
+    fn the_manifest_membership_and_order_are_unchanged() {
         let holder = temp_dir("wrapper");
         let one = holder.join("one");
         let two = holder.join("two");
@@ -1830,10 +1876,9 @@ mod tests {
         let mut config = base_config(&one);
         config.roots = vec![one.clone(), two.clone()];
         config.min_size = 4;
-        let cancel = AtomicBool::new(false);
-        let (files, skipped) = walk(&config, &cancel, |_, _, _| {}).unwrap();
+        let outcome = collect(&config);
 
-        let names: Vec<String> = files
+        let names: Vec<String> = finished(&outcome)
             .iter()
             .map(|f| {
                 f.path
@@ -1853,12 +1898,22 @@ mod tests {
             ],
             "root order preserved, traversal order preserved"
         );
-        assert_eq!(skipped, 2, "one non-UTF8 name per root, counted as before");
+        for root in [&one, &two] {
+            assert_eq!(
+                summary(&outcome, root).per_reason().collect::<Vec<_>>(),
+                vec![
+                    (OmissionReason::MinSize, EventCount::ONE),
+                    (OmissionReason::NonUtf8, EventCount::ONE),
+                    (OmissionReason::UnsupportedEntry, EventCount::ONE),
+                ],
+                "each root accounts its own tiny file, bad name and fifo"
+            );
+        }
 
         fs::remove_dir_all(&holder).ok();
     }
 
-    /// Non-UTF8 guard: a file with a non-UTF8 name is skipped and counted,
+    /// Non-UTF8 guard: a file with a non-UTF8 name is skipped and accounted,
     /// a valid one makes it into the manifest.
     #[test]
     fn skips_and_counts_non_utf8_paths() {
@@ -1879,10 +1934,14 @@ mod tests {
         config.min_size = 0; // don't filter out by size
         config.exclude_globs.clear(); // no default exclusions — determinism
 
-        let cancel = AtomicBool::new(false);
-        let (files, skipped) = walk(&config, &cancel, |_, _, _| {}).unwrap();
+        let outcome = collect(&config);
 
-        assert_eq!(skipped, 1, "exactly one non-UTF8 file must be skipped");
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![(String::new(), OmissionReason::NonUtf8, 1)],
+            "exactly one non-UTF8 file, accounted where it lives"
+        );
+        let files = finished(&outcome);
         assert_eq!(
             files.len(),
             1,
@@ -1894,5 +1953,96 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The no-authority observed tally.
+    // -----------------------------------------------------------------------------------------
+
+    /// A walk whose roots cannot be keyed still counts every event it would have ledgered —
+    /// filters, a bad name, a special entry and a walk error — once each, without attribution.
+    #[test]
+    fn an_unkeyable_walk_counts_every_event_it_observes() {
+        let root = temp_dir("observed_all");
+        fs::write(root.join("ok.bin"), vec![b'k'; 20]).unwrap();
+        fs::write(root.join("tiny.bin"), b"x").unwrap();
+        fs::write(
+            root.join(OsStr::from_bytes(b"bad\xffname.bin")),
+            vec![b'n'; 20],
+        )
+        .unwrap();
+        make_fifo(&root.join("pipe"));
+
+        let mut config = base_config(&root);
+        config.min_size = 4;
+        config.roots = vec![root.join("..").join(root.file_name().unwrap())];
+        let faults = IteratorErrorFaults::arm(vec![(
+            config.roots[0].clone(),
+            ignore::Error::Io(std::io::Error::other("no path at all")),
+        )]);
+        let outcome = collect(&config);
+        assert_eq!(faults.fired().len(), 1, "the injected error fired");
+
+        match &outcome {
+            WalkOutcome::Finished {
+                files,
+                omissions:
+                    OmissionSnapshot::Unavailable(SnapshotUnavailable::Roots { observed, .. }),
+            } => {
+                assert_eq!(files.len(), 1, "only ok.bin passes the filters");
+                assert_eq!(
+                    observed.per_reason().collect::<Vec<_>>(),
+                    vec![
+                        (OmissionReason::MinSize, EventCount::ONE),
+                        (OmissionReason::NonUtf8, EventCount::ONE),
+                        (OmissionReason::WalkError, EventCount::ONE),
+                        (OmissionReason::UnsupportedEntry, EventCount::ONE),
+                    ],
+                    "each event once, no attribution invented"
+                );
+            }
+            other => panic!("expected the Roots fallback, got {:?}", other.kind()),
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The observed tally holds its FIRST `u64` overflow and reports it as the typed loud state —
+    /// never a silently frozen previous count, and never a fake root or path.
+    #[test]
+    fn the_observed_tally_overflow_is_loud_and_first_wins() {
+        let mut tally = ObservedTally::default();
+        tally
+            .summary
+            .add(OmissionReason::MinSize, EventCount::new(u64::MAX).unwrap())
+            .unwrap();
+        tally.record(OmissionReason::MinSize); // overflows
+        tally.record(OmissionReason::NonUtf8); // ignored: the failure is already held
+        match tally.finish(AuthorityUnavailable::NoRoots) {
+            OmissionSnapshot::Unavailable(SnapshotUnavailable::ObservedOverflow { reason }) => {
+                assert_eq!(
+                    reason,
+                    OmissionReason::MinSize,
+                    "the first failure is named"
+                )
+            }
+            OmissionSnapshot::Unavailable(_) => panic!("the wrong unavailable state"),
+            OmissionSnapshot::Publishable(_) => {
+                panic!("an overflowed tally must never look publishable")
+            }
+        }
+
+        // Control: a value of exactly `u64::MAX` is valid — the tally is session-only and the
+        // storable-column rule deliberately does not apply to it.
+        let mut fine = ObservedTally::default();
+        fine.summary
+            .add(OmissionReason::MinSize, EventCount::new(u64::MAX).unwrap())
+            .unwrap();
+        match fine.finish(AuthorityUnavailable::NoRoots) {
+            OmissionSnapshot::Unavailable(SnapshotUnavailable::Roots { observed, .. }) => {
+                assert_eq!(observed.known_omitted_files().unwrap(), u64::MAX)
+            }
+            _ => panic!("a full-range count is still an expected fallback"),
+        }
     }
 }

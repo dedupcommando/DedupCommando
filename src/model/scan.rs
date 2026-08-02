@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::model::duplicate::DirSigAlgo;
+use crate::model::omission::OmissionSummary;
 use crate::model::reclaim::ReclaimEstimate;
 use crate::state::GroupSummary;
 
@@ -171,15 +172,19 @@ mod tests {
     }
 
     #[test]
-    fn on_completion_maps_failures_to_status() {
-        // 0 failures → Complete; any >0 → CompleteWithWarnings.
-        assert_eq!(ScanStatus::on_completion(0), ScanStatus::Complete);
+    fn on_completion_maps_failures_and_warning_events_to_status() {
+        // Nothing wrong → Complete; either count > 0 → CompleteWithWarnings.
+        assert_eq!(ScanStatus::on_completion(0, 0), ScanStatus::Complete);
         assert_eq!(
-            ScanStatus::on_completion(1),
+            ScanStatus::on_completion(1, 0),
             ScanStatus::CompleteWithWarnings
         );
         assert_eq!(
-            ScanStatus::on_completion(9999),
+            ScanStatus::on_completion(0, 1),
+            ScanStatus::CompleteWithWarnings
+        );
+        assert_eq!(
+            ScanStatus::on_completion(9999, 9999),
             ScanStatus::CompleteWithWarnings
         );
     }
@@ -237,11 +242,14 @@ impl ScanStatus {
         )
     }
 
-    /// The final status of a finished scan by the number of uncommitted candidates:
-    /// `>0` → `CompleteWithWarnings` (a visible warning + the `hash_failures` counter),
-    /// otherwise `Complete`. The single decision point — called in `run_phases` at the finish.
-    pub fn on_completion(hash_failures: u64) -> ScanStatus {
-        if hash_failures > 0 {
+    /// The final status of a finished scan. The single decision point — called in `run_phases`
+    /// at the finish. `hash_failures` counts candidates left without a committed hash;
+    /// `warning_events` counts non-intentional omission events — walk errors, metadata errors,
+    /// non-UTF8 names and unsupported entries. Either being non-zero means the result is
+    /// incomplete in a way the operator did not choose, so the status carries a warning.
+    /// Intentional min/max/extension filters are deliberately not in either number.
+    pub fn on_completion(hash_failures: u64, warning_events: u64) -> ScanStatus {
+        if hash_failures > 0 || warning_events > 0 {
             ScanStatus::CompleteWithWarnings
         } else {
             ScanStatus::Complete
@@ -328,6 +336,27 @@ pub struct ScanSummary {
     /// Candidates without a committed hash at the moment of completion. 0 → status
     /// `Complete`; >0 → `CompleteWithWarnings`. Counted in; here always 0.
     pub hash_failures: u64,
+    /// What the scan left out, and how far that account can be trusted.
+    pub omissions: OmissionAccounting,
+}
+
+/// The provenance of a scan's omission counters.
+///
+/// Three states, not an optional summary: an exact ledger account, a session-only observed
+/// account, and «nothing retained» are different claims, and collapsing the last two would let a
+/// reopen present a lost account as an empty one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum OmissionAccounting {
+    /// From a fully authoritative persisted ledger — identical at completion and after reopen.
+    Ledger(OmissionSummary),
+    /// Counted live by a walk whose roots carry no completeness authority. Session-only:
+    /// nothing about it can be persisted without inventing a root attribution.
+    Observed(OmissionSummary),
+    /// No account is available: a pre-ledger scan, a not-fully-authoritative ledger, or a
+    /// roots-unavailable scan after reopen. The persisted status still records that a warning
+    /// happened; the detail is what was not retained.
+    #[default]
+    Unavailable,
 }
 
 /// Scan result: lightweight group summaries + the scan summary. Full

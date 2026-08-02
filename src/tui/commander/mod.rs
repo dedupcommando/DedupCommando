@@ -24,7 +24,7 @@ use ratatui::{
 
 use crate::app::{App, Screen};
 use crate::error::AppError;
-use crate::model::duplicate::{DirGroup, DuplicateGroup, FileEntry};
+use crate::model::duplicate::{DuplicateGroup, FileEntry};
 use crate::state::ScanStore;
 use crate::tui::centered;
 use crate::tui::event::AppEvent;
@@ -88,6 +88,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
         let focused = index == app.commander.active;
         let dedup = app.commander.dedup.dir(&app.commander.panels[index].cwd);
+        let dedup_error = app.commander.dedup.error(&app.commander.panels[index].cwd);
         // We pass the whole WatchEntry — render uses both `result`
         // and `empty` (the reason for emptiness) for a targeted fallback.
         let source = app.commander.watch_cache.get(index);
@@ -101,10 +102,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             *rect,
             &mut app.commander.panels[index],
             dedup,
+            dedup_error,
             &cross,
             &app.commander.dir_size_cache,
             &app.commander.group_summaries,
             &app.commander.dir_groups,
+            app.commander.dir_groups_error.as_deref(),
             source,
             source_dir_group,
             compare_peers[index].as_ref(),
@@ -177,7 +180,9 @@ fn cross_panel_hashes(app: &App) -> HashSet<String> {
                     }
                 }
                 EntryKind::Dir => {
-                    if let Some(sig) = dir.dir_signature(&entry.path) {
+                    // Trusted only: an untrusted signature must never make two panels claim an
+                    // exact directory match.
+                    if let Some(sig) = dir.trusted_dir_signature(&entry.path) {
                         panel_keys.insert(sig);
                     }
                 }
@@ -353,6 +358,7 @@ fn apply_auto_switch(app: &mut App, cwd: &Path, target: Option<i64>) {
             app.commander.dedup_scan_id = None;
             app.commander.group_summaries = Vec::new();
             app.commander.dir_groups = Vec::new();
+            app.commander.dir_groups_error = None;
             app.commander.groups_loaded_for = None;
             app.commander.watch_cache = Vec::new();
             app.commander.watch_dir_cache = Vec::new();
@@ -913,7 +919,7 @@ fn count_panel_matches(
                 }
             }
             EntryKind::Dir => {
-                if let Some(sig) = other_dedup.and_then(|d| d.dir_signature(&entry.path)) {
+                if let Some(sig) = other_dedup.and_then(|d| d.trusted_dir_signature(&entry.path)) {
                     other_dirs.insert(sig);
                 }
             }
@@ -934,7 +940,7 @@ fn count_panel_matches(
             }
             EntryKind::Dir => {
                 if active_dedup
-                    .and_then(|d| d.dir_signature(&entry.path))
+                    .and_then(|d| d.trusted_dir_signature(&entry.path))
                     .is_some_and(|sig| other_dirs.contains(sig))
                 {
                     dirs += 1;
@@ -1581,7 +1587,7 @@ fn panel_row_count(app: &App, index: usize) -> usize {
             .watch_dir_cache
             .get(index)
             .and_then(|slot| slot.as_ref())
-            .map(|group| group.paths.len())
+            .map(|group| group.group.paths.len())
             .unwrap_or(0),
     }
 }
@@ -1771,10 +1777,28 @@ fn ensure_commander_groups_loaded(app: &mut App) {
     if !needs {
         return;
     }
-    if let Ok(store) = ScanStore::open(&app.db_path) {
-        app.commander.group_summaries = store.group_summaries(scan_id).unwrap_or_default();
-        app.commander.dir_groups = store.dir_groups(scan_id).unwrap_or_default();
-        app.commander.groups_loaded_for = Some(scan_id);
+    match ScanStore::open(&app.db_path) {
+        Ok(store) => {
+            app.commander.group_summaries = store.group_summaries(scan_id).unwrap_or_default();
+            // Attributed and fail-visible: a store error must never render as the legitimate
+            // «no directory groups» — the error state is kept and drawn in its place.
+            match store.attributed_dir_groups(scan_id) {
+                Ok(groups) => {
+                    app.commander.dir_groups = groups;
+                    app.commander.dir_groups_error = None;
+                }
+                Err(err) => {
+                    app.commander.dir_groups = Vec::new();
+                    app.commander.dir_groups_error =
+                        Some(crate::textsan::terminal(&err.to_string()));
+                }
+            }
+            app.commander.groups_loaded_for = Some(scan_id);
+        }
+        Err(err) => {
+            app.commander.dir_groups = Vec::new();
+            app.commander.dir_groups_error = Some(crate::textsan::terminal(&err.to_string()));
+        }
     }
 }
 
@@ -1981,8 +2005,8 @@ fn resolve_watch_group(
 
 /// Resolves the directory group for DirGroupFiles: takes the group
 /// selected in the adjacent DirGroupList panel on the left — from the loaded `dir_groups`,
-/// without hitting the DB.
-fn resolve_dir_group(app: &App, i: usize) -> Option<DirGroup> {
+/// without hitting the DB. Attributed, so the member rows carry their unverified markers.
+fn resolve_dir_group(app: &App, i: usize) -> Option<crate::model::duplicate::AttributedDirGroup> {
     let panel = &app.commander.panels[i];
     if panel.view != PanelView::DirGroupFiles {
         return None;
@@ -2487,34 +2511,31 @@ pub(crate) fn fetch_panel_dedup(app: &mut App, target: state::LoadTarget) {
     let db_path = app.db_path.clone();
     let events = app.events.clone();
     std::thread::spawn(move || {
-        let dir = match ScanStore::open(&db_path) {
-            Ok(store) => {
-                let rows = store.dir_dedup_status(scan_id, &files).unwrap_or_default();
-                let mut status = HashMap::new();
-                let mut hashes = HashMap::new();
-                for (path, row) in &rows {
-                    status.insert(path.clone(), DedupStatus::classify(row));
-                    if let Some(hash) = &row.hashed {
-                        hashes.insert(path.clone(), hash.clone());
-                    }
-                }
-                // The live sig must be computed with the same algorithm as the
-                // persisted dir_dedup of this scan — otherwise the hex will diverge.
-                let algo = store
-                    .load_config(scan_id)
-                    .map(|c| c.dir_sig_algo)
-                    .unwrap_or_default();
-                DirDedup {
-                    status,
-                    hashes,
-                    dir_sizes: store.dir_sizes_under(scan_id, &dirs).unwrap_or_default(),
-                    dir_signatures: store
-                        .dir_signatures_under(scan_id, &dirs, algo)
-                        .unwrap_or_default(),
+        // Any store failure — open, an unknown reason, a corrupt key/count/generation, plain SQL —
+        // is sent as the typed error, never flattened into an empty overlay that would render as
+        // «nothing here is in the scan».
+        let dir = (|| -> crate::error::Result<DirDedup> {
+            let store = ScanStore::open(&db_path)?;
+            let rows = store.dir_dedup_status(scan_id, &files)?;
+            let mut status = HashMap::new();
+            let mut hashes = HashMap::new();
+            for (path, row) in &rows {
+                status.insert(path.clone(), DedupStatus::classify(row));
+                if let Some(hash) = &row.hashed {
+                    hashes.insert(path.clone(), hash.clone());
                 }
             }
-            Err(_) => DirDedup::default(),
-        };
+            // The live sig must be computed with the same algorithm as the
+            // persisted dir_dedup of this scan — otherwise the hex will diverge.
+            let algo = store.load_config(scan_id)?.dir_sig_algo;
+            Ok(DirDedup {
+                status,
+                hashes,
+                dir_sizes: store.dir_sizes_under(scan_id, &dirs)?,
+                dir_signatures: store.dir_signatures_under(scan_id, &dirs, algo)?,
+            })
+        })()
+        .map_err(|err| crate::textsan::terminal(&err.to_string()));
         let _ = events.send(AppEvent::CommanderDirDedup { cwd, dir });
     });
 }
@@ -3688,6 +3709,88 @@ mod triage_tests {
         assert_eq!(got, vec![dir.join("a.bin"), dir.join("b.bin")]);
         assert!(same_size_files(&dir, 999).is_empty());
         fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod live_trust_tests {
+    //! R3D: only a `Trusted` live signature may enter the cross-panel exact-match set or the
+    //! match counters. An `Unknown` scan's signatures are inspectable, never exact-looking.
+
+    use super::*;
+    use crate::model::duplicate::DirTrust;
+    use crate::state::LiveDirSignature;
+    use crate::tui::commander::dedup::DirDedup;
+
+    fn dir_entry(path: &str) -> state::PanelEntry {
+        state::PanelEntry {
+            path: PathBuf::from(path),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            kind: EntryKind::Dir,
+            size: 0,
+            mtime: 0,
+            device: 0,
+            inode: 0,
+        }
+    }
+
+    fn dedup_with(sig_path: &str, signature: &str, trust: DirTrust) -> DirDedup {
+        let mut dedup = DirDedup::default();
+        dedup.dir_signatures.insert(
+            PathBuf::from(sig_path),
+            LiveDirSignature {
+                signature: signature.to_string(),
+                trust,
+            },
+        );
+        dedup
+    }
+
+    /// Two panels holding the same signature: trusted on both sides → a cross match; untrusted
+    /// on either side → no match, no count, nothing exact-looking.
+    #[test]
+    fn cross_panel_matching_and_counts_are_trusted_only() {
+        let (mut app, _events) = crate::app::test_app();
+        app.commander.panels[0].cwd = PathBuf::from("/d1");
+        app.commander.panels[0].entries = vec![dir_entry("/d1/x")];
+        app.commander.panels[1].cwd = PathBuf::from("/d2");
+        app.commander.panels[1].entries = vec![dir_entry("/d2/y")];
+
+        app.commander.dedup.insert_dir(
+            PathBuf::from("/d1"),
+            Ok(dedup_with("/d1/x", "S", DirTrust::Trusted)),
+        );
+        app.commander.dedup.insert_dir(
+            PathBuf::from("/d2"),
+            Ok(dedup_with("/d2/y", "S", DirTrust::Untrusted)),
+        );
+        assert!(
+            cross_panel_hashes(&app).is_empty(),
+            "an untrusted signature must not complete an exact match"
+        );
+        let (files, dirs) = count_panel_matches(
+            app.commander.dedup.dir(Path::new("/d1")),
+            app.commander.dedup.dir(Path::new("/d2")),
+            &app.commander.panels[0],
+            &app.commander.panels[1],
+        );
+        assert_eq!((files, dirs), (0, 0), "and must not count as one either");
+
+        app.commander.dedup.insert_dir(
+            PathBuf::from("/d2"),
+            Ok(dedup_with("/d2/y", "S", DirTrust::Trusted)),
+        );
+        assert!(
+            cross_panel_hashes(&app).contains("S"),
+            "both sides trusted → the match is real"
+        );
+        let (_, dirs) = count_panel_matches(
+            app.commander.dedup.dir(Path::new("/d1")),
+            app.commander.dedup.dir(Path::new("/d2")),
+            &app.commander.panels[0],
+            &app.commander.panels[1],
+        );
+        assert_eq!(dirs, 1);
     }
 }
 

@@ -9,13 +9,17 @@ use rusqlite::{params, Connection, OpenFlags, Transaction};
 use crate::error::{AppError, Result};
 use crate::model::action::{ActionKind, MoveEvent};
 use crate::model::duplicate::{
-    build_dir_signatures_streaming, hex_encode, signature_of, DirGroup, DirSigAlgo, DuplicateGroup,
+    build_dir_signatures_streaming_in_context, hex_encode, signature_of,
+    sort_attributed_by_benefit, AttributedDirGroup, DirGroup, DirSigAlgo, DirTrust, DuplicateGroup,
     FileEntry,
 };
 use crate::model::omission::{
-    AuthorityUnavailable, DirCompleteness, EventCount, OmissionCounts, OmissionReason,
-    OmissionSummary, PathKey, RootRegistration,
+    AuthorityUnavailable, CompletenessSnapshot, DirCompleteness, DirDisposition, DirScope,
+    LegacyContext, OmissionCounts, PathKey, RootRegistration, ScanAccounting, SignatureContext,
+    SnapshotOutcome, StoredOmission,
 };
+#[cfg(test)]
+use crate::model::omission::{EventCount, OmissionReason};
 use crate::model::plan::{
     ActionPlan, MarkIntent, PlanGroupInput, PlanMemberEvidence, PlanObjectKey, PlanRefusal,
     PlanResult, RequestedMark,
@@ -24,7 +28,8 @@ use crate::model::reclaim::{
     DestructivePlanVerdict, GroupReclaim, LinkCount, ReclaimEstimate, ReclaimState,
 };
 use crate::model::scan::{
-    ResumeInfo, ScanConfig, ScanEnvironment, ScanStatsRow, ScanStatus, ScanSummary,
+    OmissionAccounting, ResumeInfo, ScanConfig, ScanEnvironment, ScanStatsRow, ScanStatus,
+    ScanSummary,
 };
 
 use super::schema;
@@ -147,33 +152,58 @@ pub struct GroupLinks {
     pub total: LinkCount,
 }
 
-/// A lightweight twin-directory group summary — for
-/// the `[2] Directories` tab in the browser. Analogous to `GroupSummary` for file groups: a single
-/// `dir_group_summaries` query → `Vec<DirGroupSummary>` without `paths`. The directory paths
-/// in a group themselves — `store::dir_group_paths(signature)` on entry into the group.
-/// Browser does not hold all `paths` in RAM (on /tank there are sometimes several
-/// thousand dir-groups, each with 2-20 paths — ~MB of memory, tolerable, but for uniformity with
-/// the file-tab we make it lazy).
-#[derive(Debug, Clone)]
-pub struct DirGroupSummary {
-    /// Sequential «by benefit» rank (1-based, for UI `#N`).
+/// A lightweight twin-directory group summary with the trust the current ledger vouches — for
+/// the `[2] Directories` tab in the browser. Analogous to `GroupSummary` for file groups: one
+/// attributed read → summaries without `paths`; the surviving paths of one group are read on
+/// entry (`attributed_dir_group`). Counts are of SURVIVING members: a member the current ledger
+/// suppresses is removed exactly as the builder would have removed it, and a group left with
+/// fewer than two members is not a group at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributedDirGroupSummary {
+    /// Sequential «by benefit» rank (1-based, for UI `#N`), assigned after suppression.
     pub rank: u32,
-    /// blake3 signature of the directory's contents (hex). The key for `dir_group_paths`.
+    /// blake3 signature of the directory's contents (hex). The key for `attributed_dir_group`.
     pub signature: String,
-    /// How many twin directories are in the group (>= 2 by the SQL filter).
+    /// Surviving twin directories in the group (>= 2, re-evaluated after suppression).
     pub dir_count: u32,
     /// Files in a SINGLE directory of the group (the same for all — same signature).
     pub file_count: u32,
     /// Total size of one directory's files (the same for all in the group).
     pub size_per_dir: u64,
+    /// `Trusted` only when EVERY surviving member is trusted; an `Unknown` member keeps the group
+    /// browseable and makes it an unverified candidate.
+    pub trust: DirTrust,
 }
 
-impl DirGroupSummary {
-    /// How much space will be freed if one directory of the group is kept.
+impl AttributedDirGroupSummary {
+    /// How much space will be freed if one directory of the group is kept. A display figure for
+    /// TRUSTED groups; an unverified candidate never shows one.
     pub fn reclaim_bytes(&self) -> u64 {
         let extra = (self.dir_count.saturating_sub(1)) as u64;
         self.size_per_dir.saturating_mul(extra)
     }
+}
+
+/// Every attributed summary of one scan plus the only aggregate a mixed list may display: the
+/// exact total over trusted groups and a separate COUNT of unverified candidates. There is
+/// deliberately no combined figure — an unverified candidate has no meaningful reclaim ceiling.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AttributedDirGroupSummaries {
+    pub groups: Vec<AttributedDirGroupSummary>,
+    /// Checked sum of `reclaim_bytes` over `Trusted` groups only.
+    pub trusted_reclaim_total: u64,
+    /// How many groups are unverified candidates (`Untrusted`).
+    pub unverified_groups: u32,
+}
+
+/// One live directory signature plus the trust the ledger vouched at the moment it was read.
+///
+/// `Suppressed` is represented by absence — exactly the absence the builders produce — so an
+/// untyped consumer cannot exist: whoever holds a signature holds its trust beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveDirSignature {
+    pub signature: String,
+    pub trust: DirTrust,
 }
 
 /// Checkpoint store: a SQLite DB with the scan state and the file manifest.
@@ -1110,6 +1140,9 @@ impl ScanStore {
         Ok(ScanSummary {
             reclaim: self.scan_reclaim(scan_id)?,
             already_linked_sets: self.already_linked_sets(scan_id)?,
+            // The reopen side of counter parity: an authoritative ledger folds to the same totals
+            // the completion published; anything less is typed `Unavailable`, never an exact zero.
+            omissions: self.scan_omission_accounting(scan_id)?,
             ..summary
         })
     }
@@ -2072,45 +2105,13 @@ impl ScanStore {
         Ok(())
     }
 
-    /// The scan's duplicate-directory groups, sorted by benefit (read in
-    /// commander on entering the directory-groups mode).
-    pub fn dir_groups(&self, scan_id: i64) -> Result<Vec<DirGroup>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT signature, path, file_count, size_per_dir FROM dir_dedup
-             WHERE scan_id = ?1 ORDER BY signature, path",
-        )?;
-        let rows = stmt.query_map(params![scan_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                PathBuf::from(row.get::<_, String>(1)?),
-                row.get::<_, i64>(2)? as u32,
-                row.get::<_, i64>(3)? as u64,
-            ))
-        })?;
-
-        let mut by_sig: std::collections::HashMap<String, DirGroup> =
-            std::collections::HashMap::new();
-        let mut order: Vec<String> = Vec::new();
-        for row in rows {
-            let (sig, path, count, size) = row?;
-            let group = by_sig.entry(sig.clone()).or_insert_with(|| {
-                order.push(sig.clone());
-                DirGroup {
-                    id: 0,
-                    signature: sig.clone(),
-                    paths: Vec::new(),
-                    file_count: count,
-                    size_per_dir: size,
-                }
-            });
-            group.paths.push(path);
-        }
-        let mut groups: Vec<DirGroup> = order
-            .into_iter()
-            .filter_map(|sig| by_sig.remove(&sig))
-            .collect();
-        crate::model::duplicate::sort_dir_groups_by_benefit(&mut groups);
-        Ok(groups)
+    /// The scan's duplicate-directory groups, revalidated against the CURRENT ledger and sorted
+    /// by benefit (read in commander on entering the directory-groups mode). One deferred
+    /// transaction: the rows and the authority they are judged by cannot come from different WAL
+    /// states. Exactly 4 statements — 3 authority reads plus one ordered `dir_dedup` scan.
+    pub fn attributed_dir_groups(&self, scan_id: i64) -> Result<Vec<AttributedDirGroup>> {
+        let tx = self.conn.unchecked_transaction()?;
+        attributed_dir_groups_tx(&tx, scan_id)
     }
 
     /// Saves action marks for the specified scan files (Feature 6B).
@@ -2657,12 +2658,16 @@ impl ScanStore {
         Ok(out)
     }
 
-    /// The content signature of each directory in `dirs` (a prefix range over the PK + the
-    /// `signature_of` core). A signature is produced ONLY for COMPLETE directories —
-    /// where every scanned file under it has a hash; a directory with an unhashed
-    /// (unique-size / failure) file does NOT enter the map (nor do directories with no files at all).
-    /// A match of two directories' signatures = the same SCANNED contents
-    /// (cross-panel highlighting).
+    /// The content signature of each directory in `dirs`, with the trust the current ledger
+    /// vouches for it — one read snapshot: three authority statements plus one existing subtree
+    /// query per requested directory.
+    ///
+    /// A signature is produced ONLY for directories both classifiers call whole enough to show:
+    /// every scanned file under it has a hash (the unhashed-file rule, unchanged), AND the ledger
+    /// does not suppress it. A `Suppressed` directory is absent — exactly the absence the
+    /// builders produce — and under a bounded scan a directory outside every selected root is
+    /// absent too, mirroring the materialized output's root bounding. `Unknown` stays inspectable
+    /// as `Untrusted`; the consumer decides that only `Trusted` may look like an exact match.
     ///
     /// `algo` MUST match the one with which this scan's `dir_dedup` was
     /// materialized (see `ScanConfig.dir_sig_algo`), otherwise the hex of live signatures will diverge
@@ -2674,17 +2679,36 @@ impl ScanStore {
         scan_id: i64,
         dirs: &[PathBuf],
         algo: DirSigAlgo,
-    ) -> Result<HashMap<PathBuf, String>> {
+    ) -> Result<HashMap<PathBuf, LiveDirSignature>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let outcome = completeness_snapshot_tx(&tx, scan_id)?;
+        let legacy = LegacyContext;
+        let ctx: &dyn SignatureContext = match &outcome {
+            SnapshotOutcome::Bounded(snapshot) => snapshot,
+            SnapshotOutcome::Unavailable(_) => &legacy,
+        };
+
         let mut out = HashMap::new();
         // We take ALL files under the directory (not only `hash IS NOT NULL`).
         // An unhashed file (unique-size / failure) makes the directory INCOMPLETE — a live
         // signature for it is NOT produced (no false cross-panel «twin» highlighting).
-        let mut stmt = self.conn.prepare(
+        let mut stmt = tx.prepare(
             "SELECT path, hash FROM file
              WHERE scan_id = ?1 AND path >= ?2 AND path < ?3
              ORDER BY path",
         )?;
         for dir in dirs {
+            // The ledger gate, before any row is read: a suppressed directory emits nothing, and
+            // a bounded scan emits nothing above or outside its selected roots — the same
+            // above-root loss the materialized path accepted.
+            let trust = match ctx.disposition(dir) {
+                DirDisposition::Suppressed => continue,
+                DirDisposition::Trusted => DirTrust::Trusted,
+                DirDisposition::Untrusted => DirTrust::Untrusted,
+            };
+            if matches!(ctx.scope(dir), DirScope::Outside) {
+                continue;
+            }
             let (lo, hi) = prefix_bounds(dir);
             let rows = stmt.query_map(params![scan_id, lo, hi], |row| {
                 Ok((
@@ -2692,7 +2716,7 @@ impl ScanStore {
                     row.get::<_, Option<Vec<u8>>>(1)?,
                 ))
             })?;
-            match algo {
+            let signature = match algo {
                 DirSigAlgo::Old => {
                     let mut entries: Vec<(String, String)> = Vec::new();
                     let mut complete = true;
@@ -2707,12 +2731,15 @@ impl ScanStore {
                         }
                     }
                     if complete && !entries.is_empty() {
-                        out.insert(dir.clone(), signature_of(&entries));
+                        Some(signature_of(&entries))
+                    } else {
+                        None
                     }
                 }
                 DirSigAlgo::Merkle => {
                     // Gather files under `dir` (size is not needed for sig — 0 placeholder),
-                    // run streaming-Merkle; an incomplete `dir` is NOT emitted → no sig.
+                    // run the accepted marker-aware streaming build with the same context; an
+                    // incomplete or suppressed `dir` is NOT emitted → no sig.
                     let mut files: Vec<(PathBuf, u64, Option<String>)> = Vec::new();
                     for row in rows {
                         let (path, hash) = row?;
@@ -2722,109 +2749,47 @@ impl ScanStore {
                         continue;
                     }
                     let mut dir_sig: Option<String> = None;
-                    build_dir_signatures_streaming(files, |emitted, sig, _, _| {
-                        if emitted.as_path() == dir.as_path() {
-                            dir_sig = Some(sig);
+                    build_dir_signatures_streaming_in_context(files, ctx, |emitted| {
+                        if emitted.path.as_path() == dir.as_path() {
+                            dir_sig = Some(emitted.signature);
                         }
                         Ok(())
                     })?;
-                    if let Some(sig) = dir_sig {
-                        out.insert(dir.clone(), sig);
-                    }
+                    dir_sig
                 }
+            };
+            if let Some(signature) = signature {
+                out.insert(dir.clone(), LiveDirSignature { signature, trust });
             }
         }
         Ok(out)
     }
 
-    /// Summaries of all twin-directory groups for
-    /// the browser tab `[2] Directories`. SQL aggregation over `dir_dedup`: a group =
-    /// rows with the same `signature`, filter `COUNT(*) >= 2`, sorted by
-    /// descending benefit `(count - 1) * size_per_dir`. Entries in `dir_dedup` are already
-    /// ≥2 by themselves (that is how they were written via `record_dir_groups` /
-    /// `materialize_dir_groups`); `HAVING` is a safeguard against future migrations.
-    /// `rank` is 1-based, set in code after the fetch.
-    ///
-    pub fn dir_group_summaries(&self, scan_id: i64) -> Result<Vec<DirGroupSummary>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT signature,
-                    CAST(COUNT(*) AS INTEGER)          AS dir_count,
-                    CAST(MIN(file_count) AS INTEGER)   AS file_count,
-                    CAST(MIN(size_per_dir) AS INTEGER) AS size_per_dir
-             FROM dir_dedup
-             WHERE scan_id = ?1
-             GROUP BY signature
-             HAVING COUNT(*) >= 2
-             ORDER BY (CAST(COUNT(*) AS INTEGER) - 1) * CAST(MIN(size_per_dir) AS INTEGER) DESC,
-                      signature ASC",
-        )?;
-        let rows = stmt.query_map(params![scan_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)? as u32,
-                r.get::<_, i64>(2)? as u32,
-                r.get::<_, i64>(3)? as u64,
-            ))
-        })?;
-        let mut out: Vec<DirGroupSummary> = Vec::new();
-        for (rank, row) in (1_u32..).zip(rows) {
-            let (signature, dir_count, file_count, size_per_dir) = row?;
-            out.push(DirGroupSummary {
-                rank,
-                signature,
-                dir_count,
-                file_count,
-                size_per_dir,
-            });
-        }
-        Ok(out)
+    /// Attributed summaries of all twin-directory groups for the browser tab `[2] Directories`
+    /// and its header totals. One deferred transaction, exactly 4 statements: 3 authority reads
+    /// plus one ordered `dir_dedup` scan, folded with O(1) state per signature run and no path
+    /// retained. Members the current ledger suppresses are removed, cardinality is re-evaluated
+    /// (`< 2` survivors → no group), `rank` is 1-based over the surviving groups.
+    pub fn attributed_dir_group_summaries(
+        &self,
+        scan_id: i64,
+    ) -> Result<AttributedDirGroupSummaries> {
+        let tx = self.conn.unchecked_transaction()?;
+        attributed_dir_group_summaries_tx(&tx, scan_id)
     }
 
-    /// The full twin-directory group by signature —
-    /// for the right panel of the browser Dirs tab on entering a group. Uses
-    /// the index `dir_dedup_by_scan_sig` (schema.rs:58). Returns `None`
-    /// if the signature does not exist (safeguard).
-    ///
-    pub fn dir_group_paths(&self, scan_id: i64, signature: &str) -> Result<Option<DirGroup>> {
-        use rusqlite::OptionalExtension;
-        // LIMIT 1 (not MIN/COUNT): on an empty selection it returns NoRow → `.optional()`
-        // gives `None`. MIN/COUNT return a SINGLE row with NULL even on an empty
-        // selection, and `r.get::<_, i64>` then fails on NULL — not our case.
-        // For all rows of a group `file_count` and `size_per_dir` are the same (that is how
-        // they are written in `record_dir_groups`/`materialize_dir_groups`).
-        let row = self
-            .conn
-            .query_row(
-                "SELECT file_count, size_per_dir FROM dir_dedup
-                 WHERE scan_id = ?1 AND signature = ?2 LIMIT 1",
-                params![scan_id, signature],
-                |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u64)),
-            )
-            .optional()?;
-        let Some((file_count, size_per_dir)) = row else {
-            return Ok(None);
-        };
-        let mut stmt = self.conn.prepare(
-            "SELECT path FROM dir_dedup
-             WHERE scan_id = ?1 AND signature = ?2 ORDER BY path",
-        )?;
-        let mut paths: Vec<PathBuf> = Vec::new();
-        let rows = stmt.query_map(params![scan_id, signature], |r| {
-            Ok(PathBuf::from(r.get::<_, String>(0)?))
-        })?;
-        for row in rows {
-            paths.push(row?);
-        }
-        if paths.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(DirGroup {
-            id: 0,
-            signature: signature.to_string(),
-            paths,
-            file_count,
-            size_per_dir,
-        }))
+    /// The full twin-directory group by signature, revalidated against the CURRENT ledger — for
+    /// the right panel of the browser Dirs tab on entering a group. Uses the index
+    /// `dir_dedup_by_scan_sig` (schema.rs:58). One deferred transaction, exactly 4 statements.
+    /// Returns `None` if the signature does not exist, or if the current ledger has whittled the
+    /// group below two surviving members — a claim with no twin is not answered.
+    pub fn attributed_dir_group(
+        &self,
+        scan_id: i64,
+        signature: &str,
+    ) -> Result<Option<AttributedDirGroup>> {
+        let tx = self.conn.unchecked_transaction()?;
+        attributed_dir_group_tx(&tx, scan_id, signature)
     }
 
     /// «twin folder» — finding twins of a specific directory in
@@ -3577,7 +3542,10 @@ enum PersistedRoots {
     Unavailable(AuthorityUnavailable),
 }
 
-/// What a clear operation covers.
+/// What a clear operation covers. `Root` and `Subtree` are the accepted partial-invalidation
+/// scopes that R3D deliberately leaves unwired (P0 decision D7: the only production re-walk is
+/// whole-scan) — they stay for the future partial-rescan consumer and their tests.
+#[allow(dead_code)]
 enum ClearScope {
     /// Every root of the scan.
     WholeScan,
@@ -3598,21 +3566,22 @@ thread_local! {
     static LEDGER_INSERT_FAULT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
-/// Arms the insert fault for this thread and disarms it on drop.
+/// Arms the insert fault for this thread and disarms it on drop. `pub(crate)`: the pipeline's
+/// re-walk crash test drives the same fault through `run_scan`, not only through the store.
 #[cfg(test)]
-struct LedgerInsertFault;
+pub(crate) struct LedgerInsertFault;
 
 #[cfg(test)]
 impl LedgerInsertFault {
     /// Fails the insert that follows `survivors` successful ones.
-    fn after(survivors: u32) -> Self {
+    pub(crate) fn after(survivors: u32) -> Self {
         LEDGER_INSERT_FAULT.with(|slot| slot.set(Some(survivors)));
         LedgerInsertFault
     }
 
     /// Whether the armed fault is still waiting — a fault that never fired means the test proved
     /// nothing about rollback.
-    fn pending(&self) -> bool {
+    pub(crate) fn pending(&self) -> bool {
         LEDGER_INSERT_FAULT.with(|slot| slot.get().is_some())
     }
 }
@@ -3862,119 +3831,406 @@ fn next_generation_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<i64> {
     })
 }
 
+// Test-only statement seam for the bounded snapshot load and its consumers. Thread-local like the
+// walk's fault seams and for the same reason: parallel tests must not pollute each other, and the
+// helpers below are free functions with no `self` to hang a per-instance counter on. The claim it
+// pins is the design's: the classification portion of every ledger read is exactly three flat
+// statements, regardless of how many directories or groups are then answered offline.
+#[cfg(test)]
+thread_local! {
+    static LEDGER_STATEMENTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Resets the seam for the current thread and returns the previous count.
+#[cfg(test)]
+pub(crate) fn reset_ledger_statements() -> u64 {
+    LEDGER_STATEMENTS.with(|cell| cell.replace(0))
+}
+
+/// Statements the ledger read path has executed on this thread since the last reset.
+#[cfg(test)]
+pub(crate) fn ledger_statements() -> u64 {
+    LEDGER_STATEMENTS.with(|cell| cell.get())
+}
+
+#[cfg(test)]
+fn note_ledger_statement() {
+    LEDGER_STATEMENTS.with(|cell| cell.set(cell.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_ledger_statement() {}
+
+/// One bounded snapshot load: exactly three flat reads — the persisted `config_json`, the
+/// registered root generations, and the scan's whole omission ledger — inside the caller's
+/// transaction, handed to the accepted pure constructor.
+///
+/// Deliberately RAW reads: `CompletenessSnapshot::build` is the single validator and the single
+/// stale-generation filter, and validating or filtering here as well would be a second copy of
+/// those rules waiting to disagree. Reading the whole ledger without a generation predicate is
+/// bounded by what `commit_omissions` leaves behind — one generation per root — plus whatever a
+/// zeroed root still holds, which the constructor drops.
+fn completeness_snapshot_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<SnapshotOutcome> {
+    note_ledger_statement();
+    let roots = persisted_roots_tx(tx, scan_id)?;
+
+    note_ledger_statement();
+    let mut stmt = tx.prepare("SELECT root_key, generation FROM scan_root WHERE scan_id = ?1")?;
+    let rows = stmt.query_map(params![scan_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut registered = Vec::new();
+    for row in rows {
+        registered.push(row?);
+    }
+
+    note_ledger_statement();
+    let mut stmt = tx.prepare(
+        "SELECT root_key, dir_key, reason, event_count, generation
+           FROM dir_omission WHERE scan_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![scan_id], |row| {
+        Ok(StoredOmission {
+            root_key: row.get(0)?,
+            dir_key: row.get(1)?,
+            reason: row.get(2)?,
+            event_count: row.get(3)?,
+            generation: row.get(4)?,
+        })
+    })?;
+    let mut omissions = Vec::new();
+    for row in rows {
+        omissions.push(row?);
+    }
+
+    CompletenessSnapshot::build(&roots, registered, omissions)
+}
+
 /// Reads the verdicts for `dirs` from an open transaction.
 ///
 /// The production query helper: the public method is this function plus the transaction that
 /// makes it a snapshot, and the concurrency test drives exactly this, so a passing test cannot be
-/// about a query that merely resembles the real one.
+/// about a query that merely resembles the real one. Since R3D the classification itself is the
+/// accepted `CompletenessSnapshot::verdict` — the same authority the builders and the live path
+/// consult — so the per-directory SQL formulation this helper used to carry is gone, and with it
+/// the possibility of the two classifiers drifting.
+#[allow(dead_code)] // consumed through `directory_completeness`, whose production wiring is deferred
 fn directory_completeness_tx(
     tx: &Transaction<'_>,
     scan_id: i64,
     dirs: &[&Path],
 ) -> Result<HashMap<PathBuf, DirCompleteness>> {
-    // The registered authority is only worth reading while it still describes the scan's own
-    // configuration. Checked HERE, inside the same snapshot as everything else, because an
-    // explicit re-registration is what cleans stale rows and nothing guarantees one has run yet:
-    // the interval between a configuration changing and the next `ensure_scan_roots` would
-    // otherwise be a window of trusted answers about roots the scan no longer has.
-    let registered = registered_roots_tx(tx, scan_id)?;
-    let agrees = match persisted_root_keys_tx(tx, scan_id)? {
-        PersistedRoots::Unavailable(_) => false,
-        PersistedRoots::Keyable(persisted) => {
-            let mut names: Vec<&PathKey> = registered.iter().map(|(key, _)| key).collect();
-            names.sort();
-            names.len() == persisted.len()
-                && names.into_iter().zip(persisted.iter()).all(|(a, b)| a == b)
-        }
-    };
-    // Not an error: a configuration this build cannot speak for is an expected state, and the
-    // honest answer about every directory of such a scan is «unknown». A malformed `config_json`
-    // or a storage failure already returned above, as an error.
-    let roots: &[(PathKey, i64)] = if agrees { &registered } else { &[] };
-
-    // The `dir_key = root_key` walk-error row is the root-wide sentinel: an iterator error that
-    // carried no pathname at all could stand for any part of that tree, so it is included for
-    // every directory the root owns — not only for the root and its ancestors. The ordinary range
-    // propagates a row UPWARD, which is exactly why a row parked at the root would otherwise reach
-    // no child at all.
-    //
-    // A path-known walk error that genuinely lands at the root is over-tainted by this, and that
-    // is the deliberate trade: without a scope column the two rows are indistinguishable, and
-    // over-tainting costs a twin claim while under-tainting costs the truth. Every other reason
-    // stored at the root taints the root and its ancestors only, as usual.
-    //
-    // One statement with three disjuncts rather than two queries: a row satisfying more than one
-    // of them is still one row in one `GROUP BY`, so nothing is counted twice.
-    let mut stmt = tx.prepare(
-        "SELECT reason, SUM(event_count) FROM dir_omission
-          WHERE scan_id = ?1 AND root_key = ?2 AND generation = ?3
-            AND (dir_key = ?4
-                 OR (dir_key >= ?5 AND dir_key < ?6)
-                 OR (reason = ?7 AND dir_key = ?2))
-          GROUP BY reason
-          ORDER BY reason",
-    )?;
-
+    let outcome = completeness_snapshot_tx(tx, scan_id)?;
     let mut out = HashMap::with_capacity(dirs.len());
-    for dir in dirs {
-        let verdict = match PathKey::new(dir) {
-            None => DirCompleteness::Unknown,
-            Some(key) => {
-                // Exactly one root may own a directory. Registration refuses an overlapping set,
-                // so a second match cannot arise from a scan this build wrote; if one is there
-                // anyway, refusing to choose is the only safe answer.
-                let mut owning = roots.iter().filter(|(root, _)| key.is_at_or_under(root));
-                match (owning.next(), owning.next()) {
-                    (Some((root, generation)), None) if *generation > 0 => {
-                        let (lo, hi) = key.subtree_bounds();
-                        let rows = stmt.query_map(
-                            params![
-                                scan_id,
-                                root.as_str(),
-                                generation,
-                                key.as_str(),
-                                lo,
-                                hi,
-                                OmissionReason::WalkError.as_str(),
-                            ],
-                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-                        )?;
-                        let mut summary = OmissionSummary::default();
-                        for row in rows {
-                            let (raw, total) = row?;
-                            // An unrecognized reason is never folded into «complete»: the public
-                            // result is an error, so a future value cannot make a directory look
-                            // whole to a build that does not understand it.
-                            let reason = OmissionReason::parse(&raw).ok_or_else(|| {
-                                AppError::msg(format!(
-                                    "dedcom.db records an omission reason this build does not know ({}); upgrade dedcom, or move the old dedcom.db aside.",
-                                    crate::textsan::terminal(&raw)
-                                ))
-                            })?;
-                            summary.add(reason, EventCount::from_i64(total)?)?;
-                        }
-                        if summary.is_empty() {
-                            DirCompleteness::Complete
-                        } else {
-                            DirCompleteness::Incomplete(summary)
-                        }
-                    }
-                    _ => DirCompleteness::Unknown,
-                }
+    match outcome {
+        SnapshotOutcome::Bounded(snapshot) => {
+            for dir in dirs {
+                out.insert(dir.to_path_buf(), snapshot.verdict(dir)?);
             }
-        };
-        out.insert(dir.to_path_buf(), verdict);
+        }
+        // Not an error: a configuration this build cannot speak for is an expected state, and
+        // the honest answer about every directory of such a scan is «unknown». Malformed stored
+        // data already returned above, as an error.
+        SnapshotOutcome::Unavailable(_) => {
+            for dir in dirs {
+                out.insert(dir.to_path_buf(), DirCompleteness::Unknown);
+            }
+        }
     }
     Ok(out)
 }
 
-#[allow(dead_code)]
+/// One member's revalidated standing: `None` for a member the current ledger suppresses —
+/// removed exactly as the builder would have removed it — otherwise its trust.
+fn member_trust_of(ctx: &dyn SignatureContext, path: &Path) -> Option<DirTrust> {
+    match ctx.disposition(path) {
+        DirDisposition::Suppressed => None,
+        DirDisposition::Trusted => Some(DirTrust::Trusted),
+        DirDisposition::Untrusted => Some(DirTrust::Untrusted),
+    }
+}
+
+/// The signature context an attributed read classifies against: the bounded snapshot, or the
+/// legacy everything-untrusted context when the configuration carries no authority — so legacy
+/// and unkeyable scans stay browseable with every member surviving as `Untrusted`.
+fn attribution_context<'a>(
+    outcome: &'a SnapshotOutcome,
+    legacy: &'a LegacyContext,
+) -> &'a dyn SignatureContext {
+    match outcome {
+        SnapshotOutcome::Bounded(snapshot) => snapshot,
+        SnapshotOutcome::Unavailable(_) => legacy,
+    }
+}
+
+/// Attributed summaries: the three authority reads plus exactly ONE ordered `dir_dedup` scan,
+/// folded with O(1) state per signature run and no path retained.
+fn attributed_dir_group_summaries_tx(
+    tx: &Transaction<'_>,
+    scan_id: i64,
+) -> Result<AttributedDirGroupSummaries> {
+    let outcome = completeness_snapshot_tx(tx, scan_id)?;
+    let legacy = LegacyContext;
+    let ctx = attribution_context(&outcome, &legacy);
+
+    struct Run {
+        signature: String,
+        file_count: u32,
+        size_per_dir: u64,
+        survivors: u32,
+        any_untrusted: bool,
+    }
+    fn flush(run: Option<Run>, groups: &mut Vec<AttributedDirGroupSummary>) {
+        if let Some(run) = run {
+            // Cardinality is re-evaluated over the SURVIVING members: fewer than two means the
+            // stored rows no longer form a group at all.
+            if run.survivors >= 2 {
+                groups.push(AttributedDirGroupSummary {
+                    rank: 0,
+                    signature: run.signature,
+                    dir_count: run.survivors,
+                    file_count: run.file_count,
+                    size_per_dir: run.size_per_dir,
+                    trust: if run.any_untrusted {
+                        DirTrust::Untrusted
+                    } else {
+                        DirTrust::Trusted
+                    },
+                });
+            }
+        }
+    }
+
+    note_ledger_statement();
+    let mut stmt = tx.prepare(
+        "SELECT signature, path, file_count, size_per_dir FROM dir_dedup
+          WHERE scan_id = ?1 ORDER BY signature, path",
+    )?;
+    let rows = stmt.query_map(params![scan_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)? as u32,
+            row.get::<_, i64>(3)? as u64,
+        ))
+    })?;
+
+    let mut groups: Vec<AttributedDirGroupSummary> = Vec::new();
+    let mut run: Option<Run> = None;
+    for row in rows {
+        let (signature, path, file_count, size_per_dir) = row?;
+        if run
+            .as_ref()
+            .map(|r| r.signature != signature)
+            .unwrap_or(true)
+        {
+            flush(run.take(), &mut groups);
+            run = Some(Run {
+                signature,
+                file_count,
+                size_per_dir,
+                survivors: 0,
+                any_untrusted: false,
+            });
+        }
+        let current = run.as_mut().expect("a run was just opened");
+        match member_trust_of(ctx, Path::new(&path)) {
+            None => {}
+            Some(DirTrust::Trusted) => current.survivors += 1,
+            Some(DirTrust::Untrusted) => {
+                current.survivors += 1;
+                current.any_untrusted = true;
+            }
+        }
+    }
+    flush(run.take(), &mut groups);
+
+    // The same benefit order the SQL aggregation used: (dirs − 1) × size DESC, signature ASC —
+    // over the surviving counts, so a fully trusted scan is value/order-identical to the parent.
+    groups.sort_by(|a, b| {
+        b.reclaim_bytes()
+            .cmp(&a.reclaim_bytes())
+            .then_with(|| a.signature.cmp(&b.signature))
+    });
+    let mut trusted_reclaim_total: u64 = 0;
+    let mut unverified_groups: u32 = 0;
+    for (index, group) in groups.iter_mut().enumerate() {
+        group.rank = (index + 1) as u32;
+        match group.trust {
+            DirTrust::Trusted => {
+                trusted_reclaim_total = trusted_reclaim_total
+                    .checked_add(group.reclaim_bytes())
+                    .ok_or_else(|| {
+                        AppError::msg("the trusted reclaim total overflowed while aggregating")
+                    })?;
+            }
+            DirTrust::Untrusted => unverified_groups += 1,
+        }
+    }
+    Ok(AttributedDirGroupSummaries {
+        groups,
+        trusted_reclaim_total,
+        unverified_groups,
+    })
+}
+
+/// Attributed full groups (paths retained, the commander batch): the three authority reads plus
+/// exactly ONE ordered `dir_dedup` scan, then the shared benefit sort.
+fn attributed_dir_groups_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<Vec<AttributedDirGroup>> {
+    let outcome = completeness_snapshot_tx(tx, scan_id)?;
+    let legacy = LegacyContext;
+    let ctx = attribution_context(&outcome, &legacy);
+
+    note_ledger_statement();
+    let mut stmt = tx.prepare(
+        "SELECT signature, path, file_count, size_per_dir FROM dir_dedup
+          WHERE scan_id = ?1 ORDER BY signature, path",
+    )?;
+    let rows = stmt.query_map(params![scan_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)? as u32,
+            row.get::<_, i64>(3)? as u64,
+        ))
+    })?;
+
+    struct Run {
+        signature: String,
+        file_count: u32,
+        size_per_dir: u64,
+        members: Vec<(PathBuf, DirTrust)>,
+    }
+    fn flush(run: Option<Run>, groups: &mut Vec<AttributedDirGroup>) {
+        if let Some(run) = run {
+            if run.members.len() >= 2 {
+                let trust = if run
+                    .members
+                    .iter()
+                    .all(|(_, trust)| *trust == DirTrust::Trusted)
+                {
+                    DirTrust::Trusted
+                } else {
+                    DirTrust::Untrusted
+                };
+                let (paths, member_trust): (Vec<PathBuf>, Vec<DirTrust>) =
+                    run.members.into_iter().unzip();
+                groups.push(AttributedDirGroup {
+                    group: DirGroup {
+                        id: 0,
+                        signature: run.signature,
+                        paths,
+                        file_count: run.file_count,
+                        size_per_dir: run.size_per_dir,
+                    },
+                    member_trust,
+                    trust,
+                });
+            }
+        }
+    }
+
+    let mut groups: Vec<AttributedDirGroup> = Vec::new();
+    let mut run: Option<Run> = None;
+    for row in rows {
+        let (signature, path, file_count, size_per_dir) = row?;
+        if run
+            .as_ref()
+            .map(|r| r.signature != signature)
+            .unwrap_or(true)
+        {
+            flush(run.take(), &mut groups);
+            run = Some(Run {
+                signature,
+                file_count,
+                size_per_dir,
+                members: Vec::new(),
+            });
+        }
+        let current = run.as_mut().expect("a run was just opened");
+        let path = PathBuf::from(path);
+        if let Some(trust) = member_trust_of(ctx, &path) {
+            current.members.push((path, trust));
+        }
+    }
+    flush(run.take(), &mut groups);
+    sort_attributed_by_benefit(&mut groups);
+    Ok(groups)
+}
+
+/// One attributed group by signature (the classic on-entry read): the three authority reads plus
+/// exactly ONE indexed read of the group's own rows.
+fn attributed_dir_group_tx(
+    tx: &Transaction<'_>,
+    scan_id: i64,
+    signature: &str,
+) -> Result<Option<AttributedDirGroup>> {
+    let outcome = completeness_snapshot_tx(tx, scan_id)?;
+    let legacy = LegacyContext;
+    let ctx = attribution_context(&outcome, &legacy);
+
+    note_ledger_statement();
+    // One statement, not a header probe plus a member read: `file_count` and `size_per_dir` are
+    // the same on every row of a group, so the first row carries them.
+    let mut stmt = tx.prepare(
+        "SELECT path, file_count, size_per_dir FROM dir_dedup
+          WHERE scan_id = ?1 AND signature = ?2 ORDER BY path",
+    )?;
+    let rows = stmt.query_map(params![scan_id, signature], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)? as u32,
+            row.get::<_, i64>(2)? as u64,
+        ))
+    })?;
+
+    let mut header: Option<(u32, u64)> = None;
+    let mut members: Vec<(PathBuf, DirTrust)> = Vec::new();
+    for row in rows {
+        let (path, file_count, size_per_dir) = row?;
+        header.get_or_insert((file_count, size_per_dir));
+        let path = PathBuf::from(path);
+        if let Some(trust) = member_trust_of(ctx, &path) {
+            members.push((path, trust));
+        }
+    }
+    let Some((file_count, size_per_dir)) = header else {
+        return Ok(None);
+    };
+    // The revalidated cardinality rule, at open time too: a group the current ledger has whittled
+    // below two members no longer exists, and answering it would present a claim with no twin.
+    if members.len() < 2 {
+        return Ok(None);
+    }
+    let trust = if members.iter().all(|(_, trust)| *trust == DirTrust::Trusted) {
+        DirTrust::Trusted
+    } else {
+        DirTrust::Untrusted
+    };
+    let (paths, member_trust): (Vec<PathBuf>, Vec<DirTrust>) = members.into_iter().unzip();
+    Ok(Some(AttributedDirGroup {
+        group: DirGroup {
+            id: 0,
+            signature: signature.to_string(),
+            paths,
+            file_count,
+            size_per_dir,
+        },
+        member_trust,
+        trust,
+    }))
+}
+
 impl ScanStore {
     /// Registers the scan's roots as completeness authorities and reports what happened.
     ///
     /// The outcome is typed rather than an error: `Unavailable` is an expected state of the
     /// operator's configuration, while a SQLite, I/O or constraint failure stays an `Err`. Folding
     /// the two together would let a broken checkpoint pass for a merely unkeyable one.
+    ///
+    /// Production registers through `begin_scan`/`clear_files` (the same `ensure_roots_tx`), so
+    /// this standalone entry stays test-consumed — accepted API, deliberately unwired (D7).
+    #[allow(dead_code)]
     pub fn ensure_scan_roots(&mut self, scan_id: i64) -> Result<RootRegistration> {
         let tx = self.conn.transaction()?;
         let registration = ensure_roots_tx(&tx, scan_id)?;
@@ -3985,6 +4241,7 @@ impl ScanStore {
 
     /// Whether this root currently carries a trusted ledger, and at which generation. `None` when
     /// the root is not registered at all.
+    #[allow(dead_code)] // accepted R3A reader, test-consumed until a per-root UI needs it
     pub fn root_generation(&self, scan_id: i64, root: &Path) -> Result<Option<i64>> {
         let Some(key) = PathKey::new(root) else {
             return Ok(None);
@@ -4108,7 +4365,8 @@ impl ScanStore {
     /// Invalidates one subtree before it is re-walked: its rows go, and so does its root's
     /// authority. The subtree is part of that root's snapshot, so once a piece is missing the
     /// snapshot is no longer whole — leaving the generation alone would publish the remaining
-    /// rows as a complete answer.
+    /// rows as a complete answer. Unwired in R3D (D7): the only production re-walk is whole-scan.
+    #[allow(dead_code)]
     pub fn clear_omissions_under(&mut self, scan_id: i64, directory: &Path) -> Result<()> {
         let tx = self.conn.transaction()?;
         let key = PathKey::new(directory).ok_or_else(|| {
@@ -4141,7 +4399,8 @@ impl ScanStore {
     }
 
     /// Invalidates one root entirely — the replacement case. Other roots keep their authority,
-    /// which is why the authority is per root at all.
+    /// which is why the authority is per root at all. Unwired in R3D (D7), as above.
+    #[allow(dead_code)]
     pub fn clear_root_omissions(&mut self, scan_id: i64, root: &Path) -> Result<()> {
         let tx = self.conn.transaction()?;
         let key = PathKey::new(root).ok_or_else(|| {
@@ -4166,6 +4425,9 @@ impl ScanStore {
     }
 
     /// Invalidates the whole scan's ledger: every row goes and every root loses its authority.
+    /// Production reaches the same effect through `clear_files`; this narrower entry stays
+    /// test-consumed (it is how the bounded-generation-zero resume cases are seeded).
+    #[allow(dead_code)]
     pub fn clear_scan_omissions(&mut self, scan_id: i64) -> Result<()> {
         let tx = self.conn.transaction()?;
         delete_ledger_tx(&tx, scan_id, &ClearScope::WholeScan)?;
@@ -4182,6 +4444,7 @@ impl ScanStore {
     /// statements in a shared scope is not. Between two autocommit reads another copy of the
     /// program can commit a whole new generation, and an answer assembled half from each is an
     /// answer no state of the checkpoint ever had.
+    #[allow(dead_code)] // the accepted verdict reader; its production consumer arrives with the UI round
     pub fn directory_completeness(
         &self,
         scan_id: i64,
@@ -4189,6 +4452,37 @@ impl ScanStore {
     ) -> Result<HashMap<PathBuf, DirCompleteness>> {
         let snapshot = self.conn.unchecked_transaction()?;
         directory_completeness_tx(&snapshot, scan_id, dirs)
+    }
+
+    /// The scan's completeness authority, loaded in ONE read snapshot — exactly three flat
+    /// statements, then the accepted pure constructor. Every later verdict is offline.
+    pub fn completeness_snapshot(&self, scan_id: i64) -> Result<SnapshotOutcome> {
+        let tx = self.conn.unchecked_transaction()?;
+        completeness_snapshot_tx(&tx, scan_id)
+    }
+
+    /// Whether this scan's persisted ledger is fully authoritative: the configured and registered
+    /// root sets agree and every root carries a positive generation. This is the resume
+    /// predicate's other half — hard snapshot corruption stays `Err` and is never «solved» by a
+    /// re-walk.
+    pub fn ledger_authoritative(&self, scan_id: i64) -> Result<bool> {
+        Ok(match self.completeness_snapshot(scan_id)? {
+            SnapshotOutcome::Bounded(snapshot) => snapshot.fully_authoritative(),
+            SnapshotOutcome::Unavailable(_) => false,
+        })
+    }
+
+    /// The reopen-side omission account. `Unavailable` is an ordinary, expected answer here —
+    /// pre-ledger scans, drifted or cleared authority, and roots-unavailable configurations whose
+    /// observed detail was deliberately session-only.
+    pub fn scan_omission_accounting(&self, scan_id: i64) -> Result<OmissionAccounting> {
+        Ok(match self.completeness_snapshot(scan_id)? {
+            SnapshotOutcome::Bounded(snapshot) => match snapshot.scan_accounting()? {
+                ScanAccounting::Exact(totals) => OmissionAccounting::Ledger(totals),
+                ScanAccounting::Unavailable => OmissionAccounting::Unavailable,
+            },
+            SnapshotOutcome::Unavailable(_) => OmissionAccounting::Unavailable,
+        })
     }
 }
 
@@ -4607,6 +4901,19 @@ mod tests {
         );
     }
 
+    /// The persisted directory groups as plain `DirGroup`s — the attributed reader's view with
+    /// the trust stripped, for tests that assert what storage round-trips. Every scan here has a
+    /// generation-zero (or absent) ledger, so no member is suppressed and the membership equals
+    /// the stored rows.
+    fn plain_dir_groups(store: &ScanStore, scan_id: i64) -> Vec<DirGroup> {
+        store
+            .attributed_dir_groups(scan_id)
+            .unwrap()
+            .into_iter()
+            .map(|attributed| attributed.group)
+            .collect()
+    }
+
     #[test]
     fn dir_groups_roundtrip() {
         let mut store = ScanStore::open_in_memory().unwrap();
@@ -4622,7 +4929,7 @@ mod tests {
         }];
         store.record_dir_groups(scan_id, &groups).unwrap();
 
-        let loaded = store.dir_groups(scan_id).unwrap();
+        let loaded = plain_dir_groups(&store, scan_id);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].paths.len(), 2);
         assert_eq!(loaded[0].file_count, 3);
@@ -4639,7 +4946,7 @@ mod tests {
         store
             .materialize_dir_groups(scan_id, |_emit| Ok(()))
             .unwrap();
-        assert!(store.dir_groups(scan_id).unwrap().is_empty());
+        assert!(plain_dir_groups(&store, scan_id).is_empty());
     }
 
     #[test]
@@ -4657,7 +4964,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let groups = store.dir_groups(scan_id).unwrap();
+        let groups = plain_dir_groups(&store, scan_id);
         assert_eq!(groups.len(), 1, "only the S1 group remains");
         assert_eq!(groups[0].signature, "S1");
         assert_eq!(groups[0].paths.len(), 2);
@@ -4709,14 +5016,15 @@ mod tests {
         let live = store
             .dir_signatures_under(scan_id, &[PathBuf::from("/x/a")], DirSigAlgo::Old)
             .unwrap();
-        let persisted = store.dir_groups(scan_id).unwrap();
+        let persisted = plain_dir_groups(&store, scan_id);
         let group_with_a = persisted
             .iter()
             .find(|g| g.paths.contains(&PathBuf::from("/x/a")))
             .expect("/x/a must be in a group");
         assert_eq!(
-            live.get(&PathBuf::from("/x/a")),
-            Some(&group_with_a.signature),
+            live.get(&PathBuf::from("/x/a"))
+                .map(|l| l.signature.as_str()),
+            Some(group_with_a.signature.as_str()),
             "Old: live == persisted"
         );
     }
@@ -4768,14 +5076,15 @@ mod tests {
         let live = store
             .dir_signatures_under(scan_id, &[PathBuf::from("/x/a")], DirSigAlgo::Merkle)
             .unwrap();
-        let persisted = store.dir_groups(scan_id).unwrap();
+        let persisted = plain_dir_groups(&store, scan_id);
         let group_with_a = persisted
             .iter()
             .find(|g| g.paths.contains(&PathBuf::from("/x/a")))
             .expect("/x/a must be in a group");
         assert_eq!(
-            live.get(&PathBuf::from("/x/a")),
-            Some(&group_with_a.signature),
+            live.get(&PathBuf::from("/x/a"))
+                .map(|l| l.signature.as_str()),
+            Some(group_with_a.signature.as_str()),
             "Merkle: live == persisted"
         );
     }
@@ -4924,7 +5233,12 @@ mod tests {
                 ],
             )
             .unwrap();
-        let summaries = store.dir_group_summaries(scan_id).unwrap();
+        let attributed = store.attributed_dir_group_summaries(scan_id).unwrap();
+        // The scan's ledger sits at generation zero, so every member is Untrusted: the bytes stay
+        // out of the trusted total and every group counts as an unverified candidate.
+        assert_eq!(attributed.trusted_reclaim_total, 0);
+        assert_eq!(attributed.unverified_groups, 3);
+        let summaries = attributed.groups;
         assert_eq!(summaries.len(), 3);
         // First — C (reclaim 6000).
         assert_eq!(summaries[0].rank, 1);
@@ -4947,8 +5261,10 @@ mod tests {
         let scan_id = store
             .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
             .unwrap();
-        let summaries = store.dir_group_summaries(scan_id).unwrap();
-        assert!(summaries.is_empty());
+        let attributed = store.attributed_dir_group_summaries(scan_id).unwrap();
+        assert!(attributed.groups.is_empty());
+        assert_eq!(attributed.trusted_reclaim_total, 0);
+        assert_eq!(attributed.unverified_groups, 0);
     }
 
     #[test]
@@ -4969,18 +5285,24 @@ mod tests {
                 }],
             )
             .unwrap();
-        let group = store
-            .dir_group_paths(scan_id, "SIG_X")
+        let attributed = store
+            .attributed_dir_group(scan_id, "SIG_X")
             .unwrap()
             .expect("the signature exists");
+        let group = &attributed.group;
         assert_eq!(group.signature, "SIG_X");
         let mut paths = group.paths.clone();
         paths.sort();
         assert_eq!(paths, vec![PathBuf::from("/x/a"), PathBuf::from("/x/b")]);
         assert_eq!(group.file_count, 2);
         assert_eq!(group.size_per_dir, 100);
+        assert_eq!(
+            attributed.member_trust,
+            vec![DirTrust::Untrusted, DirTrust::Untrusted],
+            "a generation-zero ledger vouches for nothing"
+        );
         // Unknown signature — None.
-        let none = store.dir_group_paths(scan_id, "NO_SUCH").unwrap();
+        let none = store.attributed_dir_group(scan_id, "NO_SUCH").unwrap();
         assert!(none.is_none());
     }
 
@@ -5430,7 +5752,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(store.dir_groups(scan_id).unwrap().len(), 1);
+        assert_eq!(plain_dir_groups(&store, scan_id).len(), 1);
         store
             .materialize_dir_groups(scan_id, |emit| {
                 emit(PathBuf::from("/x/n1"), "S_new".to_string(), 2, 2)?;
@@ -5438,7 +5760,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let groups = store.dir_groups(scan_id).unwrap();
+        let groups = plain_dir_groups(&store, scan_id);
         assert_eq!(groups.len(), 1, "old group disappeared");
         assert_eq!(groups[0].signature, "S_new");
     }
@@ -7353,10 +7675,17 @@ mod tests {
             store.group_summaries(id).unwrap().is_empty(),
             "file_group cleared"
         );
-        assert!(
-            store.dir_groups(id).unwrap().is_empty(),
-            "dir_dedup cleared"
-        );
+        // Raw count: the attributed reader needs the scan's own config row, which purge has
+        // just deleted — the table state is what this assertion is about.
+        let dir_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM dir_dedup WHERE scan_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dir_rows, 0, "dir_dedup cleared");
         assert_eq!(store.manifest_count(id).unwrap(), 0, "file cleared");
         assert!(
             store.list_scans().unwrap().iter().all(|s| s.scan_id != id),
@@ -10439,8 +10768,11 @@ mod tests {
         );
     }
 
-    /// SQLite's integer `sum()` raises `integer overflow` rather than returning a smaller number
-    /// or a float, so an aggregate that cannot be represented surfaces as an error.
+    /// An aggregate that cannot be represented is an error, never a smaller number — with the
+    /// accepted model boundary, now that the store classifies through the snapshot: the count
+    /// domain is `u64`, so two `i64::MAX` cells still fit (barely) and it takes a third to leave
+    /// the domain. This replaces the old SQL-side rule, whose `sum()` overflowed at the SIGNED
+    /// boundary the model deliberately does not have.
     #[test]
     fn an_aggregate_that_overflows_is_an_error_not_a_wrong_number() {
         let (mut store, scan_id) = ledger_store(&["/tank"]);
@@ -10463,10 +10795,40 @@ mod tests {
                 params![scan_id, i64::MAX],
             )
             .unwrap();
+        match verdict(&store, scan_id, "/tank") {
+            DirCompleteness::Incomplete(summary) => assert_eq!(
+                summary.known_omitted_files().unwrap(),
+                (i64::MAX as u64) * 2,
+                "two maxima still fit the unsigned domain — the accepted model boundary"
+            ),
+            other => panic!("expected incomplete, got {other:?}"),
+        }
 
+        // The third maximum leaves the domain: checked aggregation refuses.
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root(
+                    "/tank",
+                    &[
+                        ("/tank/a", OmissionReason::MinSize),
+                        ("/tank/b", OmissionReason::MinSize),
+                        ("/tank/c", OmissionReason::MinSize),
+                    ],
+                ),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE dir_omission SET event_count = ?2 WHERE scan_id = ?1",
+                params![scan_id, i64::MAX],
+            )
+            .unwrap();
         let err = store
             .directory_completeness(scan_id, &[Path::new("/tank")])
-            .expect_err("the aggregate must not silently wrap");
+            .expect_err("three maxima cannot be summed into one figure");
         assert!(
             err.to_string().to_lowercase().contains("overflow"),
             "the error must name the overflow: {err}"
@@ -10790,5 +11152,457 @@ mod tests {
         for dir in dirs {
             assert!(answers.contains_key(dir), "{} is missing", dir.display());
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // R3D: the bounded snapshot load, its statement seam, authority, attribution and live trust.
+    // -----------------------------------------------------------------------------------------
+
+    /// The statement counts, pinned by the seam rather than promised in prose: classification is
+    /// always the 3 flat authority reads, each attributed reader adds exactly its one group scan,
+    /// and answering one directory costs the same statements as answering forty.
+    #[test]
+    fn ledger_statement_counts_are_pinned() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/a", OmissionReason::MinSize)]),
+            )
+            .unwrap();
+        store
+            .record_dir_groups(
+                scan_id,
+                &[DirGroup {
+                    id: 0,
+                    signature: "SIG".to_string(),
+                    paths: vec![PathBuf::from("/tank/x"), PathBuf::from("/tank/y")],
+                    file_count: 1,
+                    size_per_dir: 10,
+                }],
+            )
+            .unwrap();
+
+        reset_ledger_statements();
+        store
+            .directory_completeness(scan_id, &[Path::new("/tank/a")])
+            .unwrap();
+        assert_eq!(ledger_statements(), 3, "one directory: 3 reads");
+
+        let many: Vec<PathBuf> = (0..40)
+            .map(|i| PathBuf::from(format!("/tank/d{i}")))
+            .collect();
+        let many_refs: Vec<&Path> = many.iter().map(PathBuf::as_path).collect();
+        reset_ledger_statements();
+        store.directory_completeness(scan_id, &many_refs).unwrap();
+        assert_eq!(ledger_statements(), 3, "forty directories: still 3 reads");
+
+        reset_ledger_statements();
+        store.completeness_snapshot(scan_id).unwrap();
+        assert_eq!(
+            ledger_statements(),
+            3,
+            "the snapshot load itself is 3 reads"
+        );
+
+        reset_ledger_statements();
+        store.attributed_dir_group_summaries(scan_id).unwrap();
+        assert_eq!(ledger_statements(), 4, "summaries: 3 + one ordered scan");
+
+        reset_ledger_statements();
+        store.attributed_dir_groups(scan_id).unwrap();
+        assert_eq!(ledger_statements(), 4, "full groups: 3 + one ordered scan");
+
+        reset_ledger_statements();
+        store.attributed_dir_group(scan_id, "SIG").unwrap();
+        assert_eq!(ledger_statements(), 4, "one group: 3 + one indexed read");
+
+        reset_ledger_statements();
+        store
+            .dir_signatures_under(scan_id, &many, DirSigAlgo::Old)
+            .unwrap();
+        assert_eq!(
+            ledger_statements(),
+            3,
+            "live signatures: the classification stays 3 reads however many directories ask"
+        );
+    }
+
+    /// The resume predicate's store half, over every authority shape the accounting matrix names.
+    #[test]
+    fn ledger_authoritative_matches_the_accounting_matrix() {
+        // A5-shaped: committed ledger, all generations positive.
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(scan_id, &one_root("/tank", &[]))
+            .unwrap();
+        assert!(store.ledger_authoritative(scan_id).unwrap());
+        assert_eq!(
+            store.scan_omission_accounting(scan_id).unwrap(),
+            OmissionAccounting::Ledger(crate::model::omission::OmissionSummary::default()),
+            "a committed empty ledger reopens as the exact zero"
+        );
+
+        // A7-shaped: generations zeroed.
+        store.clear_scan_omissions(scan_id).unwrap();
+        assert!(!store.ledger_authoritative(scan_id).unwrap());
+        assert_eq!(
+            store.scan_omission_accounting(scan_id).unwrap(),
+            OmissionAccounting::Unavailable,
+            "a zeroed ledger must never read as an exact zero"
+        );
+
+        // A2-shaped: pre-ledger — no scan_root rows at all.
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(scan_id, &one_root("/tank", &[]))
+            .unwrap();
+        store
+            .conn
+            .execute("DELETE FROM scan_root WHERE scan_id = ?1", params![scan_id])
+            .unwrap();
+        assert!(!store.ledger_authoritative(scan_id).unwrap());
+        assert_eq!(
+            store.scan_omission_accounting(scan_id).unwrap(),
+            OmissionAccounting::Unavailable
+        );
+
+        // A3-shaped: registration drift — the registered root is not the configured one.
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(scan_id, &one_root("/tank", &[]))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE scan_root SET root_key = '/other' WHERE scan_id = ?1",
+                params![scan_id],
+            )
+            .unwrap();
+        assert!(!store.ledger_authoritative(scan_id).unwrap());
+
+        // A4-shaped: mixed authority — one positive root, one zeroed.
+        let (mut store, scan_id) = ledger_store(&["/tank/one", "/tank/two"]);
+        let both = BTreeMap::from([
+            (key("/tank/one"), counts(&[])),
+            (key("/tank/two"), counts(&[])),
+        ]);
+        store.commit_omissions(scan_id, &both).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE scan_root SET generation = 0 WHERE scan_id = ?1 AND root_key = '/tank/two'",
+                params![scan_id],
+            )
+            .unwrap();
+        assert!(
+            !store.ledger_authoritative(scan_id).unwrap(),
+            "one positive root cannot vouch for the scan"
+        );
+        assert_eq!(
+            store.scan_omission_accounting(scan_id).unwrap(),
+            OmissionAccounting::Unavailable
+        );
+
+        // Hard corruption stays an error, never a re-walk-shaped `false`. The schema CHECKs bar a
+        // negative generation and a malformed key from ever being written, so the seedable
+        // corruption is a reason string this build does not know.
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/a", OmissionReason::MinSize)]),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE dir_omission SET reason = 'quota_error' WHERE scan_id = ?1",
+                params![scan_id],
+            )
+            .unwrap();
+        assert!(store.ledger_authoritative(scan_id).is_err());
+    }
+
+    /// Reopen counter parity for a real ledger: what the walk committed is what a fresh
+    /// accounting read folds — same totals, `Ledger` provenance.
+    #[test]
+    fn reopened_accounting_equals_the_committed_ledger() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root(
+                    "/tank",
+                    &[
+                        ("/tank/a", OmissionReason::MinSize),
+                        ("/tank/a", OmissionReason::MinSize),
+                        ("/tank/b", OmissionReason::UnsupportedEntry),
+                        ("/tank", OmissionReason::WalkError),
+                    ],
+                ),
+            )
+            .unwrap();
+        match store.scan_omission_accounting(scan_id).unwrap() {
+            OmissionAccounting::Ledger(totals) => {
+                assert_eq!(totals.known_omitted_files().unwrap(), 2);
+                assert_eq!(totals.unsupported_entries().unwrap(), 1);
+                assert_eq!(totals.unknown_cardinality_events(), 1);
+            }
+            other => panic!("expected the exact ledger account, got {other:?}"),
+        }
+    }
+
+    /// Stored-member suppression at read time: a ledger change AFTER materialization removes the
+    /// affected member exactly as the builder would have, re-evaluates cardinality, and a group
+    /// left below two members is gone — from the list, from the batch and from the open-by-
+    /// signature read alike. The unaffected `Unknown-free` members keep the group browseable.
+    #[test]
+    fn a_later_ledger_change_suppresses_stored_members_on_every_reader() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(scan_id, &one_root("/tank", &[]))
+            .unwrap();
+        store
+            .record_dir_groups(
+                scan_id,
+                &[
+                    DirGroup {
+                        id: 0,
+                        signature: "PAIR".to_string(),
+                        paths: vec![PathBuf::from("/tank/p1"), PathBuf::from("/tank/p2")],
+                        file_count: 1,
+                        size_per_dir: 100,
+                    },
+                    DirGroup {
+                        id: 1,
+                        signature: "TRIO".to_string(),
+                        paths: vec![
+                            PathBuf::from("/tank/t1"),
+                            PathBuf::from("/tank/t2"),
+                            PathBuf::from("/tank/t3"),
+                        ],
+                        file_count: 1,
+                        size_per_dir: 40,
+                    },
+                ],
+            )
+            .unwrap();
+
+        // Everything trusted at first: both groups, full membership, trusted totals.
+        let before = store.attributed_dir_group_summaries(scan_id).unwrap();
+        assert_eq!(before.groups.len(), 2);
+        assert_eq!(before.unverified_groups, 0);
+        assert_eq!(before.trusted_reclaim_total, 100 + 80);
+
+        // The next walk finds an omission under p1 and inside t3: p1 and t3 are now suppressed.
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root(
+                    "/tank",
+                    &[
+                        ("/tank/p1", OmissionReason::MetadataError),
+                        ("/tank/t3/inner", OmissionReason::NonUtf8),
+                    ],
+                ),
+            )
+            .unwrap();
+
+        let after = store.attributed_dir_group_summaries(scan_id).unwrap();
+        assert_eq!(
+            after.groups.len(),
+            1,
+            "PAIR fell below two members and is no group at all"
+        );
+        assert_eq!(after.groups[0].signature, "TRIO");
+        assert_eq!(after.groups[0].dir_count, 2, "t3 is gone, t1+t2 survive");
+        assert_eq!(after.groups[0].trust, DirTrust::Trusted);
+        assert_eq!(
+            after.trusted_reclaim_total, 40,
+            "one survivor's worth of extra copies"
+        );
+
+        let batch = store.attributed_dir_groups(scan_id).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            batch[0].group.paths,
+            vec![PathBuf::from("/tank/t1"), PathBuf::from("/tank/t2")]
+        );
+        assert_eq!(
+            batch[0].member_trust,
+            vec![DirTrust::Trusted, DirTrust::Trusted]
+        );
+
+        assert!(
+            store
+                .attributed_dir_group(scan_id, "PAIR")
+                .unwrap()
+                .is_none(),
+            "opening the whittled group answers None, not a one-member claim"
+        );
+        let trio = store
+            .attributed_dir_group(scan_id, "TRIO")
+            .unwrap()
+            .expect("TRIO still exists");
+        assert_eq!(trio.group.paths.len(), 2);
+    }
+
+    /// A hard snapshot error surfaces from every attributed reader — never an empty list that
+    /// would render as «no directory groups».
+    #[test]
+    fn attributed_readers_propagate_hard_snapshot_errors() {
+        let (mut store, scan_id) = ledger_store(&["/tank"]);
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/a", OmissionReason::MinSize)]),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE dir_omission SET reason = 'quota_error' WHERE scan_id = ?1",
+                params![scan_id],
+            )
+            .unwrap();
+        let err = store
+            .attributed_dir_group_summaries(scan_id)
+            .expect_err("an unknown reason is a hard error")
+            .to_string();
+        assert!(err.contains("does not know"), "{err}");
+        assert!(store.attributed_dir_groups(scan_id).is_err());
+        assert!(store.attributed_dir_group(scan_id, "ANY").is_err());
+        assert!(store
+            .dir_signatures_under(scan_id, &[PathBuf::from("/tank/a")], DirSigAlgo::Old)
+            .is_err());
+    }
+
+    /// Typed live trust, all three states in one scan: a suppressed directory is absent, a
+    /// trusted one carries `Trusted`, and after the authority is zeroed the same signature comes
+    /// back `Untrusted` — inspectable, never exact-looking.
+    #[test]
+    fn live_signatures_carry_the_ledger_trust() {
+        let (mut store, scan_id) = ledger_store(&["/x"]);
+        store
+            .record_files(
+                scan_id,
+                &[
+                    row("/x/a/f1", 100, 1),
+                    row("/x/b/f1", 100, 2),
+                    row("/x/c/f1", 100, 3),
+                ],
+            )
+            .unwrap();
+        let h = [7u8; 32];
+        store
+            .record_hashes(
+                scan_id,
+                &[
+                    (PathBuf::from("/x/a/f1"), h),
+                    (PathBuf::from("/x/b/f1"), h),
+                    (PathBuf::from("/x/c/f1"), h),
+                ],
+            )
+            .unwrap();
+        // The walk saw an omission under /x/c: it is suppressed; /x/a and /x/b stay whole.
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/x", &[("/x/c", OmissionReason::MetadataError)]),
+            )
+            .unwrap();
+
+        let dirs = [
+            PathBuf::from("/x/a"),
+            PathBuf::from("/x/b"),
+            PathBuf::from("/x/c"),
+        ];
+        let live = store
+            .dir_signatures_under(scan_id, &dirs, DirSigAlgo::Old)
+            .unwrap();
+        let a = live.get(Path::new("/x/a")).expect("/x/a is whole");
+        assert_eq!(a.trust, DirTrust::Trusted);
+        assert_eq!(
+            live.get(Path::new("/x/b")).map(|l| &l.signature),
+            Some(&a.signature),
+            "the twins share a signature"
+        );
+        assert!(
+            !live.contains_key(Path::new("/x/c")),
+            "a suppressed directory emits nothing"
+        );
+
+        // The same store, its authority zeroed: the signature survives, its trust does not.
+        store.clear_scan_omissions(scan_id).unwrap();
+        let untrusted = store
+            .dir_signatures_under(scan_id, &dirs, DirSigAlgo::Old)
+            .unwrap();
+        let a = untrusted.get(Path::new("/x/a")).expect("still inspectable");
+        assert_eq!(
+            a.trust,
+            DirTrust::Untrusted,
+            "an Unknown signature must never look exact"
+        );
+        assert!(
+            untrusted.contains_key(Path::new("/x/c")),
+            "nothing suppresses /x/c once the ledger is gone — it is merely untrusted"
+        );
+    }
+
+    /// Root bounding on the live path: a bounded scan emits nothing above its selected root —
+    /// the same above-root loss the materialized output accepted — while an unkeyable
+    /// configuration keeps today's unbounded output, everything untrusted.
+    #[test]
+    fn live_signatures_are_root_bounded_exactly_like_the_builders() {
+        let (mut store, scan_id) = ledger_store(&["/x/root"]);
+        store
+            .record_files(scan_id, &[row("/x/root/a/f1", 100, 1)])
+            .unwrap();
+        store
+            .record_hashes(scan_id, &[(PathBuf::from("/x/root/a/f1"), [7u8; 32])])
+            .unwrap();
+        store
+            .commit_omissions(scan_id, &one_root("/x/root", &[]))
+            .unwrap();
+        let live = store
+            .dir_signatures_under(
+                scan_id,
+                &[PathBuf::from("/x"), PathBuf::from("/x/root/a")],
+                DirSigAlgo::Old,
+            )
+            .unwrap();
+        assert!(
+            !live.contains_key(Path::new("/x")),
+            "above the selected root there is no live signature"
+        );
+        assert!(live.contains_key(Path::new("/x/root/a")));
+
+        // The unkeyable configuration: `..` in the root. The scan keeps its legacy output.
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let config = ScanConfig::new(vec![PathBuf::from("/x/other/../root")]);
+        let scan_id = store.begin_scan(&config).unwrap();
+        store
+            .record_files(scan_id, &[row("/x/root/a/f1", 100, 1)])
+            .unwrap();
+        store
+            .record_hashes(scan_id, &[(PathBuf::from("/x/root/a/f1"), [7u8; 32])])
+            .unwrap();
+        let live = store
+            .dir_signatures_under(
+                scan_id,
+                &[PathBuf::from("/x"), PathBuf::from("/x/root/a")],
+                DirSigAlgo::Old,
+            )
+            .unwrap();
+        let above = live
+            .get(Path::new("/x"))
+            .expect("the legacy context keeps the above-root signature");
+        assert_eq!(above.trust, DirTrust::Untrusted);
+        assert_eq!(
+            live.get(Path::new("/x/root/a")).map(|l| l.trust),
+            Some(DirTrust::Untrusted),
+            "nothing is trusted without an authority"
+        );
     }
 }

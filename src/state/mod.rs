@@ -6,6 +6,6 @@ pub mod store;
 
 pub use host_profile::HostProfile;
 pub use store::{
-    set_observer_role, DedupRow, DirGroupSummary, GroupClaim, GroupLinks, GroupSummary,
-    ManifestRow, ScanStore,
+    set_observer_role, AttributedDirGroupSummary, DedupRow, GroupClaim, GroupLinks, GroupSummary,
+    LiveDirSignature, ManifestRow, ScanStore,
 };

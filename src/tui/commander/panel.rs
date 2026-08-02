@@ -13,7 +13,7 @@ use ratatui::{
 };
 
 use crate::app::PathStyle;
-use crate::model::duplicate::DirGroup;
+use crate::model::duplicate::AttributedDirGroup;
 use crate::state::GroupSummary;
 use crate::tui::human_bytes_parts;
 use crate::tui::screens::browser;
@@ -41,12 +41,14 @@ pub fn render_panel(
     area: Rect,
     panel: &mut Panel,
     dedup: Option<&DirDedup>,
+    dedup_error: Option<&str>,
     cross: &HashSet<String>,
     dir_sizes: &HashMap<PathBuf, u64>,
     group_summaries: &[GroupSummary],
-    dir_groups: &[DirGroup],
+    dir_groups: &[AttributedDirGroup],
+    dir_groups_error: Option<&str>,
     source: Option<&WatchEntry>,
-    source_dir_group: Option<&DirGroup>,
+    source_dir_group: Option<&AttributedDirGroup>,
     compare_peer: Option<&HashMap<String, ComparePeer>>,
     scan_id: Option<i64>,
     index: usize,
@@ -73,6 +75,14 @@ pub fn render_panel(
         ellipsize_left(&panel.cwd.display().to_string(), title_width),
         panel.sort.label(),
     ))];
+    // A failed dedup load is an error state: the rows below carry no statuses or signatures
+    // (fail-closed), and the title says why instead of letting the panel look unscanned.
+    if dedup_error.is_some() {
+        title_spans.push(Span::styled(
+            "· dedup error ",
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
     // Confidence percentage: share of files with a known hash.
     if let Some(percent) = confidence_percent(panel, dedup) {
         let color = if percent < 30 {
@@ -159,10 +169,13 @@ pub fn render_panel(
                     );
                 }
                 (PanelView::DuplicatesOfCursor, Some(WatchResult::DirGroup(group))) => {
+                    // The watch navigation reads the materialized rows without attribution (the
+                    // `dir_twins` residual, named in the round report): no member markers here.
                     browser::render_dir_group_files(
                         frame,
                         area,
                         Some(group),
+                        None,
                         &mut panel.list,
                         focused,
                         &title,
@@ -183,7 +196,18 @@ pub fn render_panel(
             return;
         }
         PanelView::DirGroupList => {
-            if dir_groups.is_empty() {
+            if let Some(err) = dir_groups_error {
+                // A store failure, distinct from the legitimate empty-list text: no false
+                // «no directory groups».
+                render_view_fallback(
+                    frame,
+                    area,
+                    border,
+                    index,
+                    panel.view,
+                    &format!("directory groups unavailable: {err}"),
+                );
+            } else if dir_groups.is_empty() {
                 render_view_fallback(
                     frame,
                     area,
@@ -208,11 +232,16 @@ pub fn render_panel(
         PanelView::DirGroupFiles => {
             match source_dir_group {
                 Some(group) => {
-                    let title = format!(" {} · directories of group ", index + 1);
+                    let title = if group.trust == crate::model::duplicate::DirTrust::Trusted {
+                        format!(" {} · directories of group ", index + 1)
+                    } else {
+                        format!(" {} · unverified candidate — rescan required ", index + 1)
+                    };
                     browser::render_dir_group_files(
                         frame,
                         area,
-                        Some(group),
+                        Some(&group.group),
+                        Some(&group.member_trust),
                         &mut panel.list,
                         focused,
                         &title,
@@ -246,18 +275,26 @@ pub fn render_panel(
             let status = if matches!(entry.kind, EntryKind::File) {
                 dedup.map_or(DedupStatus::NotInScan, |d| d.status_for(&entry.path))
             } else {
-                DedupStatus::NotInScan
+                // A directory whose live signature the ledger cannot vouch for shows the same `?`
+                // the unhashed file does: in the scan, explicitly unverified — rescan required.
+                // It never bright-highlights and never enters a match count.
+                match dedup.and_then(|d| d.dir_signature_state(&entry.path)) {
+                    Some((_, crate::model::duplicate::DirTrust::Untrusted)) => {
+                        DedupStatus::Unhashed
+                    }
+                    _ => DedupStatus::NotInScan,
+                }
             };
             let mark = panel.marks.get(&entry.path).copied();
             // Cross-panel match: for a file — by hash, for a directory —
-            // by content signature.
+            // by TRUSTED content signature; an untrusted one may not look exact.
             let is_cross = match entry.kind {
                 EntryKind::File => dedup
                     .and_then(|d| d.hash_for(&entry.path))
                     .map(|hash| cross.contains(hash))
                     .unwrap_or(false),
                 EntryKind::Dir => dedup
-                    .and_then(|d| d.dir_signature(&entry.path))
+                    .and_then(|d| d.trusted_dir_signature(&entry.path))
                     .map(|sig| cross.contains(sig))
                     .unwrap_or(false),
                 EntryKind::Parent => false,

@@ -11,8 +11,8 @@ use std::collections::HashMap;
 
 use crate::app::{App, PathStyle};
 use crate::model::action::ActionKind;
-use crate::model::duplicate::{DirGroup, DuplicateGroup};
-use crate::state::{DirGroupSummary, GroupClaim, GroupSummary};
+use crate::model::duplicate::{AttributedDirGroup, DirGroup, DirTrust, DuplicateGroup};
+use crate::state::{AttributedDirGroupSummary, GroupClaim, GroupSummary};
 use crate::tui::human_bytes;
 
 /// Active browser tab: `Files` —
@@ -72,13 +72,28 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             ),
         ],
         BrowserTab::Dirs => vec![
-            format!(
-                " Groups: {}   Scanned: {}   Will free: {}   Marked: {} ",
-                app.browser.dir_group_summaries.len(),
-                app.browser.summary.files_scanned,
-                human_bytes(app.browser.dir_groups_reclaim_total),
-                app.browser.marked_count,
-            ),
+            {
+                // «Will free» sums TRUSTED groups only; unverified candidates are a separate
+                // COUNT, never bytes in any aggregate. A load error shows as `error`, not `0`.
+                let groups = match (
+                    &app.browser.dir_groups_error,
+                    app.browser.dir_groups_unverified,
+                ) {
+                    (Some(_), _) => "error".to_string(),
+                    (None, 0) => app.browser.dir_group_summaries.len().to_string(),
+                    (None, unverified) => format!(
+                        "{} ({unverified} unverified)",
+                        app.browser.dir_group_summaries.len()
+                    ),
+                };
+                format!(
+                    " Groups: {}   Scanned: {}   Will free: {}   Marked: {} ",
+                    groups,
+                    app.browser.summary.files_scanned,
+                    human_bytes(app.browser.dir_groups_reclaim_total),
+                    app.browser.marked_count,
+                )
+            },
             format!(
                 " already linked sets: {} ",
                 app.browser.summary.already_linked_sets
@@ -201,16 +216,35 @@ fn render_files_tab(frame: &mut Frame, panes: std::rc::Rc<[ratatui::layout::Rect
 
 /// Renders the panels of the `[1] Folders` tab.
 fn render_dirs_tab(frame: &mut Frame, panes: std::rc::Rc<[ratatui::layout::Rect]>, app: &mut App) {
-    render_dir_group_summary_list(
-        frame,
-        panes[0],
-        &app.browser.dir_group_summaries,
-        &mut app.browser.dir_group_state,
-        !app.browser.focus_files,
-        groups_panel_title(BrowserTab::Dirs),
-    );
+    if let Some(err) = &app.browser.dir_groups_error {
+        // A store failure is its own state, distinct from the legitimate empty list.
+        let para = Paragraph::new(format!("directory groups unavailable: {err}"))
+            .style(Style::new().fg(Color::Red))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(groups_panel_title(BrowserTab::Dirs)),
+            );
+        frame.render_widget(para, panes[0]);
+    } else {
+        render_dir_group_summary_list(
+            frame,
+            panes[0],
+            &app.browser.dir_group_summaries,
+            &mut app.browser.dir_group_state,
+            !app.browser.focus_files,
+            groups_panel_title(BrowserTab::Dirs),
+        );
+    }
 
-    // Right panel title: ` Group folders ` without counters.
+    // Right panel title: the plain ` Group folders ` for a trusted group; an unverified
+    // candidate names itself and its remedy instead.
+    let title = match &app.browser.open_dir_group {
+        Some(group) if group.trust == DirTrust::Untrusted => {
+            " Unverified candidate — rescan required "
+        }
+        _ => " Group folders ",
+    };
     render_dir_group_files_with_keeper(
         frame,
         panes[1],
@@ -218,7 +252,7 @@ fn render_dirs_tab(frame: &mut Frame, panes: std::rc::Rc<[ratatui::layout::Rect]
         app.browser.dir_keeper_index,
         &mut app.browser.dir_file_state,
         app.browser.focus_files,
-        " Group folders ",
+        title,
     );
 }
 
@@ -591,7 +625,7 @@ pub(crate) fn render_group_files(
 pub(crate) fn render_dir_group_list(
     frame: &mut Frame,
     area: Rect,
-    groups: &[DirGroup],
+    groups: &[AttributedDirGroup],
     state: &mut ListState,
     focused: bool,
     title: &str,
@@ -603,15 +637,27 @@ pub(crate) fn render_dir_group_list(
     let end = (start + rows).min(groups.len());
     let items: Vec<ListItem> = groups[start..end]
         .iter()
-        .map(|group| {
-            ListItem::new(format!(
-                "#{:<4} {} directories · {} files · {} · free {}",
-                group.id,
-                group.paths.len(),
-                group.file_count,
-                human_bytes(group.size_per_dir),
-                human_bytes(group.reclaimable_bytes()),
-            ))
+        .map(|attributed| {
+            let group = &attributed.group;
+            // An unverified candidate makes no reclaim claim: no `free`, no byte figure, and the
+            // qualifier sits right after the rank so the narrowest panel (36 columns) cannot
+            // truncate it away. Trusted rows stay byte-identical to the parent.
+            match attributed.trust {
+                DirTrust::Trusted => ListItem::new(format!(
+                    "#{:<4} {} directories · {} files · {} · free {}",
+                    group.id,
+                    group.paths.len(),
+                    group.file_count,
+                    human_bytes(group.size_per_dir),
+                    human_bytes(group.reclaimable_bytes()),
+                )),
+                DirTrust::Untrusted => ListItem::new(format!(
+                    "#{:<4} rescan required · {} directories · {} files",
+                    group.id,
+                    group.paths.len(),
+                    group.file_count,
+                )),
+            }
         })
         .collect();
     let list = List::new(items)
@@ -630,10 +676,13 @@ pub(crate) fn render_dir_group_list(
 
 /// Draws the directory paths of group `group` — for the commander panel
 /// in DirGroupFiles mode. The first directory is marked as the "keeper" (★).
+/// `member_trust`, when supplied, is one entry per path in the same order; an `Untrusted` member
+/// carries the `?` marker in the prefix. Trusted rows are byte-identical to the parent.
 pub(crate) fn render_dir_group_files(
     frame: &mut Frame,
     area: Rect,
     group: Option<&DirGroup>,
+    member_trust: Option<&[DirTrust]>,
     state: &mut ListState,
     focused: bool,
     title: &str,
@@ -644,15 +693,12 @@ pub(crate) fn render_dir_group_files(
             .iter()
             .enumerate()
             .map(|(index, path)| {
-                let (prefix, color) = if index == 0 {
-                    ("★ ", Color::Green)
-                } else {
-                    ("  ", Color::Reset)
-                };
-                let line = Line::from(vec![
-                    Span::styled(prefix, Style::new().fg(color).add_modifier(Modifier::BOLD)),
-                    Span::raw(path.display().to_string()),
-                ]);
+                let keeper = index == 0;
+                let line = Line::from(member_prefix_spans(
+                    keeper,
+                    member_trust.and_then(|trust| trust.get(index).copied()),
+                    path,
+                ));
                 ListItem::new(line)
             })
             .collect(),
@@ -670,16 +716,37 @@ pub(crate) fn render_dir_group_files(
     frame.render_stateful_widget(list, area, state);
 }
 
-/// Draws the list of dir-group summaries for the browser
-/// `[2] Directories` tab. Analogous to `render_group_list`, but reads `DirGroupSummary`
+/// The prefix spans of one group-member row: the keeper star, the unverified `?` marker, then
+/// the path. Trusted keeper/plain rows are byte-identical to the parent (`★ ` / `  `); an
+/// untrusted member reads `? ` (or `★?` when it is also the keeper).
+fn member_prefix_spans(
+    keeper: bool,
+    trust: Option<DirTrust>,
+    path: &std::path::Path,
+) -> Vec<Span<'static>> {
+    let untrusted = trust == Some(DirTrust::Untrusted);
+    let (prefix, color) = match (keeper, untrusted) {
+        (true, false) => ("★ ", Color::Green),
+        (true, true) => ("★?", Color::Yellow),
+        (false, true) => ("? ", Color::Yellow),
+        (false, false) => ("  ", Color::Reset),
+    };
+    vec![
+        Span::styled(prefix, Style::new().fg(color).add_modifier(Modifier::BOLD)),
+        Span::raw(path.display().to_string()),
+    ]
+}
+
+/// Draws the list of attributed dir-group summaries for the browser
+/// `[2] Directories` tab. Analogous to `render_group_list`, but reads summaries
 /// (without `paths` in RAM) — on /tank there can be several thousand dir-groups, but we're
 /// consistent with the file tab: the left panel holds only summaries, paths are read on
-/// entering the group (`store::dir_group_paths`). Without separators every 25
+/// entering the group (`store::attributed_dir_group`). Without separators every 25
 /// (per user feedback 2026-05-28).
 pub(crate) fn render_dir_group_summary_list(
     frame: &mut Frame,
     area: Rect,
-    groups: &[DirGroupSummary],
+    groups: &[AttributedDirGroupSummary],
     state: &mut ListState,
     focused: bool,
     title: Line<'static>,
@@ -691,13 +758,21 @@ pub(crate) fn render_dir_group_summary_list(
     let items: Vec<ListItem> = groups[start..end]
         .iter()
         .map(|group| {
-            ListItem::new(format!(
-                "#{:<4} {} dirs · {} files · free {}",
-                group.rank,
-                group.dir_count,
-                group.file_count,
-                human_bytes(group.reclaim_bytes()),
-            ))
+            // Same rule as the commander list: an unverified candidate makes no byte claim, and
+            // the qualifier survives the 52-column panel because it follows the rank directly.
+            match group.trust {
+                DirTrust::Trusted => ListItem::new(format!(
+                    "#{:<4} {} dirs · {} files · free {}",
+                    group.rank,
+                    group.dir_count,
+                    group.file_count,
+                    human_bytes(group.reclaim_bytes()),
+                )),
+                DirTrust::Untrusted => ListItem::new(format!(
+                    "#{:<4} rescan required · {} dirs · {} files",
+                    group.rank, group.dir_count, group.file_count,
+                )),
+            }
         })
         .collect();
     let list = List::new(items)
@@ -720,30 +795,30 @@ pub(crate) fn render_dir_group_summary_list(
 pub(crate) fn render_dir_group_files_with_keeper(
     frame: &mut Frame,
     area: Rect,
-    group: Option<&DirGroup>,
+    group: Option<&AttributedDirGroup>,
     keeper_index: usize,
     state: &mut ListState,
     focused: bool,
     title: &str,
 ) {
     let items: Vec<ListItem> = match group {
-        Some(group) => group
+        Some(attributed) => attributed
+            .group
             .paths
             .iter()
             .enumerate()
             .map(|(index, path)| {
                 let is_keeper = index == keeper_index;
-                let (prefix, color, suffix, suffix_color) = if is_keeper {
-                    ("★ ", Color::Green, "  (keeper)".to_string(), Color::Green)
-                } else {
-                    ("  ", Color::Reset, String::new(), Color::Reset)
-                };
-                let mut spans: Vec<Span<'static>> = vec![
-                    Span::styled(prefix, Style::new().fg(color).add_modifier(Modifier::BOLD)),
-                    Span::raw(path.display().to_string()),
-                ];
-                if !suffix.is_empty() {
-                    spans.push(Span::styled(suffix, Style::new().fg(suffix_color)));
+                let mut spans = member_prefix_spans(
+                    is_keeper,
+                    attributed.member_trust.get(index).copied(),
+                    path,
+                );
+                if is_keeper {
+                    spans.push(Span::styled(
+                        "  (keeper)".to_string(),
+                        Style::new().fg(Color::Green),
+                    ));
                 }
                 ListItem::new(Line::from(spans))
             })
@@ -1425,5 +1500,163 @@ pub(crate) mod tests {
         assert_eq!(visual_to_real_index(0, 24, 25), Some(24));
         // visual=25 is already outside the list.
         assert_eq!(visual_to_real_index(0, 25, 25), None);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // R3D: unverified directory candidates make no claims, at the narrowest real widths.
+    // -----------------------------------------------------------------------------------------
+
+    fn attributed_summary(rank: u32, trust: DirTrust) -> crate::state::AttributedDirGroupSummary {
+        crate::state::AttributedDirGroupSummary {
+            rank,
+            signature: format!("s{rank}"),
+            dir_count: 3,
+            file_count: 7,
+            size_per_dir: 4096,
+            trust,
+        }
+    }
+
+    fn attributed_group(trust: DirTrust, member_trust: Vec<DirTrust>) -> AttributedDirGroup {
+        AttributedDirGroup {
+            group: DirGroup {
+                id: 1,
+                signature: "sig".to_string(),
+                paths: vec![PathBuf::from("/t/one"), PathBuf::from("/t/two")],
+                file_count: 2,
+                size_per_dir: 512,
+            },
+            member_trust,
+            trust,
+        }
+    }
+
+    /// The classic Dirs rows at their fixed 52 columns: a trusted group states its savings, an
+    /// unverified candidate says `rescan required` right after the rank — where no truncation
+    /// can reach it — and shows no byte figure at all. Distinct figures per fixture, so a
+    /// neighbouring row cannot lend the missing text (the C4b2 lesson).
+    #[test]
+    fn classic_dir_rows_claim_nothing_for_unverified_candidates() {
+        let groups = vec![
+            attributed_summary(1, DirTrust::Trusted),
+            crate::state::AttributedDirGroupSummary {
+                rank: 2,
+                signature: "s2".to_string(),
+                dir_count: 5,
+                file_count: 9,
+                size_per_dir: 8192,
+                trust: DirTrust::Untrusted,
+            },
+        ];
+        let rendered = drawn(52, 8, |frame| {
+            let mut state = ListState::default();
+            render_dir_group_summary_list(
+                frame,
+                frame.area(),
+                &groups,
+                &mut state,
+                true,
+                Line::from(" groups "),
+            );
+        });
+        assert!(
+            rendered.contains("free 8.0 KiB"),
+            "the trusted row keeps its claim: {rendered}"
+        );
+        assert!(
+            rendered.contains("#2    rescan required · 5 dirs · 9 files"),
+            "the unverified row is a remedy, not a claim: {rendered}"
+        );
+        assert!(
+            !rendered.contains("32.0 KiB"),
+            "no byte figure may appear for the unverified candidate: {rendered}"
+        );
+    }
+
+    /// The commander DirGroupList rows at the 36-column panel floor: the qualifier follows the
+    /// rank, so the narrowest panel still shows `rescan required` while the byte claim of a
+    /// trusted row is allowed to fall off the end.
+    #[test]
+    fn commander_dir_rows_survive_the_36_column_floor() {
+        let groups = vec![
+            attributed_group(
+                DirTrust::Trusted,
+                vec![DirTrust::Trusted, DirTrust::Trusted],
+            ),
+            AttributedDirGroup {
+                group: DirGroup {
+                    id: 2,
+                    signature: "u".to_string(),
+                    paths: vec![PathBuf::from("/t/u1"), PathBuf::from("/t/u2")],
+                    file_count: 4,
+                    size_per_dir: 2048,
+                },
+                member_trust: vec![DirTrust::Untrusted, DirTrust::Untrusted],
+                trust: DirTrust::Untrusted,
+            },
+        ];
+        let rendered = drawn(36, 8, |frame| {
+            let mut state = ListState::default();
+            render_dir_group_list(frame, frame.area(), &groups, &mut state, true, " dirs ");
+        });
+        assert!(
+            rendered.contains("#2    rescan required"),
+            "the qualifier survives the narrowest panel: {rendered}"
+        );
+        assert!(
+            !rendered.contains("free 2.0 KiB"),
+            "the unverified candidate claims nothing: {rendered}"
+        );
+    }
+
+    /// Member rows carry the `?` marker for untrusted members — including the keeper, whose star
+    /// keeps its column — and trusted rows stay byte-identical to the parent's `★ `/`  `.
+    #[test]
+    fn member_rows_mark_untrusted_members() {
+        let group = attributed_group(
+            DirTrust::Untrusted,
+            vec![DirTrust::Trusted, DirTrust::Untrusted],
+        );
+        let rendered = drawn(36, 6, |frame| {
+            let mut state = ListState::default();
+            render_dir_group_files(
+                frame,
+                frame.area(),
+                Some(&group.group),
+                Some(&group.member_trust),
+                &mut state,
+                true,
+                " members ",
+            );
+        });
+        assert!(
+            rendered.contains("★ /t/one"),
+            "the trusted keeper is byte-identical to the parent: {rendered}"
+        );
+        assert!(
+            rendered.contains("? /t/two"),
+            "the untrusted member wears its marker: {rendered}"
+        );
+
+        let keeper_untrusted = attributed_group(
+            DirTrust::Untrusted,
+            vec![DirTrust::Untrusted, DirTrust::Trusted],
+        );
+        let rendered = drawn(36, 6, |frame| {
+            let mut state = ListState::default();
+            render_dir_group_files_with_keeper(
+                frame,
+                frame.area(),
+                Some(&keeper_untrusted),
+                0,
+                &mut state,
+                true,
+                " members ",
+            );
+        });
+        assert!(
+            rendered.contains("★?/t/one"),
+            "an untrusted keeper carries both marks: {rendered}"
+        );
     }
 }

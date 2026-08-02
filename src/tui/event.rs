@@ -28,9 +28,13 @@ pub enum AppEvent {
     /// Dedup attributes of ONE panel directory, read in the background from the DB:
     /// file status/hash + sizes/signatures of subdirectories. Placed in the cache by `cwd`.
     /// Replaces the former `CommanderDedupLoaded` (the whole scan in RAM).
+    ///
+    /// `Err` carries the sanitized store failure: an unknown reason, a corrupt key/count/
+    /// generation or a SQL failure must reach the operator as an error state, never render as a
+    /// directory that merely looks unscanned.
     CommanderDirDedup {
         cwd: std::path::PathBuf,
-        dir: crate::tui::commander::dedup::DirDedup,
+        dir: Result<crate::tui::commander::dedup::DirDedup, String>,
     },
     /// A directory's computed size, calculated in a background thread.
     CommanderDirSize(std::path::PathBuf, u64),

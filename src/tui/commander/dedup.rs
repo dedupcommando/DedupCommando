@@ -8,8 +8,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::model::duplicate::hex_encode;
-use crate::state::DedupRow;
+use crate::model::duplicate::{hex_encode, DirTrust};
+use crate::state::{DedupRow, LiveDirSignature};
 
 /// File status with respect to deduplication (color semaphore).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,7 +70,7 @@ impl DedupStatus {
 }
 
 /// Dedup attributes of a SINGLE panel directory: the status and hash of each
-/// file, the size and signature of each subdirectory. Tens-hundreds of entries — not the
+/// file, the size and typed signature of each subdirectory. Tens-hundreds of entries — not the
 /// whole scan.
 #[derive(Debug, Default, Clone)]
 pub struct DirDedup {
@@ -80,8 +80,10 @@ pub struct DirDedup {
     pub hashes: HashMap<PathBuf, String>,
     /// subdirectory path → total size of scan files under it.
     pub dir_sizes: HashMap<PathBuf, u64>,
-    /// subdirectory path → content signature (cross-panel highlighting).
-    pub dir_signatures: HashMap<PathBuf, String>,
+    /// subdirectory path → content signature WITH the trust the ledger vouched at read time.
+    /// A suppressed directory is absent. The untyped string accessor is gone on purpose: whoever
+    /// wants a signature must decide what its trust means, and only `Trusted` may look exact.
+    pub dir_signatures: HashMap<PathBuf, LiveDirSignature>,
 }
 
 impl DirDedup {
@@ -103,9 +105,21 @@ impl DirDedup {
         self.dir_sizes.get(path).copied()
     }
 
-    /// Content signature of subdirectory `path`.
-    pub fn dir_signature(&self, path: &Path) -> Option<&str> {
-        self.dir_signatures.get(path).map(String::as_str)
+    /// The TRUSTED content signature of subdirectory `path` — the only form that may enter a
+    /// cross-panel exact-match set, a match count or bright highlighting.
+    pub fn trusted_dir_signature(&self, path: &Path) -> Option<&str> {
+        self.dir_signatures
+            .get(path)
+            .filter(|live| live.trust == DirTrust::Trusted)
+            .map(|live| live.signature.as_str())
+    }
+
+    /// The signature and trust of subdirectory `path`, for rendering the explicit unverified
+    /// state. Never feeds a match set.
+    pub fn dir_signature_state(&self, path: &Path) -> Option<(&str, DirTrust)> {
+        self.dir_signatures
+            .get(path)
+            .map(|live| (live.signature.as_str(), live.trust))
     }
 }
 
@@ -113,17 +127,32 @@ impl DirDedup {
 /// `DedupIndex`: memory is bounded by the number of panels (`prune` discards directories
 /// that are not in any panel). Filled in the background when a panel's cwd changes
 /// (`fetch_panel_dedup` → `AppEvent::CommanderDirDedup`).
+///
+/// A failed load is cached as its error rather than as an empty `DirDedup`: an empty entry
+/// renders as «nothing here is in the scan», and a store failure must never wear that costume.
 #[derive(Debug, Default)]
 pub struct DedupCache {
-    by_cwd: HashMap<PathBuf, DirDedup>,
+    by_cwd: HashMap<PathBuf, Result<DirDedup, String>>,
     /// cwd with a started but unfinished background request — we don't duplicate the fetch.
     pending: HashSet<PathBuf>,
 }
 
 impl DedupCache {
-    /// Dedup data of directory `cwd`, if already loaded.
+    /// Dedup data of directory `cwd`, if already loaded successfully. A failed load answers
+    /// `None` here — fail-closed: no statuses, no signatures, no highlight.
     pub fn dir(&self, cwd: &Path) -> Option<&DirDedup> {
-        self.by_cwd.get(cwd)
+        match self.by_cwd.get(cwd) {
+            Some(Ok(dir)) => Some(dir),
+            _ => None,
+        }
+    }
+
+    /// The load error for directory `cwd`, if its background read failed.
+    pub fn error(&self, cwd: &Path) -> Option<&str> {
+        match self.by_cwd.get(cwd) {
+            Some(Err(message)) => Some(message.as_str()),
+            _ => None,
+        }
     }
 
     /// A background request is running for directory `cwd` (still loading).
@@ -135,8 +164,7 @@ impl DedupCache {
     /// the directory or in subdirectories). Corresponds to the former "dir is an ancestor
     /// of a scan file".
     pub fn covered(&self, cwd: &Path) -> bool {
-        self.by_cwd
-            .get(cwd)
+        self.dir(cwd)
             .map(|dir| !dir.status.is_empty() || !dir.dir_sizes.is_empty())
             .unwrap_or(false)
     }
@@ -147,7 +175,7 @@ impl DedupCache {
     }
 
     /// Places the result of a directory's background request into the cache (clears pending).
-    pub fn insert_dir(&mut self, cwd: PathBuf, dir: DirDedup) {
+    pub fn insert_dir(&mut self, cwd: PathBuf, dir: Result<DirDedup, String>) {
         self.pending.remove(&cwd);
         self.by_cwd.insert(cwd, dir);
     }
@@ -161,13 +189,21 @@ impl DedupCache {
     /// Adds a hash computed on demand for a file into its directory's cache (F4/after a
     /// move). A duplicate is determined within the same directory: entering a group for
     /// the authoritative picture still reads the DB. If the directory is not yet in the
-    /// cache — creates a lightweight entry with just this file.
+    /// cache — creates a lightweight entry with just this file. Fresh information supersedes a
+    /// cached error: the hash was just computed, so the entry restarts from it.
     pub fn insert_hash(&mut self, path: PathBuf, hash: [u8; 32]) {
         let Some(parent) = path.parent().map(Path::to_path_buf) else {
             return;
         };
         let hex = hex_encode(&hash);
-        let dir = self.by_cwd.entry(parent).or_default();
+        let slot = self
+            .by_cwd
+            .entry(parent)
+            .or_insert_with(|| Ok(DirDedup::default()));
+        if slot.is_err() {
+            *slot = Ok(DirDedup::default());
+        }
+        let dir = slot.as_mut().expect("just replaced any error");
         dir.hashes.insert(path, hex.clone());
         let same: Vec<PathBuf> = dir
             .hashes
@@ -258,11 +294,64 @@ mod tests {
     #[test]
     fn prune_drops_unkept_cwds() {
         let mut cache = DedupCache::default();
-        cache.insert_dir(PathBuf::from("/a"), DirDedup::default());
-        cache.insert_dir(PathBuf::from("/b"), DirDedup::default());
+        cache.insert_dir(PathBuf::from("/a"), Ok(DirDedup::default()));
+        cache.insert_dir(PathBuf::from("/b"), Ok(DirDedup::default()));
         let keep: HashSet<PathBuf> = [PathBuf::from("/a")].into_iter().collect();
         cache.prune(&keep);
         assert!(cache.dir(Path::new("/a")).is_some());
         assert!(cache.dir(Path::new("/b")).is_none());
+    }
+
+    /// A failed load is an error state, never an empty directory: `dir()` answers nothing (so no
+    /// status, signature or highlight can be built from it) and the message stays readable until
+    /// fresh information supersedes it.
+    #[test]
+    fn a_failed_load_is_an_error_not_an_empty_directory() {
+        let mut cache = DedupCache::default();
+        cache.mark_pending(PathBuf::from("/a"));
+        cache.insert_dir(PathBuf::from("/a"), Err("boom".to_string()));
+        assert!(cache.dir(Path::new("/a")).is_none(), "fail-closed");
+        assert!(!cache.covered(Path::new("/a")));
+        assert!(!cache.is_pending(Path::new("/a")));
+        assert_eq!(cache.error(Path::new("/a")), Some("boom"));
+        // A hash computed on demand is fresh information and restarts the entry.
+        cache.insert_hash(PathBuf::from("/a/x"), [9u8; 32]);
+        assert!(cache.error(Path::new("/a")).is_none());
+        assert!(cache.dir(Path::new("/a")).is_some());
+    }
+
+    /// Only a `Trusted` live signature may look exact; the untrusted one stays inspectable with
+    /// its trust beside it.
+    #[test]
+    fn only_a_trusted_signature_feeds_exact_matching() {
+        let mut dir = DirDedup::default();
+        dir.dir_signatures.insert(
+            PathBuf::from("/d/trusted"),
+            LiveDirSignature {
+                signature: "aa".into(),
+                trust: DirTrust::Trusted,
+            },
+        );
+        dir.dir_signatures.insert(
+            PathBuf::from("/d/unknown"),
+            LiveDirSignature {
+                signature: "bb".into(),
+                trust: DirTrust::Untrusted,
+            },
+        );
+        assert_eq!(
+            dir.trusted_dir_signature(Path::new("/d/trusted")),
+            Some("aa")
+        );
+        assert_eq!(
+            dir.trusted_dir_signature(Path::new("/d/unknown")),
+            None,
+            "an untrusted signature must never enter a match set"
+        );
+        assert_eq!(
+            dir.dir_signature_state(Path::new("/d/unknown")),
+            Some(("bb", DirTrust::Untrusted)),
+            "but it stays inspectable, with its trust beside it"
+        );
     }
 }

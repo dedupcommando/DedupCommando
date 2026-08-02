@@ -586,6 +586,20 @@ pub enum SnapshotOutcome {
     Unavailable(AuthorityUnavailable),
 }
 
+/// Scan-wide omission accounting. Exact totals exist only under full authority — anything less is
+/// typed [`ScanAccounting::Unavailable`], never an exact zero read off an empty or partial fold.
+/// `Bounded` alone proves the roots are keyable scope; whether the ledger may be summed is a
+/// separate fact, and this type is the only way to obtain the sum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanAccounting {
+    /// Every stored current-generation cell folded exactly once, checked. A committed empty
+    /// ledger is a genuine exact zero.
+    Exact(OmissionSummary),
+    /// Pre-ledger scans (no registration), registration drift, any generation-zero root, mixed
+    /// authority. Browseable, but no figure may be presented.
+    Unavailable,
+}
+
 /// One scan's completeness authority, loaded once and answerable offline.
 ///
 /// Holds the scan's own persisted configured roots, the registered generations, the checked
@@ -791,6 +805,38 @@ impl CompletenessSnapshot {
         } else {
             Ok(DirCompleteness::Incomplete(summary))
         }
+    }
+
+    /// The one authority predicate: the configured and registered root sets agree AND every
+    /// registered root carries a positive generation. `agrees` already pins set equality, so the
+    /// second clause reads the registered generations directly. This is what separates «bounded
+    /// scope» from «a ledger whose totals may be spoken»: pre-ledger scans, drift, a cleared root
+    /// and mixed authority all answer false here while still constructing a bounded snapshot.
+    pub fn fully_authoritative(&self) -> bool {
+        self.agrees && self.registered.values().all(|generation| *generation > 0)
+    }
+
+    /// Scan-wide accounting, gated by [`Self::fully_authoritative`]. The fold itself is private:
+    /// no caller can obtain totals without passing the authority gate, and authority is never
+    /// inferred from whether the totals happen to be empty.
+    pub fn scan_accounting(&self) -> Result<ScanAccounting> {
+        if !self.fully_authoritative() {
+            return Ok(ScanAccounting::Unavailable);
+        }
+        Ok(ScanAccounting::Exact(self.fold_totals()?))
+    }
+
+    /// Folds each stored current-generation cell exactly once, checked. Deliberately iterates the
+    /// rows and never calls [`Self::verdict`]: a root sentinel is one stored cell, and its
+    /// root-wide reach is verdict-time semantics that must not multiply it here.
+    fn fold_totals(&self) -> Result<OmissionSummary> {
+        let mut totals = OmissionSummary::default();
+        for (_, summary) in self.rows.values() {
+            for (reason, count) in summary.per_reason() {
+                totals.add(reason, count)?;
+            }
+        }
+        Ok(totals)
     }
 }
 
@@ -1651,5 +1697,90 @@ mod tests {
             maxed.disposition(Path::new("/a/q")),
             DirDisposition::Suppressed
         );
+    }
+
+    /// `Bounded` is scope; authority is this separate predicate. Pre-ledger, drift, a zeroed root
+    /// and MIXED generations all construct a bounded snapshot and must all answer false — only
+    /// full agreement with every generation positive answers true.
+    #[test]
+    fn full_authority_requires_agreement_and_every_generation_positive() {
+        fn check(roots: &[&str], gens: &[(&str, i64)], expect: bool, label: &str) {
+            let snapshot = bounded(roots, gens, Vec::new());
+            assert_eq!(snapshot.fully_authoritative(), expect, "{label}");
+        }
+        check(&["/a"], &[("/a", 1)], true, "one trusted root");
+        check(
+            &["/a", "/b"],
+            &[("/a", 1), ("/b", 2)],
+            true,
+            "two trusted roots",
+        );
+        check(&["/a"], &[], false, "pre-ledger: no registration at all");
+        check(&["/a"], &[("/other", 1)], false, "registration drift");
+        check(&["/a"], &[("/a", 0)], false, "generation zero");
+        check(
+            &["/a", "/b"],
+            &[("/a", 1), ("/b", 0)],
+            false,
+            "mixed authority: one positive root cannot vouch for the scan",
+        );
+    }
+
+    /// Accounting is gated by the predicate, never inferred from empty totals: a committed empty
+    /// ledger is a genuine exact zero, while a pre-ledger or partially cleared scan folding to
+    /// the very same emptiness is `Unavailable`.
+    #[test]
+    fn exact_accounting_exists_only_under_full_authority() {
+        let committed_empty = bounded(&["/a"], &[("/a", 1)], Vec::new());
+        match committed_empty.scan_accounting().unwrap() {
+            ScanAccounting::Exact(totals) => assert!(totals.is_empty(), "a genuine exact zero"),
+            ScanAccounting::Unavailable => panic!("a committed empty ledger is exact"),
+        }
+
+        for (gens, label) in [
+            (&[][..], "pre-ledger"),
+            (&[("/a", 0)][..], "generation zero"),
+        ] {
+            let snapshot = bounded(&["/a"], gens, Vec::new());
+            assert_eq!(
+                snapshot.scan_accounting().unwrap(),
+                ScanAccounting::Unavailable,
+                "{label} folds to the same emptiness and must NOT read as an exact zero"
+            );
+        }
+    }
+
+    /// The totals fold each stored cell exactly once. The mutation this exists to catch is a
+    /// fold written over per-directory verdicts: the root sentinel reaches every descendant
+    /// there, so such a fold would multiply it — here it is one stored cell, once.
+    #[test]
+    fn scan_totals_fold_each_stored_cell_once() {
+        let snapshot = bounded(
+            &["/a", "/b"],
+            &[("/a", 1), ("/b", 1)],
+            vec![
+                stored("/a", "/a", "walk_error", 3, 1),
+                stored("/a", "/a/x/y/z", "walk_error", 10, 1),
+                stored("/a", "/a/x", "min_size", 7, 1),
+                stored("/b", "/b/q", "unsupported_entry", 2, 1),
+            ],
+        );
+        match snapshot.scan_accounting().unwrap() {
+            ScanAccounting::Exact(totals) => {
+                assert_eq!(
+                    totals.per_reason().collect::<Vec<_>>(),
+                    vec![
+                        (OmissionReason::MinSize, EventCount::new(7).unwrap()),
+                        (OmissionReason::WalkError, EventCount::new(13).unwrap()),
+                        (
+                            OmissionReason::UnsupportedEntry,
+                            EventCount::new(2).unwrap()
+                        ),
+                    ],
+                    "3 + 10 walk errors, once each — never the sentinel times its descendants"
+                );
+            }
+            ScanAccounting::Unavailable => panic!("fully authoritative by construction"),
+        }
     }
 }

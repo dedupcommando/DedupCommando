@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, Result};
 use crate::model::action::ActionKind;
-use crate::model::omission::{DirDisposition, DirScope, LegacyContext, SignatureContext};
+#[cfg(test)]
+use crate::model::omission::LegacyContext;
+use crate::model::omission::{DirDisposition, DirScope, SignatureContext};
 use crate::model::reclaim::{GroupReclaim, LinkCount, ObjectLinks};
 
 /// A file that is part of a duplicate group.
@@ -185,17 +187,8 @@ fn by_benefit(a: &DirGroup, b: &DirGroup) -> std::cmp::Ordering {
         .then_with(|| a.signature.cmp(&b.signature))
 }
 
-/// Sorts directory groups by descending benefit and reassigns `id`.
-pub fn sort_dir_groups_by_benefit(groups: &mut [DirGroup]) {
-    groups.sort_by(by_benefit);
-    for (index, group) in groups.iter_mut().enumerate() {
-        group.id = index as u32;
-    }
-}
-
 /// Trust in an emitted signature. `Suppressed` never reaches here — it produces no signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum DirTrust {
     Trusted,
     Untrusted,
@@ -207,7 +200,6 @@ pub enum DirTrust {
 /// revalidates against the ledger's current state rather than trusting a stored value. `DirGroup`
 /// itself is unchanged, so every existing constructor and every database reader is untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct AttributedDirGroup {
     pub group: DirGroup,
     /// One entry per member, in exactly `group.paths` order.
@@ -222,7 +214,6 @@ pub struct AttributedDirGroup {
 /// A struct rather than a fifth positional argument, so the existing four-argument producer in
 /// `store::materialize_dir_groups` needs no change in this commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct DirSignature {
     pub path: PathBuf,
     pub signature: String,
@@ -232,9 +223,9 @@ pub struct DirSignature {
 }
 
 /// Sorts marker-aware groups by the same benefit ordering, carrying each member's trust with its
-/// path so the two vectors cannot fall out of step.
-#[allow(dead_code)]
-fn sort_attributed_by_benefit(groups: &mut [AttributedDirGroup]) {
+/// path so the two vectors cannot fall out of step. `pub(crate)`: the store's attributed readers
+/// rank their groups through this same function, so the two surfaces cannot order differently.
+pub(crate) fn sort_attributed_by_benefit(groups: &mut [AttributedDirGroup]) {
     groups.sort_by(|a, b| by_benefit(&a.group, &b.group));
     for (index, attributed) in groups.iter_mut().enumerate() {
         attributed.group.id = index as u32;
@@ -246,7 +237,6 @@ fn sort_attributed_by_benefit(groups: &mut [AttributedDirGroup]) {
 /// Under `Root` the chain stops at the selected root — component-wise, so a spelling with `.` or a
 /// trailing separator still matches. Under `Unbounded` it is exactly `path.ancestors().skip(1)`,
 /// which is what a pre-ledger build walks, including for a relative or `..`-spelled pathname.
-#[allow(dead_code)]
 fn accountable_ancestors<'p>(path: &'p Path, scope: DirScope<'_>) -> Vec<&'p Path> {
     match scope {
         DirScope::Outside => Vec::new(),
@@ -264,7 +254,6 @@ fn accountable_ancestors<'p>(path: &'p Path, scope: DirScope<'_>) -> Vec<&'p Pat
 /// The error a manifest file under no selected root produces. Unreachable when the manifest and
 /// the configured roots come from the same scan, which is exactly why it must be loud rather than
 /// a silent skip.
-#[allow(dead_code)]
 fn outside_every_root(path: &Path) -> AppError {
     AppError::msg(format!(
         "{} is not inside any selected scan root, so its directories cannot be attributed",
@@ -278,7 +267,6 @@ fn outside_every_root(path: &Path) -> AppError {
 /// Under a valid snapshot the ledger's own subtree aggregation already marks every ancestor
 /// through the owning root, so there is deliberately no second upward pass — the unhashed-file
 /// rule still propagates by its own file row, exactly as before.
-#[allow(dead_code)]
 pub fn build_dir_groups_in_context(
     files: &[(PathBuf, u64, Option<String>)],
     ctx: &dyn SignatureContext,
@@ -392,9 +380,14 @@ pub fn signature_of(entries: &[(String, String)]) -> String {
 /// `(path, size, hex hash)`. A directory gets a signature from its subtree;
 /// directories with the same signature and count >= 2 form a group.
 /// A pure function — tested without a DB.
-/// Compatibility wrapper: today's signature and today's output, delegating through the explicit
+/// Compatibility wrapper: the pre-R3C signature and output, delegating through the explicit
 /// unbounded, nothing-trusted context. Byte-, membership- and order-identical to the pre-R3C
 /// build, including its above-root output and relative or `..`-spelled inputs.
+///
+/// Test-only since R3D: every production caller selects its context from the persisted snapshot
+/// and reaches `LegacyContext` only through the typed `SnapshotOutcome::Unavailable` match. The
+/// wrapper survives precisely because the R3C parity evidence is expressed against it.
+#[cfg(test)]
 pub fn build_dir_groups(files: &[(PathBuf, u64, Option<String>)]) -> Vec<DirGroup> {
     build_dir_groups_in_context(files, &LegacyContext)
         .expect("the unbounded context puts no file outside a root")
@@ -438,6 +431,10 @@ pub enum DirSigAlgo {
 /// `emit(path, sig, total_size, file_count)` — a callback: called on the CLOSING of
 /// each directory; the caller usually streams into `materialize_dir_groups`.
 /// Errors from `emit` are propagated.
+///
+/// Test-only since R3D, for the same reason as `build_dir_groups`: the parity evidence lives
+/// here, and production goes through the `_in_context` builder with an explicit context.
+#[cfg(test)]
 pub fn build_dir_signatures_streaming<I, F>(files: I, mut emit: F) -> Result<()>
 where
     I: IntoIterator<Item = (PathBuf, u64, Option<String>)>,
@@ -469,7 +466,6 @@ where
 ///
 /// Retained directory state is the frame stack plus whatever the supplied context owns — there is
 /// no candidate-directory index anywhere in this function or its signature.
-#[allow(dead_code)]
 pub fn build_dir_signatures_streaming_in_context<I, F>(
     files: I,
     ctx: &dyn SignatureContext,

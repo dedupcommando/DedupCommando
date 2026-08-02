@@ -1031,7 +1031,7 @@ mod headless_readonly_tests {
 /// this reporting is that every surface says the same thing about the same result, and a claim
 /// nothing tests is a claim waiting to drift.
 fn completion_lines(summary: &model::scan::ScanSummary) -> Vec<String> {
-    vec![
+    let mut lines = vec![
         format!("Files scanned:        {}", summary.files_scanned),
         // Candidates without a pinned hash (error/identity) — did NOT take part in
         // duplicate detection. >0 → scan status `complete_with_warnings`.
@@ -1047,7 +1047,32 @@ fn completion_lines(summary: &model::scan::ScanSummary) -> Vec<String> {
             tui::format_duration(summary.elapsed_seconds),
             tui::format_speed(summary.bytes_hashed, summary.elapsed_seconds),
         ),
-    ]
+    ];
+    // The omission account, with its provenance: exact from the ledger, session-only when the
+    // roots carry no authority, or honestly not retained.
+    let counted = |totals: &model::omission::OmissionSummary, suffix: &str| match (
+        totals.known_omitted_files(),
+        totals.unsupported_entries(),
+    ) {
+        (Ok(files), Ok(entries)) => format!(
+            "Omissions:            {} files, {} walk errors, {} unsupported entries{}",
+            files,
+            totals.unknown_cardinality_events(),
+            entries,
+            suffix,
+        ),
+        _ => "Omissions:            totals overflow what can be printed".to_string(),
+    };
+    match &summary.omissions {
+        model::scan::OmissionAccounting::Ledger(totals) => lines.push(counted(totals, "")),
+        model::scan::OmissionAccounting::Observed(totals) => {
+            lines.push(counted(totals, " (session only — not persisted)"))
+        }
+        model::scan::OmissionAccounting::Unavailable => {
+            lines.push("Omissions:            details not retained".to_string())
+        }
+    }
+    lines
 }
 
 /// The per-scan block of the `--stats` report, for the same reason.
@@ -1085,6 +1110,7 @@ mod reporting_tests {
             bytes_hashed: 4096,
             elapsed_seconds: 1.0,
             hash_failures: 0,
+            ..Default::default()
         }
     }
 

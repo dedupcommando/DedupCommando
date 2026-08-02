@@ -75,16 +75,19 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let focus = board.focus;
 
     let source_dedup = app.commander.dedup.dir(&board.source.cwd);
+    let source_dedup_error = app.commander.dedup.error(&board.source.cwd);
     // Board does not use watch_cache (source/receivers are fixed).
     panel::render_panel(
         frame,
         slots[0].1,
         &mut board.source,
         source_dedup,
+        source_dedup_error,
         &cross,
         dir_sizes,
         &[],
         &[],
+        None,
         None,
         None,
         None,
@@ -96,15 +99,18 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let labels = ["1", "2", "3", "4"];
     for (i, label) in labels.iter().enumerate() {
         let dedup = app.commander.dedup.dir(&board.receivers[i].cwd);
+        let dedup_error = app.commander.dedup.error(&board.receivers[i].cwd);
         panel::render_panel(
             frame,
             slots[i + 1].1,
             &mut board.receivers[i],
             dedup,
+            dedup_error,
             &cross,
             dir_sizes,
             &[],
             &[],
+            None,
             None,
             None,
             None,
