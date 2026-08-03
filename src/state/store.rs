@@ -1045,6 +1045,11 @@ impl ScanStore {
             "file_mark",
             "file",
             "dir_dedup",
+            // Members before the summaries they name, and the authority before the scan it
+            // belongs to. The declared foreign keys enforce nothing while `PRAGMA foreign_keys`
+            // is off, so this order IS the enforcement — as it already is for the ledger below.
+            "file_group_member",
+            "scan_membership",
             "file_group",
             "file_dedup",
             "dir_omission",
@@ -1055,6 +1060,12 @@ impl ScanStore {
                 &format!("DELETE FROM {table} WHERE scan_id = ?1"),
                 params![scan_id],
             )?;
+            // Test seam: fails part-way down the list, so a rollback assertion here is about a
+            // real partial delete rather than a transaction that never began.
+            #[cfg(test)]
+            if table == "dir_dedup" && take_clear_fault() {
+                return Err(AppError::msg("injected purge fault"));
+            }
         }
         tx.execute("DELETE FROM scan WHERE id = ?1", params![scan_id])?;
         tx.commit()?;
@@ -1168,10 +1179,11 @@ impl ScanStore {
     /// that no longer exists, so `file_group` outliving the manifest is a group whose files cannot
     /// be found; `results_materialized` outliving it is worse still, because opening the scan then
     /// returns through that marker and hands the operator the old groups as if they were current.
-    /// Revoked here: `file_group`, the legacy `file_dedup` rows, `dir_dedup`, the prepared marker,
-    /// the published reclaim total and its state, and the counters that describe the deleted
-    /// manifest (`groups_found`, `files_scanned`, `bytes_hashed`, `hash_failures` and the four
-    /// candidate-progress columns).
+    /// Revoked here: the v5 membership authority (`scan_membership`) and its members
+    /// (`file_group_member`), `file_group`, the legacy `file_dedup` rows, `dir_dedup`, the prepared
+    /// marker, the published reclaim total and its state, and the counters that describe the
+    /// deleted manifest (`groups_found`, `files_scanned`, `bytes_hashed`, `hash_failures` and the
+    /// four candidate-progress columns).
     ///
     /// Deliberately NOT revoked: `file_mark` — the operator's own work, which a re-walk of the same
     /// roots re-attaches to a fresh manifest, and which already refuses a plan while its manifest
@@ -1187,6 +1199,17 @@ impl ScanStore {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM file WHERE scan_id = ?1", params![scan_id])?;
         delete_ledger_tx(&tx, scan_id, &ClearScope::WholeScan)?;
+        // Members first, then the authority that names their publication, then the summaries they
+        // belong to: membership that outlives its manifest is a trusted orphan, and an authority
+        // left standing over deleted members would read as «this scan's membership is known».
+        tx.execute(
+            "DELETE FROM file_group_member WHERE scan_id = ?1",
+            params![scan_id],
+        )?;
+        tx.execute(
+            "DELETE FROM scan_membership WHERE scan_id = ?1",
+            params![scan_id],
+        )?;
         tx.execute(
             "DELETE FROM file_group WHERE scan_id = ?1",
             params![scan_id],
@@ -3599,12 +3622,12 @@ impl Drop for LedgerInsertFault {
     }
 }
 
-// Test-only: fail `clear_files` from INSIDE its open transaction.
+// Test-only: fail `clear_files` or `purge_scan` from INSIDE its open transaction.
 //
 // A separate seam from `LEDGER_INSERT_FAULT` above, because that one is consulted only on the
-// ledger insert path and a clear never reaches it — arming it would prove nothing about this
-// transaction. Holding the write lock from a second connection is no substitute either: it stops
-// the transaction from ever starting, which is no-start atomicity, a different property from
+// ledger insert path and neither of these ever reaches it — arming it would prove nothing about
+// these transactions. Holding the write lock from a second connection is no substitute either: it
+// stops the transaction from ever starting, which is no-start atomicity, a different property from
 // rolling back after rows have already gone. Absent from every non-test build.
 #[cfg(test)]
 thread_local! {
@@ -3617,8 +3640,9 @@ pub(crate) struct ClearFault;
 
 #[cfg(test)]
 impl ClearFault {
-    /// Arms the shot. It fires inside `clear_files`, once the manifest, the ledger, `file_group`
-    /// and `file_dedup` rows are gone and before anything else in that transaction.
+    /// Arms the shot. In `clear_files` it fires once the manifest, the ledger, the membership and
+    /// `file_group`/`file_dedup` rows are gone and before anything else in that transaction; in
+    /// `purge_scan`, once the first tables of its explicit list have been deleted.
     pub(crate) fn armed() -> Self {
         CLEAR_FAULT.with(|slot| slot.set(true));
         ClearFault
@@ -10618,6 +10642,25 @@ mod tests {
                 ],
             )
             .unwrap();
+        // v5 membership, written by hand: R4A is storage only, so no production writer exists yet.
+        // Explicit mode, generation 1, both members of rank 0.
+        store
+            .conn
+            .execute(
+                "INSERT INTO scan_membership(scan_id, mode, generation) VALUES (?1, 2, 1)",
+                params![scan_id],
+            )
+            .unwrap();
+        for path in ["/tank/a.bin", "/tank/b.bin"] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
+                     VALUES (?1, 0, ?2, 1)",
+                    params![scan_id, path],
+                )
+                .unwrap();
+        }
         store
             .record_scan_environment(
                 scan_id,
@@ -10676,6 +10719,8 @@ mod tests {
     struct ScanState {
         manifest: Vec<String>,
         groups: Vec<String>,
+        authority: Vec<String>,
+        members: Vec<String>,
         legacy_members: Vec<String>,
         dir_groups: Vec<String>,
         materialized: bool,
@@ -10761,6 +10806,19 @@ mod tests {
                 scan_id,
                 7,
             ),
+            authority: rendered(
+                store,
+                "SELECT mode, generation FROM scan_membership WHERE scan_id = ?1",
+                scan_id,
+                2,
+            ),
+            members: rendered(
+                store,
+                "SELECT group_rank, path, generation FROM file_group_member
+                  WHERE scan_id = ?1 ORDER BY group_rank, path",
+                scan_id,
+                3,
+            ),
             legacy_members: rendered(
                 store,
                 "SELECT hash, path FROM file_dedup WHERE scan_id = ?1 ORDER BY path",
@@ -10801,6 +10859,11 @@ mod tests {
         let before = scan_state(&store, scan_id);
         assert!(!before.groups.is_empty(), "the fixture published groups");
         assert!(before.materialized, "the fixture set the prepared marker");
+        assert!(
+            !before.authority.is_empty(),
+            "the fixture published an authority"
+        );
+        assert_eq!(before.members.len(), 2, "the fixture published members");
 
         store.clear_files(scan_id).unwrap();
 
@@ -10809,6 +10872,14 @@ mod tests {
         assert!(
             after.groups.is_empty(),
             "file_group must go with the manifest"
+        );
+        assert!(
+            after.authority.is_empty(),
+            "an authority over a deleted manifest reads as «this membership is known»"
+        );
+        assert!(
+            after.members.is_empty(),
+            "members that outlive their manifest are trusted orphans"
         );
         assert!(
             after.legacy_members.is_empty(),
@@ -10994,6 +11065,149 @@ mod tests {
         assert_eq!(scan_state(&store, scan_id), before);
         drop(store);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Rows of the two v5 tables anywhere in the database, whatever scan they belong to.
+    fn membership_rows(store: &ScanStore) -> (i64, i64) {
+        store
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM scan_membership),
+                        (SELECT COUNT(*) FROM file_group_member)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    /// A purge is the hard, irreversible delete: it must leave no row of the scan anywhere,
+    /// membership included, and it must not reach into a second scan.
+    #[test]
+    fn purge_scan_removes_the_membership_tables_and_spares_other_scans() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let first = seed_published_scan(&mut store);
+        let second = seed_published_scan(&mut store);
+        let other_before = scan_state(&store, second);
+        assert_eq!(
+            membership_rows(&store),
+            (2, 4),
+            "both scans have membership"
+        );
+
+        store.purge_scan(first).unwrap();
+
+        // The purged scan keeps no row anywhere — `scan_stats` is gone too, so this asks the
+        // tables directly rather than through the snapshot helper.
+        for table in [
+            "scan_membership",
+            "file_group_member",
+            "file_group",
+            "file",
+            "file_dedup",
+            "dir_dedup",
+            "scan_stats",
+            "file_mark",
+        ] {
+            let rows: i64 = store
+                .conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE scan_id = ?1"),
+                    params![first],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0, "{table} still holds rows of the purged scan");
+        }
+        assert_eq!(
+            membership_rows(&store),
+            (1, 2),
+            "only the purged scan's membership is gone"
+        );
+        assert_eq!(
+            scan_state(&store, second),
+            other_before,
+            "the other scan is untouched"
+        );
+        let scans: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM scan WHERE id = ?1",
+                params![first],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(scans, 0, "the scan row itself is gone");
+    }
+
+    /// A purge that fails part-way down its table list leaves every row, membership included.
+    /// The fault fires after real deletes, so this is rollback rather than no-start atomicity.
+    #[test]
+    fn a_failed_purge_preserves_every_row() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_published_scan(&mut store);
+        let before = scan_state(&store, scan_id);
+
+        let fault = ClearFault::armed();
+        let err = store
+            .purge_scan(scan_id)
+            .expect_err("the armed fault must fail the purge");
+        assert!(err.to_string().contains("injected purge fault"), "{err}");
+        assert!(
+            fault.fired(),
+            "a seam that was never reached proves nothing"
+        );
+
+        assert_eq!(
+            scan_state(&store, scan_id),
+            before,
+            "a failed purge leaves the complete prior state"
+        );
+        assert_eq!(membership_rows(&store), (1, 2));
+    }
+
+    /// R4A is storage only. Every ordinary flow — a fresh manifest, a derived materialization, a
+    /// `--verify` publication and a legacy preparation — must leave both new tables empty, because
+    /// no production writer exists yet and none may infer an authority from the rows it finds.
+    #[test]
+    fn ordinary_flows_write_no_membership() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+
+        // Fresh scan: manifest and hashes only.
+        let fresh = seed_two_groups(&mut store);
+        assert_eq!(
+            membership_rows(&store),
+            (0, 0),
+            "walking/hashing writes none"
+        );
+
+        // The default publication path.
+        store.materialize_file_groups(fresh).unwrap();
+        assert_eq!(
+            membership_rows(&store),
+            (0, 0),
+            "derived publication writes none"
+        );
+
+        // The --verify publication path.
+        let verified = seed_two_groups(&mut store);
+        let groups = store.duplicate_groups(verified).unwrap();
+        store.record_file_results(verified, &groups).unwrap();
+        assert_eq!(
+            membership_rows(&store),
+            (0, 0),
+            "explicit publication writes none"
+        );
+
+        // The legacy preparation path.
+        let legacy = seed_two_groups(&mut store);
+        store.set_status(legacy, ScanStatus::Complete).unwrap();
+        store.ensure_materialized(legacy).unwrap();
+        assert!(store.results_materialized(legacy).unwrap());
+        assert_eq!(
+            membership_rows(&store),
+            (0, 0),
+            "preparing a legacy result may not invent an authority"
+        );
     }
 
     /// A second commit replaces the first wholesale and advances the generation; no row of the

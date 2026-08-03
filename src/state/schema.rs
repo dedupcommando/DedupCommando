@@ -116,6 +116,57 @@ CREATE TABLE IF NOT EXISTS file_dedup (
     PRIMARY KEY (scan_id, hash, path)
 );
 CREATE INDEX IF NOT EXISTS file_dedup_by_scan_hash ON file_dedup(scan_id, hash);
+-- v5, the membership authority: which writer last published this scan's results, and which
+-- publication the member rows below belong to. ONE row per scan.
+--
+-- Absence of a row is the answer for a scan no v5 writer has spoken for — a migrated v4
+-- checkpoint, or one whose publication never committed — and it reads as «unknown», never as
+-- «derived». There is deliberately no persisted unknown mode: a mode column that could spell it
+-- would let a writer, or a migration, manufacture the one state that must only ever be inferred
+-- from absence.
+--
+-- `mode` 1 = derived (membership is the manifest by digest), 2 = explicit (membership is the
+-- `file_group_member` rows). `generation` is bumped by every publication, so a group identity
+-- carried by an older plan can be recognised as stale rather than silently re-resolved: rank is
+-- reassigned by payoff on each publication, and `{scan_id, rank}` alone would name a different
+-- group after republication.
+--
+-- Storage only in R4A: no production reader or writer touches this table yet.
+CREATE TABLE IF NOT EXISTS scan_membership (
+    scan_id    INTEGER NOT NULL PRIMARY KEY,
+    mode       INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    CHECK (mode IN (1, 2)),
+    CHECK (generation > 0),
+    FOREIGN KEY (scan_id) REFERENCES scan(id) ON DELETE CASCADE
+);
+-- v5, the accepted members of one verified group. Written ONLY in explicit mode.
+--
+-- `path` carries the exact `file.path` TEXT spelling, in whatever form the walk yielded: a scan
+-- rooted at a relative path stores relative pathnames, and a name containing LF is one member, not
+-- two. No absolute-path check, no normalization, no canonicalization — the membership domain is
+-- the manifest's domain or it is a second answer waiting to disagree.
+--
+-- `generation` is redundant with `scan_membership.generation` by construction (publication is
+-- delete-then-insert in one transaction) and is kept as a cross-check against a hand-edited row.
+CREATE TABLE IF NOT EXISTS file_group_member (
+    scan_id    INTEGER NOT NULL,
+    group_rank INTEGER NOT NULL,
+    path       TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    PRIMARY KEY (scan_id, group_rank, path),
+    CHECK (group_rank >= 0),
+    CHECK (generation > 0),
+    CHECK (path <> ''),
+    FOREIGN KEY (scan_id, group_rank)
+        REFERENCES file_group(scan_id, rank) ON DELETE CASCADE
+);
+-- The reverse question every cursor asks — «which group is this pathname in?» — and the structural
+-- form of the rule that one path belongs to at most one group of a scan. Not a duplicate of the
+-- primary key: that one is prefixed by `group_rank`, this one is not. `file_group.hash` stays
+-- non-unique, so two explicit ranks may legitimately share one digest.
+CREATE UNIQUE INDEX IF NOT EXISTS file_group_member_by_path
+    ON file_group_member(scan_id, path);
 CREATE TABLE IF NOT EXISTS hash_cache (
     device     INTEGER NOT NULL,
     inode      INTEGER NOT NULL,
@@ -218,7 +269,14 @@ CREATE INDEX IF NOT EXISTS dir_omission_by_root
 /// not open a v4 DB: it cannot see `scan_root`, so it would judge a v4 scan's directories by the
 /// hash-only completeness rule alone and hand back exactly the false twins the ledger exists to
 /// suppress.
-pub const SCHEMA_VERSION: i64 = 4;
+///
+/// v5 adds the membership authority: `scan_membership` (which writer published this scan's
+/// results, and which publication) and `file_group_member` (the accepted members of a verified
+/// group). Purely additive — two new tables and one index, no column on any existing table, so the
+/// migration reads no data and rewrites no row. A v4 build must not open a v5 DB: it cannot see the
+/// authority, so it would answer every membership question from raw digests and hand back the very
+/// pathnames verification rejected.
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// The version refusal itself, parameterized by the maximum schema a *reading build* supports.
 ///
@@ -334,6 +392,13 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // tables, so the `CREATE TABLE IF NOT EXISTS` batch above already brought them into an
     // existing DB. No column is added to any existing table, no row is read and none is rewritten
     // — a migrated scan simply has no `scan_root` row, which is exactly «completeness unknown».
+    //
+    // v5, membership, needs nothing here either, and for the same reason: `scan_membership`,
+    // `file_group_member` and the one index arrived with the batch above. Nothing seeds them — a
+    // migrated scan simply has no authority row, which is exactly «membership unknown». Inferring
+    // an authority from the rows a v4 result already carries is the one thing this migration must
+    // never do: those rows are what the raw-digest readers built, and stamping them `derived` would
+    // hand a migrated checkpoint the destructive trust it was never granted.
     // Stamp the current schema version (also upgrades a pre-versioning DB from 0).
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
@@ -433,6 +498,30 @@ mod tests {
             .collect()
     }
 
+    /// Strips what v5 adds. Written once, for the same reason `strip_v4` is: a rewind fixture that
+    /// keeps a later version's tables is not that version's shape.
+    fn strip_v5(conn: &Connection) {
+        conn.execute_batch(
+            "DROP TABLE file_group_member;
+             DROP TABLE scan_membership;",
+        )
+        .unwrap();
+        let tables = table_names(conn);
+        assert!(!tables.contains(&"scan_membership".to_string()));
+        assert!(!tables.contains(&"file_group_member".to_string()));
+        assert!(!index_names(conn).contains(&"file_group_member_by_path".to_string()));
+    }
+
+    /// A genuinely v4-shaped DB: the current schema with every v5 addition taken away again and the
+    /// stamp rewound.
+    fn v4_shaped_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        strip_v5(&conn);
+        conn.pragma_update(None, "user_version", 4i64).unwrap();
+        conn
+    }
+
     /// Strips what v4 adds. Shared by both rewind fixtures below, so «what v4 adds» is written
     /// once and neither shape can drift away from it.
     fn strip_v4(conn: &Connection) {
@@ -453,6 +542,7 @@ mod tests {
     fn v3_shaped_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
+        strip_v5(&conn);
         strip_v4(&conn);
         conn.pragma_update(None, "user_version", 3i64).unwrap();
         conn
@@ -464,6 +554,7 @@ mod tests {
     fn v2_shaped_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
+        strip_v5(&conn);
         strip_v4(&conn);
         conn.execute_batch(
             "DROP INDEX file_scan_identity;
@@ -696,18 +787,55 @@ mod tests {
         assert_eq!((groups, prepared), (4, 0));
     }
 
-    /// A fresh writable DB is exactly schema v4: every new column, table and index comes from
+    /// A fresh writable DB is exactly schema v5: every new column, table and index comes from
     /// `CREATE TABLE`/`CREATE INDEX`, not only from the `ALTER` path a migrated DB takes.
     #[test]
-    fn fresh_db_is_schema_v4_with_every_new_column_table_and_index() {
+    fn fresh_db_is_schema_v5_with_every_new_column_table_and_index() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
 
-        assert_eq!(SCHEMA_VERSION, 4, "v4 is the schema this build writes");
+        assert_eq!(SCHEMA_VERSION, 5, "v5 is the schema this build writes");
         let stamped: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(stamped, 4, "a fresh DB is stamped v4");
+        assert_eq!(stamped, 5, "a fresh DB is stamped v5");
+
+        // v5: the membership authority and its members, with the one reverse index.
+        let tables = table_names(&conn);
+        for table in ["scan_membership", "file_group_member"] {
+            assert!(
+                tables.contains(&table.to_string()),
+                "no table {table} in a fresh DB"
+            );
+        }
+        assert_eq!(
+            columns_of(&conn, "scan_membership"),
+            vec!["scan_id", "mode", "generation"],
+            "the authority's shape is part of the contract"
+        );
+        assert_eq!(
+            columns_of(&conn, "file_group_member"),
+            vec!["scan_id", "group_rank", "path", "generation"]
+        );
+        assert!(
+            index_names(&conn).contains(&"file_group_member_by_path".to_string()),
+            "no index file_group_member_by_path"
+        );
+        // Exactly one explicit index on the member table: the primary key already provides the
+        // (scan_id, group_rank, path) order, so a second one over the same prefix would be dead
+        // weight on every publication.
+        let member_indexes: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1")
+            .unwrap()
+            .query_map(["file_group_member"], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .filter(|name| !name.starts_with("sqlite_autoindex"))
+            .collect();
+        assert_eq!(
+            member_indexes,
+            vec!["file_group_member_by_path".to_string()]
+        );
 
         // v4: the omission ledger, both tables and the root-keyed index.
         let tables = table_names(&conn);
@@ -778,7 +906,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             user_version(&conn),
-            4,
+            SCHEMA_VERSION,
             "the stamp moves to the current schema"
         );
 
@@ -899,24 +1027,41 @@ mod tests {
             (0, 0),
             "a migrated scan has no authority and no ledger — it is unknown, not complete"
         );
+
+        // v5: the same shape for membership. The migrated scan carries a `file_group` summary the
+        // raw-digest readers built, and stamping that as `derived` would hand it destructive trust
+        // it never earned. Absence of the authority row is the whole answer.
+        let (authority, members): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM scan_membership WHERE scan_id = 1),
+                        (SELECT COUNT(*) FROM file_group_member WHERE scan_id = 1)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (authority, members),
+            (0, 0),
+            "a migrated scan's membership is unknown; nothing may be inferred from its summaries"
+        );
     }
 
     /// The v3→v4 step on its own, on a DB whose shape really is v3: two tables and one index
     /// appear, the stamp moves, and the existing result is untouched.
     #[test]
-    fn a_v3_db_migrates_to_v4_and_gains_no_authority() {
+    fn a_v3_db_migrates_and_gains_no_authority() {
         let conn = v3_shaped_db();
         seed_completed_scan(&conn);
         assert_eq!(user_version(&conn), 3, "the fixture really is a v3 DB");
         let data_before = representative_data(&conn);
         assert!(!data_before.is_empty(), "there must be data to preserve");
 
-        // A v3 DB is readable by this build, and migrating brings it to v4.
+        // A v3 DB is readable by this build, and migrating brings it to the current schema.
         assert!(ensure_version_supported(&conn).is_ok());
         migrate(&conn).unwrap();
         migrate(&conn).unwrap(); // idempotent
 
-        assert_eq!(user_version(&conn), 4, "the stamp moves to v4");
+        assert_eq!(user_version(&conn), SCHEMA_VERSION, "the stamp moves");
         let tables = table_names(&conn);
         for table in ["scan_root", "dir_omission"] {
             assert!(
@@ -1017,10 +1162,9 @@ mod tests {
     /// *is* what a v3 build does to a v4 DB.
     #[test]
     fn a_v3_aware_build_refuses_a_v4_db() {
-        // A real v4 DB with real results, produced by the actual migration.
-        let conn = v3_shaped_db();
+        // A real v4-shaped DB with real results.
+        let conn = v4_shaped_db();
         seed_completed_scan(&conn);
-        migrate(&conn).unwrap();
         assert_eq!(user_version(&conn), 4, "the subject really is a v4 DB");
 
         let schema_before = schema_fingerprint(&conn);
@@ -1102,5 +1246,340 @@ mod tests {
             data_before,
             "nor touch the data"
         );
+    }
+
+    /// The v5 half of the same guarantee: a build that only knows v4 must refuse a v5 DB rather
+    /// than answer every membership question from raw digests and hand back the pathnames
+    /// verification rejected.
+    ///
+    /// The refusing maximum is `SCHEMA_VERSION - 1`, not a literal: a literal 4 would quietly
+    /// become «the current schema» at the next bump and the refusal it asserts would stop existing.
+    #[test]
+    fn a_v4_aware_build_refuses_a_v5_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        seed_completed_scan(&conn);
+        assert_eq!(
+            user_version(&conn),
+            SCHEMA_VERSION,
+            "the subject is a current-schema DB"
+        );
+
+        let schema_before = schema_fingerprint(&conn);
+        let data_before = representative_data(&conn);
+        assert!(!data_before.is_empty(), "there must be data to compare");
+
+        // This build's own maximum accepts it; that is the control.
+        assert!(ensure_version_supported(&conn).is_ok());
+
+        let previous = SCHEMA_VERSION - 1;
+        let err = ensure_version_at_most(&conn, previous)
+            .expect_err("a build one version behind must refuse this DB");
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("schema v{SCHEMA_VERSION}")),
+            "the database's own version must be named: {text}"
+        );
+        assert!(
+            text.contains(&format!("supports v{previous}")),
+            "and the maximum the refusing build supports: {text}"
+        );
+
+        assert_eq!(
+            user_version(&conn),
+            SCHEMA_VERSION,
+            "a refusal must not restamp"
+        );
+        assert_eq!(schema_fingerprint(&conn), schema_before, "nor migrate");
+        assert_eq!(
+            representative_data(&conn),
+            data_before,
+            "nor touch the data"
+        );
+    }
+
+    /// The v4→v5 step on a DB whose shape really is v4 and which carries a real result: two tables
+    /// and one index appear, the stamp moves, every pre-existing row survives byte for byte, and
+    /// the new tables are empty — no authority is invented for a scan that never published one.
+    #[test]
+    fn a_v4_db_migrates_to_v5_additively_and_invents_no_authority() {
+        let conn = v4_shaped_db();
+        seed_completed_scan(&conn);
+        assert_eq!(user_version(&conn), 4, "the fixture really is a v4 DB");
+        let data_before = representative_data(&conn);
+        assert!(!data_before.is_empty(), "there must be data to preserve");
+        let tables_before = table_names(&conn);
+
+        assert!(ensure_version_supported(&conn).is_ok());
+        migrate(&conn).unwrap();
+        let after_first = schema_fingerprint(&conn);
+        migrate(&conn).unwrap(); // reopening a v5 DB is idempotent
+
+        assert_eq!(user_version(&conn), SCHEMA_VERSION, "the stamp moves to v5");
+        assert_eq!(
+            schema_fingerprint(&conn),
+            after_first,
+            "a second open must not rewrite the schema"
+        );
+        for table in ["scan_membership", "file_group_member"] {
+            assert!(
+                !tables_before.contains(&table.to_string()),
+                "{table} must be absent before the migration"
+            );
+            assert!(
+                table_names(&conn).contains(&table.to_string()),
+                "no table {table} after the v4→v5 migration"
+            );
+        }
+        assert!(index_names(&conn).contains(&"file_group_member_by_path".to_string()));
+        assert_eq!(
+            representative_data(&conn),
+            data_before,
+            "the migration reads no data and rewrites no row"
+        );
+
+        let (authority, members): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM scan_membership),
+                        (SELECT COUNT(*) FROM file_group_member)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (authority, members),
+            (0, 0),
+            "nothing is backfilled: a migrated scan's membership stays unknown"
+        );
+    }
+
+    /// A migration that fails leaves the exact v4 state — no half-created table, no stamp. The
+    /// failure is real SQLite behaviour rather than an injected seam: a database in which
+    /// `file_group_member` already exists with a foreign shape takes `CREATE TABLE IF NOT EXISTS`
+    /// as a no-op and then fails on the index over columns that table does not have, after
+    /// `scan_membership` has already been created inside the same transaction.
+    #[test]
+    fn a_failed_migration_rolls_back_both_the_ddl_and_the_stamp() {
+        let conn = v4_shaped_db();
+        seed_completed_scan(&conn);
+        conn.execute_batch("CREATE TABLE file_group_member (unrelated INTEGER);")
+            .unwrap();
+        let schema_before = schema_fingerprint(&conn);
+        let data_before = representative_data(&conn);
+
+        let err = migrate(&conn).expect_err("the index cannot be built over a foreign table");
+        assert!(
+            err.to_string().contains("scan_id"),
+            "the failure must name the missing column: {err}"
+        );
+
+        assert_eq!(
+            user_version(&conn),
+            4,
+            "a failed migration must not restamp"
+        );
+        assert!(
+            !table_names(&conn).contains(&"scan_membership".to_string()),
+            "the table created earlier in the same transaction must be rolled back"
+        );
+        assert_eq!(
+            schema_fingerprint(&conn),
+            schema_before,
+            "the exact prior schema survives"
+        );
+        assert_eq!(representative_data(&conn), data_before, "and its data");
+    }
+
+    /// Seeds one scan with one group summary, the anchor every member row needs.
+    fn seed_group_for_members(conn: &Connection, scan_id: i64, ranks: &[(i64, &str)]) {
+        conn.execute(
+            "INSERT OR IGNORE INTO scan(id, created_at, updated_at, status, config_json)
+             VALUES (?1, 'then', 'then', 'completed', '{\"roots\":[]}')",
+            [scan_id],
+        )
+        .unwrap();
+        for (rank, hash) in ranks {
+            conn.execute(
+                "INSERT INTO file_group(scan_id, rank, hash, file_count, size, reclaim)
+                 VALUES (?1, ?2, ?3, 2, 100, 100)",
+                rusqlite::params![scan_id, rank, hash],
+            )
+            .unwrap();
+        }
+    }
+
+    /// Every declared constraint, exercised on INSERT and on UPDATE. A CHECK that only holds on
+    /// insert is a CHECK a later writer can walk around.
+    #[test]
+    fn membership_constraints_hold_on_insert_and_update() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        seed_group_for_members(&conn, 1, &[(0, "aabb")]);
+
+        // The authority: modes 1 and 2 are accepted, everything else is not.
+        for mode in [1i64, 2] {
+            conn.execute(
+                "INSERT OR REPLACE INTO scan_membership(scan_id, mode, generation)
+                 VALUES (1, ?1, 1)",
+                [mode],
+            )
+            .unwrap();
+        }
+        for mode in [0i64, 3, -1] {
+            assert!(
+                conn.execute(
+                    "INSERT OR REPLACE INTO scan_membership(scan_id, mode, generation)
+                     VALUES (2, ?1, 1)",
+                    [mode],
+                )
+                .is_err(),
+                "mode {mode} must be refused — unknown is absence, not a value"
+            );
+        }
+        for generation in [0i64, -1] {
+            assert!(
+                conn.execute(
+                    "INSERT OR REPLACE INTO scan_membership(scan_id, mode, generation)
+                     VALUES (2, 1, ?1)",
+                    [generation],
+                )
+                .is_err(),
+                "generation {generation} must be refused"
+            );
+        }
+        assert!(
+            conn.execute("UPDATE scan_membership SET mode = 3 WHERE scan_id = 1", [])
+                .is_err(),
+            "the mode CHECK must hold on UPDATE too"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE scan_membership SET generation = 0 WHERE scan_id = 1",
+                []
+            )
+            .is_err(),
+            "the generation CHECK must hold on UPDATE too"
+        );
+
+        // The members: rank >= 0, generation > 0, path non-empty.
+        conn.execute(
+            "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
+             VALUES (1, 0, '/tank/a', 1)",
+            [],
+        )
+        .unwrap();
+        for (rank, path, generation, why) in [
+            (-1i64, "/tank/b", 1i64, "a negative rank"),
+            (0, "", 1, "an empty path"),
+            (0, "/tank/b", 0, "a zero generation"),
+            (0, "/tank/b", -1, "a negative generation"),
+        ] {
+            assert!(
+                conn.execute(
+                    "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
+                     VALUES (1, ?1, ?2, ?3)",
+                    rusqlite::params![rank, path, generation],
+                )
+                .is_err(),
+                "{why} must be refused"
+            );
+        }
+        for (sql, why) in [
+            ("UPDATE file_group_member SET group_rank = -1", "rank"),
+            ("UPDATE file_group_member SET path = ''", "path"),
+            ("UPDATE file_group_member SET generation = 0", "generation"),
+        ] {
+            assert!(
+                conn.execute(sql, []).is_err(),
+                "the {why} CHECK must hold on UPDATE too"
+            );
+        }
+    }
+
+    /// One pathname belongs to at most one group of a scan — the unique index is the structural
+    /// form of that rule. The same pathname in a different scan is a different fact and stays
+    /// legal, and two ranks of one scan may legitimately share a digest: that is the two-verified-
+    /// subgroups shape the whole round exists to make representable.
+    #[test]
+    fn a_path_belongs_to_one_group_while_two_ranks_may_share_a_digest() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        seed_group_for_members(&conn, 1, &[(0, "aabb"), (1, "aabb")]);
+        seed_group_for_members(&conn, 2, &[(0, "aabb")]);
+
+        conn.execute(
+            "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
+             VALUES (1, 0, '/tank/a', 7)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
+                 VALUES (1, 1, '/tank/a', 7)",
+                [],
+            )
+            .is_err(),
+            "one path in two ranks of one scan is the corruption the index exists to refuse"
+        );
+        // A different scan is a different fact.
+        conn.execute(
+            "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
+             VALUES (2, 0, '/tank/a', 7)",
+            [],
+        )
+        .unwrap();
+        // And two ranks sharing one digest, each with its own members, is legal.
+        conn.execute(
+            "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
+             VALUES (1, 1, '/tank/b', 7)",
+            [],
+        )
+        .unwrap();
+        let shared: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_group WHERE scan_id = 1 AND hash = 'aabb'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared, 2, "file_group.hash must stay non-unique");
+    }
+
+    /// The member domain is the manifest's domain: whatever spelling the walk yielded comes back
+    /// byte for byte. A relative root is a supported scan, and LF is legal inside a pathname — one
+    /// member with a newline in its name is one member, not two.
+    #[test]
+    fn member_paths_round_trip_exactly() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        seed_group_for_members(&conn, 1, &[(0, "aabb")]);
+
+        let paths = [
+            "./dir-completeness-resume/a.bin",
+            "relative/b.bin",
+            "/tank/we\nird.bin",
+            "/tank/ünïcødé.bin",
+        ];
+        for (index, path) in paths.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
+                 VALUES (1, 0, ?1, ?2)",
+                rusqlite::params![path, index as i64 + 1],
+            )
+            .unwrap();
+        }
+        let stored: Vec<String> = conn
+            .prepare("SELECT path FROM file_group_member WHERE scan_id = 1 ORDER BY generation")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(stored, paths, "no normalization, no canonicalization");
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM file_group_member", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 4, "the LF name is one row, not two");
     }
 }
