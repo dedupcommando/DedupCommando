@@ -347,8 +347,15 @@ pub fn ensure_migrated(conn: &Connection) -> Result<()> {
 /// Accepts exactly the current schema and nothing else — for a connection that must neither
 /// migrate nor tolerate a half-known file (the staged apply-lease opener). One `PRAGMA
 /// user_version` read serves both comparisons: calling the two existing helpers would read the
-/// pragma twice, and the two reads could in principle disagree. The wording of each refusal is
-/// the wording of the existing helper for that direction. Performs no migration and no write.
+/// pragma twice, and the two reads could in principle disagree. Performs no migration and no
+/// write.
+///
+/// The two directions keep distinct wording, and the older one is deliberately NOT the
+/// read-only helper's sentence: this caller holds a READ_WRITE connection and its reader IS the
+/// operator, so «read-only mode cannot upgrade it — start dedcom as the operator» would send
+/// someone to do what they are already doing. What is actually true is that a destructive apply
+/// refuses to migrate at all: migration belongs to the ordinary open path, which must run
+/// first.
 ///
 /// Staged by R4B-1; `ScanStore::open_for_apply_lease` is its only caller until R4B-2 wires the
 /// worker route.
@@ -361,7 +368,7 @@ pub fn ensure_version_exact(conn: &Connection) -> Result<()> {
     }
     if version < SCHEMA_VERSION {
         return Err(AppError::msg(format!(
-            "dedcom.db uses an older schema (v{version}; this build needs v{SCHEMA_VERSION}) and read-only mode cannot upgrade it. Start dedcom once as the operator."
+            "dedcom.db uses an older schema (v{version}; this build needs v{SCHEMA_VERSION}), and applying actions never migrates the checkpoint. Open dedcom normally once so it upgrades the database, then run the actions again."
         )));
     }
     Ok(())
@@ -1988,13 +1995,19 @@ mod tests {
         ensure_version_exact(&conn).unwrap();
 
         for (seeded, must_contain) in [
-            (SCHEMA_VERSION - 1, "older schema"),
-            (0, "older schema"),
-            (SCHEMA_VERSION + 1, "newer version"),
+            (SCHEMA_VERSION - 1, "never migrates the checkpoint"),
+            (0, "never migrates the checkpoint"),
+            (SCHEMA_VERSION + 1, "created by a newer version"),
         ] {
             conn.pragma_update(None, "user_version", seeded).unwrap();
             let text = ensure_version_exact(&conn).unwrap_err().to_string();
             assert!(text.contains(must_contain), "v{seeded}: {text}");
+            // The old wording sent an operator holding a READ_WRITE connection to «start
+            // dedcom once as the operator». It must not come back.
+            assert!(
+                !text.contains("read-only mode"),
+                "the apply refusal must not blame read-only mode: {text}"
+            );
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();

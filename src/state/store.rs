@@ -3870,6 +3870,18 @@ pub struct MembershipSnapshot<'a> {
     scan_id: i64,
     mode: MembershipMode,
     generation: i64,
+    /// The whole-authority integrity result, computed once when the snapshot was taken and
+    /// shared by every trusted method.
+    integrity: AuthorityIntegrity,
+}
+
+/// What the one central validation found. Structural corruption never reaches this value — it
+/// fails the snapshot outright — so what remains is the per-group disagreement the contract
+/// deliberately keeps reportable: a summary whose `file_count` differs from its real member
+/// count. `summaries()` names those identities; every exact answer for them refuses.
+#[derive(Debug, Clone, Default)]
+struct AuthorityIntegrity {
+    inconsistent_ranks: std::collections::BTreeSet<i64>,
 }
 
 /// The held apply lease: one `BEGIN IMMEDIATE` transaction that validated the witness and now
@@ -3968,6 +3980,165 @@ fn decode_authority(
     }
 }
 
+/// The one whole-authority validation every trusted membership answer rests on.
+///
+/// Set-wise and fixed in statement count — never per group, never per page. It accounts for the
+/// COMPLETE scan, because the alternative is what R4B-1 shipped: each method validating the
+/// subset it happened to read, so corruption one row past a `LIMIT` was trusted.
+///
+/// Statements: 1 (summary domains, both modes) + 1 (mode-specific structure) + 1 (per-rank
+/// count agreement). Structural corruption that cannot be represented safely returns
+/// `Inconsistent` here, before any trusted answer exists; ordinary per-group count
+/// disagreement is carried out as the exact ranks, so `summaries()` can name them while every
+/// exact answer for them refuses.
+fn validate_authority(
+    tx: &Connection,
+    scan_id: i64,
+    mode: MembershipMode,
+    generation: i64,
+) -> std::result::Result<AuthorityIntegrity, MembershipMiss> {
+    if mode == MembershipMode::Unknown {
+        // Nothing is trusted, so there is nothing to validate: the candidate view derives raw
+        // digests and hands back no identity at all.
+        return Ok(AuthorityIntegrity::default());
+    }
+
+    // 1. Storage classes and domains of every summary cell this layer converts to Rust. A
+    //    declared INTEGER is an affinity, not a domain: `-3` and a BLOB both live happily in
+    //    `file_count`, and `as u64` would turn the first into 18446744073709551613.
+    let bad_summary: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM file_group
+          WHERE scan_id = ?1
+            AND (typeof(rank) <> 'integer' OR rank < 0
+              OR typeof(hash) <> 'text'
+              OR typeof(file_count) <> 'integer' OR file_count < 0
+              OR typeof(size) <> 'integer' OR size < 0
+              OR typeof(reclaim) <> 'integer' OR reclaim < 0
+              OR typeof(object_count) <> 'integer' OR object_count < 0
+              OR typeof(reclaim_state) <> 'integer' OR reclaim_state < 0)",
+        params![scan_id],
+        |row| row.get(0),
+    )?;
+    if bad_summary != 0 {
+        return Err(MembershipMiss::Inconsistent {
+            detail: format!(
+                "scan {scan_id} holds {bad_summary} group summary row(s) whose stored values are \
+                 not in the domain this build can read"
+            ),
+        });
+    }
+
+    match mode {
+        MembershipMode::Explicit => {
+            // 2. Every structural Explicit invariant, in ONE statement, over the whole scan.
+            let (bad_cells, wrong_generation, no_manifest, no_summary, duplicated, empty_groups): (
+                i64,
+                i64,
+                i64,
+                i64,
+                i64,
+                i64,
+            ) = tx.query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM file_group_member m
+                     WHERE m.scan_id = ?1
+                       AND (typeof(m.path) <> 'text'
+                         OR typeof(m.group_rank) <> 'integer' OR m.group_rank < 0
+                         OR typeof(m.generation) <> 'integer')),
+                   (SELECT COUNT(*) FROM file_group_member m
+                     WHERE m.scan_id = ?1 AND m.generation <> ?2),
+                   (SELECT COUNT(*) FROM file_group_member m
+                     LEFT JOIN file f ON f.scan_id = m.scan_id AND f.path = m.path
+                     WHERE m.scan_id = ?1 AND f.path IS NULL),
+                   (SELECT COUNT(*) FROM file_group_member m
+                     LEFT JOIN file_group g ON g.scan_id = m.scan_id AND g.rank = m.group_rank
+                     WHERE m.scan_id = ?1 AND g.rank IS NULL),
+                   (SELECT COUNT(*) FROM (SELECT path FROM file_group_member
+                                           WHERE scan_id = ?1
+                                           GROUP BY path HAVING COUNT(*) > 1)),
+                   (SELECT COUNT(*) FROM file_group g
+                     LEFT JOIN file_group_member m
+                            ON m.scan_id = g.scan_id AND m.group_rank = g.rank
+                     WHERE g.scan_id = ?1 AND m.path IS NULL)",
+                params![scan_id, generation],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )?;
+            for (count, what) in [
+                (
+                    bad_cells,
+                    "member row(s) whose stored values are out of domain",
+                ),
+                (
+                    wrong_generation,
+                    "member row(s) of a generation other than the current publication",
+                ),
+                (no_manifest, "member row(s) with no manifest row"),
+                (no_summary, "member row(s) with no group summary"),
+                (duplicated, "pathname(s) belonging to two ranks"),
+                (empty_groups, "explicit group(s) with no members"),
+            ] {
+                if count != 0 {
+                    return Err(MembershipMiss::Inconsistent {
+                        detail: format!("scan {scan_id} holds {count} {what}"),
+                    });
+                }
+            }
+        }
+        MembershipMode::Derived => {
+            // 2'. Derived membership is the manifest by digest, so its own invariant is that
+            //     no member row exists at all — a surplus row is corruption, never surplus.
+            let members: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM file_group_member WHERE scan_id = ?1",
+                params![scan_id],
+                |row| row.get(0),
+            )?;
+            if members != 0 {
+                return Err(MembershipMiss::Inconsistent {
+                    detail: format!(
+                        "scan {scan_id} declares derived membership but holds {members} explicit \
+                         member row(s)"
+                    ),
+                });
+            }
+        }
+        MembershipMode::Unknown => unreachable!("returned above"),
+    }
+
+    // 3. Per-rank count agreement, for the whole scan at once. This is the ONE disagreement
+    //    the contract keeps reportable rather than fatal: the caller learns which identities
+    //    are inconsistent, and every exact answer for them refuses.
+    let members_expr = match mode {
+        MembershipMode::Explicit => {
+            "(SELECT COUNT(*) FROM file_group_member m
+               WHERE m.scan_id = g.scan_id AND m.group_rank = g.rank)"
+        }
+        _ => {
+            "(SELECT COUNT(*) FROM file f
+               WHERE f.scan_id = g.scan_id AND f.hash = unhex(g.hash))"
+        }
+    };
+    let mut stmt = tx.prepare(&format!(
+        "SELECT g.rank FROM file_group g
+          WHERE g.scan_id = ?1 AND {members_expr} <> g.file_count
+          ORDER BY g.rank"
+    ))?;
+    let rows = stmt.query_map(params![scan_id], |row| row.get::<_, i64>(0))?;
+    let mut inconsistent_ranks = std::collections::BTreeSet::new();
+    for row in rows {
+        inconsistent_ranks.insert(row?);
+    }
+    Ok(AuthorityIntegrity { inconsistent_ranks })
+}
+
 /// Serializes the witnessed `{rank, digest}` pairs into the ONE JSON array parameter the
 /// validation statements bind — the bound-variable count never grows with the plan.
 fn witness_wants_json(witness: &PlanWitness) -> String {
@@ -4013,46 +4184,17 @@ impl ScanStore {
             Some((mode_value, generation_value)) => decode_authority(mode_value, generation_value)
                 .map_err(|detail| MembershipMiss::Inconsistent { detail })?,
         };
-        match mode {
-            MembershipMode::Derived => {
-                // A member row under derived authority is corruption, never surplus.
-                let members: i64 = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM file_group_member WHERE scan_id = ?1)",
-                    params![scan_id],
-                    |row| row.get(0),
-                )?;
-                if members != 0 {
-                    return Err(MembershipMiss::Inconsistent {
-                        detail: format!(
-                            "scan {scan_id} declares derived membership but holds explicit member rows"
-                        ),
-                    });
-                }
-            }
-            MembershipMode::Explicit => {
-                // One path in two ranks is structurally impossible while the unique index
-                // stands; a checkpoint that lost the index is exactly what must not pass.
-                let duplicated: i64 = tx.query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM file_group_member WHERE scan_id = ?1
-                          GROUP BY path HAVING COUNT(*) > 1
-                     )",
-                    params![scan_id],
-                    |row| row.get(0),
-                )?;
-                if duplicated != 0 {
-                    return Err(MembershipMiss::Inconsistent {
-                        detail: format!("scan {scan_id} holds one pathname in two groups"),
-                    });
-                }
-            }
-            MembershipMode::Unknown => {}
-        }
+        // ONE whole-authority integrity result, computed here, under this transaction, and
+        // shared by every trusted method. Nothing below re-derives a subset of it: a page, a
+        // reverse lookup or a membership test that validated only what it happened to read is
+        // exactly how corruption outside the read escapes.
+        let integrity = validate_authority(&tx, scan_id, mode, generation)?;
         Ok(MembershipSnapshot {
             tx,
             scan_id,
             mode,
             generation,
+            integrity,
         })
     }
 
@@ -4351,51 +4493,68 @@ impl ScanStore {
     }
 
     /// The future single preparation path: distinguishes a scan the v5 authority already
-    /// speaks for from a legacy/migrated one it does not. An authoritative scan is validated
-    /// and left exactly as it is; malformed authority is an error, never a shrug. A scan with
-    /// NO authority gets today's browse-only summary preparation (`ensure_materialized`) and
-    /// deliberately NO `scan_membership`/`file_group_member` row: a completed v4→v5 checkpoint
-    /// stays Unknown and browse-only until a real republish or rescan.
+    /// speaks for from a legacy/migrated one it does not. A scan with NO authority gets
+    /// today's browse-only summary preparation (`ensure_materialized`) and deliberately NO
+    /// `scan_membership`/`file_group_member` row: a completed v4→v5 checkpoint stays Unknown
+    /// and browse-only until a real republish or rescan.
+    ///
+    /// An authoritative scan is validated by the SAME whole-authority rules every reader
+    /// obeys, under one consistent snapshot — not by reading the two authority cells and
+    /// calling that validation. A valid scan is left byte-identical; every corruption those
+    /// rules name is refused here too, including the per-rank count disagreement, because
+    /// «prepared» must not mean «prepared and unusable».
     ///
     /// Staged by R4B-1 with no production caller.
     #[allow(dead_code)] // R4B-2 repoints the preparation call sites here.
     pub fn prepare_legacy_for_viewing(&mut self, scan_id: i64) -> Result<()> {
-        use rusqlite::OptionalExtension;
-        let authority: Option<(Value, Value)> = self
-            .conn
-            .query_row(
-                "SELECT mode, generation FROM scan_membership WHERE scan_id = ?1",
-                params![scan_id],
-                |row| Ok((row.get::<_, Value>(0)?, row.get::<_, Value>(1)?)),
-            )
-            .optional()?;
-        match &authority {
-            None => self.ensure_materialized(scan_id),
-            Some((mode_value, generation_value)) => {
-                let (mode, _generation) =
-                    decode_authority(mode_value, generation_value).map_err(|detail| {
-                        AppError::msg(format!(
-                            "scan {scan_id} carries malformed membership authority ({detail}) — \
-                             refusing to prepare it"
-                        ))
-                    })?;
-                if mode == MembershipMode::Derived {
-                    let members: i64 = self.conn.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM file_group_member WHERE scan_id = ?1)",
-                        params![scan_id],
-                        |row| row.get(0),
-                    )?;
-                    if members != 0 {
-                        return Err(AppError::msg(format!(
-                            "scan {scan_id} declares derived membership but holds explicit \
-                             member rows — refusing to prepare corrupt authority"
-                        )));
-                    }
+        let legacy = {
+            let snapshot = self.membership_snapshot(scan_id).map_err(|miss| {
+                AppError::msg(format!(
+                    "scan {scan_id} cannot be prepared: {}",
+                    describe_miss(&miss)
+                ))
+            })?;
+            if snapshot.mode() == MembershipMode::Unknown {
+                true
+            } else {
+                // The one reportable disagreement is fatal for preparation: a browsing surface
+                // opened on it would show a group whose every exact answer refuses.
+                let summaries = snapshot.summaries().map_err(|miss| {
+                    AppError::msg(format!(
+                        "scan {scan_id} cannot be prepared: {}",
+                        describe_miss(&miss)
+                    ))
+                })?;
+                if let Some(id) = summaries.inconsistent.first() {
+                    return Err(AppError::msg(format!(
+                        "scan {scan_id} holds a group (rank {}) whose summary and membership \
+                         disagree — refusing to prepare corrupt authority",
+                        id.rank
+                    )));
                 }
-                // Already authoritative: validated, and deliberately a no-op.
-                Ok(())
+                false
             }
+        };
+        if legacy {
+            // Browsing summaries only. No authority row, no member row, nothing invented.
+            return self.ensure_materialized(scan_id);
         }
+        Ok(())
+    }
+}
+
+/// One sentence for a typed miss, so a caller that must return `AppError` does not have to
+/// invent wording per call site — and so no control flow is ever decided from the text.
+fn describe_miss(miss: &MembershipMiss) -> String {
+    match miss {
+        MembershipMiss::NoSuchScan => "no such scan".into(),
+        MembershipMiss::NoSuchGroup => "no such group".into(),
+        MembershipMiss::Unknown => "the scan has no membership authority".into(),
+        MembershipMiss::Stale { expected, found } => {
+            format!("the plan carries generation {expected}, the database {found}")
+        }
+        MembershipMiss::Inconsistent { detail } => detail.clone(),
+        MembershipMiss::Store { detail } => detail.clone(),
     }
 }
 
@@ -4417,7 +4576,9 @@ impl MembershipSnapshot<'_> {
         Ok(())
     }
 
-    /// An identity is answerable only when it names this scan's CURRENT publication.
+    /// An identity is answerable only when it names this scan's CURRENT publication AND the
+    /// central validation found its rank consistent. The rank check is here, in the one gate
+    /// every exact answer passes through, rather than in each method.
     fn require_current(&self, id: &GroupId) -> std::result::Result<(), MembershipMiss> {
         self.require_authority()?;
         if id.scan_id != self.scan_id || id.rank < 0 {
@@ -4429,33 +4590,40 @@ impl MembershipSnapshot<'_> {
                 found: self.generation,
             });
         }
+        self.require_consistent(id.rank)
+    }
+
+    /// A rank the central validation found inconsistent answers nothing exactly — only
+    /// `summaries()` reports it, by identity.
+    fn require_consistent(&self, rank: i64) -> std::result::Result<(), MembershipMiss> {
+        if self.integrity.inconsistent_ranks.contains(&rank) {
+            return Err(MembershipMiss::Inconsistent {
+                detail: format!(
+                    "group rank {rank} of scan {} declares a member count its membership does \
+                     not hold",
+                    self.scan_id
+                ),
+            });
+        }
         Ok(())
     }
 
-    /// Every current summary with its identity, plus the identities whose summary and
-    /// membership disagree — named, never repaired.
+    /// Every current summary with its identity, plus the identities the central validation
+    /// found inconsistent — named, never repaired. The inconsistency verdict is not recomputed
+    /// here: it is the same whole-authority result every other method obeys.
     pub fn summaries(&self) -> std::result::Result<MembershipSummaries, MembershipMiss> {
         self.require_authority()?;
-        let members_sql = match self.mode {
-            MembershipMode::Explicit => {
-                "(SELECT COUNT(*) FROM file_group_member m
-                   WHERE m.scan_id = g.scan_id AND m.group_rank = g.rank)"
-            }
-            _ => {
-                "(SELECT COUNT(*) FROM file f
-                   WHERE f.scan_id = g.scan_id AND f.hash = unhex(g.hash))"
-            }
-        };
-        let mut stmt = self.tx.prepare(&format!(
-            "SELECT g.rank, g.hash, g.file_count, g.size, g.reclaim, g.object_count,
-                    g.reclaim_state, {members_sql} AS members
-               FROM file_group g WHERE g.scan_id = ?1 ORDER BY g.rank"
-        ))?;
+        let mut stmt = self.tx.prepare(
+            "SELECT rank, hash, file_count, size, reclaim, object_count, reclaim_state
+               FROM file_group WHERE scan_id = ?1 ORDER BY rank",
+        )?;
         let rows = stmt.query_map(params![self.scan_id], |row| {
             Ok((
                 GroupSummary {
                     rank: row.get(0)?,
                     hash: row.get(1)?,
+                    // The domains were validated centrally, so these conversions cannot turn a
+                    // negative cell into a plausible huge count.
                     file_count: row.get::<_, i64>(2)? as u64,
                     size_bytes: row.get::<_, i64>(3)? as u64,
                     object_count: row.get::<_, i64>(5)? as u64,
@@ -4463,13 +4631,12 @@ impl MembershipSnapshot<'_> {
                 },
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(6)?,
-                row.get::<_, i64>(7)?,
             ))
         })?;
         let mut groups = Vec::new();
         let mut inconsistent = Vec::new();
         for row in rows {
-            let (mut summary, reclaim, state, members) = row?;
+            let (mut summary, reclaim, state) = row?;
             summary.reclaim = ReclaimEstimate::from_persisted(reclaim, state).map_err(|err| {
                 MembershipMiss::Inconsistent {
                     detail: err.to_string(),
@@ -4480,7 +4647,7 @@ impl MembershipSnapshot<'_> {
                 rank: summary.rank,
                 generation: self.generation,
             };
-            if members as u64 != summary.file_count {
+            if self.integrity.inconsistent_ranks.contains(&summary.rank) {
                 inconsistent.push(id);
             }
             groups.push((id, summary));
@@ -4561,6 +4728,9 @@ impl MembershipSnapshot<'_> {
         let text = path.to_string_lossy();
         match self.mode {
             MembershipMode::Explicit => {
+                // Generation, manifest presence and summary existence were settled centrally
+                // for every member of the scan; what remains is this rank's own consistency,
+                // which no identity may escape.
                 let rank: Option<i64> = self
                     .tx
                     .query_row(
@@ -4570,11 +4740,17 @@ impl MembershipSnapshot<'_> {
                         |row| row.get(0),
                     )
                     .optional()?;
-                Ok(rank.map(|rank| GroupId {
-                    scan_id: self.scan_id,
-                    rank,
-                    generation: self.generation,
-                }))
+                match rank {
+                    None => Ok(None),
+                    Some(rank) => {
+                        self.require_consistent(rank)?;
+                        Ok(Some(GroupId {
+                            scan_id: self.scan_id,
+                            rank,
+                            generation: self.generation,
+                        }))
+                    }
+                }
             }
             _ => {
                 let mut stmt = self.tx.prepare(
@@ -4590,11 +4766,14 @@ impl MembershipSnapshot<'_> {
                 let ranks: Vec<i64> = rows.collect::<rusqlite::Result<_>>()?;
                 match ranks.as_slice() {
                     [] => Ok(None),
-                    [rank] => Ok(Some(GroupId {
-                        scan_id: self.scan_id,
-                        rank: *rank,
-                        generation: self.generation,
-                    })),
+                    [rank] => {
+                        self.require_consistent(*rank)?;
+                        Ok(Some(GroupId {
+                            scan_id: self.scan_id,
+                            rank: *rank,
+                            generation: self.generation,
+                        }))
+                    }
                     _ => Err(MembershipMiss::Inconsistent {
                         detail: format!(
                             "one digest resolves {} to two ranks under derived authority",
@@ -4701,24 +4880,24 @@ impl MembershipSnapshot<'_> {
                 detail: err.to_string(),
             }
         })?;
-        let live = self.group_member_count(id)?;
-        if live != summary.file_count {
-            return Err(MembershipMiss::Inconsistent {
-                detail: format!(
-                    "group rank {} declares {} members while its membership holds {live}",
-                    id.rank, summary.file_count
-                ),
-            });
-        }
-        if self.mode == MembershipMode::Explicit && live == 0 {
-            return Err(MembershipMiss::Inconsistent {
-                detail: format!("explicit group rank {} has no member rows", id.rank),
-            });
-        }
+        // `require_current` already refused a rank the central validation found inconsistent,
+        // and that validation covered the WHOLE scan — every member's generation, manifest row
+        // and summary, over every rank, not just the rows a page happens to return. What is
+        // left to check here is only the shape of what was actually read.
         let members = match self.mode {
             MembershipMode::Explicit => self.explicit_members(id, page)?,
             _ => self.derived_members(id, page)?,
         };
+        if page.is_none() && members.len() as u64 != summary.file_count {
+            return Err(MembershipMiss::Inconsistent {
+                detail: format!(
+                    "group rank {} returned {} members against a declared {}",
+                    id.rank,
+                    members.len(),
+                    summary.file_count
+                ),
+            });
+        }
         Ok(ResolvedGroup {
             id: *id,
             mode: self.mode,
@@ -4727,8 +4906,10 @@ impl MembershipSnapshot<'_> {
         })
     }
 
-    /// Explicit members: the member rows of the current generation joined back to the manifest
-    /// — a member without its manifest row, or of another generation, is corruption.
+    /// Explicit members: the member rows joined to the manifest. An INNER join is correct here
+    /// precisely BECAUSE the central validation ran under this same transaction — a member
+    /// without a manifest row already refused the whole snapshot, so a join that could silently
+    /// shorten a page cannot be reached with one.
     fn explicit_members(
         &self,
         id: &GroupId,
@@ -4736,41 +4917,18 @@ impl MembershipSnapshot<'_> {
     ) -> std::result::Result<Vec<FileEntry>, MembershipMiss> {
         let (limit, offset) = page_bounds(page);
         let mut stmt = self.tx.prepare(&format!(
-            "SELECT {GROUP_FILE_COLUMNS}, mm.path, mm.generation
+            "SELECT {GROUP_FILE_COLUMNS}
                FROM file_group_member mm
-               LEFT JOIN file f      ON f.scan_id = mm.scan_id AND f.path = mm.path
+               JOIN file f           ON f.scan_id = mm.scan_id AND f.path = mm.path
                LEFT JOIN file_mark m ON m.scan_id = mm.scan_id AND m.path = mm.path
               WHERE mm.scan_id = ?1 AND mm.group_rank = ?2
               ORDER BY mm.path
               LIMIT ?3 OFFSET ?4"
         ))?;
-        let mut rows = stmt.query(params![id.scan_id, id.rank, limit, offset])?;
+        let rows = stmt.query_map(params![id.scan_id, id.rank, limit, offset], group_file_row)?;
         let mut members = Vec::new();
-        while let Some(row) = rows.next()? {
-            let manifest_path: Option<String> = row.get(0)?;
-            let member_path: String = row.get(11)?;
-            if manifest_path.is_none() {
-                return Err(MembershipMiss::Inconsistent {
-                    detail: format!(
-                        "member {} of group rank {} has no manifest row",
-                        crate::textsan::terminal(&member_path),
-                        id.rank
-                    ),
-                });
-            }
-            let member_generation: i64 = row.get(12)?;
-            if member_generation != self.generation {
-                return Err(MembershipMiss::Inconsistent {
-                    detail: format!(
-                        "member {} of group rank {} carries generation {member_generation} \
-                         under authority generation {}",
-                        crate::textsan::terminal(&member_path),
-                        id.rank,
-                        self.generation
-                    ),
-                });
-            }
-            members.push(group_file_row(row)?);
+        for row in rows {
+            members.push(row?);
         }
         Ok(members)
     }
@@ -4978,6 +5136,28 @@ fn stream_witnessed_ranks(
         let observed: i64 = row
             .get(if read_member_generation { 6 } else { 5 })
             .map_err(lease_store_refusal)?;
+        if read_member_generation {
+            // Explicit mode carries two more columns: this member's manifest presence, and the
+            // scan's count of pathnames living in two ranks. Both are structural corruption
+            // that must stop the batch before it starts.
+            let has_manifest: i64 = row.get(7).map_err(lease_store_refusal)?;
+            if member_path.is_some() && has_manifest == 0 {
+                return Err(LeaseRefusal::Inconsistent {
+                    detail: format!(
+                        "rank {rank} carries member {} with no manifest row",
+                        crate::textsan::terminal(member_path.as_deref().unwrap_or_default())
+                    ),
+                });
+            }
+            let duplicated: i64 = row.get(8).map_err(lease_store_refusal)?;
+            if duplicated != 0 {
+                return Err(LeaseRefusal::Inconsistent {
+                    detail: format!(
+                        "the scan holds {duplicated} pathname(s) belonging to two ranks"
+                    ),
+                });
+            }
+        }
         if current.as_ref().map(|c| c.rank) != Some(rank) {
             if let Some(done) = current.take() {
                 check_witnessed_rank(&done, witness, generation)?;
@@ -5006,6 +5186,14 @@ fn stream_witnessed_ranks(
 /// Explicit-mode validation: one statement, one member per ROW (P0d §1.2). Pathname boundaries
 /// are row boundaries — nothing is concatenated, nothing is parsed, and a member named `a\nb`
 /// can never equal two members `a` and `b`.
+///
+/// Every returned member also carries its manifest presence and its own generation, and the
+/// statement counts the scan's duplicated pathnames once, as an uncorrelated scalar. So the
+/// final gate re-establishes the structural Explicit invariants itself — a member whose
+/// manifest row was deleted after planning, a member of another generation, a member with no
+/// summary, one pathname in two ranks — instead of trusting an earlier resolver read or the
+/// unique index still existing in an externally damaged database. Statement and bind counts are
+/// unchanged: one statement, three binds, whatever K is.
 fn validate_explicit_witness(
     tx: &Connection,
     witness: &PlanWitness,
@@ -5021,10 +5209,15 @@ fn validate_explicit_witness(
                    FROM json_each(?2)
              )
              SELECT want.rank, want.digest, g.hash, g.file_count, m.path, m.generation,
-                    COUNT(m.path) OVER (PARTITION BY want.rank) AS observed
+                    COUNT(m.path) OVER (PARTITION BY want.rank) AS observed,
+                    f.path IS NOT NULL                          AS has_manifest,
+                    (SELECT COUNT(*) FROM (SELECT path FROM file_group_member
+                                            WHERE scan_id = ?1
+                                            GROUP BY path HAVING COUNT(*) > 1)) AS dup_paths
                FROM want
                LEFT JOIN file_group        g ON g.scan_id = ?1 AND g.rank       = want.rank
                LEFT JOIN file_group_member m ON m.scan_id = ?1 AND m.group_rank = want.rank
+               LEFT JOIN file              f ON f.scan_id = ?1 AND f.path        = m.path
               ORDER BY want.rank, m.path",
         )
         .map_err(lease_store_refusal)?;
@@ -15132,8 +15325,20 @@ mod membership_staging_tests {
         let digest = [121u8; 32];
         let a = write(&dir, "a.bin", b"corrupt");
         let b = write(&dir, "b.bin", b"corrupt");
+        // A third manifest row outside the group: substituting a member for THIS pathname is a
+        // membership change, while substituting one for a pathname the manifest never had is a
+        // missing manifest row — two different refusals, and the fixture must not conflate them.
+        let spare = write(&dir, "spare.bin", b"unrelated");
         let mut store = ScanStore::open_in_memory().unwrap();
-        let scan_id = seed(&mut store, &dir, &[(a.clone(), digest), (b, digest)]);
+        let scan_id = seed(
+            &mut store,
+            &dir,
+            &[
+                (a.clone(), digest),
+                (b, digest),
+                (spare.clone(), [122u8; 32]),
+            ],
+        );
         let verified =
             crate::pipeline::verify::verify_groups(store.duplicate_groups(scan_id).unwrap())
                 .unwrap();
@@ -15151,26 +15356,28 @@ mod membership_staging_tests {
         };
         assert!(store.acquire_membership_lease(&witness).is_ok());
 
-        // A member set that changed under a live authority.
-        let moved = dir.join("moved.bin");
+        // A member set that changed under a live authority, to a pathname the manifest does
+        // hold — so the refusal is about membership, not about a missing manifest row.
         store
             .conn
             .execute(
                 "UPDATE file_group_member SET path = ?2
                   WHERE scan_id = ?1 AND group_rank = 0 AND path = ?3",
-                params![scan_id, moved.to_string_lossy(), a.to_string_lossy()],
+                params![scan_id, spare.to_string_lossy(), a.to_string_lossy()],
             )
             .unwrap();
         assert_eq!(
             store.acquire_membership_lease(&witness).err(),
-            Some(LeaseRefusal::MembershipChanged { path: moved })
+            Some(LeaseRefusal::MembershipChanged {
+                path: spare.clone()
+            })
         );
         store
             .conn
             .execute(
-                "UPDATE file_group_member SET path = ?2 WHERE scan_id = ?1 AND group_rank = 0
-                   AND path NOT IN (SELECT path FROM file WHERE scan_id = ?1)",
-                params![scan_id, a.to_string_lossy()],
+                "UPDATE file_group_member SET path = ?2
+                  WHERE scan_id = ?1 AND group_rank = 0 AND path = ?3",
+                params![scan_id, a.to_string_lossy(), spare.to_string_lossy()],
             )
             .unwrap();
 
@@ -15323,13 +15530,24 @@ mod membership_staging_tests {
                          VALUES (?1, ?2, ?3, 1)",
                     )
                     .unwrap();
+                // Every member gets its manifest row: since R4B-1a the lease re-checks manifest
+                // presence, and a fixture without one would be proving a refusal instead of the
+                // statement count it exists to pin.
+                let mut manifest = tx
+                    .prepare(
+                        "INSERT INTO file(scan_id, path, size, mtime, device, inode, nlink)
+                         VALUES (?1, ?2, 4096, 0, 1, ?3, 1)",
+                    )
+                    .unwrap();
                 for rank in 0..GROUPS {
                     summary
                         .execute(params![scan_id, rank, format!("{rank:064x}")])
                         .unwrap();
-                    for side in ['a', 'b'] {
-                        member
-                            .execute(params![scan_id, rank, format!("/pool/{rank}/{side}.bin")])
+                    for (index, side) in ['a', 'b'].into_iter().enumerate() {
+                        let path = format!("/pool/{rank}/{side}.bin");
+                        member.execute(params![scan_id, rank, path]).unwrap();
+                        manifest
+                            .execute(params![scan_id, path, rank * 2 + index as i64 + 1])
                             .unwrap();
                     }
                 }
@@ -15373,9 +15591,11 @@ mod membership_staging_tests {
             );
         }
 
-        // And it still refuses a single corrupted member among the forty thousand.
+        // And it still refuses a single corrupted member among the forty thousand — the
+        // substitute is a real manifest row of a different group, so what the lease meets is a
+        // membership change rather than a missing manifest row.
         let mut forged = witness;
-        forged.groups[39_999].members[1] = PathBuf::from("/pool/39999/c.bin");
+        forged.groups[39_999].members[1] = PathBuf::from("/pool/0/a.bin");
         assert!(matches!(
             store.acquire_membership_lease(&forged),
             Err(LeaseRefusal::MembershipChanged { .. })
@@ -15444,6 +15664,452 @@ mod membership_staging_tests {
             "a malformed witness costs no statement and takes no lock"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- R4B-1a: the fail-open paths R4B-1 left open, each red on parent `6c2e739` ---
+
+    /// A published Explicit scan over `count` byte-identical files sharing one digest.
+    fn published_explicit(tag: &str, count: usize) -> (PathBuf, ScanStore, i64, Vec<PathBuf>) {
+        let dir = temp_dir(tag);
+        let digest = [5u8; 32];
+        let paths: Vec<PathBuf> = (0..count)
+            .map(|i| write(&dir, &format!("f{i}.bin"), b"identical"))
+            .collect();
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let files: Vec<(PathBuf, [u8; 32])> = paths.iter().map(|p| (p.clone(), digest)).collect();
+        let scan_id = seed(&mut store, &dir, &files);
+        let verified =
+            crate::pipeline::verify::verify_groups(store.duplicate_groups(scan_id).unwrap())
+                .unwrap();
+        assert_eq!(verified.len(), 1, "the fixture publishes one group");
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .unwrap();
+        (dir, store, scan_id, paths)
+    }
+
+    /// Moves one member row to another generation without touching the authority — the shape
+    /// a partially-applied republication or a hand edit leaves behind.
+    fn corrupt_member_generation(store: &ScanStore, scan_id: i64, path: &Path) {
+        let changed = store
+            .conn
+            .execute(
+                "UPDATE file_group_member SET generation = generation + 98
+                  WHERE scan_id = ?1 AND path = ?2",
+                params![scan_id, path.to_string_lossy()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "the fixture must really corrupt one member row");
+    }
+
+    /// Red on `6c2e739`: preparation read the two authority cells and called that validation.
+    /// A member of another generation must refuse it.
+    #[test]
+    fn preparation_refuses_a_member_of_another_generation() {
+        let (dir, mut store, scan_id, paths) = published_explicit("prep_gen", 2);
+        corrupt_member_generation(&store, scan_id, &paths[1]);
+
+        let err = store
+            .prepare_legacy_for_viewing(scan_id)
+            .expect_err("preparation must refuse a wrong-generation member")
+            .to_string();
+        assert!(err.contains("generation"), "{err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Red on `6c2e739`: `group_page` validated only the rows its `LIMIT` returned, so
+    /// corruption one row past the page was trusted. The whole-scan validation now refuses the
+    /// page — and a valid group still pages exactly as before.
+    #[test]
+    fn a_page_cannot_hide_corruption_outside_its_own_rows() {
+        let (dir, store, scan_id, paths) = published_explicit("page_gen", 3);
+        let id = GroupId {
+            scan_id,
+            rank: 0,
+            generation: 1,
+        };
+
+        // Control first: the valid group pages stably.
+        {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            let first = snapshot.group_page(&id, 0, 1).unwrap();
+            let second = snapshot.group_page(&id, 1, 1).unwrap();
+            assert_eq!(member_paths(&first), vec![paths[0].clone()]);
+            assert_eq!(member_paths(&second), vec![paths[1].clone()]);
+        }
+
+        corrupt_member_generation(&store, scan_id, &paths[2]);
+        let snapshot = store.membership_snapshot(scan_id);
+        match snapshot {
+            Err(MembershipMiss::Inconsistent { .. }) => {}
+            Err(other) => panic!("expected Inconsistent, got {other:?}"),
+            Ok(snapshot) => panic!(
+                "the snapshot must refuse; instead page 0 returned {:?}",
+                snapshot.group_page(&id, 0, 1).map(|g| member_paths(&g))
+            ),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Red on `6c2e739`: `group_of_path` read a rank and `is_member` an existence bit, both
+    /// ignoring the member's generation. Neither may vouch for it now.
+    #[test]
+    fn the_reverse_lookups_refuse_a_member_of_another_generation() {
+        let (dir, store, scan_id, paths) = published_explicit("reverse_gen", 2);
+        corrupt_member_generation(&store, scan_id, &paths[1]);
+
+        match store.membership_snapshot(scan_id) {
+            Err(MembershipMiss::Inconsistent { .. }) => {}
+            Err(other) => panic!("expected Inconsistent, got {other:?}"),
+            Ok(snapshot) => {
+                let id = GroupId {
+                    scan_id,
+                    rank: 0,
+                    generation: 1,
+                };
+                panic!(
+                    "the snapshot must refuse; instead group_of_path gave {:?} and is_member {:?}",
+                    snapshot
+                        .group_of_path(&paths[1])
+                        .map(|id| id.map(|i| i.rank)),
+                    snapshot.is_member(&id, &paths[1])
+                );
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A member row whose manifest row is gone, a member row whose summary is gone, one
+    /// pathname in two ranks (with the unique index dropped, as an externally damaged DB would
+    /// have it), and an out-of-domain summary cell: each fails closed at the snapshot, so no
+    /// trusted answer for the scan can exist at all.
+    #[test]
+    fn structural_corruption_fails_the_whole_snapshot_closed() {
+        // (a) member without its manifest row.
+        let (dir, mut store, scan_id, paths) = published_explicit("struct_manifest", 2);
+        let deleted = store
+            .conn
+            .execute(
+                "DELETE FROM file WHERE scan_id = ?1 AND path = ?2",
+                params![scan_id, paths[1].to_string_lossy()],
+            )
+            .unwrap();
+        assert_eq!(deleted, 1, "the manifest row is really gone");
+        assert!(matches!(
+            store.membership_snapshot(scan_id),
+            Err(MembershipMiss::Inconsistent { .. })
+        ));
+        assert!(store.prepare_legacy_for_viewing(scan_id).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+
+        // (b) member without its summary — seeded with the foreign keys suspended, which is
+        //     the only way this shape exists at all under a live CASCADE.
+        let (dir, mut store, scan_id, _paths) = published_explicit("struct_orphan", 2);
+        store
+            .conn
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM file_group WHERE scan_id = ?1 AND rank = 0",
+                params![scan_id],
+            )
+            .unwrap();
+        store.conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        let orphans: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_group_member WHERE scan_id = ?1",
+                params![scan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 2, "the fixture kept orphaned member rows");
+        assert!(matches!(
+            store.membership_snapshot(scan_id),
+            Err(MembershipMiss::Inconsistent { .. })
+        ));
+        assert!(store.prepare_legacy_for_viewing(scan_id).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+
+        // (c) one pathname in two ranks, with the unique index dropped.
+        let (dir, mut store, scan_id, paths) = published_explicit("struct_dup", 2);
+        store
+            .conn
+            .execute_batch("DROP INDEX IF EXISTS file_group_member_by_path;")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO file_group(scan_id, rank, hash, file_count, size, reclaim,
+                                        object_count, reclaim_state)
+                 SELECT ?1, 1, hash, 1, size, reclaim, object_count, reclaim_state
+                   FROM file_group WHERE scan_id = ?1 AND rank = 0",
+                params![scan_id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
+                 VALUES (?1, 1, ?2, 1)",
+                params![scan_id, paths[0].to_string_lossy()],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.membership_snapshot(scan_id),
+            Err(MembershipMiss::Inconsistent { .. })
+        ));
+        assert!(store.prepare_legacy_for_viewing(scan_id).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every numeric family this layer converts is checked for storage class AND domain: a
+    /// negative or non-integer cell refuses instead of becoming a plausible huge unsigned
+    /// value. `18446744073709551613` is what `-3 as u64` would have produced.
+    #[test]
+    fn out_of_domain_summary_cells_are_refused_not_cast() {
+        for column in [
+            "rank",
+            "file_count",
+            "size",
+            "reclaim",
+            "object_count",
+            "reclaim_state",
+        ] {
+            let (dir, store, scan_id, _paths) = published_explicit(&format!("domain_{column}"), 2);
+            // Both guards are suspended to seed the row: the CHECK because the value is out of
+            // domain by construction, and the foreign key because `rank` is a parent column of
+            // `file_group_member`. That is exactly the state the decoder must not delegate to
+            // SQLite — a build without the constraint, or a hand edit, leaves it behind.
+            store
+                .conn
+                .execute_batch("PRAGMA ignore_check_constraints=1; PRAGMA foreign_keys=OFF;")
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    &format!("UPDATE file_group SET {column} = -3 WHERE scan_id = ?1 AND rank = 0"),
+                    params![scan_id],
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    store.membership_snapshot(scan_id),
+                    Err(MembershipMiss::Inconsistent { .. })
+                ),
+                "a negative {column} must be refused"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+
+            let (dir, store, scan_id, _paths) = published_explicit(&format!("class_{column}"), 2);
+            // Both guards are suspended to seed the row: the CHECK because the value is out of
+            // domain by construction, and the foreign key because `rank` is a parent column of
+            // `file_group_member`. That is exactly the state the decoder must not delegate to
+            // SQLite — a build without the constraint, or a hand edit, leaves it behind.
+            store
+                .conn
+                .execute_batch("PRAGMA ignore_check_constraints=1; PRAGMA foreign_keys=OFF;")
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    &format!(
+                        "UPDATE file_group SET {column} = x'00ff' WHERE scan_id = ?1 AND rank = 0"
+                    ),
+                    params![scan_id],
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    store.membership_snapshot(scan_id),
+                    Err(MembershipMiss::Inconsistent { .. })
+                ),
+                "a BLOB in {column} must be refused"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// The kept distinction: an ordinary per-group count disagreement is NOT fatal to the
+    /// snapshot — `summaries()` names the exact identity — while every exact answer for that
+    /// identity refuses, and preparation refuses too.
+    #[test]
+    fn a_count_disagreement_is_named_by_summaries_and_refused_everywhere_else() {
+        let (dir, mut store, scan_id, paths) = published_explicit("count_split", 2);
+        store
+            .conn
+            .execute(
+                "UPDATE file_group SET file_count = 3 WHERE scan_id = ?1 AND rank = 0",
+                params![scan_id],
+            )
+            .unwrap();
+        let id = GroupId {
+            scan_id,
+            rank: 0,
+            generation: 1,
+        };
+
+        {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            let summaries = snapshot.summaries().unwrap();
+            assert_eq!(summaries.inconsistent, vec![id], "the identity is named");
+            assert_eq!(summaries.groups.len(), 1, "the summary itself still reads");
+            for refused in [
+                snapshot.group(&id).err(),
+                snapshot.group_page(&id, 0, 1).err(),
+                snapshot.group_member_count(&id).err(),
+                snapshot.is_member(&id, &paths[0]).err(),
+                snapshot.group_of_path(&paths[0]).err(),
+            ] {
+                assert!(
+                    matches!(refused, Some(MembershipMiss::Inconsistent { .. })),
+                    "every exact answer must refuse: {refused:?}"
+                );
+            }
+        }
+        assert!(store.prepare_legacy_for_viewing(scan_id).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Red on `6c2e739`: the lease joined the witnessed ranks to their member rows but never
+    /// back to the manifest, so a member whose `file` row was deleted after planning still
+    /// took the lease. It must refuse, before `after_lease`.
+    #[test]
+    fn the_lease_refuses_a_member_whose_manifest_row_was_deleted() {
+        let (dir, mut store, scan_id, paths) = published_explicit("lease_manifest", 2);
+        let id = GroupId {
+            scan_id,
+            rank: 0,
+            generation: 1,
+        };
+        let witness = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            witness_of(&snapshot, &[id])
+        };
+        assert!(
+            store.acquire_membership_lease(&witness).is_ok(),
+            "the fixture's witness is valid before the corruption"
+        );
+
+        let deleted = store
+            .conn
+            .execute(
+                "DELETE FROM file WHERE scan_id = ?1 AND path = ?2",
+                params![scan_id, paths[1].to_string_lossy()],
+            )
+            .unwrap();
+        assert_eq!(deleted, 1);
+        let (members, manifest): (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM file_group_member WHERE scan_id = ?1),
+                        (SELECT COUNT(*) FROM file WHERE scan_id = ?1)",
+                params![scan_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (members, manifest),
+            (2, 1),
+            "the exact corrupt shape: two member rows, one manifest row"
+        );
+
+        match store.acquire_membership_lease(&witness) {
+            Err(LeaseRefusal::Inconsistent { detail }) => {
+                assert!(detail.contains("manifest"), "{detail}")
+            }
+            Err(other) => panic!("expected Inconsistent, got {other:?}"),
+            Ok(_) => panic!("the lease must refuse a member with no manifest row"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The lease also refuses the other structural Explicit corruptions that can appear after
+    /// planning without a generation bump — a member whose summary is gone, and one pathname
+    /// in two ranks with the unique index dropped — without relying on an earlier resolver
+    /// read or on the index still existing.
+    #[test]
+    fn the_lease_refuses_structural_corruption_after_planning() {
+        // (a) the summary of a witnessed rank is gone while its member rows remain.
+        let (dir, mut store, scan_id, _paths) = published_explicit("lease_orphan", 2);
+        let id = GroupId {
+            scan_id,
+            rank: 0,
+            generation: 1,
+        };
+        let witness = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            witness_of(&snapshot, &[id])
+        };
+        store
+            .conn
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM file_group WHERE scan_id = ?1 AND rank = 0",
+                params![scan_id],
+            )
+            .unwrap();
+        store.conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        assert!(
+            matches!(
+                store.acquire_membership_lease(&witness),
+                Err(LeaseRefusal::Inconsistent { .. })
+            ),
+            "member rows with no summary must refuse the lease"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        // (b) one pathname in two ranks, unique index dropped.
+        let (dir, mut store, scan_id, paths) = published_explicit("lease_dup", 2);
+        let id = GroupId {
+            scan_id,
+            rank: 0,
+            generation: 1,
+        };
+        let witness = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            witness_of(&snapshot, &[id])
+        };
+        store
+            .conn
+            .execute_batch("DROP INDEX IF EXISTS file_group_member_by_path;")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO file_group(scan_id, rank, hash, file_count, size, reclaim,
+                                        object_count, reclaim_state)
+                 SELECT ?1, 1, hash, 1, size, reclaim, object_count, reclaim_state
+                   FROM file_group WHERE scan_id = ?1 AND rank = 0",
+                params![scan_id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
+                 VALUES (?1, 1, ?2, 1)",
+                params![scan_id, paths[0].to_string_lossy()],
+            )
+            .unwrap();
+        match store.acquire_membership_lease(&witness) {
+            Err(LeaseRefusal::Inconsistent { detail }) => {
+                assert!(detail.contains("two ranks"), "{detail}")
+            }
+            Err(other) => panic!("expected Inconsistent, got {other:?}"),
+            Ok(_) => panic!("one pathname in two ranks must refuse the lease"),
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

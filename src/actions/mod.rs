@@ -230,8 +230,12 @@ pub enum ApplyRefusal {
         expected: u64,
         found: u64,
     },
+    /// The pathname is a `String`, not a `PathBuf`, on purpose: it has already been through
+    /// `textsan::terminal` at construction, and a `PathBuf` here would let a renderer print the
+    /// raw bytes of a hostile file name straight to the terminal — which is exactly what the
+    /// «sanitized once» promise is supposed to prevent.
     MembershipChanged {
-        path: PathBuf,
+        path: String,
     },
     Inconsistent {
         detail: String,
@@ -274,7 +278,9 @@ impl ApplyRefusal {
                 expected,
                 found,
             },
-            LeaseRefusal::MembershipChanged { path } => ApplyRefusal::MembershipChanged { path },
+            LeaseRefusal::MembershipChanged { path } => ApplyRefusal::MembershipChanged {
+                path: crate::textsan::terminal(&path.display().to_string()),
+            },
             LeaseRefusal::Inconsistent { detail } => ApplyRefusal::Inconsistent {
                 detail: crate::textsan::terminal(&detail),
             },
@@ -2603,13 +2609,43 @@ mod guarded_staging_tests {
         forged.groups[0].members = vec![ghost.clone(), ghost.clone()];
 
         match refusal(guarded(&ops, &published, &forged, &datasets)) {
-            ApplyRefusal::MembershipChanged { path } => {
-                assert!(path.starts_with(&published.scenario.root))
-            }
+            ApplyRefusal::MembershipChanged { path } => assert!(
+                path.starts_with(&published.scenario.root.to_string_lossy().into_owned()),
+                "the refusal names the pathname: {path}"
+            ),
             other => panic!("expected a named membership change, got {other:?}"),
         }
         assert_eq!(ops.snapshots.load(Ordering::SeqCst), 0);
         assert_eq!(ops.actions.load(Ordering::SeqCst), 0);
+    }
+
+    /// R4B-1a: the refusal that promises a once-sanitized pathname must STORE the sanitized
+    /// one. Asserting on `{refusal:?}` proves nothing — `Debug` for `PathBuf` escapes control
+    /// bytes itself, so the raw value renders as `\u{1b}` and the check passes either way. The
+    /// stored value is what a renderer prints, so the stored value is what is checked.
+    #[test]
+    fn a_membership_refusal_stores_the_sanitized_pathname() {
+        let hostile = PathBuf::from("/pool/we\u{1b}[31mird\nname.bin");
+        let refusal = ApplyRefusal::from_lease(LeaseRefusal::MembershipChanged {
+            path: hostile.clone(),
+        });
+        let stored = match &refusal {
+            ApplyRefusal::MembershipChanged { path } => path.clone(),
+            other => panic!("expected MembershipChanged, got {other:?}"),
+        };
+        assert!(
+            !stored.contains('\u{1b}'),
+            "no raw escape may survive: {stored:?}"
+        );
+        assert!(
+            !stored.contains('\n'),
+            "no raw newline may survive: {stored:?}"
+        );
+        assert_eq!(
+            stored,
+            crate::textsan::terminal(&hostile.display().to_string()),
+            "sanitized exactly once, at the layer boundary"
+        );
     }
 
     /// A checkpoint that is missing, or is a symlink, refuses as an `Open` with its detail
