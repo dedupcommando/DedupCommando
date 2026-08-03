@@ -1575,6 +1575,72 @@ mod hash_failures_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// R4-C1's production route: a resume that re-walks clears the manifest first, and a
+    /// cancellation right after leaves the scan with no manifest at all. Nothing the previous run
+    /// published may still be readable then — a summary whose members cannot be found, or a
+    /// prepared marker that makes an opening scan return those summaries as current, is a result
+    /// that outlived its evidence.
+    #[test]
+    fn a_cancelled_rewalk_leaves_no_result_behind() {
+        let dir = unique_temp_dir("rewalk_cancel");
+        std::fs::write(dir.join("a.bin"), b"identical duplicate content").unwrap();
+        std::fs::write(dir.join("b.bin"), b"identical duplicate content").unwrap();
+        let mut cfg = ScanConfig::new(vec![dir.clone()]);
+        cfg.min_size = 0;
+        cfg.exclude_globs = Vec::new();
+
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let id = match run_scan(&mut store, &cfg, None, false, &cancel, |_| {}).unwrap() {
+            ScanOutcome::Completed(results) => results.scan_id,
+            ScanOutcome::Cancelled => panic!("the first run completes"),
+        };
+        assert_eq!(
+            store.group_summaries(id).unwrap().len(),
+            1,
+            "the first run published one group"
+        );
+        assert!(store.results_materialized(id).unwrap());
+        assert!(store.scan_reclaim(id).unwrap().guaranteed_bytes() > 0);
+        assert!(
+            !store.attributed_dir_groups(id).unwrap().is_empty()
+                || store.manifest_count(id).unwrap() > 0,
+            "the first run left something to invalidate"
+        );
+
+        // Force the re-walk route and cancel before it can publish anything.
+        store.set_status(id, ScanStatus::Walking).unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        let outcome = run_scan(&mut store, &cfg, Some(id), false, &cancel, |_| {}).unwrap();
+        assert!(
+            matches!(outcome, ScanOutcome::Cancelled),
+            "the re-walk must cancel before publication"
+        );
+
+        assert_eq!(store.manifest_count(id).unwrap(), 0, "the manifest is gone");
+        assert!(
+            store.group_summaries(id).unwrap().is_empty(),
+            "no file group may outlive the manifest its members came from"
+        );
+        assert!(
+            store.attributed_dir_groups(id).unwrap().is_empty(),
+            "no directory group either"
+        );
+        assert!(
+            !store.results_materialized(id).unwrap(),
+            "the prepared marker must not survive: opening returns through it"
+        );
+        let reclaim = store.scan_reclaim(id).unwrap();
+        assert_eq!(reclaim.guaranteed_bytes(), 0);
+        assert_eq!(
+            reclaim.state(),
+            crate::model::reclaim::ReclaimState::Unknown,
+            "an exact total over a deleted manifest is a claim nothing supports"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// G12: `unsupported_entry` escalates to `CompleteWithWarnings`; an intentional min-size
     /// filter never does. Both leave their exact `Ledger` account and one aggregate notice; the
     /// old standalone non-UTF8 notice is gone from the stream.

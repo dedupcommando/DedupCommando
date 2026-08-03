@@ -1157,12 +1157,27 @@ impl ScanStore {
     }
 
     /// Deletes the scan's file manifest (before a re-walk), together with everything the previous
-    /// walk claimed about completeness.
+    /// walk claimed about completeness AND everything the previous run published about its results.
     ///
     /// One transaction, and that is the whole point: a ledger that outlived its manifest would let
     /// the next walk inherit the previous one's omissions, and an authority left standing over a
     /// deleted ledger would read as «nothing was omitted». Manifest, ledger and every root
     /// generation go together or not at all.
+    ///
+    /// The results go with them, for the same reason. A summary describes members of a manifest
+    /// that no longer exists, so `file_group` outliving the manifest is a group whose files cannot
+    /// be found; `results_materialized` outliving it is worse still, because opening the scan then
+    /// returns through that marker and hands the operator the old groups as if they were current.
+    /// Revoked here: `file_group`, the legacy `file_dedup` rows, `dir_dedup`, the prepared marker,
+    /// the published reclaim total and its state, and the counters that describe the deleted
+    /// manifest (`groups_found`, `files_scanned`, `bytes_hashed`, `hash_failures` and the four
+    /// candidate-progress columns).
+    ///
+    /// Deliberately NOT revoked: `file_mark` — the operator's own work, which a re-walk of the same
+    /// roots re-attaches to a fresh manifest, and which already refuses a plan while its manifest
+    /// row is missing; `elapsed_seconds` and the environment columns, which describe the session
+    /// rather than its result; `move_event`, a journal that is not scan-scoped in meaning; and
+    /// `hash_cache`, which is keyed by allocation and shared across scans.
     ///
     /// Root registration runs here too, so a scan that predates the ledger — its `scan_root` rows
     /// were never written, because `begin_scan` is not called on resume — can earn an authority by
@@ -1172,6 +1187,23 @@ impl ScanStore {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM file WHERE scan_id = ?1", params![scan_id])?;
         delete_ledger_tx(&tx, scan_id, &ClearScope::WholeScan)?;
+        tx.execute(
+            "DELETE FROM file_group WHERE scan_id = ?1",
+            params![scan_id],
+        )?;
+        tx.execute(
+            "DELETE FROM file_dedup WHERE scan_id = ?1",
+            params![scan_id],
+        )?;
+        // Test seam: fails HERE, with the manifest, the ledger and both membership tables already
+        // gone and the rest of the transaction still ahead — the only position from which a
+        // rollback assertion is about a real partial write.
+        #[cfg(test)]
+        if take_clear_fault() {
+            return Err(AppError::msg("injected clear fault"));
+        }
+        tx.execute("DELETE FROM dir_dedup WHERE scan_id = ?1", params![scan_id])?;
+        revoke_published_results_tx(&tx, scan_id)?;
         zero_generations_tx(&tx, scan_id, None)?;
         let registration = ensure_roots_tx(&tx, scan_id)?;
         tx.commit()?;
@@ -3567,6 +3599,51 @@ impl Drop for LedgerInsertFault {
     }
 }
 
+// Test-only: fail `clear_files` from INSIDE its open transaction.
+//
+// A separate seam from `LEDGER_INSERT_FAULT` above, because that one is consulted only on the
+// ledger insert path and a clear never reaches it — arming it would prove nothing about this
+// transaction. Holding the write lock from a second connection is no substitute either: it stops
+// the transaction from ever starting, which is no-start atomicity, a different property from
+// rolling back after rows have already gone. Absent from every non-test build.
+#[cfg(test)]
+thread_local! {
+    static CLEAR_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms the one-shot clear fault for this thread and disarms it on drop.
+#[cfg(test)]
+pub(crate) struct ClearFault;
+
+#[cfg(test)]
+impl ClearFault {
+    /// Arms the shot. It fires inside `clear_files`, once the manifest, the ledger, `file_group`
+    /// and `file_dedup` rows are gone and before anything else in that transaction.
+    pub(crate) fn armed() -> Self {
+        CLEAR_FAULT.with(|slot| slot.set(true));
+        ClearFault
+    }
+
+    /// Whether the armed shot has been consumed. A test whose seam was never reached proved
+    /// nothing about rollback, so it has to assert this rather than the error alone.
+    pub(crate) fn fired(&self) -> bool {
+        CLEAR_FAULT.with(|slot| !slot.get())
+    }
+}
+
+#[cfg(test)]
+impl Drop for ClearFault {
+    fn drop(&mut self) {
+        CLEAR_FAULT.with(|slot| slot.set(false));
+    }
+}
+
+/// Consumes an armed clear fault, if any.
+#[cfg(test)]
+fn take_clear_fault() -> bool {
+    CLEAR_FAULT.with(|slot| slot.replace(false))
+}
+
 /// Consumes one step of an armed insert fault, if any.
 #[cfg(test)]
 fn take_insert_fault() -> bool {
@@ -3736,6 +3813,32 @@ fn ensure_roots_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<RootRegistratio
         }
     }
     Ok(RootRegistration::Registered { roots: keys.len() })
+}
+
+/// Revokes, in the caller's open transaction, everything the previous run published about this
+/// scan's results. A plain `UPDATE`: a scan with no `scan_stats` row has nothing to revoke, and
+/// inventing one here would be a second writer of a row `begin_scan` owns.
+///
+/// `elapsed_seconds` and the environment columns are absent from the list on purpose — they
+/// describe the session, which is continuing, not the result, which is gone.
+fn revoke_published_results_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE scan_stats
+            SET results_materialized = 0,
+                reclaimable_bytes = 0,
+                reclaim_state = 0,
+                groups_found = 0,
+                files_scanned = 0,
+                bytes_hashed = 0,
+                hash_failures = 0,
+                cand_files_total = 0,
+                cand_bytes_total = 0,
+                cand_files_hashed = 0,
+                cand_bytes_hashed = 0
+          WHERE scan_id = ?1",
+        params![scan_id],
+    )?;
+    Ok(())
 }
 
 /// Zeroes the generation of one root, or of every root of the scan. Always issued in the same
@@ -10457,6 +10560,440 @@ mod tests {
             .commit_omissions(scan_id, &one_root("/tank", &[]))
             .unwrap();
         assert_eq!(verdict(&store, scan_id, "/tank"), DirCompleteness::Complete);
+    }
+
+    /// Everything one finished run publishes about a scan: manifest, hashes, group summaries and
+    /// their reclaim total, directory groups, a legacy membership row of the kind a migrated
+    /// database still carries, the completed-run counters, candidate progress, the omission ledger,
+    /// an operator mark, the session's own elapsed/environment fields, and the two stores that are
+    /// not scan result state at all — the move journal and the shared hash cache.
+    fn seed_published_scan(store: &mut ScanStore) -> i64 {
+        let config = ScanConfig::new(vec![PathBuf::from("/tank")]);
+        let scan_id = store.begin_scan(&config).unwrap();
+        store
+            .record_files(
+                scan_id,
+                &[
+                    row("/tank/a.bin", 100, 1),
+                    row("/tank/b.bin", 100, 2),
+                    row("/tank/u.bin", 70, 3),
+                ],
+            )
+            .unwrap();
+        let dup = [1u8; 32];
+        store
+            .record_hashes(
+                scan_id,
+                &[
+                    (PathBuf::from("/tank/a.bin"), dup),
+                    (PathBuf::from("/tank/b.bin"), dup),
+                    (PathBuf::from("/tank/u.bin"), [9u8; 32]),
+                ],
+            )
+            .unwrap();
+        // Group summaries + the published reclaim total + the prepared marker, in one write.
+        store.materialize_file_groups(scan_id).unwrap();
+        // Directory groups: two directories sharing one signature, so the >= 2 filter keeps them.
+        store
+            .materialize_dir_groups(scan_id, |emit| {
+                emit(PathBuf::from("/tank/one"), "sig".to_string(), 100, 1)?;
+                emit(PathBuf::from("/tank/two"), "sig".to_string(), 100, 1)
+            })
+            .unwrap();
+        // A legacy membership row. Production stopped writing `file_dedup` in v2, but a migrated
+        // checkpoint still holds them and they describe the same vanishing manifest.
+        store
+            .conn
+            .execute(
+                "INSERT INTO file_dedup(scan_id, hash, path, size, mtime, device, inode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    scan_id,
+                    hex_encode(&dup),
+                    "/tank/a.bin",
+                    100i64,
+                    0i64,
+                    1i64,
+                    1i64
+                ],
+            )
+            .unwrap();
+        store
+            .record_scan_environment(
+                scan_id,
+                &crate::model::scan::ScanEnvironment {
+                    storage_type: "nvme".to_string(),
+                    pool_layout: "mirror".to_string(),
+                    zfs_version: "2.4.3".to_string(),
+                },
+            )
+            .unwrap();
+        store.add_elapsed(scan_id, 12.5).unwrap();
+        store
+            .record_scan_result(
+                scan_id,
+                &ScanSummary {
+                    files_scanned: 3,
+                    bytes_hashed: 270,
+                    groups_found: 1,
+                    hash_failures: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .update_candidate_progress(scan_id, 3, 270, 3, 270)
+            .unwrap();
+        store
+            .commit_omissions(
+                scan_id,
+                &one_root("/tank", &[("/tank/x", OmissionReason::MinSize)]),
+            )
+            .unwrap();
+        // The operator's own work: one keeper mark on a real group member.
+        let summaries = store.group_summaries(scan_id).unwrap();
+        let mut files = store.group_files(scan_id, &summaries[0].hash).unwrap();
+        files[0].is_keeper = true;
+        store.save_marks(scan_id, files.iter()).unwrap();
+        // Neither of these is this scan's result: a move journal entry and a shared cache row.
+        store
+            .record_move_event(&MoveEvent {
+                created_at: "2026-08-03T00:00:00+00:00".to_string(),
+                scan_id: Some(scan_id),
+                source_path: PathBuf::from("/tank/moved"),
+                target_path: PathBuf::from("/tank/elsewhere"),
+                hash: Some([7u8; 32]),
+                duplicate: false,
+            })
+            .unwrap();
+        store.upsert_hash(1, 1, 100, 0, &dup).unwrap();
+        scan_id
+    }
+
+    /// Everything a clear must be able to compare, before and after. Rows are rendered to text so
+    /// a mismatch names the row that changed instead of printing an opaque tuple.
+    #[derive(Debug, PartialEq)]
+    struct ScanState {
+        manifest: Vec<String>,
+        groups: Vec<String>,
+        legacy_members: Vec<String>,
+        dir_groups: Vec<String>,
+        materialized: bool,
+        /// `groups_found, files_scanned, bytes_hashed, hash_failures, reclaimable_bytes,
+        /// reclaim_state, cand_files_total, cand_bytes_total, cand_files_hashed, cand_bytes_hashed`
+        counters: Vec<i64>,
+        elapsed: f64,
+        environment: Vec<Option<String>>,
+        marks: Vec<String>,
+        omissions: i64,
+        root_generation: Option<i64>,
+        move_events: usize,
+        cached_hashes: i64,
+    }
+
+    /// One query rendered as sorted text lines.
+    fn rendered(store: &ScanStore, sql: &str, scan_id: i64, columns: usize) -> Vec<String> {
+        let mut stmt = store.conn.prepare(sql).unwrap();
+        stmt.query_map(params![scan_id], |row| {
+            let mut line = String::new();
+            for index in 0..columns {
+                if index > 0 {
+                    line.push('|');
+                }
+                line.push_str(&format!("{:?}", row.get_ref(index)?));
+            }
+            Ok(line)
+        })
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+    }
+
+    fn scan_state(store: &ScanStore, scan_id: i64) -> ScanState {
+        let counters = store
+            .conn
+            .query_row(
+                "SELECT groups_found, files_scanned, bytes_hashed, hash_failures,
+                        reclaimable_bytes, reclaim_state, cand_files_total, cand_bytes_total,
+                        cand_files_hashed, cand_bytes_hashed
+                   FROM scan_stats WHERE scan_id = ?1",
+                params![scan_id],
+                |row| {
+                    let mut out = Vec::with_capacity(10);
+                    for index in 0..10 {
+                        out.push(row.get::<_, i64>(index)?);
+                    }
+                    Ok(out)
+                },
+            )
+            .unwrap();
+        let environment = store
+            .conn
+            .query_row(
+                "SELECT storage_type, pool_layout, zfs_version FROM scan_stats WHERE scan_id = ?1",
+                params![scan_id],
+                |row| Ok(vec![row.get(0)?, row.get(1)?, row.get(2)?]),
+            )
+            .unwrap();
+        let omissions = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM dir_omission WHERE scan_id = ?1",
+                params![scan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let cached_hashes = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM hash_cache", [], |row| row.get(0))
+            .unwrap();
+        ScanState {
+            manifest: rendered(
+                store,
+                "SELECT path, hash, size FROM file WHERE scan_id = ?1 ORDER BY path",
+                scan_id,
+                3,
+            ),
+            groups: rendered(
+                store,
+                "SELECT rank, hash, file_count, size, reclaim, object_count, reclaim_state
+                   FROM file_group WHERE scan_id = ?1 ORDER BY rank",
+                scan_id,
+                7,
+            ),
+            legacy_members: rendered(
+                store,
+                "SELECT hash, path FROM file_dedup WHERE scan_id = ?1 ORDER BY path",
+                scan_id,
+                2,
+            ),
+            dir_groups: rendered(
+                store,
+                "SELECT signature, path, file_count, size_per_dir
+                   FROM dir_dedup WHERE scan_id = ?1 ORDER BY path",
+                scan_id,
+                4,
+            ),
+            materialized: store.results_materialized(scan_id).unwrap(),
+            counters,
+            elapsed: store.elapsed_seconds(scan_id).unwrap(),
+            environment,
+            marks: rendered(
+                store,
+                "SELECT path, is_keeper, action FROM file_mark WHERE scan_id = ?1 ORDER BY path",
+                scan_id,
+                3,
+            ),
+            omissions,
+            root_generation: store.root_generation(scan_id, Path::new("/tank")).unwrap(),
+            move_events: store.move_events().unwrap().len(),
+            cached_hashes,
+        }
+    }
+
+    /// A result describes members of a manifest. Clearing the manifest without clearing the result
+    /// leaves summaries whose files cannot be found — and, through the prepared marker, an opening
+    /// scan that returns those summaries as if they were current.
+    #[test]
+    fn clear_files_revokes_every_published_result() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_published_scan(&mut store);
+        let before = scan_state(&store, scan_id);
+        assert!(!before.groups.is_empty(), "the fixture published groups");
+        assert!(before.materialized, "the fixture set the prepared marker");
+
+        store.clear_files(scan_id).unwrap();
+
+        let after = scan_state(&store, scan_id);
+        assert_eq!(store.manifest_count(scan_id).unwrap(), 0);
+        assert!(
+            after.groups.is_empty(),
+            "file_group must go with the manifest"
+        );
+        assert!(
+            after.legacy_members.is_empty(),
+            "legacy file_dedup rows describe the same vanished manifest"
+        );
+        assert!(
+            after.dir_groups.is_empty(),
+            "directory groups are derived from the manifest too"
+        );
+        assert!(
+            !after.materialized,
+            "the prepared marker must not survive the result it marks"
+        );
+        assert_eq!(
+            after.counters,
+            vec![0i64; 10],
+            "every counter describing the deleted manifest is revoked"
+        );
+        // Read back through the ordinary APIs, not only the columns.
+        for summary in store.group_summaries(scan_id).unwrap() {
+            let members = store.group_files(scan_id, &summary.hash).unwrap();
+            assert!(
+                !members.is_empty(),
+                "a surviving summary of {} files whose members cannot be found",
+                summary.file_count
+            );
+        }
+        assert!(store.group_summaries(scan_id).unwrap().is_empty());
+        let reclaim = store.scan_reclaim(scan_id).unwrap();
+        assert_eq!(reclaim.guaranteed_bytes(), 0);
+        assert_eq!(reclaim.state(), ReclaimState::Unknown);
+        // The marker no longer short-circuits an open: preparing a cleared scan finds nothing to
+        // hand back, rather than returning through a marker left over from the previous result.
+        store.ensure_materialized(scan_id).unwrap();
+        assert!(
+            store.group_summaries(scan_id).unwrap().is_empty(),
+            "preparing a cleared scan must not return the previous run's groups"
+        );
+    }
+
+    /// The operator's marks, the session's own time and environment, the move journal and the
+    /// cross-scan hash cache are not this scan's result and must survive untouched.
+    #[test]
+    fn clear_files_keeps_marks_session_fields_and_shared_stores() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_published_scan(&mut store);
+        let before = scan_state(&store, scan_id);
+
+        store.clear_files(scan_id).unwrap();
+
+        let after = scan_state(&store, scan_id);
+        assert_eq!(
+            after.marks, before.marks,
+            "operator intent survives a re-walk"
+        );
+        assert_eq!(after.elapsed, before.elapsed, "the session time continues");
+        assert_eq!(after.environment, before.environment);
+        assert_eq!(
+            after.move_events, before.move_events,
+            "not scan result state"
+        );
+        assert_eq!(
+            after.cached_hashes, before.cached_hashes,
+            "hash_cache is keyed by allocation and shared across scans"
+        );
+        // And the existing contract is untouched: ledger gone, root still registered at zero.
+        assert_eq!(after.omissions, 0);
+        assert_eq!(after.root_generation, Some(0));
+    }
+
+    /// Clearing one scan is not allowed to reach into another.
+    #[test]
+    fn clear_files_touches_only_its_own_scan() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let first = seed_published_scan(&mut store);
+        let second = seed_published_scan(&mut store);
+        let before = scan_state(&store, second);
+
+        store.clear_files(first).unwrap();
+
+        assert_eq!(
+            scan_state(&store, second),
+            before,
+            "the other scan is untouched"
+        );
+    }
+
+    /// The reset must not poison the next run: a re-walk publishes fresh summaries and a fresh
+    /// total over the same columns it just zeroed.
+    #[test]
+    fn a_cleared_scan_can_publish_again() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_published_scan(&mut store);
+        store.clear_files(scan_id).unwrap();
+
+        store
+            .record_files(
+                scan_id,
+                &[row("/tank/a.bin", 100, 1), row("/tank/b.bin", 100, 2)],
+            )
+            .unwrap();
+        let dup = [4u8; 32];
+        store
+            .record_hashes(
+                scan_id,
+                &[
+                    (PathBuf::from("/tank/a.bin"), dup),
+                    (PathBuf::from("/tank/b.bin"), dup),
+                ],
+            )
+            .unwrap();
+        store.materialize_file_groups(scan_id).unwrap();
+
+        let summaries = store.group_summaries(scan_id).unwrap();
+        assert_eq!(summaries.len(), 1, "the next run publishes normally");
+        assert_eq!(summaries[0].file_count, 2);
+        assert!(store.results_materialized(scan_id).unwrap());
+        assert_eq!(
+            store.scan_reclaim(scan_id).unwrap().guaranteed_bytes(),
+            100,
+            "a fresh total, not the zero the clear left behind"
+        );
+    }
+
+    /// Rollback, proved from inside the transaction. The fault fires with the manifest, the ledger
+    /// and both membership tables already deleted and the rest of the clear still ahead, so what
+    /// this asserts is a real undo — not a transaction that never started.
+    #[test]
+    fn a_clear_that_fails_mid_transaction_restores_everything() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed_published_scan(&mut store);
+        let before = scan_state(&store, scan_id);
+
+        let fault = ClearFault::armed();
+        let err = store
+            .clear_files(scan_id)
+            .expect_err("the armed fault must fail the clear");
+        assert!(err.to_string().contains("injected clear fault"), "{err}");
+        assert!(
+            fault.fired(),
+            "a seam that was never reached proves nothing"
+        );
+
+        assert_eq!(
+            scan_state(&store, scan_id),
+            before,
+            "a failed clear leaves the complete prior state"
+        );
+    }
+
+    /// The control, named for what it actually proves: with another writer holding the database,
+    /// the clear never starts. That is no-start atomicity, not rollback — the test above is the
+    /// rollback proof.
+    #[test]
+    fn a_clear_that_cannot_take_the_write_lock_changes_nothing() {
+        // `role_guard` is this file's own pre-existing lock for every file-backed store (the
+        // observer role is process-wide); it is not serialisation introduced to steady a race.
+        let _role = role_guard();
+        let dir = temp_state_dir("clear_no_start");
+        let db = dir.join("dedcom.db");
+        let mut store = ScanStore::open_writable(&db).unwrap();
+        let scan_id = seed_published_scan(&mut store);
+        let before = scan_state(&store, scan_id);
+
+        // A second connection owns the write lock; ours refuses at once rather than queueing.
+        let blocker = Connection::open(&db).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        store.conn.execute_batch("PRAGMA busy_timeout=0").unwrap();
+
+        let err = store
+            .clear_files(scan_id)
+            .expect_err("no destructive statement can run against a held write lock");
+        match &err {
+            AppError::Db(rusqlite::Error::SqliteFailure(code, _)) => assert_eq!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy,
+                "expected a busy refusal, got {err}"
+            ),
+            other => panic!("expected a busy refusal, got {other}"),
+        }
+
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(scan_state(&store, scan_id), before);
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A second commit replaces the first wholesale and advances the generation; no row of the
