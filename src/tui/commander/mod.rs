@@ -1849,10 +1849,10 @@ fn resolve_watch_groups(app: &mut App) {
                         entry.empty = reason;
                         entry.unavailable = None;
                     }
-                    Err(state::WatchMiss::Unavailable(err)) => {
+                    Err(state::WatchMiss::Unavailable(failure)) => {
                         entry.result = None;
                         entry.empty = state::WatchEmpty::default();
-                        entry.unavailable = Some(err);
+                        entry.unavailable = Some(failure);
                     }
                 }
             }
@@ -1906,10 +1906,24 @@ fn compute_watch_key(app: &App, i: usize) -> Result<state::WatchKey, state::Watc
     }
 }
 
-/// A store failure on the watch path, sanitized for the terminal like every other error the
-/// commander shows.
-fn watch_unavailable(err: &crate::error::AppError) -> state::WatchMiss {
-    state::WatchMiss::Unavailable(crate::textsan::terminal(&err.to_string()))
+/// A store failure on the watch path: the subject that could not be read, and the error sanitized
+/// for the terminal. The single place that sanitizes, so no detail is escaped twice.
+fn watch_unavailable(
+    subject: state::WatchSubject,
+    err: &crate::error::AppError,
+) -> state::WatchMiss {
+    state::WatchMiss::Unavailable(state::WatchUnavailable {
+        subject,
+        detail: crate::textsan::terminal(&err.to_string()),
+    })
+}
+
+/// What a watch key is asking about — the subject a failure to answer it belongs to.
+fn subject_of(key: &state::WatchKey) -> state::WatchSubject {
+    match key {
+        state::WatchKey::Group(_) | state::WatchKey::DupOf(_) => state::WatchSubject::FileGroup,
+        state::WatchKey::DirOf(_) => state::WatchSubject::DirectoryGroup,
+    }
 }
 
 /// Lazy provision of a DB connection (opened on the first access within a frame).
@@ -1941,19 +1955,11 @@ fn resolve_watch_group(
     store: &mut Option<ScanStore>,
 ) -> Result<state::WatchResult, state::WatchMiss> {
     let scan_id = scan_id.ok_or(state::WatchEmpty::NotInScan)?;
-    // A database that will not open is a failure, not an answer — but only the directory key is
-    // authorized to say so. `Group` and `DupOf` keep translating it into «out of scan» exactly as
-    // before, until the finding about their own error sinks is taken up.
+    // A database that will not open is a failure, not an answer — for every key. Which subject
+    // failed is decided here, from the key that was asked for, and travels with the error.
     let store = match ensure_store(app, store) {
         Ok(store) => store,
-        Err(err) => {
-            return match key {
-                state::WatchKey::DirOf(_) => Err(watch_unavailable(&err)),
-                state::WatchKey::Group(_) | state::WatchKey::DupOf(_) => {
-                    Err(state::WatchEmpty::NotInScan.into())
-                }
-            }
-        }
+        Err(err) => return Err(watch_unavailable(subject_of(key), &err)),
     };
     match key {
         state::WatchKey::Group(idx) => {
@@ -1969,14 +1975,14 @@ fn resolve_watch_group(
                 .clone();
             let files = store
                 .group_files(scan_id, &hash)
-                .map_err(|_| state::WatchEmpty::NoDuplicates)?;
-            // A group whose claim cannot be read is shown as no group at all: an unstated figure
-            // is what this whole change exists to remove.
-            let claim = store
-                .group_claim(scan_id, &hash)
-                .ok()
-                .flatten()
-                .ok_or(state::WatchEmpty::NoDuplicates)?;
+                .map_err(|err| watch_unavailable(state::WatchSubject::FileGroup, &err))?;
+            // A group with no claim row is a legitimate «no such group»; a claim that cannot be
+            // READ is a failure, and the two must not share an answer.
+            let claim = match store.group_claim(scan_id, &hash) {
+                Ok(Some(claim)) => claim,
+                Ok(None) => return Err(state::WatchEmpty::NoDuplicates.into()),
+                Err(err) => return Err(watch_unavailable(state::WatchSubject::FileGroup, &err)),
+            };
             Ok(state::WatchResult::FileGroup(
                 DuplicateGroup {
                     id: *idx,
@@ -1988,20 +1994,23 @@ fn resolve_watch_group(
             ))
         }
         state::WatchKey::DupOf(path) => {
-            // Hash_for_path = None → the file is not in the scan manifest → NotInScan.
+            // Hash_for_path = None → the file is not in the scan manifest → NotInScan. A failure
+            // to read it is not the same statement about the file.
             let hash = match store.hash_for_path(scan_id, path) {
                 Ok(Some(h)) => h,
                 Ok(None) => return Err(state::WatchEmpty::NotInScan.into()),
-                Err(_) => return Err(state::WatchEmpty::NotInScan.into()),
+                Err(err) => return Err(watch_unavailable(state::WatchSubject::FileGroup, &err)),
             };
             let hex = crate::model::duplicate::hex_encode(&hash);
             // No claim → the file is in the scan, but not in a materialized duplicate group.
-            let Some(claim) = store.group_claim(scan_id, &hex).ok().flatten() else {
-                return Err(state::WatchEmpty::NoDuplicates.into());
+            let claim = match store.group_claim(scan_id, &hex) {
+                Ok(Some(claim)) => claim,
+                Ok(None) => return Err(state::WatchEmpty::NoDuplicates.into()),
+                Err(err) => return Err(watch_unavailable(state::WatchSubject::FileGroup, &err)),
             };
             let files = store
                 .group_files(scan_id, &hex)
-                .map_err(|_| state::WatchEmpty::NoDuplicates)?;
+                .map_err(|err| watch_unavailable(state::WatchSubject::FileGroup, &err))?;
             Ok(state::WatchResult::FileGroup(
                 DuplicateGroup {
                     id: 0,
@@ -2019,12 +2028,14 @@ fn resolve_watch_group(
             match store.attributed_dir_group_at(scan_id, path) {
                 Ok(Some(group)) => return Ok(state::WatchResult::DirGroup(group)),
                 Ok(None) => {}
-                Err(err) => return Err(watch_unavailable(&err)),
+                Err(err) => {
+                    return Err(watch_unavailable(state::WatchSubject::DirectoryGroup, &err))
+                }
             }
             // Fallback: duplicate files INSIDE the directory.
             let inside = store
                 .dup_files_inside(scan_id, path)
-                .map_err(|err| watch_unavailable(&err))?;
+                .map_err(|err| watch_unavailable(state::WatchSubject::DirectoryGroup, &err))?;
             if !inside.is_empty() {
                 return Ok(state::WatchResult::InnerDupes(inside));
             }
@@ -2033,7 +2044,7 @@ fn resolve_watch_group(
             // covered subdirectory) and «in scan, but no duplicates» (everything is unique).
             if store
                 .is_path_in_scan(scan_id, path)
-                .map_err(|err| watch_unavailable(&err))?
+                .map_err(|err| watch_unavailable(state::WatchSubject::DirectoryGroup, &err))?
             {
                 Err(state::WatchEmpty::NoDuplicates.into())
             } else {
@@ -4590,11 +4601,20 @@ mod dir_watch_tests {
         let (mut app, _events) = app_watching(&db, scan_id, "/tank/t1");
         resolve_watch_groups(&mut app);
         let entry = watch_entry(&app);
-        let err = entry
+        let failure = entry
             .unavailable
-            .as_deref()
+            .as_ref()
             .expect("the failure to read the ledger is the answer");
-        assert!(err.contains("does not know"), "{err}");
+        assert_eq!(
+            failure.subject,
+            state::WatchSubject::DirectoryGroup,
+            "the accepted directory subject is unchanged"
+        );
+        assert!(
+            failure.detail.contains("does not know"),
+            "{}",
+            failure.detail
+        );
         assert!(entry.result.is_none(), "no group is claimed");
         assert_ne!(entry.empty, state::WatchEmpty::NoDuplicates);
         assert_ne!(entry.empty, state::WatchEmpty::NotInScan);
@@ -4764,15 +4784,17 @@ mod dir_watch_tests {
 
         resolve_watch_groups(&mut app);
         let entry = watch_entry(&app);
-        let err = entry.unavailable.as_deref().unwrap_or_else(|| {
+        let failure = entry.unavailable.as_ref().unwrap_or_else(|| {
             panic!(
                 "an unopenable checkpoint is not «out of scan»: empty={:?}, result={:?}",
                 entry.empty, entry.result
             )
         });
+        assert_eq!(failure.subject, state::WatchSubject::DirectoryGroup);
         assert!(
-            err.contains("newer version"),
-            "the real open error is preserved, not a generic one: {err}"
+            failure.detail.contains("newer version"),
+            "the real open error is preserved, not a generic one: {}",
+            failure.detail
         );
         assert!(entry.result.is_none(), "no group is claimed");
         assert_ne!(entry.empty, state::WatchEmpty::NotInScan);
@@ -4792,30 +4814,22 @@ mod dir_watch_tests {
         }
     }
 
-    /// C1b is scoped to the directory key. The file-cursor key meets the same broken database and
-    /// must keep the translation it has always had, with no unavailable state — the shared helper
-    /// changed, the two file-group branches did not.
+    /// Sink 1, file cursor. C1b deliberately left this branch translating an open failure into
+    /// «out of scan»; R4-C0 is the commit authorized to change it. The subject is the FILE one.
     #[test]
-    fn a_failed_open_still_reads_as_out_of_scan_for_a_file_cursor() {
+    fn a_failed_open_is_visible_for_a_file_cursor() {
         let (db, scan_id) = unopenable_db("open_dupof");
         let (mut app, _events) = app_over_broken_db(&db, scan_id, "/tank/t1");
         app.commander.panels[0].entries = vec![panel_entry("/tank/t1/f", EntryKind::File)];
         app.commander.panels[0].list.select(Some(0));
 
         resolve_watch_groups(&mut app);
-        let entry = watch_entry(&app);
-        assert!(
-            entry.unavailable.is_none(),
-            "DupOf is explicitly out of C1b's scope: {:?}",
-            entry.unavailable
-        );
-        assert_eq!(entry.empty, state::WatchEmpty::NotInScan);
-        assert!(entry.result.is_none());
+        assert_file_unavailable(&app, "newer version");
     }
 
-    /// The same control for the group-list key.
+    /// Sink 1, group-list key.
     #[test]
-    fn a_failed_open_still_reads_as_out_of_scan_for_a_group_cursor() {
+    fn a_failed_open_is_visible_for_a_group_cursor() {
         let (db, scan_id) = unopenable_db("open_group");
         let (mut app, _events) = app_over_broken_db(&db, scan_id, "/tank/t1");
         app.commander.panels[0].view = PanelView::GroupList;
@@ -4823,13 +4837,265 @@ mod dir_watch_tests {
         app.commander.panels[1].view = PanelView::GroupFiles;
 
         resolve_watch_groups(&mut app);
-        let entry = watch_entry(&app);
-        assert!(
-            entry.unavailable.is_none(),
-            "Group is explicitly out of C1b's scope: {:?}",
-            entry.unavailable
+        assert_file_unavailable(&app, "newer version");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // R4-C0: every hard store failure of the FILE-group watch flow is visible, subject-typed and
+    // cached, and no legitimate absence changes meaning. Fixtures are real schema failures — a
+    // renamed column that `CREATE TABLE IF NOT EXISTS` cannot restore — never asserted wording.
+    // ---------------------------------------------------------------------------------------
+
+    /// A completed scan holding one real file group of two allocations.
+    fn file_group_db(tag: &str) -> (PathBuf, i64) {
+        let db = db_path(tag);
+        let mut store = ScanStore::open(&db).unwrap();
+        let scan_id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank")]))
+            .unwrap();
+        store
+            .record_files(
+                scan_id,
+                &["/tank/a.bin", "/tank/b.bin"]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, path)| crate::state::ManifestRow {
+                        path: PathBuf::from(path),
+                        size: 4096,
+                        mtime: 0,
+                        device: 1,
+                        inode: i as u64 + 1,
+                        nlink: 1,
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let digest = [7u8; 32];
+        store
+            .record_hashes(
+                scan_id,
+                &[
+                    (PathBuf::from("/tank/a.bin"), digest),
+                    (PathBuf::from("/tank/b.bin"), digest),
+                ],
+            )
+            .unwrap();
+        store.materialize_file_groups(scan_id).unwrap();
+        store.set_status(scan_id, ScanStatus::Complete).unwrap();
+        (db, scan_id)
+    }
+
+    /// The group list as the commander already holds it in RAM. Captured while the database is
+    /// still healthy, which is the real sequence: the list is loaded, and only then a read fails.
+    fn loaded_summaries(db: &Path, scan_id: i64) -> Vec<crate::state::GroupSummary> {
+        let summaries = ScanStore::open(db)
+            .expect("the fixture opens before it is broken")
+            .group_summaries(scan_id)
+            .expect("one materialized group");
+        assert_eq!(summaries.len(), 1, "the fixture must hold one group");
+        summaries
+    }
+
+    /// A commander whose watching panel resolves `WatchKey::Group(0)`.
+    fn app_watching_group(
+        db: &Path,
+        scan_id: i64,
+        summaries: Vec<crate::state::GroupSummary>,
+    ) -> (
+        App,
+        crossbeam_channel::Receiver<crate::tui::event::AppEvent>,
+    ) {
+        let (mut app, events) = app_over_broken_db(db, scan_id, "/tank/a.bin");
+        app.commander.group_summaries = summaries;
+        app.commander.groups_loaded_for = Some(scan_id);
+        app.commander.panels[0].view = PanelView::GroupList;
+        app.commander.panels[0].list.select(Some(0));
+        app.commander.panels[1].view = PanelView::GroupFiles;
+        (app, events)
+    }
+
+    /// A commander whose watching panel resolves `WatchKey::DupOf("/tank/a.bin")`.
+    fn app_watching_file(
+        db: &Path,
+        scan_id: i64,
+    ) -> (
+        App,
+        crossbeam_channel::Receiver<crate::tui::event::AppEvent>,
+    ) {
+        let (mut app, events) = app_over_broken_db(db, scan_id, "/tank/a.bin");
+        app.commander.panels[0].entries = vec![panel_entry("/tank/a.bin", EntryKind::File)];
+        app.commander.panels[0].list.select(Some(0));
+        (app, events)
+    }
+
+    /// Renames a column away, so the exact statement that reads it fails for real.
+    fn break_column(db: &Path, table: &str, column: &str) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} RENAME COLUMN {column} TO {column}_gone"
+        ))
+        .unwrap();
+    }
+
+    /// The whole R4-C0 contract for one sink: file subject, a concrete detail, cached, no result
+    /// and no empty reason left standing.
+    fn assert_file_unavailable(app: &App, expect_detail: &str) {
+        let entry = watch_entry(app);
+        let failure = entry.unavailable.as_ref().unwrap_or_else(|| {
+            panic!(
+                "a store failure is not an empty state: empty={:?}, result={:?}",
+                entry.empty, entry.result
+            )
+        });
+        assert_eq!(
+            failure.subject,
+            state::WatchSubject::FileGroup,
+            "a file-key failure must not call itself a directory one"
         );
-        assert_eq!(entry.empty, state::WatchEmpty::NotInScan);
-        assert!(entry.result.is_none());
+        assert!(
+            failure.detail.contains(expect_detail),
+            "the concrete error is preserved: {}",
+            failure.detail
+        );
+        assert!(entry.result.is_none(), "no group is claimed");
+        assert_eq!(
+            entry.empty,
+            state::WatchEmpty::NoSource,
+            "no empty reason survives beside a failure"
+        );
+    }
+
+    /// Sink 2 — `Group`, failed member read. Only that statement joins `file_mark`.
+    #[test]
+    fn a_failed_group_member_read_is_visible() {
+        let (db, scan_id) = file_group_db("grp_files");
+        let summaries = loaded_summaries(&db, scan_id);
+        break_column(&db, "file_mark", "is_keeper");
+        let (mut app, _e) = app_watching_group(&db, scan_id, summaries);
+        resolve_watch_groups(&mut app);
+        assert_file_unavailable(&app, "is_keeper");
+    }
+
+    /// Sink 3 — `Group`, failed claim read. Only that statement reads `file_group`.
+    #[test]
+    fn a_failed_group_claim_read_is_visible() {
+        let (db, scan_id) = file_group_db("grp_claim");
+        let summaries = loaded_summaries(&db, scan_id);
+        break_column(&db, "file_group", "reclaim");
+        let (mut app, _e) = app_watching_group(&db, scan_id, summaries);
+        resolve_watch_groups(&mut app);
+        assert_file_unavailable(&app, "reclaim");
+    }
+
+    /// Sink 4 — `DupOf`, failed cursor-hash read, the first read of the branch.
+    #[test]
+    fn a_failed_cursor_hash_read_is_visible() {
+        let (db, scan_id) = file_group_db("dup_hash");
+        break_column(&db, "file", "hash");
+        let (mut app, _e) = app_watching_file(&db, scan_id);
+        resolve_watch_groups(&mut app);
+        assert_file_unavailable(&app, "hash");
+    }
+
+    /// Sink 5 — `DupOf`, failed claim read, after a successful hash read.
+    #[test]
+    fn a_failed_cursor_claim_read_is_visible() {
+        let (db, scan_id) = file_group_db("dup_claim");
+        break_column(&db, "file_group", "reclaim");
+        let (mut app, _e) = app_watching_file(&db, scan_id);
+        resolve_watch_groups(&mut app);
+        assert_file_unavailable(&app, "reclaim");
+    }
+
+    /// Sink 6 — `DupOf`, failed member read, after hash and claim both succeeded.
+    #[test]
+    fn a_failed_cursor_member_read_is_visible() {
+        let (db, scan_id) = file_group_db("dup_files");
+        break_column(&db, "file_mark", "is_keeper");
+        let (mut app, _e) = app_watching_file(&db, scan_id);
+        resolve_watch_groups(&mut app);
+        assert_file_unavailable(&app, "is_keeper");
+    }
+
+    /// The legitimate absences keep their own meanings: `Ok(None)` is not a failure, and nothing
+    /// about them may acquire an unavailable state.
+    #[test]
+    fn legitimate_absences_keep_their_own_meaning() {
+        // A hashed file that forms no materialized group → NoDuplicates.
+        let (db, scan_id) = file_group_db("ok_none_claim");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("DELETE FROM file_group WHERE scan_id = ?1", [scan_id])
+            .unwrap();
+        drop(conn);
+        let (mut app, _e) = app_watching_file(&db, scan_id);
+        resolve_watch_groups(&mut app);
+        let entry = watch_entry(&app);
+        assert!(entry.unavailable.is_none(), "an absence is not a failure");
+        assert_eq!(entry.empty, state::WatchEmpty::NoDuplicates);
+
+        // A path with no manifest row at all → NotInScan.
+        let (db2, scan_id2) = file_group_db("ok_none_hash");
+        let (mut app2, _e2) = app_over_broken_db(&db2, scan_id2, "/tank/a.bin");
+        app2.commander.panels[0].entries = vec![panel_entry("/tank/missing.bin", EntryKind::File)];
+        app2.commander.panels[0].list.select(Some(0));
+        resolve_watch_groups(&mut app2);
+        let entry2 = watch_entry(&app2);
+        assert!(entry2.unavailable.is_none(), "an absence is not a failure");
+        assert_eq!(entry2.empty, state::WatchEmpty::NotInScan);
+    }
+
+    /// The unavailable state survives a re-resolve of the same key: it is cached like any other
+    /// answer, so the panel does not flicker back to a clean empty message.
+    #[test]
+    fn a_file_failure_stays_cached_across_a_re_resolve() {
+        let (db, scan_id) = file_group_db("cached");
+        break_column(&db, "file_mark", "is_keeper");
+        let (mut app, _e) = app_watching_file(&db, scan_id);
+        resolve_watch_groups(&mut app);
+        assert_file_unavailable(&app, "is_keeper");
+        app.browse_store = None;
+        re_resolve(&mut app);
+        assert_file_unavailable(&app, "is_keeper");
+    }
+
+    /// What the operator actually reads, at the widest and at the supported floor: the complete
+    /// subject phrase, never truncated away, and never the directory wording.
+    #[test]
+    fn a_file_failure_names_its_subject_at_every_supported_width() {
+        let (db, scan_id) = file_group_db("render_file");
+        break_column(&db, "file_mark", "is_keeper");
+        let (mut app, _e) = app_watching_file(&db, scan_id);
+        resolve_watch_groups(&mut app);
+
+        let (wide_lines, wide_width) = render_watch_panel_at(&mut app, 120);
+        assert_eq!(wide_width, 60, "two panels across 120 columns");
+        let wide = wide_lines.join("\n");
+        assert!(
+            wide.contains("file group unavailable:"),
+            "the panel names what failed: {wide}"
+        );
+        assert!(
+            !wide.contains("directory group unavailable"),
+            "a file failure must not borrow the directory wording: {wide}"
+        );
+        for forbidden in ["no dupes at the cursor", "out of scan", "no scan data"] {
+            assert!(
+                !wide.contains(forbidden),
+                "a failure must not read as «{forbidden}»: {wide}"
+            );
+        }
+
+        let (narrow_lines, narrow_width) = render_watch_panel_at(&mut app, 72);
+        assert_eq!(
+            narrow_width,
+            layout::MIN_PANEL_WIDTH,
+            "72 columns is exactly two panels at the supported floor"
+        );
+        let narrow = narrow_lines.join("\n");
+        assert!(
+            narrow.contains("file group unavailable:"),
+            "the subject survives the floor whole — `unavailable` is never truncated: {narrow}"
+        );
     }
 }

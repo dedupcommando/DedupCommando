@@ -57,7 +57,7 @@ pub fn render_panel(
 ) {
     let source_result = source.and_then(|e| e.result.as_ref());
     let source_empty = source.map(|e| e.empty).unwrap_or_default();
-    let source_unavailable = source.and_then(|e| e.unavailable.as_deref());
+    let source_unavailable = source.and_then(|e| e.unavailable.as_ref());
     let border = if focused {
         Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     } else {
@@ -156,16 +156,10 @@ pub fn render_panel(
             let title = format!(" {} · {} ", index + 1, panel.view.label());
             // A checkpoint that could not be READ is its own state: it precedes every result and
             // every empty message, so a store failure can never be shown as «no dupes at the
-            // cursor» or as the directory being outside the scan.
-            if let Some(err) = source_unavailable {
-                render_view_fallback(
-                    frame,
-                    area,
-                    border,
-                    index,
-                    panel.view,
-                    &format!("directory group unavailable: {err}"),
-                );
+            // cursor» or as the directory being outside the scan. The subject travels with the
+            // failure — the panel does not guess which one it is from what it happens to show.
+            if let Some(failure) = source_unavailable {
+                render_view_fallback(frame, area, border, index, panel.view, &failure.message());
                 return;
             }
             match (panel.view, source_result) {

@@ -603,6 +603,43 @@ pub enum WatchResult {
     InnerDupes(Vec<PathBuf>),
 }
 
+/// Which kind of source failed to read. Carried from the resolver through the cache to the
+/// renderer: the wording of a failure is a property of what was asked for, and inferring it later
+/// from whichever panel happens to be on screen is how a file error ends up calling itself a
+/// directory one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchSubject {
+    /// The group of a file cursor or of a selected group row.
+    FileGroup,
+    /// The twin-directory group of a directory cursor.
+    DirectoryGroup,
+}
+
+impl WatchSubject {
+    /// The frozen subject phrase. The directory wording is the one R3D-C1 froze, unchanged.
+    pub fn unavailable_label(self) -> &'static str {
+        match self {
+            WatchSubject::FileGroup => "file group unavailable",
+            WatchSubject::DirectoryGroup => "directory group unavailable",
+        }
+    }
+}
+
+/// A store failure behind an absent result: what could not be read, and why. The detail is
+/// sanitized once, where the error is caught.
+#[derive(Debug, Clone)]
+pub struct WatchUnavailable {
+    pub subject: WatchSubject,
+    pub detail: String,
+}
+
+impl WatchUnavailable {
+    /// The line the panel draws.
+    pub fn message(&self) -> String {
+        format!("{}: {}", self.subject.unavailable_label(), self.detail)
+    }
+}
+
 /// Why a "watching" panel has no result. Emptiness and failure are different answers: the three
 /// `WatchEmpty` reasons are legitimate states of the data, while `Unavailable` means the store
 /// could not be read at all. Folding the second into the first is what lets a broken database
@@ -610,8 +647,8 @@ pub enum WatchResult {
 #[derive(Debug, Clone)]
 pub enum WatchMiss {
     Empty(WatchEmpty),
-    /// A hard store/snapshot failure, already sanitized for the terminal.
-    Unavailable(String),
+    /// A hard store failure, with the subject that failed.
+    Unavailable(WatchUnavailable),
 }
 
 impl From<WatchEmpty> for WatchMiss {
@@ -647,9 +684,9 @@ pub struct WatchEntry {
     pub key: Option<WatchKey>,
     pub result: Option<WatchResult>,
     pub empty: WatchEmpty,
-    /// The store failure behind an absent result, sanitized. While it is set the panel says so
-    /// and enters no fallback: an unreadable checkpoint is not «no duplicates».
-    pub unavailable: Option<String>,
+    /// The store failure behind an absent result. While it is set the panel says so and enters no
+    /// fallback: an unreadable checkpoint is not «no duplicates».
+    pub unavailable: Option<WatchUnavailable>,
 }
 
 impl WatchEntry {
