@@ -190,7 +190,7 @@ pub fn render_panel(
                     let title = if group.trust == crate::model::duplicate::DirTrust::Trusted {
                         title
                     } else {
-                        format!(" {} · unverified candidate — rescan required ", index + 1)
+                        unverified_dir_title(index, area.width)
                     };
                     browser::render_dir_group_files(
                         frame,
@@ -679,6 +679,25 @@ pub(crate) fn group_files_empty_message(empty: WatchEmpty) -> &'static str {
         WatchEmpty::NoSource => "no source — need a «groups» panel on the left",
         WatchEmpty::NotInScan => "group selected, but it's not in the scan",
         WatchEmpty::NoDuplicates => "group has no files",
+    }
+}
+
+/// Title of an unverified directory answer, sized to the panel that will draw it.
+///
+/// The remedy is the whole point of the wording, so it may not be the part that falls off the
+/// end. A panel at the supported floor (`layout::MIN_PANEL_WIDTH` = 36) leaves 34 title cells
+/// between its borders, two short of the wide form — and the two that go are `required`, leaving
+/// a title that names a problem and no way out of it. The compact form keeps both facts inside 34
+/// cells by dropping the noun, which carries no information the panel does not already show.
+/// Chosen from the panel's own width, never from the terminal's or the panel count.
+fn unverified_dir_title(index: usize, width: u16) -> String {
+    let wide = format!(" {} · unverified candidate — rescan required ", index + 1);
+    // Cells between the two border columns. `chars().count()` is the width measure the rest of
+    // this file uses (`fit`, `ellipsize_left`); every character in either title is one cell wide.
+    if wide.chars().count() <= width.saturating_sub(2) as usize {
+        wide
+    } else {
+        format!(" {} · unverified · rescan required ", index + 1)
     }
 }
 

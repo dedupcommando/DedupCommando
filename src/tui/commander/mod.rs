@@ -4460,15 +4460,22 @@ mod dir_watch_tests {
             .collect()
     }
 
-    /// Renders the commander and returns the watching panel's lines.
-    fn render_watch_panel(app: &mut App) -> Vec<String> {
-        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+    /// Renders the commander at `term_width` and returns the watching panel's lines together with
+    /// the width that panel actually received. A render proof about a narrow panel is worth
+    /// nothing if the panel quietly came out wide, so the width is returned to be asserted.
+    fn render_watch_panel_at(app: &mut App, term_width: u16) -> (Vec<String>, u16) {
+        let mut terminal = Terminal::new(TestBackend::new(term_width, 20)).unwrap();
         terminal.draw(|frame| render(frame, app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
-        let regions = layout::regions(Rect::new(0, 0, 120, 20));
-        let rects = layout::panel_rects(regions.panels, visible_panel_count(app, 120));
+        let regions = layout::regions(Rect::new(0, 0, term_width, 20));
+        let rects = layout::panel_rects(regions.panels, visible_panel_count(app, term_width));
         assert!(rects.len() >= 2, "the watching panel must be on screen");
-        panel_lines(&buffer, rects[1])
+        (panel_lines(&buffer, rects[1]), rects[1].width)
+    }
+
+    /// Renders the commander and returns the watching panel's lines.
+    fn render_watch_panel(app: &mut App) -> Vec<String> {
+        render_watch_panel_at(app, 120).0
     }
 
     /// The whole point of C1: the ledger written AFTER materialization decides what the watch
@@ -4636,7 +4643,9 @@ mod dir_watch_tests {
             other => panic!("an unverified group stays inspectable: {other:?}"),
         }
 
-        let unverified = render_watch_panel(&mut app).join("\n");
+        let (wide_lines, wide_width) = render_watch_panel_at(&mut app, 120);
+        assert_eq!(wide_width, 60, "two panels across 120 columns");
+        let unverified = wide_lines.join("\n");
         assert!(
             unverified.contains("unverified candidate — rescan required"),
             "the frozen qualifier must be visible: {unverified}"
@@ -4649,6 +4658,42 @@ mod dir_watch_tests {
             assert!(
                 !unverified.contains(forbidden),
                 "an unverified answer may not claim «{forbidden}»: {unverified}"
+            );
+        }
+    }
+
+    /// The same answer at the SUPPORTED FLOOR. 36 columns leave 34 title cells, two short of the
+    /// wide wording — and the two characters that fall off are the end of `required`, the only
+    /// part that says what to do about it. The compact title keeps both facts inside the floor.
+    #[test]
+    fn the_unverified_remedy_survives_the_narrow_panel() {
+        let (db, scan_id) = seeded_db("narrow");
+        let (mut app, _events) = app_watching(&db, scan_id, "/tank/t1");
+        let mut store = ScanStore::open(&db).unwrap();
+        store.clear_scan_omissions(scan_id).unwrap();
+        drop(store);
+        app.browse_store = None;
+        re_resolve(&mut app);
+
+        let (lines, width) = render_watch_panel_at(&mut app, 72);
+        assert_eq!(
+            width,
+            layout::MIN_PANEL_WIDTH,
+            "72 columns is exactly two panels at the supported floor"
+        );
+        let narrow = lines.join("\n");
+        assert!(
+            narrow.contains("unverified · rescan required"),
+            "the remedy may not be the part that gets clipped: {narrow}"
+        );
+        assert!(
+            narrow.contains("★?/tank/t1") && narrow.contains("? /tank/t2"),
+            "every member still carries the unverified marker: {narrow}"
+        );
+        for forbidden in ["twin", "duplicate", "dupes", "KiB", "MiB", " B "] {
+            assert!(
+                !narrow.contains(forbidden),
+                "an unverified answer may not claim «{forbidden}»: {narrow}"
             );
         }
     }
