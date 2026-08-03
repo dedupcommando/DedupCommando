@@ -4662,9 +4662,10 @@ mod dir_watch_tests {
         }
     }
 
-    /// The same answer at the SUPPORTED FLOOR. 36 columns leave 34 title cells, two short of the
-    /// wide wording — and the two characters that fall off are the end of `required`, the only
-    /// part that says what to do about it. The compact title keeps both facts inside the floor.
+    /// The same answer at the SUPPORTED FLOOR. 36 columns leave 34 title cells against the wide
+    /// wording's 44, so ten are clipped: the tail ` required ` goes whole and the title stops
+    /// after `rescan`, losing the only part that says what to do about it. The compact title
+    /// keeps both facts inside the floor.
     #[test]
     fn the_unverified_remedy_survives_the_narrow_panel() {
         let (db, scan_id) = seeded_db("narrow");

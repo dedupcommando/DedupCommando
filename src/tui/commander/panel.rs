@@ -685,10 +685,11 @@ pub(crate) fn group_files_empty_message(empty: WatchEmpty) -> &'static str {
 /// Title of an unverified directory answer, sized to the panel that will draw it.
 ///
 /// The remedy is the whole point of the wording, so it may not be the part that falls off the
-/// end. A panel at the supported floor (`layout::MIN_PANEL_WIDTH` = 36) leaves 34 title cells
-/// between its borders, two short of the wide form — and the two that go are `required`, leaving
-/// a title that names a problem and no way out of it. The compact form keeps both facts inside 34
-/// cells by dropping the noun, which carries no information the panel does not already show.
+/// end. The wide form is 44 cells; a panel at the supported floor (`layout::MIN_PANEL_WIDTH` =
+/// 36) leaves 34 between its borders, so ten are clipped — exactly the tail ` required `, which
+/// ends the visible title after `rescan` and names a problem with no way out of it. The compact
+/// form keeps both facts inside 34 cells by dropping the noun, which carries no information the
+/// panel does not already show.
 /// Chosen from the panel's own width, never from the terminal's or the panel count.
 fn unverified_dir_title(index: usize, width: u16) -> String {
     let wide = format!(" {} · unverified candidate — rescan required ", index + 1);
