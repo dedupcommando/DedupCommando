@@ -288,6 +288,15 @@ grep -q "Resuming unfinished scan" "$STATE_RESUME_AUTH/run2.out" || {
 grep -q "^Omissions:            0 files, 0 walk errors, 0 unsupported entries" \
     "$STATE_RESUME_AUTH/run2.out" || { echo "exact zero ledger totals expected"; exit 1; }
 
+# Only NOW does the resume tree gain an omission: 8a above had to see a clean root and prove an
+# exact zero, while 8b needs one real event whose account cannot outlive the interrupted process.
+# A FIFO is the deterministic, privilege-free choice -- the walk classifies it by entry type, with
+# no sleep, no permission race and no mocked counter. It lives in the disposable pool and dies
+# with it.
+mkfifo "$BIGROOT/one/resume-observed.pipe"
+test -p "$BIGROOT/one/resume-observed.pipe" || {
+    echo "the unsupported-entry fixture is not a FIFO"; exit 1; }
+
 # 8b. Roots-unavailable (relative root spelling): the resume MUST re-walk and reconstruct
 # the observed account before completing.
 export STATE_RESUME_REL=/tmp/dedcom-dir-resume-rel
@@ -299,23 +308,42 @@ grep -q "Resuming unfinished scan" "$STATE_RESUME_REL/run2.out" || {
     echo "run 2 must resume the relative-root scan"; exit 1; }
 [ "$(walk_count "$STATE_RESUME_REL")" = "2" ] || {
     echo "a no-authority Hashing resume must re-walk"; exit 1; }
-grep -q "(session only — not persisted)" "$STATE_RESUME_REL/run2.out" || {
-    echo "the reconstructed observed account must be reported"; exit 1; }
+# The lost-session-account window: run 1 counted the FIFO and died with its count. Run 2 has to
+# re-walk and arrive at the SAME number -- an exact account, not merely the session-only wording.
+grep -qxF "Omissions:            0 files, 0 walk errors, 1 unsupported entries (session only — not persisted)" \
+    "$STATE_RESUME_REL/run2.out" || {
+    echo "the reconstructed account must be exactly one unsupported entry, session-only:"
+    grep -n "^Omissions:" "$STATE_RESUME_REL/run2.out" || echo "(no Omissions line at all)"
+    exit 1; }
+# And the aggregate notice must name the same event AND its persistence truth.
+grep -q "Scan left gaps: 1 unsupported entries" "$STATE_RESUME_REL/run2.out" || {
+    echo "the notice must name the reconstructed event:"; cat "$STATE_RESUME_REL/run2.out"; exit 1; }
+grep -qF "(details not persisted: no completeness authority)" "$STATE_RESUME_REL/run2.out" || {
+    echo "the notice must say the account was not persisted:"; cat "$STATE_RESUME_REL/run2.out"; exit 1; }
 cd /tmp
 python3 - <<'PY'
 import os, sqlite3
-for name, state, want_root in (
-    ("auth", os.environ["STATE_RESUME_AUTH"], 1),
-    ("rel", os.environ["STATE_RESUME_REL"], 0),
+# One expected status for both cases would hide the whole point: the authoritative root finishes
+# clean, while the root that could never be registered finishes WITH warnings -- it saw a real
+# omission it has nowhere to persist. Hence a per-case matrix, and a dir_omission count that
+# proves the reconstructed account really is session-only rather than quietly stored.
+for name, state, want_root, want_status in (
+    ("auth", os.environ["STATE_RESUME_AUTH"], 1, "complete"),
+    ("rel", os.environ["STATE_RESUME_REL"], 0, "complete_with_warnings"),
 ):
     con = sqlite3.connect(os.path.join(state, "dedcom.db"))
     sid, status = con.execute("SELECT id, status FROM scan ORDER BY id DESC LIMIT 1").fetchone()
-    if status != "complete":
-        raise SystemExit(f"[{name}] the resumed scan must complete cleanly: {status}")
+    if status != want_status:
+        raise SystemExit(f"[{name}] expected status {want_status}, got {status}")
     roots = con.execute("SELECT COUNT(*) FROM scan_root WHERE scan_id=?", (sid,)).fetchone()[0]
     if roots != want_root:
         raise SystemExit(f"[{name}] expected {want_root} scan_root rows, got {roots}")
-    print(f"[resume/{name}] status={status}, scan_root rows={roots}")
+    omissions = con.execute(
+        "SELECT COUNT(*) FROM dir_omission WHERE scan_id=?", (sid,)
+    ).fetchone()[0]
+    if omissions != 0:
+        raise SystemExit(f"[{name}] expected no persisted omission rows, got {omissions}")
+    print(f"[resume/{name}] status={status}, scan_root rows={roots}, dir_omission rows={omissions}")
 PY
 
 banner "9. Old/Merkle parity holds for the walk-error fixture too"
