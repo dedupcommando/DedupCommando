@@ -21,8 +21,8 @@ use crate::model::omission::{
 #[cfg(test)]
 use crate::model::omission::{EventCount, OmissionReason};
 use crate::model::plan::{
-    ActionPlan, GroupId, MarkIntent, PlanGroupInput, PlanMemberEvidence, PlanObjectKey,
-    PlanRefusal, PlanResult, PlanWitness, RequestedMark,
+    ActionPlan, GroupId, GroupWitness, MarkIntent, PlanGroupInput, PlanMemberEvidence,
+    PlanObjectKey, PlanRefusal, PlanResult, PlanWitness, RequestedMark,
 };
 use crate::model::reclaim::{
     DestructivePlanVerdict, GroupReclaim, LinkCount, ReclaimEstimate, ReclaimState,
@@ -3980,6 +3980,28 @@ fn decode_authority(
     }
 }
 
+/// Every value `file_group.reclaim_state` may legitimately hold, as an SQL list.
+///
+/// Taken from the enum rather than written as `IN (0, 1, 2)`: the exhaustive `match` below is
+/// what makes a new variant a compile error here instead of a silently narrowed domain check
+/// that would start rejecting freshly published data.
+fn persisted_reclaim_states() -> String {
+    let all = [
+        ReclaimState::Unknown,
+        ReclaimState::Exact,
+        ReclaimState::UpperBound,
+    ];
+    for state in all {
+        match state {
+            ReclaimState::Unknown | ReclaimState::Exact | ReclaimState::UpperBound => {}
+        }
+    }
+    all.iter()
+        .map(|state| state.as_i64().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The one whole-authority validation every trusted membership answer rests on.
 ///
 /// Set-wise and fixed in statement count — never per group, never per page. It accounts for the
@@ -4003,19 +4025,28 @@ fn validate_authority(
         return Ok(AuthorityIntegrity::default());
     }
 
-    // 1. Storage classes and domains of every summary cell this layer converts to Rust. A
-    //    declared INTEGER is an affinity, not a domain: `-3` and a BLOB both live happily in
-    //    `file_count`, and `as u64` would turn the first into 18446744073709551613.
+    // 1. Storage classes AND the real persisted domains of every summary cell this layer
+    //    converts to Rust. A declared INTEGER is an affinity, not a domain: `-3` and a BLOB
+    //    both live happily in `file_count`, and `as u64` would turn the first into
+    //    18446744073709551613. Two of these are domains rather than ranges: `reclaim_state`
+    //    is an enum, so `99` is not «large», it is not a state at all; and `hash` is
+    //    canonical lower-case BLAKE3 hex, which is what `GroupWitness.digest` is specified to
+    //    carry — an identity whose digest no consumer can decode is not a trusted identity.
     let bad_summary: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM file_group
-          WHERE scan_id = ?1
-            AND (typeof(rank) <> 'integer' OR rank < 0
-              OR typeof(hash) <> 'text'
-              OR typeof(file_count) <> 'integer' OR file_count < 0
-              OR typeof(size) <> 'integer' OR size < 0
-              OR typeof(reclaim) <> 'integer' OR reclaim < 0
-              OR typeof(object_count) <> 'integer' OR object_count < 0
-              OR typeof(reclaim_state) <> 'integer' OR reclaim_state < 0)",
+        &format!(
+            "SELECT COUNT(*) FROM file_group
+              WHERE scan_id = ?1
+                AND (typeof(rank) <> 'integer' OR rank < 0
+                  OR typeof(hash) <> 'text'
+                  OR length(hash) <> 64 OR hash GLOB '*[^0-9a-f]*'
+                  OR typeof(file_count) <> 'integer' OR file_count < 0
+                  OR typeof(size) <> 'integer' OR size < 0
+                  OR typeof(reclaim) <> 'integer' OR reclaim < 0
+                  OR typeof(object_count) <> 'integer' OR object_count < 0
+                  OR typeof(reclaim_state) <> 'integer'
+                  OR reclaim_state NOT IN ({states}))",
+            states = persisted_reclaim_states()
+        ),
         params![scan_id],
         |row| row.get(0),
     )?;
@@ -4031,18 +4062,19 @@ fn validate_authority(
     match mode {
         MembershipMode::Explicit => {
             // 2. Every structural Explicit invariant, in ONE statement, over the whole scan.
-            let (bad_cells, wrong_generation, no_manifest, no_summary, duplicated, empty_groups): (
-                i64,
-                i64,
-                i64,
-                i64,
-                i64,
-                i64,
-            ) = tx.query_row(
+            let (
+                bad_cells,
+                wrong_generation,
+                no_manifest,
+                no_summary,
+                duplicated,
+                empty_groups,
+                foreign_digest,
+            ): (i64, i64, i64, i64, i64, i64, i64) = tx.query_row(
                 "SELECT
                    (SELECT COUNT(*) FROM file_group_member m
                      WHERE m.scan_id = ?1
-                       AND (typeof(m.path) <> 'text'
+                       AND (typeof(m.path) <> 'text' OR m.path = ''
                          OR typeof(m.group_rank) <> 'integer' OR m.group_rank < 0
                          OR typeof(m.generation) <> 'integer')),
                    (SELECT COUNT(*) FROM file_group_member m
@@ -4059,7 +4091,16 @@ fn validate_authority(
                    (SELECT COUNT(*) FROM file_group g
                      LEFT JOIN file_group_member m
                             ON m.scan_id = g.scan_id AND m.group_rank = g.rank
-                     WHERE g.scan_id = ?1 AND m.path IS NULL)",
+                     WHERE g.scan_id = ?1 AND m.path IS NULL),
+                   (SELECT COUNT(*) FROM file_group_member m
+                     JOIN file_group g ON g.scan_id = m.scan_id AND g.rank = m.group_rank
+                     JOIN file       f ON f.scan_id = m.scan_id AND f.path = m.path
+                     WHERE m.scan_id = ?1
+                       AND (f.hash IS NULL
+                         OR typeof(f.hash) <> 'blob'
+                         OR length(f.hash) <> 32
+                         OR unhex(g.hash) IS NULL
+                         OR f.hash <> unhex(g.hash)))",
                 params![scan_id, generation],
                 |row| {
                     Ok((
@@ -4069,6 +4110,7 @@ fn validate_authority(
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )?;
@@ -4085,6 +4127,10 @@ fn validate_authority(
                 (no_summary, "member row(s) with no group summary"),
                 (duplicated, "pathname(s) belonging to two ranks"),
                 (empty_groups, "explicit group(s) with no members"),
+                (
+                    foreign_digest,
+                    "member row(s) whose manifest digest is not their group's own",
+                ),
             ] {
                 if count != 0 {
                     return Err(MembershipMiss::Inconsistent {
@@ -4094,18 +4140,36 @@ fn validate_authority(
             }
         }
         MembershipMode::Derived => {
-            // 2'. Derived membership is the manifest by digest, so its own invariant is that
-            //     no member row exists at all — a surplus row is corruption, never surplus.
-            let members: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM file_group_member WHERE scan_id = ?1",
+            // 2'. Derived membership is reconstructed from the summary's digest alone, so it
+            //     has two invariants of its own. No member row may exist — a surplus row is
+            //     corruption, never surplus. And no digest may name two summaries: two
+            //     Explicit ranks may legitimately share a digest, because byte verification
+            //     supplied their disjoint member rows, but Derived has no such discriminator
+            //     and would put the very same manifest pathnames in both groups. That is a
+            //     mode-aware READ invariant, deliberately not a UNIQUE index on
+            //     `file_group.hash` — the index would forbid the legitimate Explicit case too.
+            let (members, duplicate_digests): (i64, i64) = tx.query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM file_group_member WHERE scan_id = ?1),
+                   (SELECT COUNT(*) FROM (SELECT hash FROM file_group
+                                           WHERE scan_id = ?1
+                                           GROUP BY hash HAVING COUNT(*) > 1))",
                 params![scan_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             if members != 0 {
                 return Err(MembershipMiss::Inconsistent {
                     detail: format!(
                         "scan {scan_id} declares derived membership but holds {members} explicit \
                          member row(s)"
+                    ),
+                });
+            }
+            if duplicate_digests != 0 {
+                return Err(MembershipMiss::Inconsistent {
+                    detail: format!(
+                        "scan {scan_id} derives membership from digests but holds \
+                         {duplicate_digests} digest(s) naming two group summaries"
                     ),
                 });
             }
@@ -4698,6 +4762,10 @@ impl MembershipSnapshot<'_> {
 
     /// Every current group identity carrying this digest, in rank order. Two explicit ranks
     /// may legitimately share one digest — that is exactly R4-V1's split populations.
+    ///
+    /// Every returned rank passes the same consistency gate the exact answers pass. An
+    /// inconsistent rank refuses the whole lookup rather than being filtered out of it:
+    /// filtering would turn corruption into a smaller answer that looks entirely valid.
     pub fn groups_of_digest(
         &self,
         digest: &str,
@@ -4709,9 +4777,11 @@ impl MembershipSnapshot<'_> {
         let rows = stmt.query_map(params![self.scan_id, digest], |row| row.get::<_, i64>(0))?;
         let mut out = Vec::new();
         for row in rows {
+            let rank = row?;
+            self.require_consistent(rank)?;
             out.push(GroupId {
                 scan_id: self.scan_id,
-                rank: row?,
+                rank,
                 generation: self.generation,
             });
         }
@@ -5029,16 +5099,29 @@ struct WitnessedRank {
     observed: i64,
 }
 
+/// Rank → witnessed group, built once. The acquisition preflight has already refused a
+/// repeated rank, so the map is total and lossless — and it is what keeps validation O(K)
+/// instead of the O(K²) a linear `find` per returned rank would cost while the SQL and bind
+/// counts stayed fixed.
+type WitnessIndex<'a> = HashMap<i64, &'a GroupWitness>;
+
+fn witness_index(witness: &PlanWitness) -> WitnessIndex<'_> {
+    witness
+        .groups
+        .iter()
+        .map(|group| (group.id.rank, group))
+        .collect()
+}
+
 /// Checks one accumulated rank against the witness, in the frozen refusal order.
 fn check_witnessed_rank(
     checked: &WitnessedRank,
-    witness: &PlanWitness,
+    index: &WitnessIndex<'_>,
     generation: Option<i64>,
 ) -> std::result::Result<(), LeaseRefusal> {
-    let group = witness
-        .groups
-        .iter()
-        .find(|group| group.id.rank == checked.rank)
+    let group = index
+        .get(&checked.rank)
+        .copied()
         .ok_or_else(|| LeaseRefusal::Inconsistent {
             detail: format!("validation returned unwitnessed rank {}", checked.rank),
         })?;
@@ -5111,7 +5194,7 @@ fn check_witnessed_rank(
 /// final count of ranks seen (every witnessed rank must come back — `want` drives the join).
 fn stream_witnessed_ranks(
     rows: &mut rusqlite::Rows<'_>,
-    witness: &PlanWitness,
+    index: &WitnessIndex<'_>,
     generation: Option<i64>,
     read_member_generation: bool,
 ) -> std::result::Result<usize, LeaseRefusal> {
@@ -5136,6 +5219,22 @@ fn stream_witnessed_ranks(
         let observed: i64 = row
             .get(if read_member_generation { 6 } else { 5 })
             .map_err(lease_store_refusal)?;
+        if !read_member_generation {
+            // Derived mode carries one more column: the scan's count of digests naming two
+            // summaries. Derived membership IS the digest, so a duplicate inserted after
+            // planning silently puts the same manifest pathnames in two groups — it must stop
+            // the batch before it starts, and it costs no extra statement because the scalar
+            // is uncorrelated.
+            let duplicate_digests: i64 = row.get(6).map_err(lease_store_refusal)?;
+            if duplicate_digests != 0 {
+                return Err(LeaseRefusal::Inconsistent {
+                    detail: format!(
+                        "derived authority holds {duplicate_digests} digest(s) naming two group \
+                         summaries"
+                    ),
+                });
+            }
+        }
         if read_member_generation {
             // Explicit mode carries two more columns: this member's manifest presence, and the
             // scan's count of pathnames living in two ranks. Both are structural corruption
@@ -5160,7 +5259,7 @@ fn stream_witnessed_ranks(
         }
         if current.as_ref().map(|c| c.rank) != Some(rank) {
             if let Some(done) = current.take() {
-                check_witnessed_rank(&done, witness, generation)?;
+                check_witnessed_rank(&done, index, generation)?;
                 seen += 1;
             }
             current = Some(WitnessedRank {
@@ -5177,7 +5276,7 @@ fn stream_witnessed_ranks(
         }
     }
     if let Some(done) = current.take() {
-        check_witnessed_rank(&done, witness, generation)?;
+        check_witnessed_rank(&done, index, generation)?;
         seen += 1;
     }
     Ok(seen)
@@ -5224,7 +5323,8 @@ fn validate_explicit_witness(
     let mut rows = stmt
         .query(params![witness.scan_id, wants])
         .map_err(lease_store_refusal)?;
-    let seen = stream_witnessed_ranks(&mut rows, witness, Some(generation), true)?;
+    let index = witness_index(witness);
+    let seen = stream_witnessed_ranks(&mut rows, &index, Some(generation), true)?;
     if seen != witness.groups.len() {
         return Err(LeaseRefusal::Inconsistent {
             detail: format!(
@@ -5254,7 +5354,10 @@ fn validate_derived_witness(
                    FROM json_each(?2)
              )
              SELECT want.rank, want.digest, g.hash, g.file_count, f.path,
-                    COUNT(f.path) OVER (PARTITION BY want.rank) AS observed
+                    COUNT(f.path) OVER (PARTITION BY want.rank) AS observed,
+                    (SELECT COUNT(*) FROM (SELECT hash FROM file_group
+                                            WHERE scan_id = ?1
+                                            GROUP BY hash HAVING COUNT(*) > 1)) AS dup_digests
                FROM want
                LEFT JOIN file_group g ON g.scan_id = ?1 AND g.rank = want.rank
                LEFT JOIN file       f ON f.scan_id = ?1 AND f.hash = unhex(g.hash)
@@ -5264,7 +5367,8 @@ fn validate_derived_witness(
     let mut rows = stmt
         .query(params![witness.scan_id, wants])
         .map_err(lease_store_refusal)?;
-    let seen = stream_witnessed_ranks(&mut rows, witness, None, false)?;
+    let index = witness_index(witness);
+    let seen = stream_witnessed_ranks(&mut rows, &index, None, false)?;
     if seen != witness.groups.len() {
         return Err(LeaseRefusal::Inconsistent {
             detail: format!(
@@ -15960,12 +16064,16 @@ mod membership_staging_tests {
             let summaries = snapshot.summaries().unwrap();
             assert_eq!(summaries.inconsistent, vec![id], "the identity is named");
             assert_eq!(summaries.groups.len(), 1, "the summary itself still reads");
+            let digest = summaries.groups[0].1.hash.clone();
+            // Every trusted lookup, including the digest one — a method omitted from this
+            // matrix is exactly how `groups_of_digest` kept handing back a known-bad rank.
             for refused in [
                 snapshot.group(&id).err(),
                 snapshot.group_page(&id, 0, 1).err(),
                 snapshot.group_member_count(&id).err(),
                 snapshot.is_member(&id, &paths[0]).err(),
                 snapshot.group_of_path(&paths[0]).err(),
+                snapshot.groups_of_digest(&digest).err(),
             ] {
                 assert!(
                     matches!(refused, Some(MembershipMiss::Inconsistent { .. })),
@@ -16110,6 +16218,265 @@ mod membership_staging_tests {
             Err(other) => panic!("expected Inconsistent, got {other:?}"),
             Ok(_) => panic!("one pathname in two ranks must refuse the lease"),
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- R4B-1b: the invariants the whole-authority validator was still missing ---
+
+    /// A `reclaim_state` outside the persisted enum is not «large», it is not a state: the
+    /// snapshot refuses centrally, before a reverse lookup or a membership test can answer.
+    /// The positive control runs every valid state, so the stricter predicate cannot start
+    /// rejecting published data.
+    #[test]
+    fn a_reclaim_state_outside_the_enum_is_refused_centrally() {
+        for state in [
+            ReclaimState::Unknown,
+            ReclaimState::Exact,
+            ReclaimState::UpperBound,
+        ] {
+            let (dir, store, scan_id, _paths) =
+                published_explicit(&format!("state_ok_{}", state.as_i64()), 2);
+            store
+                .conn
+                .execute(
+                    "UPDATE file_group SET reclaim_state = ?2 WHERE scan_id = ?1 AND rank = 0",
+                    params![scan_id, state.as_i64()],
+                )
+                .unwrap();
+            assert!(
+                store.membership_snapshot(scan_id).is_ok(),
+                "a published reclaim state must stay readable: {state:?}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        let (dir, store, scan_id, paths) = published_explicit("state_bad", 2);
+        store
+            .conn
+            .execute(
+                "UPDATE file_group SET reclaim_state = 99 WHERE scan_id = ?1 AND rank = 0",
+                params![scan_id],
+            )
+            .unwrap();
+        match store.membership_snapshot(scan_id) {
+            Err(MembershipMiss::Inconsistent { .. }) => {}
+            Err(other) => panic!("expected Inconsistent, got {other:?}"),
+            Ok(snapshot) => panic!(
+                "the snapshot must refuse centrally; is_member answered {:?}",
+                snapshot.is_member(
+                    &GroupId {
+                        scan_id,
+                        rank: 0,
+                        generation: 1
+                    },
+                    &paths[0]
+                )
+            ),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A member path that is TEXT but empty is not a pathname. With the CHECKs suspended it
+    /// otherwise satisfies manifest presence, summary, generation and count, and becomes
+    /// trusted membership.
+    #[test]
+    fn an_empty_member_path_is_out_of_domain() {
+        let (dir, store, scan_id, paths) = published_explicit("empty_path", 2);
+        store
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints=1;")
+            .unwrap();
+        for table in ["file", "file_group_member"] {
+            store
+                .conn
+                .execute(
+                    &format!("UPDATE {table} SET path = '' WHERE scan_id = ?1 AND path = ?2"),
+                    params![scan_id, paths[1].to_string_lossy()],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            store.membership_snapshot(scan_id),
+            Err(MembershipMiss::Inconsistent { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The summary digest is the domain `GroupWitness.digest` is specified to carry: canonical
+    /// lower-case hex of the right length. An identity whose digest no consumer can decode is
+    /// not a trusted identity — while a real published digest, of course, still reads.
+    #[test]
+    fn a_non_canonical_summary_digest_is_refused() {
+        for (label, forged) in [
+            ("empty", String::new()),
+            ("short", "abcd".to_string()),
+            ("upper case", "A".repeat(64)),
+            ("non-hex", "z".repeat(64)),
+            ("too long", "a".repeat(65)),
+        ] {
+            let (dir, store, scan_id, _paths) =
+                published_explicit(&format!("digest_{}", label.replace(' ', "_")), 2);
+            store
+                .conn
+                .execute(
+                    "UPDATE file_group SET hash = ?2 WHERE scan_id = ?1 AND rank = 0",
+                    params![scan_id, forged],
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    store.membership_snapshot(scan_id),
+                    Err(MembershipMiss::Inconsistent { .. })
+                ),
+                "a {label} digest must refuse"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Derived membership IS the digest, so two derived summaries sharing one would put the
+    /// very same manifest pathnames in two groups. Two EXPLICIT ranks sharing a digest stay
+    /// legitimate — that is R4-V1's split populations, asserted right here so the new rule
+    /// cannot quietly outlaw them.
+    #[test]
+    fn derived_authority_refuses_two_ranks_with_one_digest() {
+        let dir = temp_dir("derived_dup");
+        let digest = [9u8; 32];
+        let a = write(&dir, "a.bin", b"twins");
+        let b = write(&dir, "b.bin", b"twins");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &[(a, digest), (b, digest)]);
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        assert!(store.membership_snapshot(scan_id).is_ok(), "the control");
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO file_group(scan_id, rank, hash, file_count, size, reclaim,
+                                        object_count, reclaim_state)
+                 SELECT ?1, 1, hash, file_count, size, reclaim, object_count, reclaim_state
+                   FROM file_group WHERE scan_id = ?1 AND rank = 0",
+                params![scan_id],
+            )
+            .unwrap();
+        match store.membership_snapshot(scan_id) {
+            Err(MembershipMiss::Inconsistent { detail }) => {
+                assert!(detail.contains("two group summaries"), "{detail}")
+            }
+            Err(other) => panic!("expected Inconsistent, got {other:?}"),
+            Ok(_) => panic!("two derived ranks with one digest must refuse"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same shape appearing AFTER planning must refuse the final lease — the plan's own
+    /// rank still validates perfectly, which is exactly why the check has to be there.
+    #[test]
+    fn the_derived_lease_refuses_a_duplicate_digest_added_after_planning() {
+        let dir = temp_dir("derived_lease_dup");
+        let digest = [10u8; 32];
+        let a = write(&dir, "a.bin", b"twins");
+        let b = write(&dir, "b.bin", b"twins");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &[(a, digest), (b, digest)]);
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        let witness = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            witness_of(
+                &snapshot,
+                &[GroupId {
+                    scan_id,
+                    rank: 0,
+                    generation: 1,
+                }],
+            )
+        };
+        assert!(
+            store.acquire_membership_lease(&witness).is_ok(),
+            "the witness is valid before the duplicate exists"
+        );
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO file_group(scan_id, rank, hash, file_count, size, reclaim,
+                                        object_count, reclaim_state)
+                 SELECT ?1, 1, hash, file_count, size, reclaim, object_count, reclaim_state
+                   FROM file_group WHERE scan_id = ?1 AND rank = 0",
+                params![scan_id],
+            )
+            .unwrap();
+        match store.acquire_membership_lease(&witness) {
+            Err(LeaseRefusal::Inconsistent { detail }) => {
+                assert!(detail.contains("two group summaries"), "{detail}")
+            }
+            Err(other) => panic!("expected Inconsistent, got {other:?}"),
+            Ok(_) => panic!("a duplicate derived digest must refuse the lease"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An explicit member whose manifest row carries a DIFFERENT digest is a foreign import.
+    /// Every other structural rule still agrees — count, generation, manifest presence,
+    /// non-empty path, unique rank — which is what made this shape trusted before.
+    #[test]
+    fn an_explicit_member_must_carry_its_summary_digest() {
+        let dir = temp_dir("foreign_member");
+        let digest_a = [11u8; 32];
+        let digest_b = [12u8; 32];
+        let a1 = write(&dir, "a1.bin", b"aaaa");
+        let a2 = write(&dir, "a2.bin", b"aaaa");
+        let outsider = write(&dir, "b1.bin", b"bbbbbb");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(
+            &mut store,
+            &dir,
+            &[
+                (a1, digest_a),
+                (a2.clone(), digest_a),
+                (outsider.clone(), digest_b),
+            ],
+        );
+        let verified =
+            crate::pipeline::verify::verify_groups(store.duplicate_groups(scan_id).unwrap())
+                .unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .unwrap();
+        assert!(store.membership_snapshot(scan_id).is_ok(), "the control");
+
+        let moved = store
+            .conn
+            .execute(
+                "UPDATE file_group_member SET path = ?2 WHERE scan_id = ?1 AND path = ?3",
+                params![scan_id, outsider.to_string_lossy(), a2.to_string_lossy()],
+            )
+            .unwrap();
+        assert_eq!(moved, 1, "one member row was redirected");
+        let backed: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_group_member m
+                   JOIN file f ON f.scan_id = m.scan_id AND f.path = m.path
+                  WHERE m.scan_id = ?1",
+                params![scan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(backed, 2, "every member still has a manifest row");
+
+        match store.membership_snapshot(scan_id) {
+            Err(MembershipMiss::Inconsistent { detail }) => {
+                assert!(detail.contains("manifest digest"), "{detail}")
+            }
+            Err(other) => panic!("expected Inconsistent, got {other:?}"),
+            Ok(_) => panic!("a member carrying another digest must refuse"),
+        }
+        assert!(store.prepare_legacy_for_viewing(scan_id).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
