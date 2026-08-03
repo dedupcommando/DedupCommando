@@ -732,6 +732,9 @@ impl ScanStore {
                 crate::textsan::terminal(&db_path.display().to_string())
             ))
         })?;
+        // Before `query_only` and before either version check: connection-local state only, so a
+        // future DB is still left untouched by the refusal below.
+        schema::enforce_foreign_keys(&conn)?;
         conn.execute_batch("PRAGMA busy_timeout=5000;\nPRAGMA query_only=1;")?;
         schema::ensure_version_supported(&conn)?;
         // Migrating needs a writer, so an out-of-date DB is reported here rather than as a
@@ -752,6 +755,10 @@ impl ScanStore {
         // the state-dir), and create with 0600. O_NOFOLLOW on the final component.
         crate::paths::prepare_db_file(db_path)?;
         let conn = Connection::open(db_path)?;
+        // First, and before the refusal below: the declared relationships are only worth what this
+        // connection enforces, and the pragma is connection state — nothing is written, so a DB
+        // from a newer build is still left exactly as it was.
+        schema::enforce_foreign_keys(&conn)?;
         // Refuse a DB written by a newer build before touching it (no WAL flip, no migration).
         schema::ensure_version_supported(&conn)?;
         // busy_timeout — the background move worker holds its own connection
@@ -770,6 +777,7 @@ impl ScanStore {
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        schema::enforce_foreign_keys(&conn)?;
         schema::migrate(&conn)?;
         Ok(Self::new(conn))
     }
@@ -1035,9 +1043,12 @@ impl ScanStore {
     /// — it is keyed by (device,inode) and shared across all scans. Metadata ≠ pool data
     /// (recreated by a re-scan). The heavy DELETE over `file` (millions of rows) should be called in the background.
     ///
-    /// `dir_omission` comes before `scan_root`, and both before `scan`: the declared foreign keys
-    /// enforce nothing while `PRAGMA foreign_keys` is off, so this order IS the enforcement. A
-    /// ledger row that outlived its authority would be read against a root that no longer exists.
+    /// `dir_omission` comes before `scan_root`, and both before `scan`. Foreign keys ARE enforced —
+    /// every `ScanStore` connection turns them on and proves it (`schema::enforce_foreign_keys`) —
+    /// so the cascades would carry these deletes anyway; the explicit order stays as deliberate
+    /// defense in depth. A ledger row that outlived its authority would be read against a root that
+    /// no longer exists, and a delete whose meaning lives only in a cascade is a delete no reader
+    /// of this function can check.
     pub fn purge_scan(&mut self, scan_id: i64) -> Result<()> {
         let tx = self.conn.transaction()?;
         for table in [
@@ -1046,8 +1057,8 @@ impl ScanStore {
             "file",
             "dir_dedup",
             // Members before the summaries they name, and the authority before the scan it
-            // belongs to. The declared foreign keys enforce nothing while `PRAGMA foreign_keys`
-            // is off, so this order IS the enforcement — as it already is for the ledger below.
+            // belongs to. Their cascades are live (see the doc comment), so this order is defense
+            // in depth — the same deliberate belt-and-braces the ledger below already gets.
             "file_group_member",
             "scan_membership",
             "file_group",
@@ -8261,10 +8272,68 @@ mod tests {
             conn.pragma_update(None, "user_version", schema::SCHEMA_VERSION + 1)
                 .unwrap();
         }
+        // The connection setup that now runs before the refusal touches connection-local state
+        // only, so the file itself must come through untouched: same bytes, same stamp.
+        let before = std::fs::read(&db).unwrap();
         assert!(
             ScanStore::open(&db).is_err(),
             "a DB from a newer schema version must be refused"
         );
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            before,
+            "a refused open must leave the file byte-identical"
+        );
+        let stamped: i64 = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stamped, schema::SCHEMA_VERSION + 1, "and its stamp alone");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every production route hands back a connection that enforces the schema's declared
+    /// relationships. Enforcement is per connection, so «the database has foreign keys» is not a
+    /// property a caller can rely on — «this constructor turned them on and checked» is.
+    #[test]
+    fn every_store_constructor_enforces_foreign_keys() {
+        let _role = role_guard();
+        let dir = temp_state_dir("fk_routes");
+        let db = dir.join("dedcom.db");
+
+        let enforced = |store: &ScanStore| -> i64 {
+            store
+                .conn
+                .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        let writable = ScanStore::open_writable(&db).unwrap();
+        assert_eq!(enforced(&writable), 1, "open_writable");
+        drop(writable);
+
+        let observer = ScanStore::open_read_only(&db).unwrap();
+        assert_eq!(enforced(&observer), 1, "open_read_only");
+        drop(observer);
+
+        let memory = ScanStore::open_in_memory().unwrap();
+        assert_eq!(enforced(&memory), 1, "open_in_memory");
+
+        // And the enforcement is real on the route an operator actually gets, not only reported:
+        // a ledger row with no registered root is refused by the key.
+        let store = ScanStore::open_writable(&db).unwrap();
+        let orphan = store.conn.execute(
+            "INSERT INTO dir_omission(scan_id, root_key, dir_key, reason, event_count, generation)
+             VALUES (1, '/tank', '/tank/a', 'min_size', 1, 1)",
+            [],
+        );
+        match orphan {
+            Err(rusqlite::Error::SqliteFailure(err, _)) => {
+                assert_eq!(err.extended_code, 787, "expected a foreign-key refusal")
+            }
+            other => panic!("an orphan ledger row must be refused: {other:?}"),
+        }
+        drop(store);
         std::fs::remove_dir_all(&dir).ok();
     }
 

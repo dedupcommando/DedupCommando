@@ -206,9 +206,10 @@ CREATE TABLE IF NOT EXISTS scan_root (
     -- SQL cannot verify it.
     CHECK (root_key = '/'
            OR (substr(root_key, 1, 1) = '/' AND substr(root_key, -1, 1) <> '/')),
-    -- Declared for intent and for a future `PRAGMA foreign_keys=ON`. The pragma is OFF
-    -- project-wide, so this enforces nothing today; deletion is enforced by purge_scan's explicit
-    -- table order, as for every other table here.
+    -- Enforced: every `ScanStore` connection turns foreign keys on and proves it
+    -- (`enforce_foreign_keys`). The explicit child-before-parent order in purge_scan and
+    -- clear_files stays anyway — defense in depth, and the one thing that keeps a delete's meaning
+    -- visible in the code rather than in a cascade.
     FOREIGN KEY (scan_id) REFERENCES scan(id) ON DELETE CASCADE
 );
 -- Directories that lost at least one file, or suffered at least one walk error, with the typed
@@ -277,6 +278,32 @@ CREATE INDEX IF NOT EXISTS dir_omission_by_root
 /// authority, so it would answer every membership question from raw digests and hand back the very
 /// pathnames verification rejected.
 pub const SCHEMA_VERSION: i64 = 5;
+
+/// Turns foreign-key enforcement on for one freshly opened connection, and proves it took.
+///
+/// The declared keys in `SCHEMA` are only worth what the connection enforces, and enforcement is
+/// per connection, not per database. The pinned bundled SQLite happens to default it on
+/// (`libsqlite3-sys` compiles the amalgamation with `SQLITE_DEFAULT_FOREIGN_KEYS=1`), which is
+/// exactly why this exists: an invariant that holds by accident of a dependency's build flags is
+/// one a version bump can withdraw in silence. Every `ScanStore` constructor states it instead.
+///
+/// The read-back is the point. `PRAGMA foreign_keys` is a no-op inside a transaction, so a caller
+/// that only issued the write would go on believing a setting that never applied; this fails
+/// closed on the observed integer rather than on any error text.
+///
+/// Connection-local state only: nothing is written to the database, so this is safe to run before
+/// the future-schema refusal that must leave a newer file untouched.
+pub fn enforce_foreign_keys(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let enabled: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    if enabled != 1 {
+        return Err(AppError::msg(format!(
+            "dedcom.db opened without foreign-key enforcement (PRAGMA foreign_keys = {enabled}); \
+             refusing to work on a checkpoint whose declared relationships are not enforced"
+        )));
+    }
+    Ok(())
+}
 
 /// The version refusal itself, parameterized by the maximum schema a *reading build* supports.
 ///
@@ -433,6 +460,116 @@ mod tests {
             .unwrap()
             .filter_map(|r| r.ok())
             .collect()
+    }
+
+    /// One column of `PRAGMA table_info`, as SQLite itself records it: declared name and type, the
+    /// NOT NULL flag, the default, and the 1-based position in the primary key (0 = not part of
+    /// it). Column names alone say nothing about which columns key a table, so a shape assertion
+    /// that reads only names cannot notice a primary key being removed or reordered.
+    #[derive(Debug, PartialEq)]
+    struct ColumnInfo {
+        name: String,
+        decl_type: String,
+        not_null: i64,
+        default: Option<String>,
+        pk_ordinal: i64,
+    }
+
+    fn table_info(conn: &Connection, table: &str) -> Vec<ColumnInfo> {
+        conn.prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| {
+                Ok(ColumnInfo {
+                    name: row.get(1)?,
+                    decl_type: row.get(2)?,
+                    not_null: row.get(3)?,
+                    default: row.get(4)?,
+                    pk_ordinal: row.get(5)?,
+                })
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    fn column(name: &str, decl_type: &str, pk_ordinal: i64) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            decl_type: decl_type.to_string(),
+            not_null: 1,
+            default: None,
+            pk_ordinal,
+        }
+    }
+
+    /// One column pairing of `PRAGMA foreign_key_list`: which key it belongs to, its position
+    /// within that key, and the exact endpoints and delete rule.
+    #[derive(Debug, PartialEq)]
+    struct ForeignKeyInfo {
+        id: i64,
+        seq: i64,
+        parent_table: String,
+        from: String,
+        to: String,
+        on_delete: String,
+    }
+
+    fn foreign_keys_of(conn: &Connection, table: &str) -> Vec<ForeignKeyInfo> {
+        conn.prepare(&format!("PRAGMA foreign_key_list({table})"))
+            .unwrap()
+            .query_map([], |row| {
+                Ok(ForeignKeyInfo {
+                    id: row.get(0)?,
+                    seq: row.get(1)?,
+                    parent_table: row.get(2)?,
+                    from: row.get(3)?,
+                    to: row.get(4)?,
+                    on_delete: row.get(6)?,
+                })
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    fn foreign_key(id: i64, seq: i64, parent: &str, from: &str, to: &str) -> ForeignKeyInfo {
+        ForeignKeyInfo {
+            id,
+            seq,
+            parent_table: parent.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+            on_delete: "CASCADE".to_string(),
+        }
+    }
+
+    /// SQLite's extended result codes for the constraint classes these tables declare. A bare
+    /// `is_err()` cannot tell them apart, and with foreign keys enforced they compete: an INSERT
+    /// that names an absent parent fails on the key before any CHECK is ever evaluated, so a CHECK
+    /// test written without a valid parent would stay green after its CHECK was deleted.
+    const CONSTRAINT_CHECK: i32 = 275;
+    const CONSTRAINT_FOREIGN_KEY: i32 = 787;
+    const CONSTRAINT_PRIMARY_KEY: i32 = 1555;
+    const CONSTRAINT_UNIQUE: i32 = 2067;
+
+    /// Asserts that a statement failed as a constraint violation of exactly the intended class.
+    #[track_caller]
+    fn assert_constraint(result: rusqlite::Result<usize>, extended: i32, what: &str) {
+        match result {
+            Ok(_) => panic!("{what}: must be refused, but the statement succeeded"),
+            Err(rusqlite::Error::SqliteFailure(err, detail)) => {
+                assert_eq!(
+                    err.code,
+                    rusqlite::ErrorCode::ConstraintViolation,
+                    "{what}: expected a constraint violation, got {err:?} ({detail:?})"
+                );
+                assert_eq!(
+                    err.extended_code, extended,
+                    "{what}: wrong constraint class ({detail:?})"
+                );
+            }
+            Err(other) => panic!("{what}: expected a constraint violation, got {other}"),
+        }
     }
 
     /// Names of every index in the DB.
@@ -1390,6 +1527,143 @@ mod tests {
         assert_eq!(representative_data(&conn), data_before, "and its data");
     }
 
+    /// What SQLite itself records about the two v5 tables — keys, index and foreign keys, not only
+    /// column names.
+    ///
+    /// A shape test that reads names alone cannot see a primary key disappear, and on
+    /// `file_group_member` the stricter `(scan_id, path)` unique index would go on refusing the
+    /// duplicate-path insert that every other test uses, so the composite key could be removed or
+    /// reordered without a single existing assertion noticing. These are the declarations R4B's
+    /// resolver will read the database through; pinning them means a later schema edit has to
+    /// change this test on purpose rather than by accident.
+    #[test]
+    fn sqlite_records_the_exact_v5_keys_index_and_foreign_keys() {
+        let conn = enforced_db();
+
+        // The authority: one row per scan, keyed by the scan alone.
+        assert_eq!(
+            table_info(&conn, "scan_membership"),
+            vec![
+                column("scan_id", "INTEGER", 1),
+                column("mode", "INTEGER", 0),
+                column("generation", "INTEGER", 0),
+            ]
+        );
+
+        // The members: the composite key is (scan_id, group_rank, path), in that order.
+        assert_eq!(
+            table_info(&conn, "file_group_member"),
+            vec![
+                column("scan_id", "INTEGER", 1),
+                column("group_rank", "INTEGER", 2),
+                column("path", "TEXT", 3),
+                column("generation", "INTEGER", 0),
+            ]
+        );
+
+        // Exactly one explicitly created index on the member table, and it is the unique reverse
+        // lookup. Selected by `origin = 'c'` rather than by name, because the primary key's own
+        // index is generated and its name is SQLite's to choose.
+        let explicit: Vec<(String, i64)> = conn
+            .prepare("PRAGMA index_list(file_group_member)")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .filter(|(_, _, origin)| origin == "c")
+            .map(|(name, unique, _)| (name, unique))
+            .collect();
+        assert_eq!(
+            explicit,
+            vec![("file_group_member_by_path".to_string(), 1)],
+            "one explicitly created index, and it must be unique"
+        );
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA index_info(file_group_member_by_path)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(2))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            columns,
+            vec!["scan_id".to_string(), "path".to_string()],
+            "the reverse lookup is (scan_id, path), in that order"
+        );
+
+        // The declared relationships. `scan_membership` hangs off the scan; a member hangs off the
+        // summary it names, through the ordered pair (scan_id, group_rank) -> (scan_id, rank).
+        assert_eq!(
+            foreign_keys_of(&conn, "scan_membership"),
+            vec![foreign_key(0, 0, "scan", "scan_id", "id")]
+        );
+        assert_eq!(
+            foreign_keys_of(&conn, "file_group_member"),
+            vec![
+                foreign_key(0, 0, "file_group", "scan_id", "scan_id"),
+                foreign_key(0, 1, "file_group", "group_rank", "rank"),
+            ],
+            "one composite relationship, both columns paired in order"
+        );
+
+        // And they are enforced on this connection, because `enforce_foreign_keys` said so and
+        // read the answer back. Declared but unenforced would make every relationship above a
+        // comment.
+        let enforced: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(enforced, 1, "the proof must run with enforcement on");
+    }
+
+    /// The helper turns enforcement on rather than assuming it. The starting point is a connection
+    /// explicitly set OFF, so this proves the production setup does the work — it does not lean on
+    /// the bundled SQLite's compile-time default, which is exactly the accident being replaced.
+    #[test]
+    fn the_helper_turns_enforcement_on_from_off() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        let before: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 0, "the fixture must really start with it off");
+
+        enforce_foreign_keys(&conn).unwrap();
+
+        let after: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 1, "the helper must have turned it on");
+    }
+
+    /// And it fails closed. `PRAGMA foreign_keys` is a no-op inside a transaction, so a helper that
+    /// only issued the write would report success over a setting that never applied. The read-back
+    /// is what makes that impossible.
+    #[test]
+    fn the_helper_refuses_when_the_pragma_cannot_take_effect() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+
+        let err = enforce_foreign_keys(&conn)
+            .expect_err("a pragma that cannot apply must not be reported as applied");
+        assert!(
+            err.to_string().contains("foreign_keys = 0"),
+            "the refusal must name what it observed: {err}"
+        );
+        let observed: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(observed, 0, "and the setting really is still off");
+
+        conn.execute_batch("ROLLBACK").unwrap();
+    }
+
     /// Seeds one scan with one group summary, the anchor every member row needs.
     fn seed_group_for_members(conn: &Connection, scan_id: i64, ranks: &[(i64, &str)]) {
         conn.execute(
@@ -1408,13 +1682,26 @@ mod tests {
         }
     }
 
-    /// Every declared constraint, exercised on INSERT and on UPDATE. A CHECK that only holds on
-    /// insert is a CHECK a later writer can walk around.
-    #[test]
-    fn membership_constraints_hold_on_insert_and_update() {
+    /// A migrated database on a connection that enforces foreign keys, which is what every
+    /// `ScanStore` route gives its caller. Constraint tests must run this way or a competing key
+    /// failure can stand in for the CHECK they mean to prove.
+    fn enforced_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
+        enforce_foreign_keys(&conn).unwrap();
         migrate(&conn).unwrap();
+        conn
+    }
+
+    /// Every declared CHECK, exercised on INSERT and on UPDATE, each proved by its own extended
+    /// code. A CHECK that only holds on insert is a CHECK a later writer can walk around; a CHECK
+    /// asserted with a bare `is_err()` over an absent parent is not asserted at all, because the
+    /// foreign key would refuse the row first and go on doing so after the CHECK was deleted.
+    #[test]
+    fn membership_checks_hold_on_insert_and_update() {
+        let conn = enforced_db();
         seed_group_for_members(&conn, 1, &[(0, "aabb")]);
+        // Scan 2 exists, so an invalid authority row for it can only fail on its CHECKs.
+        seed_group_for_members(&conn, 2, &[]);
 
         // The authority: modes 1 and 2 are accepted, everything else is not.
         for mode in [1i64, 2] {
@@ -1424,44 +1711,54 @@ mod tests {
                 [mode],
             )
             .unwrap();
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM scan_membership", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 1, "one scan keeps one authority row");
         }
         for mode in [0i64, 3, -1] {
-            assert!(
+            assert_constraint(
                 conn.execute(
-                    "INSERT OR REPLACE INTO scan_membership(scan_id, mode, generation)
-                     VALUES (2, ?1, 1)",
+                    "INSERT INTO scan_membership(scan_id, mode, generation) VALUES (2, ?1, 1)",
                     [mode],
-                )
-                .is_err(),
-                "mode {mode} must be refused — unknown is absence, not a value"
+                ),
+                CONSTRAINT_CHECK,
+                &format!("mode {mode} — unknown is absence, not a value"),
             );
         }
         for generation in [0i64, -1] {
-            assert!(
+            assert_constraint(
                 conn.execute(
-                    "INSERT OR REPLACE INTO scan_membership(scan_id, mode, generation)
-                     VALUES (2, 1, ?1)",
+                    "INSERT INTO scan_membership(scan_id, mode, generation) VALUES (2, 1, ?1)",
                     [generation],
-                )
-                .is_err(),
-                "generation {generation} must be refused"
+                ),
+                CONSTRAINT_CHECK,
+                &format!("generation {generation}"),
             );
         }
-        assert!(
-            conn.execute("UPDATE scan_membership SET mode = 3 WHERE scan_id = 1", [])
-                .is_err(),
-            "the mode CHECK must hold on UPDATE too"
+        assert_constraint(
+            conn.execute("UPDATE scan_membership SET mode = 3 WHERE scan_id = 1", []),
+            CONSTRAINT_CHECK,
+            "the mode CHECK on UPDATE",
         );
-        assert!(
+        assert_constraint(
             conn.execute(
                 "UPDATE scan_membership SET generation = 0 WHERE scan_id = 1",
-                []
-            )
-            .is_err(),
-            "the generation CHECK must hold on UPDATE too"
+                [],
+            ),
+            CONSTRAINT_CHECK,
+            "the generation CHECK on UPDATE",
         );
 
-        // The members: rank >= 0, generation > 0, path non-empty.
+        // The members: rank >= 0, generation > 0, path non-empty. `file_group.rank` carries no
+        // CHECK of its own, so a summary at rank -1 can exist purely to give the negative-rank
+        // member a valid parent — which is what isolates its CHECK from the foreign key.
+        conn.execute(
+            "INSERT INTO file_group(scan_id, rank, hash, file_count, size, reclaim)
+             VALUES (1, -1, 'aabb', 2, 100, 100)",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
              VALUES (1, 0, '/tank/a', 1)",
@@ -1474,14 +1771,14 @@ mod tests {
             (0, "/tank/b", 0, "a zero generation"),
             (0, "/tank/b", -1, "a negative generation"),
         ] {
-            assert!(
+            assert_constraint(
                 conn.execute(
                     "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
                      VALUES (1, ?1, ?2, ?3)",
                     rusqlite::params![rank, path, generation],
-                )
-                .is_err(),
-                "{why} must be refused"
+                ),
+                CONSTRAINT_CHECK,
+                why,
             );
         }
         for (sql, why) in [
@@ -1489,11 +1786,83 @@ mod tests {
             ("UPDATE file_group_member SET path = ''", "path"),
             ("UPDATE file_group_member SET generation = 0", "generation"),
         ] {
-            assert!(
-                conn.execute(sql, []).is_err(),
-                "the {why} CHECK must hold on UPDATE too"
-            );
+            assert_constraint(conn.execute(sql, []), CONSTRAINT_CHECK, why);
         }
+    }
+
+    /// The authority is one row per scan, and a second ordinary INSERT is refused by the primary
+    /// key with the parent scan present — `INSERT OR REPLACE` would prove nothing, because it
+    /// succeeds whether or not the key exists.
+    #[test]
+    fn a_scan_has_at_most_one_authority_row() {
+        let conn = enforced_db();
+        seed_group_for_members(&conn, 1, &[]);
+        conn.execute(
+            "INSERT INTO scan_membership(scan_id, mode, generation) VALUES (1, 2, 7)",
+            [],
+        )
+        .unwrap();
+
+        assert_constraint(
+            conn.execute(
+                "INSERT INTO scan_membership(scan_id, mode, generation) VALUES (1, 1, 9)",
+                [],
+            ),
+            CONSTRAINT_PRIMARY_KEY,
+            "a second authority row for one scan",
+        );
+
+        let (rows, mode, generation): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM scan_membership), mode, generation
+                   FROM scan_membership WHERE scan_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (rows, mode, generation),
+            (1, 2, 7),
+            "the original row must survive the refused insert exactly"
+        );
+    }
+
+    /// The keys are enforced, not merely declared: a row whose values are all perfectly valid is
+    /// still refused when its parent is absent, and the refusal is a foreign-key one rather than a
+    /// CHECK borrowed from somewhere else.
+    #[test]
+    fn orphan_rows_are_refused_by_the_foreign_keys() {
+        let conn = enforced_db();
+        seed_group_for_members(&conn, 1, &[(0, "aabb")]);
+
+        assert_constraint(
+            conn.execute(
+                "INSERT INTO scan_membership(scan_id, mode, generation) VALUES (99, 2, 1)",
+                [],
+            ),
+            CONSTRAINT_FOREIGN_KEY,
+            "an authority row for a scan that does not exist",
+        );
+        assert_constraint(
+            conn.execute(
+                "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
+                 VALUES (1, 42, '/tank/z', 1)",
+                [],
+            ),
+            CONSTRAINT_FOREIGN_KEY,
+            "a member of a group rank that does not exist",
+        );
+        // The v4 ledger, for the same reason and by the same rule.
+        assert_constraint(
+            conn.execute(
+                "INSERT INTO dir_omission(scan_id, root_key, dir_key, reason, event_count,
+                                          generation)
+                 VALUES (1, '/tank', '/tank/a', 'min_size', 1, 1)",
+                [],
+            ),
+            CONSTRAINT_FOREIGN_KEY,
+            "a ledger row with no registered root",
+        );
     }
 
     /// One pathname belongs to at most one group of a scan — the unique index is the structural
@@ -1502,8 +1871,7 @@ mod tests {
     /// subgroups shape the whole round exists to make representable.
     #[test]
     fn a_path_belongs_to_one_group_while_two_ranks_may_share_a_digest() {
-        let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
+        let conn = enforced_db();
         seed_group_for_members(&conn, 1, &[(0, "aabb"), (1, "aabb")]);
         seed_group_for_members(&conn, 2, &[(0, "aabb")]);
 
@@ -1513,14 +1881,14 @@ mod tests {
             [],
         )
         .unwrap();
-        assert!(
+        assert_constraint(
             conn.execute(
                 "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
                  VALUES (1, 1, '/tank/a', 7)",
                 [],
-            )
-            .is_err(),
-            "one path in two ranks of one scan is the corruption the index exists to refuse"
+            ),
+            CONSTRAINT_UNIQUE,
+            "one path in two ranks of one scan — the corruption the index exists to refuse",
         );
         // A different scan is a different fact.
         conn.execute(
@@ -1551,8 +1919,7 @@ mod tests {
     /// member with a newline in its name is one member, not two.
     #[test]
     fn member_paths_round_trip_exactly() {
-        let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
+        let conn = enforced_db();
         seed_group_for_members(&conn, 1, &[(0, "aabb")]);
 
         let paths = [
