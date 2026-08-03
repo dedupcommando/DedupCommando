@@ -5089,13 +5089,20 @@ fn validate_lease_witness(
     }
 }
 
+/// The `digest_state` a healthy Explicit member row reports: its manifest digest is a 32-byte
+/// BLOB equal to the decoded digest of its own group's summary. Every other value names one
+/// failing shape, each its own ordered CASE branch in the statement — so NULL and a failed
+/// decode are settled before any equality, `x <> NULL` being NULL rather than true.
+const MEMBER_DIGEST_OK: i64 = 6;
+
 /// One row of the lease validation statements, already grouped per rank in arrival order.
 struct WitnessedRank {
     rank: i64,
     witness_digest: String,
     current_digest: Option<String>,
+    /// pathname, its own generation, and the state of its live manifest digest.
+    members: Vec<(String, Option<i64>, i64)>,
     declared_count: Option<i64>,
-    members: Vec<(String, Option<i64>)>,
     observed: i64,
 }
 
@@ -5158,7 +5165,7 @@ fn check_witnessed_rank(
     }
     let witnessed: std::collections::HashSet<&Path> =
         group.members.iter().map(PathBuf::as_path).collect();
-    for (path, member_generation) in &checked.members {
+    for (path, member_generation, digest_state) in &checked.members {
         let live = Path::new(path);
         if !witnessed.contains(live) {
             return Err(LeaseRefusal::MembershipChanged {
@@ -5176,11 +5183,33 @@ fn check_witnessed_rank(
                 });
             }
         }
+        // Only once this really is the planned member: the digest it carries RIGHT NOW must
+        // still be its group's own. Mutating `file.hash` alone leaves pathname, member row,
+        // summary, authority and witness identical, so the set comparison above cannot see
+        // it — and inheriting the resolver's earlier word is precisely what the last gate
+        // before a destructive batch may not do.
+        let wrong = match digest_state {
+            1 => Some("no digest"),
+            2 => Some("a digest that is not a blob"),
+            3 => Some("a digest of the wrong length"),
+            4 => Some("a group digest that does not decode"),
+            5 => Some("a digest that is not this group's"),
+            _ => None,
+        };
+        if let Some(what) = wrong {
+            return Err(LeaseRefusal::Inconsistent {
+                detail: format!(
+                    "rank {} carries member {} with {what}",
+                    checked.rank,
+                    crate::textsan::terminal(path)
+                ),
+            });
+        }
     }
     let live: std::collections::HashSet<&Path> = checked
         .members
         .iter()
-        .map(|(path, _)| Path::new(path.as_str()))
+        .map(|(path, _, _)| Path::new(path.as_str()))
         .collect();
     for path in &group.members {
         if !live.contains(path.as_path()) {
@@ -5219,6 +5248,10 @@ fn stream_witnessed_ranks(
         let observed: i64 = row
             .get(if read_member_generation { 6 } else { 5 })
             .map_err(lease_store_refusal)?;
+        // Explicit only; carried to `check_witnessed_rank` rather than judged here, so a
+        // member that is not the planned one is reported as a changed membership — the
+        // sharper fact — instead of as whatever digest the substitute happened to hold.
+        let mut digest_state = MEMBER_DIGEST_OK;
         if !read_member_generation {
             // Derived mode carries one more column: the scan's count of digests naming two
             // summaries. Derived membership IS the digest, so a duplicate inserted after
@@ -5236,9 +5269,10 @@ fn stream_witnessed_ranks(
             }
         }
         if read_member_generation {
-            // Explicit mode carries two more columns: this member's manifest presence, and the
-            // scan's count of pathnames living in two ranks. Both are structural corruption
-            // that must stop the batch before it starts.
+            // Explicit mode carries three more columns: this member's manifest presence, the
+            // state of its live manifest digest, and the scan's count of pathnames living in
+            // two ranks. All three are structural corruption that must stop the batch before
+            // it starts.
             let has_manifest: i64 = row.get(7).map_err(lease_store_refusal)?;
             if member_path.is_some() && has_manifest == 0 {
                 return Err(LeaseRefusal::Inconsistent {
@@ -5248,6 +5282,7 @@ fn stream_witnessed_ranks(
                     ),
                 });
             }
+            digest_state = row.get(9).map_err(lease_store_refusal)?;
             let duplicated: i64 = row.get(8).map_err(lease_store_refusal)?;
             if duplicated != 0 {
                 return Err(LeaseRefusal::Inconsistent {
@@ -5272,7 +5307,9 @@ fn stream_witnessed_ranks(
             });
         }
         if let (Some(rankrows), Some(path)) = (current.as_mut(), member_path) {
-            rankrows.members.push((path, member_generation));
+            rankrows
+                .members
+                .push((path, member_generation, digest_state));
         }
     }
     if let Some(done) = current.take() {
@@ -5286,13 +5323,16 @@ fn stream_witnessed_ranks(
 /// are row boundaries — nothing is concatenated, nothing is parsed, and a member named `a\nb`
 /// can never equal two members `a` and `b`.
 ///
-/// Every returned member also carries its manifest presence and its own generation, and the
-/// statement counts the scan's duplicated pathnames once, as an uncorrelated scalar. So the
-/// final gate re-establishes the structural Explicit invariants itself — a member whose
-/// manifest row was deleted after planning, a member of another generation, a member with no
+/// Every returned member also carries its manifest presence, the state of its live manifest
+/// digest and its own generation, and the statement counts the scan's duplicated pathnames
+/// once, as an uncorrelated scalar. So the final gate re-establishes the structural Explicit
+/// invariants itself — a member whose manifest row was deleted after planning, one whose
+/// manifest digest is no longer the group's, a member of another generation, a member with no
 /// summary, one pathname in two ranks — instead of trusting an earlier resolver read or the
-/// unique index still existing in an externally damaged database. Statement and bind counts are
-/// unchanged: one statement, three binds, whatever K is.
+/// unique index still existing in an externally damaged database. The digest re-check is not
+/// covered by the member-set comparison: mutating `file.hash` alone leaves path, member row,
+/// summary and witness identical. Statement and bind counts are unchanged: one statement,
+/// three binds, whatever K is — the facts ride as columns of the row stream already there.
 fn validate_explicit_witness(
     tx: &Connection,
     witness: &PlanWitness,
@@ -5312,7 +5352,14 @@ fn validate_explicit_witness(
                     f.path IS NOT NULL                          AS has_manifest,
                     (SELECT COUNT(*) FROM (SELECT path FROM file_group_member
                                             WHERE scan_id = ?1
-                                            GROUP BY path HAVING COUNT(*) > 1)) AS dup_paths
+                                            GROUP BY path HAVING COUNT(*) > 1)) AS dup_paths,
+                    CASE WHEN f.path      IS NULL          THEN 0
+                         WHEN f.hash      IS NULL          THEN 1
+                         WHEN typeof(f.hash) <> 'blob'     THEN 2
+                         WHEN length(f.hash) <> 32         THEN 3
+                         WHEN unhex(g.hash) IS NULL        THEN 4
+                         WHEN f.hash <> unhex(g.hash)      THEN 5
+                         ELSE 6 END                             AS digest_state
                FROM want
                LEFT JOIN file_group        g ON g.scan_id = ?1 AND g.rank       = want.rank
                LEFT JOIN file_group_member m ON m.scan_id = ?1 AND m.group_rank = want.rank
@@ -15634,24 +15681,24 @@ mod membership_staging_tests {
                          VALUES (?1, ?2, ?3, 1)",
                     )
                     .unwrap();
-                // Every member gets its manifest row: since R4B-1a the lease re-checks manifest
-                // presence, and a fixture without one would be proving a refusal instead of the
-                // statement count it exists to pin.
+                // Every member gets its manifest row, carrying its group's own digest: since
+                // R4B-1a the lease re-checks manifest presence and since R4B-1c the digest
+                // behind it, so a fixture missing either would be proving a refusal instead of
+                // the statement count it exists to pin.
                 let mut manifest = tx
                     .prepare(
-                        "INSERT INTO file(scan_id, path, size, mtime, device, inode, nlink)
-                         VALUES (?1, ?2, 4096, 0, 1, ?3, 1)",
+                        "INSERT INTO file(scan_id, path, size, mtime, device, inode, nlink, hash)
+                         VALUES (?1, ?2, 4096, 0, 1, ?3, 1, unhex(?4))",
                     )
                     .unwrap();
                 for rank in 0..GROUPS {
-                    summary
-                        .execute(params![scan_id, rank, format!("{rank:064x}")])
-                        .unwrap();
+                    let digest = format!("{rank:064x}");
+                    summary.execute(params![scan_id, rank, digest]).unwrap();
                     for (index, side) in ['a', 'b'].into_iter().enumerate() {
                         let path = format!("/pool/{rank}/{side}.bin");
                         member.execute(params![scan_id, rank, path]).unwrap();
                         manifest
-                            .execute(params![scan_id, path, rank * 2 + index as i64 + 1])
+                            .execute(params![scan_id, path, rank * 2 + index as i64 + 1, digest])
                             .unwrap();
                     }
                 }
@@ -16418,6 +16465,80 @@ mod membership_staging_tests {
             Ok(_) => panic!("a duplicate derived digest must refuse the lease"),
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The final lease re-establishes the selected member's manifest digest itself. Mutating
+    /// only `file.hash` leaves the member path, the member row, the summary, the authority,
+    /// the generation and the witness identical, so the member-set comparison cannot see it —
+    /// and the resolver's earlier word is exactly what a pre-destructive gate may not inherit.
+    /// Each shape asserts what was actually stored, so a failed UPDATE cannot fake a pass.
+    #[test]
+    fn the_lease_rechecks_the_selected_manifest_digest_after_planning() {
+        for (label, forged) in [
+            ("another valid-length blob", Value::Blob(vec![6u8; 32])),
+            ("null", Value::Null),
+            ("non-blob", Value::Text("not a digest".into())),
+            ("wrong length", Value::Blob(vec![5u8; 16])),
+        ] {
+            let (dir, mut store, scan_id, paths) = published_explicit(&label.replace(' ', "_"), 2);
+            let witness = {
+                let snapshot = store.membership_snapshot(scan_id).unwrap();
+                witness_of(
+                    &snapshot,
+                    &[GroupId {
+                        scan_id,
+                        rank: 0,
+                        generation: 1,
+                    }],
+                )
+            };
+            assert!(
+                store.acquire_membership_lease(&witness).is_ok(),
+                "the control lease succeeds before the mutation ({label})"
+            );
+
+            store
+                .conn
+                .execute(
+                    "UPDATE file SET hash = ?3 WHERE scan_id = ?1 AND path = ?2",
+                    params![scan_id, paths[1].to_string_lossy(), forged],
+                )
+                .unwrap();
+            let (class, length): (String, Option<i64>) = store
+                .conn
+                .query_row(
+                    "SELECT typeof(hash), length(hash) FROM file
+                      WHERE scan_id = ?1 AND path = ?2",
+                    params![scan_id, paths[1].to_string_lossy()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let stored = (class.as_str(), length);
+            match label {
+                "another valid-length blob" => assert_eq!(stored, ("blob", Some(32))),
+                "null" => assert_eq!(stored, ("null", None)),
+                "non-blob" => assert_eq!(class.as_str(), "text"),
+                "wrong length" => assert_eq!(stored, ("blob", Some(16))),
+                other => panic!("unlisted case {other}"),
+            }
+
+            assert!(
+                matches!(
+                    store.membership_snapshot(scan_id),
+                    Err(MembershipMiss::Inconsistent { .. })
+                ),
+                "the resolver calls it inconsistent ({label})"
+            );
+            match store.acquire_membership_lease(&witness) {
+                Err(LeaseRefusal::Inconsistent { detail }) => assert!(
+                    detail.contains("digest"),
+                    "the refusal names the digest, not the missing row: {detail}"
+                ),
+                Err(other) => panic!("expected Inconsistent, got {other:?} ({label})"),
+                Ok(_) => panic!("the lease must reject the foreign manifest digest ({label})"),
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// An explicit member whose manifest row carries a DIFFERENT digest is a foreign import.
