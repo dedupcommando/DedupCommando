@@ -1913,11 +1913,19 @@ fn watch_unavailable(err: &crate::error::AppError) -> state::WatchMiss {
 }
 
 /// Lazy provision of a DB connection (opened on the first access within a frame).
-fn ensure_store<'a>(app: &App, store: &'a mut Option<ScanStore>) -> Option<&'a ScanStore> {
-    if store.is_none() {
-        *store = ScanStore::open(&app.db_path).ok();
+///
+/// The open error travels: a checkpoint that cannot be opened at all is the same class of failure
+/// as one that cannot be read, and `.ok()` here used to erase it before any caller could tell the
+/// two apart from an empty result. Classifying it is the caller's job — `resolve_watch_group`
+/// reports it only for the keys authorized to.
+fn ensure_store<'a>(
+    app: &App,
+    store: &'a mut Option<ScanStore>,
+) -> crate::error::Result<&'a ScanStore> {
+    match store {
+        Some(open) => Ok(open),
+        empty => Ok(empty.insert(ScanStore::open(&app.db_path)?)),
     }
-    store.as_ref()
 }
 
 /// Resolves the «watching» panel's result for the key `key`. The
@@ -1933,9 +1941,20 @@ fn resolve_watch_group(
     store: &mut Option<ScanStore>,
 ) -> Result<state::WatchResult, state::WatchMiss> {
     let scan_id = scan_id.ok_or(state::WatchEmpty::NotInScan)?;
-    // If the connection could not be opened — we treat it as «out of scan» (the database
-    // is unavailable → this scan has no visible data).
-    let store = ensure_store(app, store).ok_or(state::WatchEmpty::NotInScan)?;
+    // A database that will not open is a failure, not an answer — but only the directory key is
+    // authorized to say so. `Group` and `DupOf` keep translating it into «out of scan» exactly as
+    // before, until the finding about their own error sinks is taken up.
+    let store = match ensure_store(app, store) {
+        Ok(store) => store,
+        Err(err) => {
+            return match key {
+                state::WatchKey::DirOf(_) => Err(watch_unavailable(&err)),
+                state::WatchKey::Group(_) | state::WatchKey::DupOf(_) => {
+                    Err(state::WatchEmpty::NotInScan.into())
+                }
+            }
+        }
+    };
     match key {
         state::WatchKey::Group(idx) => {
             // GroupFiles: the group index from the adjacent GroupList panel. If the index
@@ -4392,7 +4411,7 @@ mod dir_watch_tests {
         (db, scan_id)
     }
 
-    fn dir_entry(path: &str) -> PanelEntry {
+    fn panel_entry(path: &str, kind: EntryKind) -> PanelEntry {
         let p = PathBuf::from(path);
         PanelEntry {
             name: p
@@ -4400,12 +4419,16 @@ mod dir_watch_tests {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default(),
             path: p,
-            kind: EntryKind::Dir,
+            kind,
             size: 0,
             mtime: 0,
             device: 0,
             inode: 0,
         }
+    }
+
+    fn dir_entry(path: &str) -> PanelEntry {
+        panel_entry(path, EntryKind::Dir)
     }
 
     /// A two-panel commander over `db`: a `directories` panel whose cursor stands on `cursor`, and
@@ -4697,5 +4720,116 @@ mod dir_watch_tests {
                 "an unverified answer may not claim «{forbidden}»: {narrow}"
             );
         }
+    }
+
+    /// A checkpoint `ScanStore::open` refuses outright: the schema is stamped newer than this
+    /// build supports. The panel keeps pointing at the scan because its cwd coverage was cached
+    /// while the database was healthy — the shape a swapped or upgraded checkpoint leaves behind.
+    fn unopenable_db(tag: &str) -> (PathBuf, i64) {
+        let (db, scan_id) = seeded_db(tag);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.pragma_update(None, "user_version", 9999i64).unwrap();
+        drop(conn);
+        // Evidence is worthless if the fixture accidentally opens (or creates) a usable database.
+        assert!(
+            ScanStore::open(&db).is_err(),
+            "the fixture must really fail in ScanStore::open"
+        );
+        (db, scan_id)
+    }
+
+    /// A commander whose coverage cache still points at `scan_id`, so the broken database is met
+    /// on the watch path rather than at the auto-switch that runs before it.
+    fn app_over_broken_db(
+        db: &Path,
+        scan_id: i64,
+        cursor: &str,
+    ) -> (
+        App,
+        crossbeam_channel::Receiver<crate::tui::event::AppEvent>,
+    ) {
+        let (mut app, events) = app_watching(db, scan_id, cursor);
+        app.commander
+            .scan_coverage_cache
+            .insert(PathBuf::from("/tank"), Some(scan_id));
+        (app, events)
+    }
+
+    /// A database that cannot be opened at all is the same failure as one that cannot be read:
+    /// for a directory cursor it must be said out loud, not turned into «out of scan».
+    #[test]
+    fn a_failed_database_open_is_visible_for_a_directory_cursor() {
+        let (db, scan_id) = unopenable_db("open_dirof");
+        let (mut app, _events) = app_over_broken_db(&db, scan_id, "/tank/t1");
+
+        resolve_watch_groups(&mut app);
+        let entry = watch_entry(&app);
+        let err = entry.unavailable.as_deref().unwrap_or_else(|| {
+            panic!(
+                "an unopenable checkpoint is not «out of scan»: empty={:?}, result={:?}",
+                entry.empty, entry.result
+            )
+        });
+        assert!(
+            err.contains("newer version"),
+            "the real open error is preserved, not a generic one: {err}"
+        );
+        assert!(entry.result.is_none(), "no group is claimed");
+        assert_ne!(entry.empty, state::WatchEmpty::NotInScan);
+        assert_ne!(entry.empty, state::WatchEmpty::NoDuplicates);
+
+        let (lines, _) = render_watch_panel_at(&mut app, 120);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("directory group unavailable:"),
+            "the panel says why it is empty: {text}"
+        );
+        for forbidden in ["out of scan", "no dupes", "no scan data", "dupes inside"] {
+            assert!(
+                !text.contains(forbidden),
+                "a broken checkpoint must not read as «{forbidden}»: {text}"
+            );
+        }
+    }
+
+    /// C1b is scoped to the directory key. The file-cursor key meets the same broken database and
+    /// must keep the translation it has always had, with no unavailable state — the shared helper
+    /// changed, the two file-group branches did not.
+    #[test]
+    fn a_failed_open_still_reads_as_out_of_scan_for_a_file_cursor() {
+        let (db, scan_id) = unopenable_db("open_dupof");
+        let (mut app, _events) = app_over_broken_db(&db, scan_id, "/tank/t1");
+        app.commander.panels[0].entries = vec![panel_entry("/tank/t1/f", EntryKind::File)];
+        app.commander.panels[0].list.select(Some(0));
+
+        resolve_watch_groups(&mut app);
+        let entry = watch_entry(&app);
+        assert!(
+            entry.unavailable.is_none(),
+            "DupOf is explicitly out of C1b's scope: {:?}",
+            entry.unavailable
+        );
+        assert_eq!(entry.empty, state::WatchEmpty::NotInScan);
+        assert!(entry.result.is_none());
+    }
+
+    /// The same control for the group-list key.
+    #[test]
+    fn a_failed_open_still_reads_as_out_of_scan_for_a_group_cursor() {
+        let (db, scan_id) = unopenable_db("open_group");
+        let (mut app, _events) = app_over_broken_db(&db, scan_id, "/tank/t1");
+        app.commander.panels[0].view = PanelView::GroupList;
+        app.commander.panels[0].list.select(Some(0));
+        app.commander.panels[1].view = PanelView::GroupFiles;
+
+        resolve_watch_groups(&mut app);
+        let entry = watch_entry(&app);
+        assert!(
+            entry.unavailable.is_none(),
+            "Group is explicitly out of C1b's scope: {:?}",
+            entry.unavailable
+        );
+        assert_eq!(entry.empty, state::WatchEmpty::NotInScan);
+        assert!(entry.result.is_none());
     }
 }
