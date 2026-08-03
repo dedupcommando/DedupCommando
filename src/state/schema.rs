@@ -544,9 +544,11 @@ mod tests {
     }
 
     /// SQLite's extended result codes for the constraint classes these tables declare. A bare
-    /// `is_err()` cannot tell them apart, and with foreign keys enforced they compete: an INSERT
-    /// that names an absent parent fails on the key before any CHECK is ever evaluated, so a CHECK
-    /// test written without a valid parent would stay green after its CHECK was deleted.
+    /// `is_err()` cannot tell them apart, and with foreign keys enforced one silently falls back to
+    /// the other across an edit: while the CHECK exists an invalid value is rejected as CHECK 275,
+    /// and if that CHECK is ever deleted the same deliberately parentless row falls through and is
+    /// rejected as FK 787 instead. Both are errors, so `is_err()` stays green on either side of
+    /// that transition and proves nothing about which constraint the table still has.
     const CONSTRAINT_CHECK: i32 = 275;
     const CONSTRAINT_FOREIGN_KEY: i32 = 787;
     const CONSTRAINT_PRIMARY_KEY: i32 = 1555;
@@ -1694,8 +1696,11 @@ mod tests {
 
     /// Every declared CHECK, exercised on INSERT and on UPDATE, each proved by its own extended
     /// code. A CHECK that only holds on insert is a CHECK a later writer can walk around; a CHECK
-    /// asserted with a bare `is_err()` over an absent parent is not asserted at all, because the
-    /// foreign key would refuse the row first and go on doing so after the CHECK was deleted.
+    /// asserted with a bare `is_err()` over an absent parent is not asserted at all. While the
+    /// CHECK is present that row is refused as CHECK 275; delete the CHECK and the same row is
+    /// refused as FK 787 instead, so the bare assertion never notices the loss. Hence the valid
+    /// parents seeded below — scan 2 for the authority, and a rank -1 summary for the member — so
+    /// nothing can stand in for the CHECK, and hence the extended cause is pinned.
     #[test]
     fn membership_checks_hold_on_insert_and_update() {
         let conn = enforced_db();
