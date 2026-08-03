@@ -330,18 +330,7 @@ fn run_phases(
         // With --verify a byte-for-byte comparison is needed, which can SPLIT groups → we load
         // the groups and write the verified ones the old way (result-identical to the previous behavior).
         if verify {
-            tracing::info!("RSS probe: before duplicate_groups (--verify): {}", rss());
-            let groups = store.duplicate_groups(scan_id)?;
-            // Byte-for-byte comparison — protection against a hash collision; may split groups.
-            // A split changes which allocations a group holds, so its worth is recomputed from
-            // the surviving membership inside `record_file_results` — never carried over.
-            let groups = verify::verify_groups(groups);
-            tracing::info!(
-                "RSS probe: after verify ({} groups): {}",
-                groups.len(),
-                rss()
-            );
-            store.record_file_results(scan_id, &groups)?;
+            verify_and_record(store, scan_id)?;
         } else {
             store.materialize_file_groups(scan_id)?;
             tracing::info!("RSS probe: after materialize_file_groups (SQL): {}", rss());
@@ -896,6 +885,27 @@ fn hash_phase(
 
     bench.set_entries(objects_read);
     Ok(true)
+}
+
+/// The `--verify` publication boundary: loads the candidate groups, byte-verifies ALL of them
+/// and only then records the surviving populations — `record_file_results` is never reached
+/// when any group failed to verify, so a read failure surfaces as the scan's error instead of
+/// an empty or shrunken published result. Returns the verified group count.
+fn verify_and_record(store: &mut ScanStore, scan_id: i64) -> Result<usize> {
+    let rss = || crate::tui::human_bytes(crate::sysmon::current_rss_bytes());
+    tracing::info!("RSS probe: before duplicate_groups (--verify): {}", rss());
+    let groups = store.duplicate_groups(scan_id)?;
+    // Byte-for-byte comparison — protection against a hash collision; may split groups.
+    // A split changes which allocations a group holds, so its worth is recomputed from
+    // the surviving membership inside `record_file_results` — never carried over.
+    let groups = verify::verify_groups(groups)?;
+    tracing::info!(
+        "RSS probe: after verify ({} groups): {}",
+        groups.len(),
+        rss()
+    );
+    store.record_file_results(scan_id, &groups)?;
+    Ok(groups.len())
 }
 
 /// hex-encoding of a blake3 hash (lowercase) — for directory signatures.
@@ -1815,6 +1825,114 @@ mod hash_failures_tests {
             ScanStatus::Complete,
             "Complete, not CompleteWithWarnings — no residual warning"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod verify_boundary_tests {
+    use super::safe_open::open_regular_nofollow;
+    use super::*;
+
+    /// A unique temporary directory (as in hash_failures_tests) — without the tempfile crate.
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("dedcom_pipe_{tag}_{}_{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The real manifest identity of an existing regular file.
+    fn manifest_row(path: &std::path::Path) -> ManifestRow {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).unwrap();
+        ManifestRow {
+            path: path.to_path_buf(),
+            size: meta.size(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+            ctime_sec: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
+            device: meta.dev(),
+            inode: meta.ino(),
+            nlink: meta.nlink(),
+        }
+    }
+
+    /// A verification read failure crosses the publication boundary as an error and publishes
+    /// NOTHING — no `file_group` row, no results-materialized marker — while the collected
+    /// manifest/hash evidence survives untouched. The store and the files are real; the fault
+    /// is a symlink replacing a member after hashing, which `open_regular_nofollow` provably
+    /// rejects (chmod would be inert under the root of the Docker gate).
+    #[test]
+    fn a_verify_read_failure_publishes_nothing_and_keeps_the_evidence() {
+        let dir = unique_temp_dir("verify_boundary");
+        let a = dir.join("a.bin");
+        let b = dir.join("b.bin");
+        let payload = b"identical bytes for the verify boundary";
+        std::fs::write(&a, payload).unwrap();
+        std::fs::write(&b, payload).unwrap();
+
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = store
+            .begin_scan(&ScanConfig::new(vec![dir.clone()]))
+            .unwrap();
+        store
+            .record_files(scan_id, &[manifest_row(&a), manifest_row(&b)])
+            .unwrap();
+        let digest = [7u8; 32];
+        store
+            .record_hashes(scan_id, &[(a.clone(), digest), (b.clone(), digest)])
+            .unwrap();
+        // The candidate exists BEFORE the fault: one group over two allocations.
+        assert_eq!(
+            store.duplicate_groups(scan_id).unwrap().len(),
+            1,
+            "the fixture must produce a real candidate group"
+        );
+
+        // The replacement fault is real, not inert: the member is now a symlink and the safe
+        // open rejects it.
+        std::fs::remove_file(&b).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        assert!(open_regular_nofollow(&b).is_err());
+
+        assert!(
+            verify_and_record(&mut store, scan_id).is_err(),
+            "the failed byte verification must reach the caller"
+        );
+
+        assert!(
+            store.group_summaries(scan_id).unwrap().is_empty(),
+            "no verified file_group result may be published"
+        );
+        assert!(
+            !store.results_materialized(scan_id).unwrap(),
+            "the results-materialized marker must stay unset"
+        );
+        let manifest = store.file_hash_status(scan_id).unwrap();
+        assert_eq!(manifest.len(), 2, "the manifest evidence is intact");
+        assert!(
+            manifest.iter().all(|(_, _, hash)| hash.is_some()),
+            "the collected hash evidence is not rewritten by the failure"
+        );
+
+        // The intact evidence is directly usable: repairing the member and running the same
+        // boundary again publishes from this store, without a rescan.
+        std::fs::remove_file(&b).unwrap();
+        std::fs::write(&b, payload).unwrap();
+        assert_eq!(
+            verify_and_record(&mut store, scan_id).unwrap(),
+            1,
+            "the repaired member verifies and one group is published"
+        );
+        assert!(store.results_materialized(scan_id).unwrap());
+        assert_eq!(store.group_summaries(scan_id).unwrap().len(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }
