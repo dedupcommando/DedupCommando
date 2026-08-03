@@ -191,6 +191,55 @@ pub fn enforce_db_perms_0600(db_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Verifies that `db_path` is an existing regular file whose final component is not a symlink,
+/// without creating it, changing its mode, or blocking on a FIFO/device: `O_RDONLY | O_NONBLOCK
+/// | O_NOFOLLOW | O_CLOEXEC` — no `O_CREAT`, no `fchmod` — then `fstat` on the already-open fd
+/// and a refusal of everything but a regular file. The fd closes by RAII.
+///
+/// The three safety flags are written out here rather than borrowed from
+/// `pipeline::safe_open::open_regular_nofollow` on purpose: `paths` is a leaf module that
+/// `state::store` depends on, and reaching into `pipeline` would invert that layering for seven
+/// lines whose error would then say «skipping» inside a database diagnostic. The duplication is
+/// deliberate.
+///
+/// Staged by R4B-1; `ScanStore::open_for_apply_lease` is its only caller until R4B-2 wires the
+/// worker route.
+pub fn verify_existing_db_file(db_path: &Path) -> io::Result<()> {
+    let c = cstring(db_path)?;
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let err = io::Error::last_os_error();
+        return Err(io::Error::new(
+            err.kind(),
+            format!(
+                "cannot verify the DB file (missing? symlink?): {}: {err}",
+                crate::textsan::terminal(&db_path.display().to_string())
+            ),
+        ));
+    }
+    // SAFETY: fd >= 0 and just obtained from open — we own it (closed on Drop).
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(owned.as_raw_fd(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the DB path is not a regular file: {}",
+                crate::textsan::terminal(&db_path.display().to_string())
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn cstring(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the path contains NUL"))
@@ -453,5 +502,71 @@ mod tests {
         // nothing set → None (the caller falls back to std::env::temp_dir)
         let env = |_v: &str| None::<OsString>;
         assert_eq!(xdg_state_base_from(env), None);
+    }
+
+    // --- verify_existing_db_file: the staged apply-lease path verifier (R4B-1) ---
+
+    #[test]
+    fn verify_db_accepts_a_regular_file() {
+        let base = temp_path("vf_reg");
+        let db = base.join("dedcom.db");
+        std::fs::write(&db, b"sqlite?").unwrap();
+        verify_existing_db_file(&db).unwrap();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn verify_db_refuses_an_absent_path_without_creating_it() {
+        let base = temp_path("vf_absent");
+        let db = base.join("dedcom.db");
+        assert!(verify_existing_db_file(&db).is_err());
+        assert!(!db.exists(), "verification must not create the file");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn verify_db_refuses_a_symlink_and_leaves_the_target_alone() {
+        let base = temp_path("vf_link");
+        let target = base.join("outside.bin");
+        std::fs::write(&target, b"victim").unwrap();
+        let db = base.join("dedcom.db");
+        std::os::unix::fs::symlink(&target, &db).unwrap();
+        assert!(
+            verify_existing_db_file(&db).is_err(),
+            "O_NOFOLLOW must refuse the link"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"victim");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn verify_db_refuses_a_directory() {
+        let base = temp_path("vf_dir");
+        // open(O_RDONLY) on a directory succeeds on Linux — the S_ISREG check is what rejects it.
+        assert!(verify_existing_db_file(&base).is_err());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn verify_db_refuses_a_fifo_promptly_without_a_writer() {
+        let base = temp_path("vf_fifo");
+        let fifo = base.join("dedcom.db");
+        let c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid C string for a child of an existing directory; mode 0600.
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo did not create the FIFO");
+        // No writer and no helper thread: O_NONBLOCK returns the fd immediately and the
+        // S_ISREG check rejects it — the call comes back instead of hanging.
+        assert!(verify_existing_db_file(&fifo).is_err());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn verify_db_refuses_a_unix_socket() {
+        let base = temp_path("vf_sock");
+        let sock = base.join("dedcom.db");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert!(verify_existing_db_file(&sock).is_err());
+        std::fs::remove_dir_all(&base).ok();
     }
 }

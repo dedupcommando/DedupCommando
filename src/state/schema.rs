@@ -344,6 +344,29 @@ pub fn ensure_migrated(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Accepts exactly the current schema and nothing else — for a connection that must neither
+/// migrate nor tolerate a half-known file (the staged apply-lease opener). One `PRAGMA
+/// user_version` read serves both comparisons: calling the two existing helpers would read the
+/// pragma twice, and the two reads could in principle disagree. The wording of each refusal is
+/// the wording of the existing helper for that direction. Performs no migration and no write.
+///
+/// Staged by R4B-1; `ScanStore::open_for_apply_lease` is its only caller until R4B-2 wires the
+/// worker route.
+pub fn ensure_version_exact(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(AppError::msg(format!(
+            "dedcom.db was created by a newer version (schema v{version}; this build supports v{SCHEMA_VERSION}). Upgrade dedcom, or move the old dedcom.db aside."
+        )));
+    }
+    if version < SCHEMA_VERSION {
+        return Err(AppError::msg(format!(
+            "dedcom.db uses an older schema (v{version}; this build needs v{SCHEMA_VERSION}) and read-only mode cannot upgrade it. Start dedcom once as the operator."
+        )));
+    }
+    Ok(())
+}
+
 pub fn migrate(conn: &Connection) -> Result<()> {
     // The migration is transactional and idempotent — either it all applies,
     // or the DB stays in its previous state (no half-added columns).
@@ -1953,5 +1976,29 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM file_group_member", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 4, "the LF name is one row, not two");
+    }
+
+    /// The staged apply-lease opener accepts exactly v5: an older and a newer file each get the
+    /// direction's own wording, from one PRAGMA read, and `user_version` is left unchanged by
+    /// the refusal.
+    #[test]
+    fn ensure_version_exact_accepts_only_the_current_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        ensure_version_exact(&conn).unwrap();
+
+        for (seeded, must_contain) in [
+            (SCHEMA_VERSION - 1, "older schema"),
+            (0, "older schema"),
+            (SCHEMA_VERSION + 1, "newer version"),
+        ] {
+            conn.pragma_update(None, "user_version", seeded).unwrap();
+            let text = ensure_version_exact(&conn).unwrap_err().to_string();
+            assert!(text.contains(must_contain), "v{seeded}: {text}");
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, seeded, "the refusal writes nothing");
+        }
     }
 }

@@ -305,6 +305,47 @@ pub struct PlanGroupInput {
     pub members: Vec<PlanMemberEvidence>,
 }
 
+/// The authoritative identity of one published group: which scan, which rank in that scan's
+/// current publication, and which publication (generation) assigned the rank. Rank alone is not
+/// identity — every publication reassigns ranks by payoff — so the generation travels with every
+/// rank; and the digest is deliberately NOT here — it is content, not identity, and two explicit
+/// ranks may legitimately share one.
+///
+/// Staged by R4B-1 with no production caller; R4B-2 wires it into `PlanGroupInput` and the
+/// destructive routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupId {
+    pub scan_id: i64,
+    pub rank: i64,
+    pub generation: i64,
+}
+
+/// One planned group as the plan remembers it: the identity, the digest the summary carried at
+/// planning time (lower hex, the `file_group.hash` domain), and the exact member pathnames in
+/// their persisted `file.path` spelling. The witness owns the digest so the lease can compare
+/// what the plan remembered against what the CURRENT summary says — a substituted digest is
+/// caught rather than followed.
+///
+/// Staged by R4B-1 with no production caller; R4B-2 puts the witness into `ActionPlan`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupWitness {
+    pub id: GroupId,
+    pub digest: String,
+    pub members: Vec<PathBuf>,
+}
+
+/// Everything the membership lease revalidates against the live database before a destructive
+/// batch may begin. Pathname boundaries are vector boundaries: a member containing LF is one
+/// member here and one row in storage, never a delimited list.
+///
+/// Staged by R4B-1 with no production caller; R4B-2 puts the witness into `ActionPlan`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanWitness {
+    pub scan_id: i64,
+    pub generation: i64,
+    pub groups: Vec<GroupWitness>,
+}
+
 /// What an object is doing in this plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectRole {

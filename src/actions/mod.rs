@@ -8,8 +8,11 @@ use crate::model::action::{
     ActionKind, ActionOutcome, BatchResult, FileIdentity, RevalidationMode,
 };
 use crate::model::dataset::Dataset;
-use crate::model::plan::{ActionPlan, ActionResult, PlanAction, PlanResult, RuntimeLedger};
+use crate::model::plan::{
+    ActionPlan, ActionResult, PlanAction, PlanResult, PlanWitness, RuntimeLedger,
+};
 use crate::pipeline::hash;
+use crate::state::store::{LeaseRefusal, ScanStore};
 use crate::zfs::snapshots;
 
 pub mod apply_worker;
@@ -93,6 +96,12 @@ impl ApplyShared {
 pub trait ApplyOps {
     /// The safety snapshot of one dataset.
     fn create_snapshot(&self, dataset: &str, suffix: &str) -> Result<String>;
+
+    /// Runs once the membership lease is held and BEFORE any filesystem work — the only point
+    /// at which «lease held, nothing touched yet» is observable, which is what a second worker
+    /// has to meet to prove the lease is exclusive. Staged by R4B-1; `RealOps` takes the
+    /// default no-op and production never overrides it.
+    fn after_lease(&self) {}
 
     /// Runs once after every snapshot exists and before the second whole-plan preflight.
     fn after_snapshots(&self) {}
@@ -181,6 +190,170 @@ pub(crate) fn snapshot_suffix() -> String {
         std::process::id()
     )
 }
+
+// ---------------------------------------------------------------------------------------------
+// R4B-1 — the staged guarded apply boundary (production-inert).
+//
+// Nothing below is called by the worker, the events or the UI: `apply_batch` and its call graph
+// stay byte-for-byte what they were. R4B-2 is the one atomic switch.
+// ---------------------------------------------------------------------------------------------
+
+/// Why a batch never began. Pre-batch only: every variant means zero snapshots and zero actions,
+/// and the caller still owns its plan.
+///
+/// Path and database detail is sanitized exactly ONCE, here at construction
+/// (`ApplyRefusal::from_lease`), never again at render — the single-sanitization rule R4-C0
+/// established for the watch wording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // R4B-2 gives these variants their UI and event consumers.
+pub enum ApplyRefusal {
+    Open(String),
+    Schema(String),
+    DatabaseBusy,
+    ReadOnlyRole,
+    NoSuchScan,
+    Unknown,
+    Stale {
+        expected: i64,
+        found: i64,
+    },
+    RankMissing {
+        rank: i64,
+    },
+    DigestChanged {
+        rank: i64,
+        expected: String,
+        found: String,
+    },
+    MemberCountChanged {
+        rank: i64,
+        expected: u64,
+        found: u64,
+    },
+    MembershipChanged {
+        path: PathBuf,
+    },
+    Inconsistent {
+        detail: String,
+    },
+    Store {
+        detail: String,
+    },
+}
+
+impl ApplyRefusal {
+    /// The store's typed lease refusal, carried across the layer boundary with its path and
+    /// database detail sanitized once.
+    fn from_lease(refusal: LeaseRefusal) -> Self {
+        match refusal {
+            LeaseRefusal::Open { detail } => ApplyRefusal::Open(crate::textsan::terminal(&detail)),
+            LeaseRefusal::Schema { detail } => {
+                ApplyRefusal::Schema(crate::textsan::terminal(&detail))
+            }
+            LeaseRefusal::DatabaseBusy => ApplyRefusal::DatabaseBusy,
+            LeaseRefusal::ReadOnlyRole => ApplyRefusal::ReadOnlyRole,
+            LeaseRefusal::NoSuchScan => ApplyRefusal::NoSuchScan,
+            LeaseRefusal::Unknown => ApplyRefusal::Unknown,
+            LeaseRefusal::Stale { expected, found } => ApplyRefusal::Stale { expected, found },
+            LeaseRefusal::RankMissing { rank } => ApplyRefusal::RankMissing { rank },
+            LeaseRefusal::DigestChanged {
+                rank,
+                expected,
+                found,
+            } => ApplyRefusal::DigestChanged {
+                rank,
+                expected: crate::textsan::terminal(&expected),
+                found: crate::textsan::terminal(&found),
+            },
+            LeaseRefusal::MemberCountChanged {
+                rank,
+                expected,
+                found,
+            } => ApplyRefusal::MemberCountChanged {
+                rank,
+                expected,
+                found,
+            },
+            LeaseRefusal::MembershipChanged { path } => ApplyRefusal::MembershipChanged { path },
+            LeaseRefusal::Inconsistent { detail } => ApplyRefusal::Inconsistent {
+                detail: crate::textsan::terminal(&detail),
+            },
+            LeaseRefusal::Store { detail } => ApplyRefusal::Store {
+                detail: crate::textsan::terminal(&detail),
+            },
+        }
+    }
+}
+
+/// The shape of the guarded entry: either the batch was entered, or it never began.
+///
+/// Deliberately NOT a `Result`, so `?` does not compile inside the pre-batch section: every
+/// fallible step there has to be an explicit match that keeps its classification.
+#[allow(dead_code)] // R4B-2 wires the worker closure onto these arms.
+pub enum GuardedApply {
+    /// Nothing happened; the caller still owns the plan.
+    Refused(ApplyRefusal),
+    /// `apply_batch_with` was entered — past this boundary exact plan preservation is not
+    /// promised.
+    Ran(Result<BatchResult>),
+}
+
+/// What the owning window receives when a guarded batch ends. Staged whole so R4B-2 changes the
+/// event's payload once rather than growing it in steps.
+#[allow(dead_code)] // R4B-2 makes this the `ApplyFinished` payload.
+pub enum ApplyOutcome {
+    /// The batch never began; the plan comes back to its window intact.
+    Refused {
+        refusal: ApplyRefusal,
+        plan: Box<ActionPlan>,
+    },
+    Finished(BatchResult),
+    Failed(String),
+}
+
+/// The guarded destructive entry: verify the checkpoint, take the whole-batch membership lease
+/// against the plan's witness, and only then run the batch — holding the lease across all of it,
+/// so no other writer can republish membership under a running batch.
+///
+/// The plan is BORROWED: the caller keeps ownership, which is what lets a refusal hand the exact
+/// plan back to its window. A refusal is returned before `apply_batch_with` is called, so a
+/// refused run creates zero snapshots and applies zero actions.
+///
+/// `witness` is passed explicitly only until R4B-2 puts it inside `ActionPlan`.
+///
+/// Staged by R4B-1 with no production caller.
+#[allow(dead_code)] // R4B-2 repoints the apply worker here.
+#[allow(clippy::too_many_arguments)] // R4B-2 folds db_path/witness into the plan itself.
+pub fn apply_guarded_with(
+    ops: &dyn ApplyOps,
+    db_path: &Path,
+    plan: &ActionPlan,
+    witness: &PlanWitness,
+    datasets: &[Dataset],
+    reflink_safe: bool,
+    shared: &ApplyShared,
+    mode: RevalidationMode,
+) -> GuardedApply {
+    let mut store = match ScanStore::open_for_apply_lease(db_path) {
+        Ok(store) => store,
+        Err(refusal) => return GuardedApply::Refused(ApplyRefusal::from_lease(refusal)),
+    };
+    let lease = match store.acquire_membership_lease(witness) {
+        Ok(lease) => lease,
+        Err(refusal) => return GuardedApply::Refused(ApplyRefusal::from_lease(refusal)),
+    };
+    // Lease held, nothing on the filesystem touched yet.
+    ops.after_lease();
+    let result = apply_batch_with(ops, plan, datasets, reflink_safe, shared, mode);
+    // Explicit rather than implicit: the lease is released HERE, after the batch, and the order
+    // is the guarantee — not an artefact of where the binding happens to end.
+    drop(lease);
+    GuardedApply::Ran(result)
+}
+
+// ---------------------------------------------------------------------------------------------
+// End of the R4B-1 staged guarded apply boundary.
+// ---------------------------------------------------------------------------------------------
 
 /// Applies a plan: preflight -> snapshot the affected datasets -> preflight again -> apply.
 pub fn apply_batch(
@@ -2097,5 +2270,367 @@ pub(crate) mod tests {
             res.is_err(),
             "a keeper change within the batch must be caught by re-stat"
         );
+    }
+}
+
+/// R4B-1: the staged guarded apply boundary. Every test here drives `apply_guarded_with`, which
+/// no production route calls yet — the worker keeps using `apply_batch` until R4B-2. The
+/// concurrency cases are channel rendezvous: no sleep, no retry, no timing assumption.
+#[cfg(test)]
+mod guarded_staging_tests {
+    use super::tests::dataset_over;
+    use super::*;
+    use crate::model::action::ActionKind;
+    use crate::model::plan::{GroupId, GroupWitness};
+    use crate::state::store::{role_guard, PublishMode};
+    use crate::testfixtures::PlanScenario;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    /// A published scan over two real twins, its plan and the witness that plan would carry.
+    struct Published {
+        scenario: PlanScenario,
+        plan: ActionPlan,
+        witness: PlanWitness,
+        scan_id: i64,
+    }
+
+    fn publish(tag: &str) -> Published {
+        let scenario = PlanScenario::new(tag);
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &twin, false, Some(ActionKind::Delete));
+        // The staged publisher, so the scan has real v5 authority to lease against.
+        let generation = store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        let id = GroupId {
+            scan_id,
+            rank: 0,
+            generation,
+        };
+        let witness = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            let resolved = snapshot.group(&id).unwrap();
+            PlanWitness {
+                scan_id,
+                generation,
+                groups: vec![GroupWitness {
+                    id,
+                    digest: resolved.summary.hash.clone(),
+                    members: resolved.members.iter().map(|f| f.path.clone()).collect(),
+                }],
+            }
+        };
+        let plan = store
+            .build_action_plan(scan_id, &[])
+            .expect("the marks make a plan");
+        drop(store);
+        Published {
+            scenario,
+            plan,
+            witness,
+            scan_id,
+        }
+    }
+
+    /// Counts what a refused run must never do.
+    #[derive(Default)]
+    struct CountingOps {
+        snapshots: Arc<AtomicUsize>,
+        actions: Arc<AtomicUsize>,
+    }
+
+    impl ApplyOps for CountingOps {
+        fn create_snapshot(&self, dataset: &str, suffix: &str) -> Result<String> {
+            self.snapshots.fetch_add(1, Ordering::SeqCst);
+            Ok(format!("{dataset}@dedcom-{suffix}"))
+        }
+
+        fn before_action(&self, _index: usize) {
+            self.actions.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Holds the lease inside `after_lease` until the test says to continue — the only point at
+    /// which a second worker can meet «lease held, nothing touched yet».
+    struct HoldingOps {
+        held: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+        snapshots: Arc<AtomicUsize>,
+    }
+
+    impl ApplyOps for HoldingOps {
+        fn create_snapshot(&self, dataset: &str, suffix: &str) -> Result<String> {
+            self.snapshots.fetch_add(1, Ordering::SeqCst);
+            Ok(format!("{dataset}@dedcom-{suffix}"))
+        }
+
+        fn after_lease(&self) {
+            self.held.send(()).expect("the test is listening");
+            self.release.recv().expect("the test releases the lease");
+        }
+    }
+
+    fn guarded(
+        ops: &dyn ApplyOps,
+        published: &Published,
+        witness: &PlanWitness,
+        datasets: &[Dataset],
+    ) -> GuardedApply {
+        apply_guarded_with(
+            ops,
+            &published.scenario.db_path,
+            &published.plan,
+            witness,
+            datasets,
+            true,
+            &ApplyShared::default(),
+            RevalidationMode::Hybrid,
+        )
+    }
+
+    fn refusal(outcome: GuardedApply) -> ApplyRefusal {
+        match outcome {
+            GuardedApply::Refused(refusal) => refusal,
+            GuardedApply::Ran(_) => panic!("the batch must never have been entered"),
+        }
+    }
+
+    /// The ordinary guarded run: the lease is taken, the batch runs, and afterwards the lease
+    /// is gone — a second guarded run on the same checkpoint proves the release.
+    #[test]
+    fn a_guarded_run_takes_the_lease_and_releases_it() {
+        let _guard = role_guard();
+        let published = publish("guarded_ok");
+        let datasets = vec![dataset_over(&published.scenario.root, "tank/data")];
+        let ops = CountingOps::default();
+
+        match guarded(&ops, &published, &published.witness, &datasets) {
+            GuardedApply::Ran(result) => {
+                let batch = result.expect("the batch itself succeeds");
+                assert_eq!(batch.outcomes.len(), 1, "the one planned action ran");
+            }
+            GuardedApply::Refused(refusal) => panic!("unexpected refusal: {refusal:?}"),
+        }
+        assert!(ops.snapshots.load(Ordering::SeqCst) >= 1);
+
+        // The lease is released: another acquisition on the same DB succeeds immediately.
+        let mut store = ScanStore::open_for_apply_lease(&published.scenario.db_path).unwrap();
+        assert!(store.acquire_membership_lease(&published.witness).is_ok());
+    }
+
+    /// A witness from before a republication refuses BEFORE any filesystem work.
+    #[test]
+    fn a_stale_witness_refuses_before_any_filesystem_work() {
+        let _guard = role_guard();
+        let published = publish("guarded_stale");
+        {
+            let mut store = published.scenario.store();
+            store
+                .publish_results(published.scan_id, PublishMode::Derived)
+                .unwrap();
+        }
+        let datasets = vec![dataset_over(&published.scenario.root, "tank/data")];
+        let ops = CountingOps::default();
+
+        assert_eq!(
+            refusal(guarded(&ops, &published, &published.witness, &datasets)),
+            ApplyRefusal::Stale {
+                expected: 1,
+                found: 2
+            }
+        );
+        assert_eq!(ops.snapshots.load(Ordering::SeqCst), 0, "zero snapshots");
+        assert_eq!(ops.actions.load(Ordering::SeqCst), 0, "zero actions");
+    }
+
+    /// A checkpoint of the wrong schema refuses as a schema mismatch, not as a batch failure —
+    /// and `user_version` is left as it was found.
+    #[test]
+    fn a_wrong_schema_refuses_before_any_filesystem_work() {
+        let _guard = role_guard();
+        let published = publish("guarded_schema");
+        {
+            let conn = rusqlite::Connection::open(&published.scenario.db_path).unwrap();
+            conn.pragma_update(None, "user_version", 4).unwrap();
+        }
+        let datasets = vec![dataset_over(&published.scenario.root, "tank/data")];
+        let ops = CountingOps::default();
+
+        assert!(matches!(
+            refusal(guarded(&ops, &published, &published.witness, &datasets)),
+            ApplyRefusal::Schema(_)
+        ));
+        assert_eq!(ops.snapshots.load(Ordering::SeqCst), 0);
+        assert_eq!(ops.actions.load(Ordering::SeqCst), 0);
+        let conn = rusqlite::Connection::open(&published.scenario.db_path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4, "the refusal wrote nothing");
+    }
+
+    /// A database another writer already holds refuses at once — `busy_timeout=0` never queues.
+    #[test]
+    fn a_held_write_lock_refuses_immediately() {
+        let _guard = role_guard();
+        let published = publish("guarded_busy");
+        let holder = rusqlite::Connection::open(&published.scenario.db_path).unwrap();
+        holder.execute_batch("PRAGMA busy_timeout=0;").unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let datasets = vec![dataset_over(&published.scenario.root, "tank/data")];
+        let ops = CountingOps::default();
+
+        assert_eq!(
+            refusal(guarded(&ops, &published, &published.witness, &datasets)),
+            ApplyRefusal::DatabaseBusy
+        );
+        assert_eq!(ops.snapshots.load(Ordering::SeqCst), 0);
+        assert_eq!(ops.actions.load(Ordering::SeqCst), 0);
+        holder.execute_batch("ROLLBACK;").unwrap();
+    }
+
+    /// Two real workers, one plan: A holds the lease inside `after_lease` while B runs the very
+    /// same guarded entry and is refused busy with nothing touched; then A completes and a
+    /// third acquisition proves the lease is gone. Every step is a channel rendezvous.
+    #[test]
+    fn a_second_worker_is_refused_while_the_first_holds_the_lease() {
+        let _guard = role_guard();
+        let published = publish("guarded_two_workers");
+        let datasets = vec![dataset_over(&published.scenario.root, "tank/data")];
+        let (held_tx, held_rx) = crossbeam_channel::bounded(0);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(0);
+        let a_snapshots = Arc::new(AtomicUsize::new(0));
+
+        let db_path = published.scenario.db_path.clone();
+        let a_plan = published.plan.clone();
+        let a_witness = published.witness.clone();
+        let a_datasets = datasets.clone();
+        let a_counter = Arc::clone(&a_snapshots);
+        let worker_a = std::thread::spawn(move || {
+            let ops = HoldingOps {
+                held: held_tx,
+                release: release_rx,
+                snapshots: a_counter,
+            };
+            match apply_guarded_with(
+                &ops,
+                &db_path,
+                &a_plan,
+                &a_witness,
+                &a_datasets,
+                true,
+                &ApplyShared::default(),
+                RevalidationMode::Hybrid,
+            ) {
+                GuardedApply::Ran(result) => result.is_ok(),
+                GuardedApply::Refused(_) => false,
+            }
+        });
+
+        // A is now inside after_lease: the lease exists and nothing has been touched.
+        held_rx.recv().expect("worker A reached the lease");
+        let b_ops = CountingOps::default();
+        assert_eq!(
+            refusal(guarded(&b_ops, &published, &published.witness, &datasets)),
+            ApplyRefusal::DatabaseBusy,
+            "the second worker is refused, not queued"
+        );
+        assert_eq!(b_ops.snapshots.load(Ordering::SeqCst), 0);
+        assert_eq!(b_ops.actions.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            a_snapshots.load(Ordering::SeqCst),
+            0,
+            "A has not touched anything yet either"
+        );
+
+        release_tx.send(()).expect("worker A is waiting");
+        assert!(worker_a.join().expect("worker A finished"));
+
+        let mut store = ScanStore::open_for_apply_lease(&published.scenario.db_path).unwrap();
+        assert!(
+            store.acquire_membership_lease(&published.witness).is_ok(),
+            "the lease is released once the batch is done"
+        );
+    }
+
+    /// A panic inside the guarded job releases the lease while unwinding — the next acquisition
+    /// succeeds without any cleanup step.
+    #[test]
+    fn a_panic_inside_the_batch_still_releases_the_lease() {
+        let _guard = role_guard();
+        let _panic_guard = crate::panics::test_lock();
+        let published = publish("guarded_panic");
+        let datasets = vec![dataset_over(&published.scenario.root, "tank/data")];
+
+        struct PanickingOps;
+        impl ApplyOps for PanickingOps {
+            fn create_snapshot(&self, _dataset: &str, _suffix: &str) -> Result<String> {
+                panic!("the pool exploded")
+            }
+        }
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            guarded(&PanickingOps, &published, &published.witness, &datasets)
+        }));
+        std::panic::set_hook(previous);
+        assert!(outcome.is_err(), "the panic propagated as a panic");
+
+        let mut store = ScanStore::open_for_apply_lease(&published.scenario.db_path).unwrap();
+        assert!(
+            store.acquire_membership_lease(&published.witness).is_ok(),
+            "unwinding released the lease"
+        );
+    }
+
+    /// Membership corrupted without a generation bump refuses, and the refusal names the
+    /// pathname rather than a sentence a caller would have to parse.
+    #[test]
+    fn corrupt_membership_refuses_with_the_pathname_named() {
+        let _guard = role_guard();
+        let published = publish("guarded_corrupt");
+        let datasets = vec![dataset_over(&published.scenario.root, "tank/data")];
+        let ops = CountingOps::default();
+
+        let mut forged = published.witness.clone();
+        let ghost = published.scenario.root.join("ghost.bin");
+        forged.groups[0].members = vec![ghost.clone(), ghost.clone()];
+
+        match refusal(guarded(&ops, &published, &forged, &datasets)) {
+            ApplyRefusal::MembershipChanged { path } => {
+                assert!(path.starts_with(&published.scenario.root))
+            }
+            other => panic!("expected a named membership change, got {other:?}"),
+        }
+        assert_eq!(ops.snapshots.load(Ordering::SeqCst), 0);
+        assert_eq!(ops.actions.load(Ordering::SeqCst), 0);
+    }
+
+    /// A checkpoint that is missing, or is a symlink, refuses as an `Open` with its detail
+    /// sanitized once — and the missing file is not created.
+    #[test]
+    fn an_unopenable_checkpoint_refuses_without_creating_anything() {
+        let _guard = role_guard();
+        let published = publish("guarded_open");
+        let datasets = vec![dataset_over(&published.scenario.root, "tank/data")];
+        let ops = CountingOps::default();
+        std::fs::remove_file(&published.scenario.db_path).unwrap();
+
+        assert!(matches!(
+            refusal(guarded(&ops, &published, &published.witness, &datasets)),
+            ApplyRefusal::Open(_)
+        ));
+        assert!(
+            !published.scenario.db_path.exists(),
+            "a refused guarded run creates no database"
+        );
+        assert_eq!(ops.snapshots.load(Ordering::SeqCst), 0);
+        assert_eq!(ops.actions.load(Ordering::SeqCst), 0);
     }
 }

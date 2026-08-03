@@ -21,8 +21,8 @@ use crate::model::omission::{
 #[cfg(test)]
 use crate::model::omission::{EventCount, OmissionReason};
 use crate::model::plan::{
-    ActionPlan, MarkIntent, PlanGroupInput, PlanMemberEvidence, PlanObjectKey, PlanRefusal,
-    PlanResult, RequestedMark,
+    ActionPlan, GroupId, MarkIntent, PlanGroupInput, PlanMemberEvidence, PlanObjectKey,
+    PlanRefusal, PlanResult, PlanWitness, RequestedMark,
 };
 use crate::model::reclaim::{
     DestructivePlanVerdict, GroupReclaim, LinkCount, ReclaimEstimate, ReclaimState,
@@ -215,6 +215,11 @@ pub struct ScanStore {
     /// instance rather than global, so parallel tests cannot pollute each other.
     #[cfg(test)]
     propagations: std::cell::Cell<u64>,
+    /// Test-only: SQL statements spent on the staged apply-lease path (open → acquire →
+    /// release). The lease must not grow with the plan — the 40 000-group case pins this
+    /// number. Same per-instance shape as `propagations`, for the same reason.
+    #[cfg(test)]
+    membership_statements: std::cell::Cell<u64>,
 }
 
 /// Process role. `false` — operator (may write), `true` — observer.
@@ -702,6 +707,8 @@ impl ScanStore {
             conn,
             #[cfg(test)]
             propagations: std::cell::Cell::new(0),
+            #[cfg(test)]
+            membership_statements: std::cell::Cell::new(0),
         }
     }
 
@@ -709,6 +716,12 @@ impl ScanStore {
     #[cfg(test)]
     pub fn propagation_statements(&self) -> u64 {
         self.propagations.get()
+    }
+
+    /// Test-only: apply-lease statements issued so far (see the field).
+    #[cfg(test)]
+    pub fn membership_statement_count(&self) -> u64 {
+        self.membership_statements.get()
     }
 
     /// Opens the DB for the process role: an observer gets a genuinely read-only connection,
@@ -3694,6 +3707,1438 @@ fn take_insert_fault() -> bool {
         None => false,
     })
 }
+
+// ---------------------------------------------------------------------------------------------
+// R4B-1 — staged membership authority (production-inert).
+//
+// Everything from here to the next section is the future ownership of group membership: the
+// typed snapshot/resolver, the exact-schema apply opener, the fail-fast whole-batch lease and
+// the two future publication paths. NO production route calls any of it — R4B-2 is the one
+// atomic switch — which is why the entry points carry narrow `#[allow(dead_code)]` markers
+// naming that commit. Tests exercise all of it today.
+// ---------------------------------------------------------------------------------------------
+
+/// Who last published a scan's results, as `scan_membership` records it. `Unknown` is the
+/// ABSENCE of that row — a migrated checkpoint, or a publication that never committed — and is
+/// only ever inferred from absence, never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipMode {
+    /// No authority row: browse-only; only the candidate view may answer, without identities.
+    Unknown,
+    /// Membership is the manifest by the CURRENT summary's digest; zero member rows exist.
+    Derived,
+    /// Membership is the `file_group_member` rows of the current generation; a raw digest is
+    /// never a fallback.
+    Explicit,
+}
+
+/// Why a trusted membership answer does not exist. Typed — no caller decides anything by
+/// parsing an English sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MembershipMiss {
+    NoSuchScan,
+    NoSuchGroup,
+    /// The scan has no membership authority.
+    Unknown,
+    /// The asked-for generation is not the current publication.
+    Stale {
+        expected: i64,
+        found: i64,
+    },
+    /// The stored authority/membership contradicts itself; nothing is repaired silently.
+    Inconsistent {
+        detail: String,
+    },
+    /// The database read itself failed.
+    Store {
+        detail: String,
+    },
+}
+
+impl From<rusqlite::Error> for MembershipMiss {
+    fn from(err: rusqlite::Error) -> Self {
+        MembershipMiss::Store {
+            detail: err.to_string(),
+        }
+    }
+}
+
+/// One group resolved through the membership authority: the identity, the mode that vouched
+/// for it, the current summary row and the exact ordered members.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // R4B-2 makes the browser, the planner and the CSV export read these.
+pub struct ResolvedGroup {
+    pub id: GroupId,
+    pub mode: MembershipMode,
+    pub summary: GroupSummary,
+    pub members: Vec<FileEntry>,
+}
+
+/// The current summaries under one authority. Every summary/membership disagreement is NAMED by
+/// its exact identity rather than repaired — the caller decides, this reader never normalizes.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // R4B-2 makes the browser and the commander read these.
+pub struct MembershipSummaries {
+    pub mode: MembershipMode,
+    pub generation: i64,
+    pub groups: Vec<(GroupId, GroupSummary)>,
+    pub inconsistent: Vec<GroupId>,
+}
+
+/// Untrusted digest candidates of an Unknown scan — for browsing only. Deliberately carries no
+/// `GroupId`, no membership test and no conversion to `ResolvedGroup`: nothing a destructive
+/// gate could accept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateView {
+    pub candidates: Vec<DigestCandidate>,
+}
+
+/// One raw-digest candidate: the digest and how many pathnames currently share it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigestCandidate {
+    pub digest: String,
+    pub paths: u64,
+}
+
+/// Why the apply lease was not granted. Pre-batch only: every variant means nothing on the
+/// filesystem has happened. `Open`/`Schema` carry the raw diagnostic; the actions layer
+/// sanitizes exactly once at `ApplyRefusal` construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseRefusal {
+    /// The database file could not be verified or opened.
+    Open {
+        detail: String,
+    },
+    /// The file is not exactly the current schema (older and newer each keep their wording).
+    Schema {
+        detail: String,
+    },
+    /// Another writer holds the write lock right now; `busy_timeout=0` never queues.
+    DatabaseBusy,
+    /// This process is an observer and must not take a write lease at all.
+    ReadOnlyRole,
+    NoSuchScan,
+    /// The scan has no membership authority.
+    Unknown,
+    /// The authority generation moved since the plan was built.
+    Stale {
+        expected: i64,
+        found: i64,
+    },
+    /// A witnessed rank has no current summary row.
+    RankMissing {
+        rank: i64,
+    },
+    /// The current summary's digest is not the witnessed one.
+    DigestChanged {
+        rank: i64,
+        expected: String,
+        found: String,
+    },
+    /// The live member count differs from the witnessed member set.
+    MemberCountChanged {
+        rank: i64,
+        expected: u64,
+        found: u64,
+    },
+    /// The member set differs; names one differing pathname.
+    MembershipChanged {
+        path: PathBuf,
+    },
+    /// Summary and membership storage contradict each other, or the witness is malformed.
+    Inconsistent {
+        detail: String,
+    },
+    /// The database read itself failed mid-validation.
+    Store {
+        detail: String,
+    },
+}
+
+/// What the staged publisher writes: the Derived SQL materialization, or the Explicit verified
+/// groups a `--verify` run produced.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // R4B-2 repoints both production publication call sites onto these.
+pub enum PublishMode<'a> {
+    Derived,
+    Explicit(&'a [DuplicateGroup]),
+}
+
+/// One consistent read of a scan's membership. See [`ScanStore::membership_snapshot`].
+pub struct MembershipSnapshot<'a> {
+    tx: Transaction<'a>,
+    scan_id: i64,
+    mode: MembershipMode,
+    generation: i64,
+}
+
+/// The held apply lease: one `BEGIN IMMEDIATE` transaction that validated the witness and now
+/// spans the whole destructive batch. Readers continue (WAL); no other writer can commit until
+/// this drops. Dropping rolls the transaction back — the lease only ever reads, so release and
+/// rollback are the same thing.
+pub struct MembershipLease<'a> {
+    /// Kept for its Drop: the rollback IS the release.
+    _tx: Transaction<'a>,
+    #[cfg(test)]
+    statements: &'a std::cell::Cell<u64>,
+}
+
+impl MembershipLease<'_> {
+    /// Test-only: statements spent on this store's lease path so far. Readable while the lease
+    /// is held, which a borrow of the store itself would not be.
+    #[cfg(test)]
+    pub(crate) fn statements_so_far(&self) -> u64 {
+        self.statements.get()
+    }
+}
+
+impl Drop for MembershipLease<'_> {
+    fn drop(&mut self) {
+        // The inner transaction's own Drop issues the ROLLBACK; this only meters it in tests.
+        #[cfg(test)]
+        self.statements.set(self.statements.get() + 1);
+    }
+}
+
+/// Test-only statement meter for the lease path; compiles to nothing in production.
+struct LeaseMeter<'a> {
+    #[cfg(test)]
+    cell: &'a std::cell::Cell<u64>,
+    #[cfg(not(test))]
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+
+impl LeaseMeter<'_> {
+    fn bump(&self) {
+        #[cfg(test)]
+        self.cell.set(self.cell.get() + 1);
+    }
+}
+
+/// The BEGIN IMMEDIATE outcome, typed: a held write lock is `DatabaseBusy` (the fail-fast
+/// answer), anything else is a store failure. Decided on the SQLite error code, never on text.
+fn lease_begin_refusal(err: rusqlite::Error) -> LeaseRefusal {
+    if let rusqlite::Error::SqliteFailure(code, _) = &err {
+        if code.code == rusqlite::ErrorCode::DatabaseBusy {
+            return LeaseRefusal::DatabaseBusy;
+        }
+    }
+    LeaseRefusal::Store {
+        detail: err.to_string(),
+    }
+}
+
+fn lease_store_refusal(err: rusqlite::Error) -> LeaseRefusal {
+    LeaseRefusal::Store {
+        detail: err.to_string(),
+    }
+}
+
+/// The authority cell for a message: the integer itself, or the storage class that sits where
+/// an integer had to be.
+fn authority_cell(value: &Value) -> String {
+    match value {
+        Value::Integer(raw) => raw.to_string(),
+        other => storage_class(other).to_string(),
+    }
+}
+
+/// Decodes one `scan_membership` row that is REQUIRED to be well-formed: mode 1/2 and a
+/// positive integer generation. Anything else is corruption, typed by the caller.
+fn decode_authority(
+    mode_value: &Value,
+    generation_value: &Value,
+) -> std::result::Result<(MembershipMode, i64), String> {
+    let mode = match mode_value {
+        Value::Integer(1) => MembershipMode::Derived,
+        Value::Integer(2) => MembershipMode::Explicit,
+        other => {
+            return Err(format!(
+                "scan_membership.mode holds {} — not a known membership mode",
+                authority_cell(other)
+            ))
+        }
+    };
+    match generation_value {
+        Value::Integer(generation) if *generation > 0 => Ok((mode, *generation)),
+        other => Err(format!(
+            "scan_membership.generation holds {} — not a positive publication generation",
+            authority_cell(other)
+        )),
+    }
+}
+
+/// Serializes the witnessed `{rank, digest}` pairs into the ONE JSON array parameter the
+/// validation statements bind — the bound-variable count never grows with the plan.
+fn witness_wants_json(witness: &PlanWitness) -> String {
+    let wants: Vec<serde_json::Value> = witness
+        .groups
+        .iter()
+        .map(|group| serde_json::json!({ "r": group.id.rank, "d": group.digest }))
+        .collect();
+    serde_json::Value::Array(wants).to_string()
+}
+
+impl ScanStore {
+    /// One consistent read of a scan's membership: a deferred read transaction is taken and
+    /// every answer of the returned snapshot comes from it, so authority and members can never
+    /// be read from two different database states. Reads only; fails closed on malformed
+    /// authority instead of downgrading it to Unknown.
+    ///
+    /// Staged by R4B-1 with no production caller.
+    #[allow(dead_code)] // R4B-2 moves every membership reader onto this snapshot.
+    pub fn membership_snapshot(
+        &self,
+        scan_id: i64,
+    ) -> std::result::Result<MembershipSnapshot<'_>, MembershipMiss> {
+        use rusqlite::OptionalExtension;
+        let tx = self.conn.unchecked_transaction()?;
+        let exists: i64 = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scan WHERE id = ?1)",
+            params![scan_id],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            return Err(MembershipMiss::NoSuchScan);
+        }
+        let authority: Option<(Value, Value)> = tx
+            .query_row(
+                "SELECT mode, generation FROM scan_membership WHERE scan_id = ?1",
+                params![scan_id],
+                |row| Ok((row.get::<_, Value>(0)?, row.get::<_, Value>(1)?)),
+            )
+            .optional()?;
+        let (mode, generation) = match &authority {
+            None => (MembershipMode::Unknown, 0),
+            Some((mode_value, generation_value)) => decode_authority(mode_value, generation_value)
+                .map_err(|detail| MembershipMiss::Inconsistent { detail })?,
+        };
+        match mode {
+            MembershipMode::Derived => {
+                // A member row under derived authority is corruption, never surplus.
+                let members: i64 = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM file_group_member WHERE scan_id = ?1)",
+                    params![scan_id],
+                    |row| row.get(0),
+                )?;
+                if members != 0 {
+                    return Err(MembershipMiss::Inconsistent {
+                        detail: format!(
+                            "scan {scan_id} declares derived membership but holds explicit member rows"
+                        ),
+                    });
+                }
+            }
+            MembershipMode::Explicit => {
+                // One path in two ranks is structurally impossible while the unique index
+                // stands; a checkpoint that lost the index is exactly what must not pass.
+                let duplicated: i64 = tx.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM file_group_member WHERE scan_id = ?1
+                          GROUP BY path HAVING COUNT(*) > 1
+                     )",
+                    params![scan_id],
+                    |row| row.get(0),
+                )?;
+                if duplicated != 0 {
+                    return Err(MembershipMiss::Inconsistent {
+                        detail: format!("scan {scan_id} holds one pathname in two groups"),
+                    });
+                }
+            }
+            MembershipMode::Unknown => {}
+        }
+        Ok(MembershipSnapshot {
+            tx,
+            scan_id,
+            mode,
+            generation,
+        })
+    }
+
+    /// Opens the checkpoint for the destructive apply lease — and does nothing else. The path
+    /// is verified first (no create, no follow, no chmod); SQLite opens `READ_WRITE` explicitly
+    /// WITHOUT `CREATE`; the R4A-C1 foreign-key helper runs with its read-back; this connection
+    /// alone gets `busy_timeout=0` (the lease never queues); and the schema must be exactly
+    /// current — no migration, no WAL flip, no vacuum, nothing altered merely by opening.
+    ///
+    /// Staged by R4B-1 with no production caller.
+    #[allow(dead_code)] // R4B-2 moves the apply worker onto this opener.
+    pub fn open_for_apply_lease(db_path: &Path) -> std::result::Result<Self, LeaseRefusal> {
+        if is_observer_role() {
+            return Err(LeaseRefusal::ReadOnlyRole);
+        }
+        if let Err(err) = crate::paths::verify_existing_db_file(db_path) {
+            return Err(LeaseRefusal::Open {
+                detail: err.to_string(),
+            });
+        }
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = match Connection::open_with_flags(db_path, flags) {
+            Ok(conn) => conn,
+            Err(err) => {
+                return Err(LeaseRefusal::Open {
+                    detail: err.to_string(),
+                })
+            }
+        };
+        // The R4A-C1 invariant, per connection, proved by read-back (2 statements).
+        if let Err(err) = schema::enforce_foreign_keys(&conn) {
+            return Err(LeaseRefusal::Open {
+                detail: err.to_string(),
+            });
+        }
+        // Fail-fast: the apply lease never queues behind another writer (1 statement).
+        if let Err(err) = conn.execute_batch("PRAGMA busy_timeout=0;") {
+            return Err(LeaseRefusal::Open {
+                detail: err.to_string(),
+            });
+        }
+        // Exactly v5, one PRAGMA read, distinct older/newer refusals (1 statement).
+        if let Err(err) = schema::ensure_version_exact(&conn) {
+            return Err(LeaseRefusal::Schema {
+                detail: err.to_string(),
+            });
+        }
+        let store = Self::new(conn);
+        #[cfg(test)]
+        store.membership_statements.set(4);
+        Ok(store)
+    }
+
+    /// Takes the fail-fast whole-batch membership lease: `BEGIN IMMEDIATE` under
+    /// `busy_timeout=0`, then the witness is revalidated against the LIVE authority, summaries
+    /// and members — in order: scan, authority/generation, per-rank summary digest and count,
+    /// exact member sets, mode-specific member source — before anything destructive may start.
+    /// There is no wait parameter and no retry: a refused acquisition is the answer, not a
+    /// queue. The lease writes nothing and releases by RAII rollback.
+    ///
+    /// Statement shape (pinned by test): BEGIN + scan existence + authority + one validation
+    /// statement (explicit) or two (derived, adding the no-member-rows assertion) + the
+    /// ROLLBACK on drop. Each validation statement binds the scan id and ONE JSON array of
+    /// `{rank, digest}`; member sets come back one ROW per member and are compared in Rust —
+    /// neither statements nor bind variables grow with the plan.
+    ///
+    /// Staged by R4B-1 with no production caller.
+    #[allow(dead_code)] // R4B-2 moves the apply worker onto this lease.
+    pub fn acquire_membership_lease(
+        &mut self,
+        witness: &PlanWitness,
+    ) -> std::result::Result<MembershipLease<'_>, LeaseRefusal> {
+        // Witness self-consistency costs no statement and fails closed before the lock.
+        if witness.groups.is_empty() {
+            return Err(LeaseRefusal::Inconsistent {
+                detail: "the witness carries no groups".into(),
+            });
+        }
+        let mut ranks = std::collections::HashSet::new();
+        for group in &witness.groups {
+            if group.id.scan_id != witness.scan_id {
+                return Err(LeaseRefusal::Inconsistent {
+                    detail: format!(
+                        "witnessed rank {} belongs to scan {}, not scan {}",
+                        group.id.rank, group.id.scan_id, witness.scan_id
+                    ),
+                });
+            }
+            if group.id.generation != witness.generation {
+                return Err(LeaseRefusal::Inconsistent {
+                    detail: format!(
+                        "witnessed rank {} carries generation {}, the witness {}",
+                        group.id.rank, group.id.generation, witness.generation
+                    ),
+                });
+            }
+            if group.id.rank < 0 {
+                return Err(LeaseRefusal::Inconsistent {
+                    detail: format!("witnessed rank {} is negative", group.id.rank),
+                });
+            }
+            if !ranks.insert(group.id.rank) {
+                return Err(LeaseRefusal::Inconsistent {
+                    detail: format!("rank {} is witnessed twice", group.id.rank),
+                });
+            }
+            if group.members.is_empty() {
+                return Err(LeaseRefusal::Inconsistent {
+                    detail: format!("witnessed rank {} carries no members", group.id.rank),
+                });
+            }
+        }
+
+        // Disjoint-field borrows: the meter cell first, the connection second (the same shape
+        // `record_hashes_verified` uses).
+        #[cfg(test)]
+        let statements = &self.membership_statements;
+        let meter = LeaseMeter {
+            #[cfg(test)]
+            cell: statements,
+            #[cfg(not(test))]
+            _phantom: std::marker::PhantomData,
+        };
+        let tx = match self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        {
+            Ok(tx) => tx,
+            Err(err) => return Err(lease_begin_refusal(err)),
+        };
+        meter.bump(); // BEGIN IMMEDIATE
+
+        validate_lease_witness(&tx, witness, &meter)?;
+
+        Ok(MembershipLease {
+            _tx: tx,
+            #[cfg(test)]
+            statements,
+        })
+    }
+
+    /// The future single publication path: replaces summaries, membership, authority, the scan
+    /// totals and the prepared marker in ONE immediate transaction and returns the generation
+    /// it published. The generation starts at 1 and increments checked — an overflow refuses
+    /// and the whole transaction rolls back. Derived publishes no member rows; Explicit writes
+    /// every surviving group's members against the rank the authoritative reclaim sort
+    /// assigned. FK enforcement is ON on every store connection, and the child-before-parent
+    /// DELETE order is kept anyway: the active `ON DELETE CASCADE` from `file_group` to
+    /// `file_group_member` would empty the member table on its own — that fact is stated here
+    /// and pinned by a test rather than silently relied on.
+    ///
+    /// Staged by R4B-1 with no production caller; `record_file_results` and
+    /// `materialize_file_groups` remain the production writers until the switch.
+    #[allow(dead_code)] // R4B-2 repoints both production publication call sites here.
+    pub fn publish_results(&mut self, scan_id: i64, mode: PublishMode<'_>) -> Result<i64> {
+        use rusqlite::OptionalExtension;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let previous: Option<Value> = tx
+            .query_row(
+                "SELECT generation FROM scan_membership WHERE scan_id = ?1",
+                params![scan_id],
+                |row| row.get::<_, Value>(0),
+            )
+            .optional()?;
+        let generation = match previous {
+            None => 1,
+            Some(Value::Integer(previous)) if previous > 0 => {
+                previous.checked_add(1).ok_or_else(|| {
+                    AppError::msg(format!(
+                        "scan {scan_id} has exhausted its publication generations ({previous}); \
+                         republication would overflow"
+                    ))
+                })?
+            }
+            Some(other) => {
+                return Err(AppError::msg(format!(
+                    "scan_membership.generation for scan {scan_id} holds {} — refusing to \
+                     publish over corrupt authority",
+                    authority_cell(&other)
+                )))
+            }
+        };
+        // Children before parents; the summaries after both. The CASCADE would remove the
+        // member rows on its own — kept explicit so the delete's meaning stays in the code.
+        tx.execute(
+            "DELETE FROM file_group_member WHERE scan_id = ?1",
+            params![scan_id],
+        )?;
+        tx.execute(
+            "DELETE FROM file_group WHERE scan_id = ?1",
+            params![scan_id],
+        )?;
+        tx.execute(
+            "DELETE FROM file_dedup WHERE scan_id = ?1",
+            params![scan_id],
+        )?;
+        let mode_value: i64 = match mode {
+            PublishMode::Derived => {
+                // The same aggregation, order and refusal the production SQL writer uses.
+                refuse_untrustworthy_group_objects(&tx, scan_id)?;
+                tx.execute(
+                    &format!(
+                        "{groups}
+                         INSERT INTO file_group(scan_id, rank, hash, file_count, size, reclaim,
+                                                object_count, reclaim_state)
+                         SELECT ?1,
+                                ROW_NUMBER() OVER (ORDER BY guaranteed DESC, reclaim DESC, hash ASC) - 1,
+                                hash, file_count, size, reclaim, object_count, state
+                           FROM (
+                               SELECT lower(hex(digest)) AS hash, file_count, size, object_count, state,
+                                      CASE WHEN state = 1 THEN ceiling ELSE 0 END AS guaranteed,
+                                      CASE WHEN state = 0 THEN 0 ELSE ceiling END AS reclaim
+                                 FROM groups
+                           )",
+                        groups = group_rows_sql()
+                    ),
+                    params![scan_id],
+                )?;
+                1
+            }
+            PublishMode::Explicit(groups) => {
+                // The same figures-first rule and the same total order as `record_file_results`
+                // — duplicated deliberately: the production writer stays byte-untouched in this
+                // inert commit, and R4B-2 retires it in favour of this path.
+                let mut rows: Vec<(&DuplicateGroup, GroupReclaim)> =
+                    Vec::with_capacity(groups.len());
+                for group in groups {
+                    let reclaim = group.physical_reclaim()?;
+                    if reclaim.object_count >= 2 {
+                        rows.push((group, reclaim));
+                    }
+                }
+                rows.sort_by(|(left, left_reclaim), (right, right_reclaim)| {
+                    let (left_guaranteed, left_ceiling) = left_reclaim.estimate.order_key();
+                    let (right_guaranteed, right_ceiling) = right_reclaim.estimate.order_key();
+                    right_guaranteed
+                        .cmp(&left_guaranteed)
+                        .then(right_ceiling.cmp(&left_ceiling))
+                        .then(left.hash.cmp(&right.hash))
+                });
+                {
+                    let mut ins_group = tx.prepare(
+                        "INSERT INTO file_group(scan_id, rank, hash, file_count, size, reclaim,
+                                                object_count, reclaim_state)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    )?;
+                    let mut ins_member = tx.prepare(
+                        "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
+                         VALUES (?1, ?2, ?3, ?4)",
+                    )?;
+                    for (rank, (group, reclaim)) in rows.iter().enumerate() {
+                        ins_group.execute(params![
+                            scan_id,
+                            rank as i64,
+                            group.hash,
+                            reclaim.observed_paths as i64,
+                            group.size_bytes as i64,
+                            reclaim.estimate.persisted_bytes() as i64,
+                            reclaim.object_count as i64,
+                            reclaim.estimate.state().as_i64(),
+                        ])?;
+                        for file in &group.files {
+                            let path = file.path.to_string_lossy();
+                            ins_member.execute(params![
+                                scan_id,
+                                rank as i64,
+                                &*path,
+                                generation
+                            ])?;
+                            // Test seam: fails right after the FIRST member insert, with parent
+                            // and child rows already in the open transaction — the only
+                            // position from which a rollback assertion is about a real partial
+                            // write.
+                            #[cfg(test)]
+                            if take_publish_fault() {
+                                return Err(AppError::msg("injected publish fault"));
+                            }
+                        }
+                    }
+                }
+                2
+            }
+        };
+        record_scan_reclaim(&tx, scan_id)?;
+        mark_prepared(&tx, scan_id)?;
+        tx.execute(
+            "INSERT INTO scan_membership(scan_id, mode, generation) VALUES (?1, ?2, ?3)
+             ON CONFLICT(scan_id) DO UPDATE SET mode = excluded.mode,
+                                                generation = excluded.generation",
+            params![scan_id, mode_value, generation],
+        )?;
+        tx.commit()?;
+        Ok(generation)
+    }
+
+    /// The future single preparation path: distinguishes a scan the v5 authority already
+    /// speaks for from a legacy/migrated one it does not. An authoritative scan is validated
+    /// and left exactly as it is; malformed authority is an error, never a shrug. A scan with
+    /// NO authority gets today's browse-only summary preparation (`ensure_materialized`) and
+    /// deliberately NO `scan_membership`/`file_group_member` row: a completed v4→v5 checkpoint
+    /// stays Unknown and browse-only until a real republish or rescan.
+    ///
+    /// Staged by R4B-1 with no production caller.
+    #[allow(dead_code)] // R4B-2 repoints the preparation call sites here.
+    pub fn prepare_legacy_for_viewing(&mut self, scan_id: i64) -> Result<()> {
+        use rusqlite::OptionalExtension;
+        let authority: Option<(Value, Value)> = self
+            .conn
+            .query_row(
+                "SELECT mode, generation FROM scan_membership WHERE scan_id = ?1",
+                params![scan_id],
+                |row| Ok((row.get::<_, Value>(0)?, row.get::<_, Value>(1)?)),
+            )
+            .optional()?;
+        match &authority {
+            None => self.ensure_materialized(scan_id),
+            Some((mode_value, generation_value)) => {
+                let (mode, _generation) =
+                    decode_authority(mode_value, generation_value).map_err(|detail| {
+                        AppError::msg(format!(
+                            "scan {scan_id} carries malformed membership authority ({detail}) — \
+                             refusing to prepare it"
+                        ))
+                    })?;
+                if mode == MembershipMode::Derived {
+                    let members: i64 = self.conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM file_group_member WHERE scan_id = ?1)",
+                        params![scan_id],
+                        |row| row.get(0),
+                    )?;
+                    if members != 0 {
+                        return Err(AppError::msg(format!(
+                            "scan {scan_id} declares derived membership but holds explicit \
+                             member rows — refusing to prepare corrupt authority"
+                        )));
+                    }
+                }
+                // Already authoritative: validated, and deliberately a no-op.
+                Ok(())
+            }
+        }
+    }
+}
+
+#[allow(dead_code)] // R4B-2 moves the membership readers onto these; tests exercise them today.
+impl MembershipSnapshot<'_> {
+    pub fn mode(&self) -> MembershipMode {
+        self.mode
+    }
+
+    /// The current publication generation — only a scan WITH authority has one.
+    pub fn generation(&self) -> Option<i64> {
+        (self.mode != MembershipMode::Unknown).then_some(self.generation)
+    }
+
+    fn require_authority(&self) -> std::result::Result<(), MembershipMiss> {
+        if self.mode == MembershipMode::Unknown {
+            return Err(MembershipMiss::Unknown);
+        }
+        Ok(())
+    }
+
+    /// An identity is answerable only when it names this scan's CURRENT publication.
+    fn require_current(&self, id: &GroupId) -> std::result::Result<(), MembershipMiss> {
+        self.require_authority()?;
+        if id.scan_id != self.scan_id || id.rank < 0 {
+            return Err(MembershipMiss::NoSuchGroup);
+        }
+        if id.generation != self.generation {
+            return Err(MembershipMiss::Stale {
+                expected: id.generation,
+                found: self.generation,
+            });
+        }
+        Ok(())
+    }
+
+    /// Every current summary with its identity, plus the identities whose summary and
+    /// membership disagree — named, never repaired.
+    pub fn summaries(&self) -> std::result::Result<MembershipSummaries, MembershipMiss> {
+        self.require_authority()?;
+        let members_sql = match self.mode {
+            MembershipMode::Explicit => {
+                "(SELECT COUNT(*) FROM file_group_member m
+                   WHERE m.scan_id = g.scan_id AND m.group_rank = g.rank)"
+            }
+            _ => {
+                "(SELECT COUNT(*) FROM file f
+                   WHERE f.scan_id = g.scan_id AND f.hash = unhex(g.hash))"
+            }
+        };
+        let mut stmt = self.tx.prepare(&format!(
+            "SELECT g.rank, g.hash, g.file_count, g.size, g.reclaim, g.object_count,
+                    g.reclaim_state, {members_sql} AS members
+               FROM file_group g WHERE g.scan_id = ?1 ORDER BY g.rank"
+        ))?;
+        let rows = stmt.query_map(params![self.scan_id], |row| {
+            Ok((
+                GroupSummary {
+                    rank: row.get(0)?,
+                    hash: row.get(1)?,
+                    file_count: row.get::<_, i64>(2)? as u64,
+                    size_bytes: row.get::<_, i64>(3)? as u64,
+                    object_count: row.get::<_, i64>(5)? as u64,
+                    reclaim: ReclaimEstimate::unknown(),
+                },
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })?;
+        let mut groups = Vec::new();
+        let mut inconsistent = Vec::new();
+        for row in rows {
+            let (mut summary, reclaim, state, members) = row?;
+            summary.reclaim = ReclaimEstimate::from_persisted(reclaim, state).map_err(|err| {
+                MembershipMiss::Inconsistent {
+                    detail: err.to_string(),
+                }
+            })?;
+            let id = GroupId {
+                scan_id: self.scan_id,
+                rank: summary.rank,
+                generation: self.generation,
+            };
+            if members as u64 != summary.file_count {
+                inconsistent.push(id);
+            }
+            groups.push((id, summary));
+        }
+        Ok(MembershipSummaries {
+            mode: self.mode,
+            generation: self.generation,
+            groups,
+            inconsistent,
+        })
+    }
+
+    /// The exact group — trusted membership only, never a raw-digest fallback.
+    pub fn group(&self, id: &GroupId) -> std::result::Result<ResolvedGroup, MembershipMiss> {
+        self.resolve(id, None)
+    }
+
+    /// A stable page of the exact group's members: same order, same trust, same refusals.
+    pub fn group_page(
+        &self,
+        id: &GroupId,
+        offset: usize,
+        limit: usize,
+    ) -> std::result::Result<ResolvedGroup, MembershipMiss> {
+        self.resolve(id, Some((offset, limit)))
+    }
+
+    /// The exact group's live member count.
+    pub fn group_member_count(&self, id: &GroupId) -> std::result::Result<u64, MembershipMiss> {
+        self.require_current(id)?;
+        let count: i64 = match self.mode {
+            MembershipMode::Explicit => self.tx.query_row(
+                "SELECT COUNT(*) FROM file_group_member
+                  WHERE scan_id = ?1 AND group_rank = ?2",
+                params![id.scan_id, id.rank],
+                |row| row.get(0),
+            )?,
+            _ => self.tx.query_row(
+                "SELECT COUNT(*) FROM file f
+                   JOIN file_group g ON g.scan_id = f.scan_id AND g.rank = ?2
+                  WHERE f.scan_id = ?1 AND f.hash = unhex(g.hash)",
+                params![id.scan_id, id.rank],
+                |row| row.get(0),
+            )?,
+        };
+        Ok(count as u64)
+    }
+
+    /// Every current group identity carrying this digest, in rank order. Two explicit ranks
+    /// may legitimately share one digest — that is exactly R4-V1's split populations.
+    pub fn groups_of_digest(
+        &self,
+        digest: &str,
+    ) -> std::result::Result<Vec<GroupId>, MembershipMiss> {
+        self.require_authority()?;
+        let mut stmt = self.tx.prepare(
+            "SELECT rank FROM file_group WHERE scan_id = ?1 AND hash = ?2 ORDER BY rank",
+        )?;
+        let rows = stmt.query_map(params![self.scan_id, digest], |row| row.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(GroupId {
+                scan_id: self.scan_id,
+                rank: row?,
+                generation: self.generation,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Which group holds this exact pathname, if any.
+    pub fn group_of_path(
+        &self,
+        path: &Path,
+    ) -> std::result::Result<Option<GroupId>, MembershipMiss> {
+        use rusqlite::OptionalExtension;
+        self.require_authority()?;
+        let text = path.to_string_lossy();
+        match self.mode {
+            MembershipMode::Explicit => {
+                let rank: Option<i64> = self
+                    .tx
+                    .query_row(
+                        "SELECT group_rank FROM file_group_member
+                          WHERE scan_id = ?1 AND path = ?2",
+                        params![self.scan_id, &*text],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                Ok(rank.map(|rank| GroupId {
+                    scan_id: self.scan_id,
+                    rank,
+                    generation: self.generation,
+                }))
+            }
+            _ => {
+                let mut stmt = self.tx.prepare(
+                    "SELECT g.rank
+                       FROM file f
+                       JOIN file_group g ON g.scan_id = f.scan_id
+                                        AND g.hash = lower(hex(f.hash))
+                      WHERE f.scan_id = ?1 AND f.path = ?2
+                      ORDER BY g.rank LIMIT 2",
+                )?;
+                let rows =
+                    stmt.query_map(params![self.scan_id, &*text], |row| row.get::<_, i64>(0))?;
+                let ranks: Vec<i64> = rows.collect::<rusqlite::Result<_>>()?;
+                match ranks.as_slice() {
+                    [] => Ok(None),
+                    [rank] => Ok(Some(GroupId {
+                        scan_id: self.scan_id,
+                        rank: *rank,
+                        generation: self.generation,
+                    })),
+                    _ => Err(MembershipMiss::Inconsistent {
+                        detail: format!(
+                            "one digest resolves {} to two ranks under derived authority",
+                            crate::textsan::terminal(&text)
+                        ),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// The membership test for one exact identity and pathname.
+    pub fn is_member(
+        &self,
+        id: &GroupId,
+        path: &Path,
+    ) -> std::result::Result<bool, MembershipMiss> {
+        self.require_current(id)?;
+        let text = path.to_string_lossy();
+        let exists: i64 = match self.mode {
+            MembershipMode::Explicit => self.tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM file_group_member
+                                WHERE scan_id = ?1 AND group_rank = ?2 AND path = ?3)",
+                params![id.scan_id, id.rank, &*text],
+                |row| row.get(0),
+            )?,
+            _ => self.tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM file_group g
+                                 JOIN file f ON f.scan_id = g.scan_id
+                                            AND f.hash = unhex(g.hash)
+                                            AND f.path = ?3
+                                WHERE g.scan_id = ?1 AND g.rank = ?2)",
+                params![id.scan_id, id.rank, &*text],
+                |row| row.get(0),
+            )?,
+        };
+        Ok(exists != 0)
+    }
+
+    /// The Unknown scan's browse-only raw-digest candidates. `Ok(None)` when the scan HAS
+    /// authority — a trusted scan is answered by the trusted API, and this view deliberately
+    /// offers nothing a destructive gate could accept.
+    pub fn unknown_candidates(&self) -> std::result::Result<Option<CandidateView>, MembershipMiss> {
+        if self.mode != MembershipMode::Unknown {
+            return Ok(None);
+        }
+        // The same object rule every candidate reader applies: a digest counts only when at
+        // least two DISTINCT allocations carry it.
+        let mut stmt = self.tx.prepare(&format!(
+            "SELECT lower(hex(digest)) AS digest_hex, SUM(observed)
+               FROM ({objects})
+              GROUP BY digest HAVING COUNT(*) >= 2
+              ORDER BY digest_hex",
+            objects = group_objects_sql()
+        ))?;
+        let rows = stmt.query_map(params![self.scan_id], |row| {
+            Ok(DigestCandidate {
+                digest: row.get(0)?,
+                paths: row.get::<_, i64>(1)? as u64,
+            })
+        })?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            candidates.push(row?);
+        }
+        Ok(Some(CandidateView { candidates }))
+    }
+
+    /// Shared body of `group`/`group_page`.
+    fn resolve(
+        &self,
+        id: &GroupId,
+        page: Option<(usize, usize)>,
+    ) -> std::result::Result<ResolvedGroup, MembershipMiss> {
+        use rusqlite::OptionalExtension;
+        self.require_current(id)?;
+        let summary: Option<(GroupSummary, i64, i64)> = self
+            .tx
+            .query_row(
+                "SELECT rank, hash, file_count, size, reclaim, object_count, reclaim_state
+                   FROM file_group WHERE scan_id = ?1 AND rank = ?2",
+                params![id.scan_id, id.rank],
+                |row| {
+                    Ok((
+                        GroupSummary {
+                            rank: row.get(0)?,
+                            hash: row.get(1)?,
+                            file_count: row.get::<_, i64>(2)? as u64,
+                            size_bytes: row.get::<_, i64>(3)? as u64,
+                            object_count: row.get::<_, i64>(5)? as u64,
+                            reclaim: ReclaimEstimate::unknown(),
+                        },
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((mut summary, reclaim, state)) = summary else {
+            return Err(MembershipMiss::NoSuchGroup);
+        };
+        summary.reclaim = ReclaimEstimate::from_persisted(reclaim, state).map_err(|err| {
+            MembershipMiss::Inconsistent {
+                detail: err.to_string(),
+            }
+        })?;
+        let live = self.group_member_count(id)?;
+        if live != summary.file_count {
+            return Err(MembershipMiss::Inconsistent {
+                detail: format!(
+                    "group rank {} declares {} members while its membership holds {live}",
+                    id.rank, summary.file_count
+                ),
+            });
+        }
+        if self.mode == MembershipMode::Explicit && live == 0 {
+            return Err(MembershipMiss::Inconsistent {
+                detail: format!("explicit group rank {} has no member rows", id.rank),
+            });
+        }
+        let members = match self.mode {
+            MembershipMode::Explicit => self.explicit_members(id, page)?,
+            _ => self.derived_members(id, page)?,
+        };
+        Ok(ResolvedGroup {
+            id: *id,
+            mode: self.mode,
+            summary,
+            members,
+        })
+    }
+
+    /// Explicit members: the member rows of the current generation joined back to the manifest
+    /// — a member without its manifest row, or of another generation, is corruption.
+    fn explicit_members(
+        &self,
+        id: &GroupId,
+        page: Option<(usize, usize)>,
+    ) -> std::result::Result<Vec<FileEntry>, MembershipMiss> {
+        let (limit, offset) = page_bounds(page);
+        let mut stmt = self.tx.prepare(&format!(
+            "SELECT {GROUP_FILE_COLUMNS}, mm.path, mm.generation
+               FROM file_group_member mm
+               LEFT JOIN file f      ON f.scan_id = mm.scan_id AND f.path = mm.path
+               LEFT JOIN file_mark m ON m.scan_id = mm.scan_id AND m.path = mm.path
+              WHERE mm.scan_id = ?1 AND mm.group_rank = ?2
+              ORDER BY mm.path
+              LIMIT ?3 OFFSET ?4"
+        ))?;
+        let mut rows = stmt.query(params![id.scan_id, id.rank, limit, offset])?;
+        let mut members = Vec::new();
+        while let Some(row) = rows.next()? {
+            let manifest_path: Option<String> = row.get(0)?;
+            let member_path: String = row.get(11)?;
+            if manifest_path.is_none() {
+                return Err(MembershipMiss::Inconsistent {
+                    detail: format!(
+                        "member {} of group rank {} has no manifest row",
+                        crate::textsan::terminal(&member_path),
+                        id.rank
+                    ),
+                });
+            }
+            let member_generation: i64 = row.get(12)?;
+            if member_generation != self.generation {
+                return Err(MembershipMiss::Inconsistent {
+                    detail: format!(
+                        "member {} of group rank {} carries generation {member_generation} \
+                         under authority generation {}",
+                        crate::textsan::terminal(&member_path),
+                        id.rank,
+                        self.generation
+                    ),
+                });
+            }
+            members.push(group_file_row(row)?);
+        }
+        Ok(members)
+    }
+
+    /// Derived members: the manifest by the CURRENT summary's digest — exactly the production
+    /// composition, read under this snapshot.
+    fn derived_members(
+        &self,
+        id: &GroupId,
+        page: Option<(usize, usize)>,
+    ) -> std::result::Result<Vec<FileEntry>, MembershipMiss> {
+        let (limit, offset) = page_bounds(page);
+        let mut stmt = self.tx.prepare(&format!(
+            "SELECT {GROUP_FILE_COLUMNS}
+               FROM file_group g
+               JOIN file f       ON f.scan_id = g.scan_id AND f.hash = unhex(g.hash)
+               LEFT JOIN file_mark m ON m.scan_id = f.scan_id AND m.path = f.path
+              WHERE g.scan_id = ?1 AND g.rank = ?2
+              ORDER BY f.path
+              LIMIT ?3 OFFSET ?4"
+        ))?;
+        let rows = stmt.query_map(params![id.scan_id, id.rank, limit, offset], group_file_row)?;
+        let mut members = Vec::new();
+        for row in rows {
+            members.push(row?);
+        }
+        Ok(members)
+    }
+}
+
+/// `LIMIT`/`OFFSET` for an optional page: the full set is `LIMIT -1 OFFSET 0` (SQLite reads a
+/// negative limit as «no limit»).
+fn page_bounds(page: Option<(usize, usize)>) -> (i64, i64) {
+    match page {
+        Some((offset, limit)) => (limit as i64, offset as i64),
+        None => (-1, 0),
+    }
+}
+
+/// The lease-side witness validation, in the frozen order: scan, authority, then one
+/// mode-specific statement whose rows carry one member per ROW.
+fn validate_lease_witness(
+    tx: &Connection,
+    witness: &PlanWitness,
+    meter: &LeaseMeter<'_>,
+) -> std::result::Result<(), LeaseRefusal> {
+    use rusqlite::OptionalExtension;
+    // 1. The scan exists.
+    meter.bump();
+    let exists: i64 = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM scan WHERE id = ?1)",
+            params![witness.scan_id],
+            |row| row.get(0),
+        )
+        .map_err(lease_store_refusal)?;
+    if exists == 0 {
+        return Err(LeaseRefusal::NoSuchScan);
+    }
+    // 2. Authority exists, is well-typed, and is exactly the witnessed generation.
+    meter.bump();
+    let authority: Option<(Value, Value)> = tx
+        .query_row(
+            "SELECT mode, generation FROM scan_membership WHERE scan_id = ?1",
+            params![witness.scan_id],
+            |row| Ok((row.get::<_, Value>(0)?, row.get::<_, Value>(1)?)),
+        )
+        .optional()
+        .map_err(lease_store_refusal)?;
+    let Some((mode_value, generation_value)) = authority else {
+        return Err(LeaseRefusal::Unknown);
+    };
+    let (mode, generation) = decode_authority(&mode_value, &generation_value)
+        .map_err(|detail| LeaseRefusal::Inconsistent { detail })?;
+    if generation != witness.generation {
+        return Err(LeaseRefusal::Stale {
+            expected: witness.generation,
+            found: generation,
+        });
+    }
+    // 3.–5. Summaries, exact member sets and the mode's own member source.
+    let wants = witness_wants_json(witness);
+    match mode {
+        MembershipMode::Explicit => {
+            validate_explicit_witness(tx, witness, &wants, generation, meter)
+        }
+        _ => validate_derived_witness(tx, witness, &wants, meter),
+    }
+}
+
+/// One row of the lease validation statements, already grouped per rank in arrival order.
+struct WitnessedRank {
+    rank: i64,
+    witness_digest: String,
+    current_digest: Option<String>,
+    declared_count: Option<i64>,
+    members: Vec<(String, Option<i64>)>,
+    observed: i64,
+}
+
+/// Checks one accumulated rank against the witness, in the frozen refusal order.
+fn check_witnessed_rank(
+    checked: &WitnessedRank,
+    witness: &PlanWitness,
+    generation: Option<i64>,
+) -> std::result::Result<(), LeaseRefusal> {
+    let group = witness
+        .groups
+        .iter()
+        .find(|group| group.id.rank == checked.rank)
+        .ok_or_else(|| LeaseRefusal::Inconsistent {
+            detail: format!("validation returned unwitnessed rank {}", checked.rank),
+        })?;
+    let Some(current_digest) = &checked.current_digest else {
+        if checked.members.is_empty() {
+            return Err(LeaseRefusal::RankMissing { rank: checked.rank });
+        }
+        return Err(LeaseRefusal::Inconsistent {
+            detail: format!("rank {} has member rows but no summary row", checked.rank),
+        });
+    };
+    if *current_digest != checked.witness_digest {
+        return Err(LeaseRefusal::DigestChanged {
+            rank: checked.rank,
+            expected: checked.witness_digest.clone(),
+            found: current_digest.clone(),
+        });
+    }
+    let declared = checked.declared_count.unwrap_or(-1);
+    if declared != checked.observed {
+        return Err(LeaseRefusal::Inconsistent {
+            detail: format!(
+                "rank {} declares {declared} members while its membership holds {}",
+                checked.rank, checked.observed
+            ),
+        });
+    }
+    if checked.observed as u64 != group.members.len() as u64 {
+        return Err(LeaseRefusal::MemberCountChanged {
+            rank: checked.rank,
+            expected: group.members.len() as u64,
+            found: checked.observed.max(0) as u64,
+        });
+    }
+    let witnessed: std::collections::HashSet<&Path> =
+        group.members.iter().map(PathBuf::as_path).collect();
+    for (path, member_generation) in &checked.members {
+        let live = Path::new(path);
+        if !witnessed.contains(live) {
+            return Err(LeaseRefusal::MembershipChanged {
+                path: live.to_path_buf(),
+            });
+        }
+        if let (Some(expected), Some(found)) = (generation, member_generation.as_ref()) {
+            if *found != expected {
+                return Err(LeaseRefusal::Inconsistent {
+                    detail: format!(
+                        "rank {} carries a member of generation {found} under authority \
+                         generation {expected}",
+                        checked.rank
+                    ),
+                });
+            }
+        }
+    }
+    let live: std::collections::HashSet<&Path> = checked
+        .members
+        .iter()
+        .map(|(path, _)| Path::new(path.as_str()))
+        .collect();
+    for path in &group.members {
+        if !live.contains(path.as_path()) {
+            return Err(LeaseRefusal::MembershipChanged { path: path.clone() });
+        }
+    }
+    Ok(())
+}
+
+/// Streams the per-rank rows of one validation statement into `check_witnessed_rank`, plus the
+/// final count of ranks seen (every witnessed rank must come back — `want` drives the join).
+fn stream_witnessed_ranks(
+    rows: &mut rusqlite::Rows<'_>,
+    witness: &PlanWitness,
+    generation: Option<i64>,
+    read_member_generation: bool,
+) -> std::result::Result<usize, LeaseRefusal> {
+    let mut seen = 0usize;
+    let mut current: Option<WitnessedRank> = None;
+    loop {
+        let row = match rows.next() {
+            Ok(row) => row,
+            Err(err) => return Err(lease_store_refusal(err)),
+        };
+        let Some(row) = row else { break };
+        let rank: i64 = row.get(0).map_err(lease_store_refusal)?;
+        let witness_digest: String = row.get(1).map_err(lease_store_refusal)?;
+        let current_digest: Option<String> = row.get(2).map_err(lease_store_refusal)?;
+        let declared_count: Option<i64> = row.get(3).map_err(lease_store_refusal)?;
+        let member_path: Option<String> = row.get(4).map_err(lease_store_refusal)?;
+        let member_generation: Option<i64> = if read_member_generation {
+            row.get(5).map_err(lease_store_refusal)?
+        } else {
+            None
+        };
+        let observed: i64 = row
+            .get(if read_member_generation { 6 } else { 5 })
+            .map_err(lease_store_refusal)?;
+        if current.as_ref().map(|c| c.rank) != Some(rank) {
+            if let Some(done) = current.take() {
+                check_witnessed_rank(&done, witness, generation)?;
+                seen += 1;
+            }
+            current = Some(WitnessedRank {
+                rank,
+                witness_digest,
+                current_digest,
+                declared_count,
+                members: Vec::new(),
+                observed,
+            });
+        }
+        if let (Some(rankrows), Some(path)) = (current.as_mut(), member_path) {
+            rankrows.members.push((path, member_generation));
+        }
+    }
+    if let Some(done) = current.take() {
+        check_witnessed_rank(&done, witness, generation)?;
+        seen += 1;
+    }
+    Ok(seen)
+}
+
+/// Explicit-mode validation: one statement, one member per ROW (P0d §1.2). Pathname boundaries
+/// are row boundaries — nothing is concatenated, nothing is parsed, and a member named `a\nb`
+/// can never equal two members `a` and `b`.
+fn validate_explicit_witness(
+    tx: &Connection,
+    witness: &PlanWitness,
+    wants: &str,
+    generation: i64,
+    meter: &LeaseMeter<'_>,
+) -> std::result::Result<(), LeaseRefusal> {
+    meter.bump();
+    let mut stmt = tx
+        .prepare(
+            "WITH want(rank, digest) AS (
+                 SELECT json_extract(value, '$.r'), json_extract(value, '$.d')
+                   FROM json_each(?2)
+             )
+             SELECT want.rank, want.digest, g.hash, g.file_count, m.path, m.generation,
+                    COUNT(m.path) OVER (PARTITION BY want.rank) AS observed
+               FROM want
+               LEFT JOIN file_group        g ON g.scan_id = ?1 AND g.rank       = want.rank
+               LEFT JOIN file_group_member m ON m.scan_id = ?1 AND m.group_rank = want.rank
+              ORDER BY want.rank, m.path",
+        )
+        .map_err(lease_store_refusal)?;
+    let mut rows = stmt
+        .query(params![witness.scan_id, wants])
+        .map_err(lease_store_refusal)?;
+    let seen = stream_witnessed_ranks(&mut rows, witness, Some(generation), true)?;
+    if seen != witness.groups.len() {
+        return Err(LeaseRefusal::Inconsistent {
+            detail: format!(
+                "validation covered {seen} of {} witnessed ranks",
+                witness.groups.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Derived-mode validation: membership is derived from the CURRENT summary's digest — never
+/// the witness's — and the witnessed digest is compared against the summary in Rust, so a
+/// substituted digest is caught rather than followed. Plus the mode's own invariant: a derived
+/// scan carries no member rows at all.
+fn validate_derived_witness(
+    tx: &Connection,
+    witness: &PlanWitness,
+    wants: &str,
+    meter: &LeaseMeter<'_>,
+) -> std::result::Result<(), LeaseRefusal> {
+    meter.bump();
+    let mut stmt = tx
+        .prepare(
+            "WITH want(rank, digest) AS (
+                 SELECT json_extract(value, '$.r'), json_extract(value, '$.d')
+                   FROM json_each(?2)
+             )
+             SELECT want.rank, want.digest, g.hash, g.file_count, f.path,
+                    COUNT(f.path) OVER (PARTITION BY want.rank) AS observed
+               FROM want
+               LEFT JOIN file_group g ON g.scan_id = ?1 AND g.rank = want.rank
+               LEFT JOIN file       f ON f.scan_id = ?1 AND f.hash = unhex(g.hash)
+              ORDER BY want.rank, f.path",
+        )
+        .map_err(lease_store_refusal)?;
+    let mut rows = stmt
+        .query(params![witness.scan_id, wants])
+        .map_err(lease_store_refusal)?;
+    let seen = stream_witnessed_ranks(&mut rows, witness, None, false)?;
+    if seen != witness.groups.len() {
+        return Err(LeaseRefusal::Inconsistent {
+            detail: format!(
+                "validation covered {seen} of {} witnessed ranks",
+                witness.groups.len()
+            ),
+        });
+    }
+    meter.bump();
+    let members: i64 = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM file_group_member WHERE scan_id = ?1)",
+            params![witness.scan_id],
+            |row| row.get(0),
+        )
+        .map_err(lease_store_refusal)?;
+    if members != 0 {
+        return Err(LeaseRefusal::Inconsistent {
+            detail: "derived authority with explicit member rows".into(),
+        });
+    }
+    Ok(())
+}
+
+// A one-shot fault for `publish_results`, mirroring `ClearFault`: it fires right after the
+// FIRST explicit member insert — parent summary and one child row already written inside the
+// open transaction — so a green rollback assertion is about a real partial write, not a
+// preflight refusal. Absent from every non-test build.
+#[cfg(test)]
+thread_local! {
+    static PUBLISH_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms the one-shot publish fault for this thread and disarms it on drop.
+#[cfg(test)]
+pub(crate) struct PublishFault;
+
+#[cfg(test)]
+impl PublishFault {
+    pub(crate) fn armed() -> Self {
+        PUBLISH_FAULT.with(|slot| slot.set(true));
+        PublishFault
+    }
+
+    /// Whether the armed shot has been consumed. A test whose seam was never reached proved
+    /// nothing about rollback, so it has to assert this rather than the error alone.
+    pub(crate) fn fired(&self) -> bool {
+        PUBLISH_FAULT.with(|slot| !slot.get())
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublishFault {
+    fn drop(&mut self) {
+        PUBLISH_FAULT.with(|slot| slot.set(false));
+    }
+}
+
+/// Consumes an armed publish fault, if any.
+#[cfg(test)]
+fn take_publish_fault() -> bool {
+    PUBLISH_FAULT.with(|slot| slot.replace(false))
+}
+
+// ---------------------------------------------------------------------------------------------
+// End of the R4B-1 staged membership authority.
+// ---------------------------------------------------------------------------------------------
 
 /// Reports a registration outcome once, where an operator can see it. An unavailable authority is
 /// an expected state of the operator's own configuration, not a failure — the scan runs exactly as
@@ -12635,5 +14080,1370 @@ mod tests {
             Some(DirTrust::Untrusted),
             "nothing is trusted without an authority"
         );
+    }
+}
+
+/// R4B-1: the staged membership authority. Everything here exercises APIs no production route
+/// calls yet — the switch is R4B-2 — so these tests ARE the only callers today.
+#[cfg(test)]
+mod membership_staging_tests {
+    use super::*;
+    use crate::model::plan::{GroupWitness, PlanWitness};
+    use crate::model::scan::ScanConfig;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "dedcom_membership_{tag}_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A manifest row carrying the real identity of an existing file — the plan and reclaim
+    /// authorities compare against `stat`, so synthetic rows would not do.
+    fn manifest_row(path: &Path) -> ManifestRow {
+        let meta = std::fs::symlink_metadata(path).unwrap();
+        ManifestRow {
+            path: path.to_path_buf(),
+            size: meta.size(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+            ctime_sec: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
+            device: meta.dev(),
+            inode: meta.ino(),
+            nlink: meta.nlink(),
+        }
+    }
+
+    /// A scan whose manifest is `files`, each carrying the supplied digest.
+    fn seed(store: &mut ScanStore, root: &Path, files: &[(PathBuf, [u8; 32])]) -> i64 {
+        let scan_id = store
+            .begin_scan(&ScanConfig::new(vec![root.to_path_buf()]))
+            .unwrap();
+        let rows: Vec<ManifestRow> = files.iter().map(|(path, _)| manifest_row(path)).collect();
+        store.record_files(scan_id, &rows).unwrap();
+        let hashes: Vec<(PathBuf, [u8; 32])> = files.to_vec();
+        store.record_hashes(scan_id, &hashes).unwrap();
+        scan_id
+    }
+
+    fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn member_paths(group: &ResolvedGroup) -> Vec<PathBuf> {
+        group.members.iter().map(|f| f.path.clone()).collect()
+    }
+
+    /// The witness a plan over `ids` would carry, taken from the resolver itself.
+    fn witness_of(snapshot: &MembershipSnapshot<'_>, ids: &[GroupId]) -> PlanWitness {
+        let groups: Vec<GroupWitness> = ids
+            .iter()
+            .map(|id| {
+                let resolved = snapshot.group(id).expect("the witnessed group resolves");
+                GroupWitness {
+                    id: *id,
+                    digest: resolved.summary.hash.clone(),
+                    members: member_paths(&resolved),
+                }
+            })
+            .collect();
+        PlanWitness {
+            scan_id: ids[0].scan_id,
+            generation: ids[0].generation,
+            groups,
+        }
+    }
+
+    /// Matrix: an Unknown scan can yield only a candidate view. No `ResolvedGroup`, no
+    /// identity, nothing a destructive gate could accept — and the candidates are still the
+    /// object rule's, not a pathname count.
+    #[test]
+    fn unknown_authority_yields_only_candidates() {
+        let dir = temp_dir("unknown");
+        let digest = [3u8; 32];
+        let a = write(&dir, "a.bin", b"same");
+        let b = write(&dir, "b.bin", b"same");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &[(a, digest), (b, digest)]);
+
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        assert_eq!(snapshot.mode(), MembershipMode::Unknown);
+        assert_eq!(snapshot.generation(), None, "no publication, no generation");
+        let id = GroupId {
+            scan_id,
+            rank: 0,
+            generation: 1,
+        };
+        assert!(matches!(snapshot.group(&id), Err(MembershipMiss::Unknown)));
+        assert_eq!(snapshot.summaries().unwrap_err(), MembershipMiss::Unknown);
+        assert_eq!(
+            snapshot.groups_of_digest(&hex_encode(&digest)).unwrap_err(),
+            MembershipMiss::Unknown
+        );
+        let view = snapshot
+            .unknown_candidates()
+            .unwrap()
+            .expect("an unknown scan offers candidates");
+        assert_eq!(view.candidates.len(), 1);
+        assert_eq!(view.candidates[0].digest, hex_encode(&digest));
+        assert_eq!(view.candidates[0].paths, 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Matrix: an ordinary scan published derived and published explicit resolves to exactly
+    /// the same members, in the same order — the switch cannot move what the operator sees.
+    #[test]
+    fn derived_and_explicit_resolve_identical_members() {
+        let dir = temp_dir("parity");
+        let digest = [9u8; 32];
+        let a = write(&dir, "a.bin", b"twins");
+        let b = write(&dir, "b.bin", b"twins");
+        let files = [(a.clone(), digest), (b.clone(), digest)];
+
+        let mut derived_store = ScanStore::open_in_memory().unwrap();
+        let derived_scan = seed(&mut derived_store, &dir, &files);
+        assert_eq!(
+            derived_store
+                .publish_results(derived_scan, PublishMode::Derived)
+                .unwrap(),
+            1,
+            "the first publication is generation 1"
+        );
+
+        let mut explicit_store = ScanStore::open_in_memory().unwrap();
+        let explicit_scan = seed(&mut explicit_store, &dir, &files);
+        let verified = crate::pipeline::verify::verify_groups(
+            explicit_store.duplicate_groups(explicit_scan).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(verified.len(), 1);
+        explicit_store
+            .publish_results(explicit_scan, PublishMode::Explicit(&verified))
+            .unwrap();
+
+        let derived = derived_store.membership_snapshot(derived_scan).unwrap();
+        let explicit = explicit_store.membership_snapshot(explicit_scan).unwrap();
+        assert_eq!(derived.mode(), MembershipMode::Derived);
+        assert_eq!(explicit.mode(), MembershipMode::Explicit);
+
+        let derived_group = derived
+            .group(&GroupId {
+                scan_id: derived_scan,
+                rank: 0,
+                generation: 1,
+            })
+            .unwrap();
+        let explicit_group = explicit
+            .group(&GroupId {
+                scan_id: explicit_scan,
+                rank: 0,
+                generation: 1,
+            })
+            .unwrap();
+        assert_eq!(member_paths(&derived_group), vec![a.clone(), b.clone()]);
+        assert_eq!(member_paths(&explicit_group), member_paths(&derived_group));
+        assert_eq!(
+            derived_group.summary.file_count,
+            explicit_group.summary.file_count
+        );
+        assert_eq!(derived_group.summary.hash, explicit_group.summary.hash);
+        // Membership tests and reverse lookups agree across the modes too.
+        assert!(derived.is_member(&derived_group.id, &a).unwrap());
+        assert!(explicit.is_member(&explicit_group.id, &a).unwrap());
+        assert_eq!(
+            derived.group_of_path(&b).unwrap().map(|id| id.rank),
+            Some(0)
+        );
+        assert_eq!(
+            explicit.group_of_path(&b).unwrap().map(|id| id.rank),
+            Some(0)
+        );
+        // A page is a stable slice of the same order.
+        let page = explicit.group_page(&explicit_group.id, 1, 1).unwrap();
+        assert_eq!(member_paths(&page), vec![b]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// THE release-blocking integration: R4-V1 splits one digest into two byte populations,
+    /// explicit publication gives each its own identity, and the resolver keeps them apart. A
+    /// digest lookup returns both ranks; each exact group returns only its own population. A
+    /// raw-digest union here would be the defect R4B exists to close.
+    #[test]
+    fn two_same_digest_populations_never_merge() {
+        let dir = temp_dir("split");
+        let digest = [11u8; 32];
+        let x1 = write(&dir, "x1.bin", b"XXXX");
+        let x2 = write(&dir, "x2.bin", b"XXXX");
+        let y1 = write(&dir, "y1.bin", b"YYYYYY");
+        let y2 = write(&dir, "y2.bin", b"YYYYYY");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(
+            &mut store,
+            &dir,
+            &[
+                (x1.clone(), digest),
+                (x2.clone(), digest),
+                (y1.clone(), digest),
+                (y2.clone(), digest),
+            ],
+        );
+
+        // The real comparator, on the real files: one candidate group in, two populations out.
+        let candidates = store.duplicate_groups(scan_id).unwrap();
+        assert_eq!(candidates.len(), 1, "one digest, one candidate group");
+        assert_eq!(candidates[0].files.len(), 4);
+        let verified = crate::pipeline::verify::verify_groups(candidates).unwrap();
+        assert_eq!(verified.len(), 2, "verification split the digest");
+
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .unwrap();
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        let hex = hex_encode(&digest);
+        let ids = snapshot.groups_of_digest(&hex).unwrap();
+        assert_eq!(ids.len(), 2, "the digest names two identities");
+        assert_ne!(ids[0].rank, ids[1].rank);
+
+        let first = snapshot.group(&ids[0]).unwrap();
+        let second = snapshot.group(&ids[1]).unwrap();
+        assert_eq!(first.summary.hash, hex);
+        assert_eq!(second.summary.hash, hex, "both keep the shared digest");
+        let first_members = member_paths(&first);
+        let second_members = member_paths(&second);
+        let (x_id, xs, y_id, ys) = if first_members.contains(&x1) {
+            (ids[0], first_members, ids[1], second_members)
+        } else {
+            (ids[1], second_members, ids[0], first_members)
+        };
+        assert_eq!(
+            xs,
+            vec![x1.clone(), x2.clone()],
+            "the X population, in order"
+        );
+        assert_eq!(
+            ys,
+            vec![y1.clone(), y2.clone()],
+            "the Y population, in order"
+        );
+        assert_eq!(first.summary.file_count, 2);
+        assert_eq!(second.summary.file_count, 2);
+        assert_ne!(
+            first.summary.size_bytes, second.summary.size_bytes,
+            "each population keeps its own size"
+        );
+        // Neither identity answers for the other's pathnames — a digest union would.
+        assert!(snapshot.is_member(&x_id, &x1).unwrap());
+        assert!(!snapshot.is_member(&x_id, &y1).unwrap());
+        assert!(snapshot.is_member(&y_id, &y2).unwrap());
+        assert!(!snapshot.is_member(&y_id, &x2).unwrap());
+        assert_eq!(snapshot.group_of_path(&x1).unwrap(), Some(x_id));
+        assert_eq!(snapshot.group_of_path(&y2).unwrap(), Some(y_id));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Matrix: a stale identity never resolves the current rank, even when the rank still
+    /// exists and still holds the same files.
+    #[test]
+    fn a_stale_generation_never_resolves() {
+        let dir = temp_dir("stale");
+        let digest = [21u8; 32];
+        let a = write(&dir, "a.bin", b"stale");
+        let b = write(&dir, "b.bin", b"stale");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &[(a, digest), (b, digest)]);
+        assert_eq!(
+            store
+                .publish_results(scan_id, PublishMode::Derived)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .publish_results(scan_id, PublishMode::Derived)
+                .unwrap(),
+            2,
+            "republication increments the generation"
+        );
+
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        assert_eq!(snapshot.generation(), Some(2));
+        let stale = GroupId {
+            scan_id,
+            rank: 0,
+            generation: 1,
+        };
+        assert!(matches!(
+            snapshot.group(&stale),
+            Err(MembershipMiss::Stale {
+                expected: 1,
+                found: 2
+            })
+        ));
+        assert!(snapshot
+            .group(&GroupId {
+                generation: 2,
+                ..stale
+            })
+            .is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Matrix: summary and membership disagreeing is NAMED in the summaries, refused by the
+    /// exact-group path and refused by the lease — never repaired, never averaged.
+    #[test]
+    fn a_summary_member_disagreement_is_named_and_refused() {
+        let dir = temp_dir("disagree");
+        let digest = [31u8; 32];
+        let a = write(&dir, "a.bin", b"disagree");
+        let b = write(&dir, "b.bin", b"disagree");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(
+            &mut store,
+            &dir,
+            &[(a.clone(), digest), (b.clone(), digest)],
+        );
+        let verified =
+            crate::pipeline::verify::verify_groups(store.duplicate_groups(scan_id).unwrap())
+                .unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .unwrap();
+
+        let id = GroupId {
+            scan_id,
+            rank: 0,
+            generation: 1,
+        };
+        let witness = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            witness_of(&snapshot, &[id])
+        };
+
+        // The summary now claims three members while the membership still holds two.
+        store
+            .conn
+            .execute(
+                "UPDATE file_group SET file_count = 3 WHERE scan_id = ?1 AND rank = 0",
+                params![scan_id],
+            )
+            .unwrap();
+
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        let summaries = snapshot.summaries().unwrap();
+        assert_eq!(
+            summaries.inconsistent,
+            vec![id],
+            "the exact identity is named, not repaired"
+        );
+        assert!(matches!(
+            snapshot.group(&id),
+            Err(MembershipMiss::Inconsistent { .. })
+        ));
+        drop(snapshot);
+        assert!(matches!(
+            store.acquire_membership_lease(&witness),
+            Err(LeaseRefusal::Inconsistent { .. })
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Matrix: a member containing LF is ONE member through publication, resolver, witness and
+    /// lease — and a group of two members `a`/`b` is not the same as one member `a\nb`. This is
+    /// the case a delimiter-encoded member list cannot distinguish.
+    #[test]
+    fn an_lf_member_stays_one_member_everywhere() {
+        let dir = temp_dir("newline");
+        let digest = [41u8; 32];
+        let weird = write(&dir, "we\nird.bin", b"lf-payload");
+        let plain = write(&dir, "plain.bin", b"lf-payload");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(
+            &mut store,
+            &dir,
+            &[(weird.clone(), digest), (plain.clone(), digest)],
+        );
+        let verified =
+            crate::pipeline::verify::verify_groups(store.duplicate_groups(scan_id).unwrap())
+                .unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .unwrap();
+
+        let id = GroupId {
+            scan_id,
+            rank: 0,
+            generation: 1,
+        };
+        let witness = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            let resolved = snapshot.group(&id).unwrap();
+            assert_eq!(
+                resolved.members.len(),
+                2,
+                "the LF name is one member, not two"
+            );
+            assert!(member_paths(&resolved).contains(&weird));
+            let rows: i64 = store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM file_group_member WHERE scan_id = ?1",
+                    params![scan_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 2, "one row per member, LF and all");
+            witness_of(&snapshot, &[id])
+        };
+        assert!(store.acquire_membership_lease(&witness).is_ok());
+
+        // The counter-fixture: the same concatenation spelled as two ordinary members must
+        // NOT validate against the one-LF-member witness.
+        let split: Vec<PathBuf> = {
+            let mut base = dir.clone();
+            base.push("we");
+            let mut second = dir.clone();
+            second.push("ird.bin");
+            vec![base, second]
+        };
+        let mut forged = witness.clone();
+        forged.groups[0].members = split;
+        assert!(
+            matches!(
+                store.acquire_membership_lease(&forged),
+                Err(LeaseRefusal::MembershipChanged { .. })
+            ),
+            "two members must not pass for one LF-containing member"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Matrix: a publication that would overflow the generation refuses, and leaves the
+    /// previous authority, summaries, members, totals and marker byte-identical.
+    #[test]
+    fn a_generation_overflow_refuses_and_changes_nothing() {
+        let dir = temp_dir("overflow");
+        let digest = [51u8; 32];
+        let a = write(&dir, "a.bin", b"overflow");
+        let b = write(&dir, "b.bin", b"overflow");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &[(a, digest), (b, digest)]);
+        let verified =
+            crate::pipeline::verify::verify_groups(store.duplicate_groups(scan_id).unwrap())
+                .unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE scan_membership SET generation = ?2 WHERE scan_id = ?1",
+                params![scan_id, i64::MAX],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE file_group_member SET generation = ?2 WHERE scan_id = ?1",
+                params![scan_id, i64::MAX],
+            )
+            .unwrap();
+        let before = authority_fingerprint(&store, scan_id);
+
+        let err = store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("overflow"), "{err}");
+        assert_eq!(
+            authority_fingerprint(&store, scan_id),
+            before,
+            "the refused publication rolled everything back"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Everything a publication owns, as one comparable value: authority, summaries, members,
+    /// the scan totals and the prepared marker.
+    fn authority_fingerprint(store: &ScanStore, scan_id: i64) -> String {
+        let authority: String = store
+            .conn
+            .query_row(
+                "SELECT COALESCE((SELECT mode || '/' || generation FROM scan_membership
+                                   WHERE scan_id = ?1), 'none')",
+                params![scan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut groups = store
+            .conn
+            .prepare(
+                "SELECT rank, hash, file_count, size, reclaim, object_count, reclaim_state
+                   FROM file_group WHERE scan_id = ?1 ORDER BY rank",
+            )
+            .unwrap();
+        let summaries: Vec<String> = groups
+            .query_map(params![scan_id], |row| {
+                Ok(format!(
+                    "{}|{}|{}|{}|{}|{}|{}",
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let mut members_stmt = store
+            .conn
+            .prepare(
+                "SELECT group_rank, path, generation FROM file_group_member
+                  WHERE scan_id = ?1 ORDER BY group_rank, path",
+            )
+            .unwrap();
+        let members: Vec<String> = members_stmt
+            .query_map(params![scan_id], |row| {
+                Ok(format!(
+                    "{}|{}|{}",
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let totals: String = store
+            .conn
+            .query_row(
+                "SELECT COALESCE(reclaimable_bytes, -1) || '/' || COALESCE(reclaim_state, -1)
+                        || '/' || COALESCE(results_materialized, -1)
+                   FROM scan_stats WHERE scan_id = ?1",
+                params![scan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        format!(
+            "{authority}\n{}\n{}\n{totals}",
+            summaries.join(","),
+            members.join(",")
+        )
+    }
+
+    /// Matrix: a fault AFTER the first explicit member insert rolls the whole publication
+    /// back. The seam fires with a summary row and a member row already written inside the
+    /// open transaction, so this proves transactional rollback rather than a preflight refusal.
+    #[test]
+    fn a_fault_after_the_first_member_insert_rolls_the_publication_back() {
+        let dir = temp_dir("rollback");
+        let digest = [61u8; 32];
+        let a = write(&dir, "a.bin", b"rollback");
+        let b = write(&dir, "b.bin", b"rollback");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &[(a, digest), (b, digest)]);
+        let verified =
+            crate::pipeline::verify::verify_groups(store.duplicate_groups(scan_id).unwrap())
+                .unwrap();
+
+        // First publication crash: nothing partial may survive, and the scan stays Unknown.
+        let fault = PublishFault::armed();
+        let err = store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("injected publish fault"), "{err}");
+        assert!(fault.fired(), "the seam must actually have been reached");
+        drop(fault);
+        assert_eq!(
+            store.membership_snapshot(scan_id).unwrap().mode(),
+            MembershipMode::Unknown,
+            "a crashed first publication leaves no authority"
+        );
+        let rows: (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM file_group WHERE scan_id = ?1),
+                        (SELECT COUNT(*) FROM file_group_member WHERE scan_id = ?1)",
+                params![scan_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, (0, 0), "no partial summaries, no partial members");
+
+        // Republication crash: the PRIOR generation survives complete.
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .unwrap();
+        let before = authority_fingerprint(&store, scan_id);
+        let fault = PublishFault::armed();
+        assert!(store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .is_err());
+        assert!(fault.fired());
+        drop(fault);
+        assert_eq!(
+            authority_fingerprint(&store, scan_id),
+            before,
+            "the prior generation is preserved completely"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Matrix: preparation validates an already-authoritative scan and does nothing to it,
+    /// while a migrated legacy scan is prepared for browsing WITHOUT ever manufacturing
+    /// authority — it stays Unknown until a real republish or rescan. Malformed authority is
+    /// an error, not a shrug.
+    #[test]
+    fn preparation_never_manufactures_authority() {
+        let dir = temp_dir("prepare");
+        let digest = [71u8; 32];
+        let a = write(&dir, "a.bin", b"prepare");
+        let b = write(&dir, "b.bin", b"prepare");
+        let mut store = ScanStore::open_in_memory().unwrap();
+
+        // Legacy/migrated: completed, no authority row.
+        let legacy = seed(
+            &mut store,
+            &dir,
+            &[(a.clone(), digest), (b.clone(), digest)],
+        );
+        store
+            .set_status(legacy, crate::model::scan::ScanStatus::Complete)
+            .unwrap();
+        store.prepare_legacy_for_viewing(legacy).unwrap();
+        assert!(
+            store.results_materialized(legacy).unwrap(),
+            "browsing summaries are prepared"
+        );
+        let authority: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM scan_membership WHERE scan_id = ?1",
+                params![legacy],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authority, 0, "preparation invents no authority");
+        assert_eq!(
+            store.membership_snapshot(legacy).unwrap().mode(),
+            MembershipMode::Unknown,
+            "a migrated checkpoint stays browse-only"
+        );
+
+        // Already authoritative: validated and left exactly as it was.
+        let published = seed(&mut store, &dir, &[(a, digest), (b, digest)]);
+        store
+            .publish_results(published, PublishMode::Derived)
+            .unwrap();
+        let before = authority_fingerprint(&store, published);
+        store.prepare_legacy_for_viewing(published).unwrap();
+        assert_eq!(
+            authority_fingerprint(&store, published),
+            before,
+            "preparing an authoritative scan is a no-op"
+        );
+
+        // Malformed authority is an error on both the preparation and the snapshot paths. The
+        // CHECK is suspended to seed it, because that is exactly the case the decoder must not
+        // delegate to SQLite: a row written by a build without the constraint, or edited by
+        // hand, arrives with the constraint no longer standing between it and the reader.
+        store
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints=1;")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE scan_membership SET mode = 7 WHERE scan_id = ?1",
+                params![published],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints=0;")
+            .unwrap();
+        assert!(store.prepare_legacy_for_viewing(published).is_err());
+        assert!(matches!(
+            store.membership_snapshot(published),
+            Err(MembershipMiss::Inconsistent { .. })
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A derived scan carrying explicit member rows is corruption — the snapshot refuses it
+    /// rather than ignoring the surplus, and so does preparation.
+    #[test]
+    fn a_derived_scan_with_member_rows_is_corruption() {
+        let dir = temp_dir("derived_rows");
+        let digest = [81u8; 32];
+        let a = write(&dir, "a.bin", b"derived");
+        let b = write(&dir, "b.bin", b"derived");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &[(a.clone(), digest), (b, digest)]);
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        let path = a.to_string_lossy().to_string();
+        store
+            .conn
+            .execute(
+                "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
+                 VALUES (?1, 0, ?2, 1)",
+                params![scan_id, path],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.membership_snapshot(scan_id),
+            Err(MembershipMiss::Inconsistent { .. })
+        ));
+        assert!(store.prepare_legacy_for_viewing(scan_id).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- the staged apply-lease opener ---
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode()
+    }
+
+    /// A published v5 checkpoint on disk, plus its scan id.
+    fn on_disk_checkpoint(dir: &Path) -> (PathBuf, i64) {
+        let digest = [91u8; 32];
+        let a = write(dir, "a.bin", b"on-disk");
+        let b = write(dir, "b.bin", b"on-disk");
+        let db = dir.join("dedcom.db");
+        let mut store = ScanStore::open_writable(&db).unwrap();
+        let scan_id = seed(&mut store, dir, &[(a, digest), (b, digest)]);
+        let verified =
+            crate::pipeline::verify::verify_groups(store.duplicate_groups(scan_id).unwrap())
+                .unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .unwrap();
+        (db, scan_id)
+    }
+
+    /// The opener accepts the current schema and alters NOTHING by opening: no migration, no
+    /// WAL flip, no chmod, no vacuum. Foreign keys are on, `busy_timeout` is the fail-fast 0,
+    /// and the file plus its WAL/SHM companions keep their modes.
+    #[test]
+    fn the_apply_opener_accepts_v5_and_changes_nothing() {
+        let _guard = role_guard();
+        let dir = temp_dir("opener_ok");
+        let (db, _scan_id) = on_disk_checkpoint(&dir);
+        let db_mode_before = mode_of(&db);
+
+        let store = ScanStore::open_for_apply_lease(&db).expect("a current checkpoint opens");
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, schema::SCHEMA_VERSION, "no migration happened");
+        let journal: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal, "wal", "the journal mode is left as it was");
+        let fk: i64 = store
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fk, 1, "foreign keys are enforced on this connection");
+        let busy: i64 = store
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy, 0, "the apply lease never queues");
+        assert_eq!(
+            store.membership_statement_count(),
+            4,
+            "opening costs exactly: FK set + FK read-back + busy_timeout + version"
+        );
+        // Nothing is widened. The main file keeps the exact mode it had; the WAL/SHM
+        // companions — which this connection may itself materialise, since the operator's
+        // store was closed and its WAL checkpointed away — inherit the main file's
+        // permissions from SQLite's unix VFS, so they are asserted rather than assumed.
+        assert_eq!(
+            mode_of(&db),
+            db_mode_before,
+            "the DB file's mode is untouched"
+        );
+        assert_eq!(mode_of(&db) & 0o777, 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let mut companion = db.as_os_str().to_owned();
+            companion.push(suffix);
+            if let Ok(meta) = std::fs::metadata(Path::new(&companion)) {
+                assert_eq!(
+                    meta.permissions().mode() & 0o777,
+                    0o600,
+                    "{suffix} must not be wider than the database itself"
+                );
+            }
+        }
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Path safety: an absent database is not created, a symlink is refused with its target
+    /// untouched, and a directory, a FIFO with no writer and a socket are all refused —
+    /// promptly, with no helper thread and no timeout.
+    #[test]
+    fn the_apply_opener_refuses_every_unsafe_path() {
+        let _guard = role_guard();
+        let dir = temp_dir("opener_paths");
+
+        let absent = dir.join("absent.db");
+        assert!(matches!(
+            ScanStore::open_for_apply_lease(&absent),
+            Err(LeaseRefusal::Open { .. })
+        ));
+        assert!(!absent.exists(), "the opener creates nothing");
+
+        let (db, _scan_id) = on_disk_checkpoint(&dir);
+        let link = dir.join("link.db");
+        std::os::unix::fs::symlink(&db, &link).unwrap();
+        let target_before = std::fs::metadata(&db).unwrap().len();
+        assert!(matches!(
+            ScanStore::open_for_apply_lease(&link),
+            Err(LeaseRefusal::Open { .. })
+        ));
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().len(),
+            target_before,
+            "the symlink's target is untouched"
+        );
+
+        assert!(matches!(
+            ScanStore::open_for_apply_lease(&dir),
+            Err(LeaseRefusal::Open { .. })
+        ));
+
+        let fifo = dir.join("fifo.db");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid C string for a child of an existing directory; mode 0600.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(matches!(
+            ScanStore::open_for_apply_lease(&fifo),
+            Err(LeaseRefusal::Open { .. })
+        ));
+
+        let sock = dir.join("sock.db");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert!(matches!(
+            ScanStore::open_for_apply_lease(&sock),
+            Err(LeaseRefusal::Open { .. })
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Schema safety: v0, v4 and a future v6 are each refused BEFORE any membership SQL, with
+    /// the direction's own wording, and `user_version` is left exactly as it was.
+    #[test]
+    fn the_apply_opener_refuses_every_other_schema() {
+        let _guard = role_guard();
+        let dir = temp_dir("opener_schema");
+        let (db, _scan_id) = on_disk_checkpoint(&dir);
+
+        for (seeded, expected) in [
+            (0, "older schema"),
+            (schema::SCHEMA_VERSION - 1, "older schema"),
+            (schema::SCHEMA_VERSION + 1, "newer version"),
+        ] {
+            {
+                let conn = Connection::open(&db).unwrap();
+                conn.pragma_update(None, "user_version", seeded).unwrap();
+            }
+            match ScanStore::open_for_apply_lease(&db) {
+                Err(LeaseRefusal::Schema { detail }) => {
+                    assert!(detail.contains(expected), "v{seeded}: {detail}")
+                }
+                Err(other) => panic!("v{seeded} must be a schema refusal, got {other:?}"),
+                Ok(_) => panic!("v{seeded} must not open at all"),
+            }
+            let conn = Connection::open(&db).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, seeded, "the refusal wrote nothing");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An observer never takes a write lease at all — refused before the file is even opened.
+    #[test]
+    fn the_apply_opener_refuses_an_observer() {
+        let _guard = role_guard();
+        let dir = temp_dir("opener_role");
+        let (db, _scan_id) = on_disk_checkpoint(&dir);
+        set_observer_role(true);
+        let refusal = ScanStore::open_for_apply_lease(&db);
+        set_observer_role(false);
+        assert_eq!(refusal.err(), Some(LeaseRefusal::ReadOnlyRole));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- the staged fail-fast membership lease ---
+
+    /// The ordinary acquisition validates the witness and pins the statement shape: BEGIN,
+    /// scan existence, authority, one validation statement (explicit) and the ROLLBACK that
+    /// releases it. A derived scan spends one more — its no-member-rows assertion.
+    #[test]
+    fn the_lease_validates_and_releases_with_a_fixed_statement_shape() {
+        let dir = temp_dir("lease_shape");
+        let digest = [101u8; 32];
+        let a = write(&dir, "a.bin", b"lease");
+        let b = write(&dir, "b.bin", b"lease");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &[(a, digest), (b, digest)]);
+        let verified =
+            crate::pipeline::verify::verify_groups(store.duplicate_groups(scan_id).unwrap())
+                .unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .unwrap();
+        let id = GroupId {
+            scan_id,
+            rank: 0,
+            generation: 1,
+        };
+        let witness = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            witness_of(&snapshot, &[id])
+        };
+
+        let before = store.membership_statement_count();
+        {
+            let lease = store
+                .acquire_membership_lease(&witness)
+                .expect("the current witness validates");
+            assert_eq!(
+                lease.statements_so_far() - before,
+                4,
+                "BEGIN + scan + authority + one explicit validation statement"
+            );
+        }
+        assert_eq!(
+            store.membership_statement_count() - before,
+            5,
+            "the release costs exactly the ROLLBACK"
+        );
+
+        // The same shape in derived mode, plus its own invariant statement.
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        let derived_witness = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            witness_of(
+                &snapshot,
+                &[GroupId {
+                    generation: 2,
+                    ..id
+                }],
+            )
+        };
+        let before = store.membership_statement_count();
+        {
+            let lease = store.acquire_membership_lease(&derived_witness).unwrap();
+            assert_eq!(
+                lease.statements_so_far() - before,
+                5,
+                "derived adds the no-member-rows assertion"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A witness from the previous publication never takes the lease, even though the rank and
+    /// its files are unchanged.
+    #[test]
+    fn the_lease_refuses_a_stale_generation() {
+        let dir = temp_dir("lease_stale");
+        let digest = [111u8; 32];
+        let a = write(&dir, "a.bin", b"stale-lease");
+        let b = write(&dir, "b.bin", b"stale-lease");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &[(a, digest), (b, digest)]);
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        let witness = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            witness_of(
+                &snapshot,
+                &[GroupId {
+                    scan_id,
+                    rank: 0,
+                    generation: 1,
+                }],
+            )
+        };
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+
+        assert_eq!(
+            store.acquire_membership_lease(&witness).err(),
+            Some(LeaseRefusal::Stale {
+                expected: 1,
+                found: 2
+            })
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Corruption without a generation bump is caught by the lease, one typed refusal per
+    /// distinguishable case: a substituted digest, two ranks whose summaries were swapped, a
+    /// changed member set, and an absent rank.
+    #[test]
+    fn the_lease_refuses_corruption_without_a_generation_bump() {
+        let dir = temp_dir("lease_corrupt");
+        let digest = [121u8; 32];
+        let a = write(&dir, "a.bin", b"corrupt");
+        let b = write(&dir, "b.bin", b"corrupt");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &[(a.clone(), digest), (b, digest)]);
+        let verified =
+            crate::pipeline::verify::verify_groups(store.duplicate_groups(scan_id).unwrap())
+                .unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .unwrap();
+        let id = GroupId {
+            scan_id,
+            rank: 0,
+            generation: 1,
+        };
+        let witness = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            witness_of(&snapshot, &[id])
+        };
+        assert!(store.acquire_membership_lease(&witness).is_ok());
+
+        // A member set that changed under a live authority.
+        let moved = dir.join("moved.bin");
+        store
+            .conn
+            .execute(
+                "UPDATE file_group_member SET path = ?2
+                  WHERE scan_id = ?1 AND group_rank = 0 AND path = ?3",
+                params![scan_id, moved.to_string_lossy(), a.to_string_lossy()],
+            )
+            .unwrap();
+        assert_eq!(
+            store.acquire_membership_lease(&witness).err(),
+            Some(LeaseRefusal::MembershipChanged { path: moved })
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE file_group_member SET path = ?2 WHERE scan_id = ?1 AND group_rank = 0
+                   AND path NOT IN (SELECT path FROM file WHERE scan_id = ?1)",
+                params![scan_id, a.to_string_lossy()],
+            )
+            .unwrap();
+
+        // A substituted digest at the planned rank.
+        store
+            .conn
+            .execute(
+                "UPDATE file_group SET hash = 'deadbeef' WHERE scan_id = ?1 AND rank = 0",
+                params![scan_id],
+            )
+            .unwrap();
+        match store.acquire_membership_lease(&witness) {
+            Err(LeaseRefusal::DigestChanged { rank, found, .. }) => {
+                assert_eq!(rank, 0);
+                assert_eq!(found, "deadbeef");
+            }
+            Err(other) => panic!("a substituted digest must be DigestChanged, got {other:?}"),
+            Ok(_) => panic!("a substituted digest must not take the lease"),
+        }
+
+        // The rank itself gone: the member rows follow it through the CASCADE, so what the
+        // witness meets is an absent identity rather than orphaned membership.
+        store
+            .conn
+            .execute(
+                "DELETE FROM file_group WHERE scan_id = ?1 AND rank = 0",
+                params![scan_id],
+            )
+            .unwrap();
+        let orphans: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_group_member WHERE scan_id = ?1",
+                params![scan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0, "the active CASCADE took the member rows too");
+        assert_eq!(
+            store.acquire_membership_lease(&witness).err(),
+            Some(LeaseRefusal::RankMissing { rank: 0 })
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Fail-fast, proved on a real file: while another connection holds `BEGIN IMMEDIATE`, the
+    /// lease returns `DatabaseBusy` at once — `busy_timeout=0`, no queue, no retry — and once
+    /// that holder rolls back, the very same acquisition succeeds.
+    #[test]
+    fn the_lease_refuses_a_busy_database_immediately() {
+        let _guard = role_guard();
+        let dir = temp_dir("lease_busy");
+        let (db, scan_id) = on_disk_checkpoint(&dir);
+        let mut store = ScanStore::open_for_apply_lease(&db).unwrap();
+        let witness = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            witness_of(
+                &snapshot,
+                &[GroupId {
+                    scan_id,
+                    rank: 0,
+                    generation: 1,
+                }],
+            )
+        };
+
+        let holder = Connection::open(&db).unwrap();
+        holder.execute_batch("PRAGMA busy_timeout=0;").unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        assert_eq!(
+            store.acquire_membership_lease(&witness).err(),
+            Some(LeaseRefusal::DatabaseBusy)
+        );
+        holder.execute_batch("ROLLBACK;").unwrap();
+        assert!(
+            store.acquire_membership_lease(&witness).is_ok(),
+            "the same acquisition succeeds once the writer is gone"
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other side of the same lock: a forced publisher cannot commit while the lease is
+    /// held, and can the moment it drops. This is what makes the lease a whole-batch guard
+    /// rather than a check.
+    #[test]
+    fn a_publisher_cannot_commit_while_the_lease_is_held() {
+        let _guard = role_guard();
+        let dir = temp_dir("lease_publisher");
+        let (db, scan_id) = on_disk_checkpoint(&dir);
+        let mut store = ScanStore::open_for_apply_lease(&db).unwrap();
+        let witness = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            witness_of(
+                &snapshot,
+                &[GroupId {
+                    scan_id,
+                    rank: 0,
+                    generation: 1,
+                }],
+            )
+        };
+
+        let publisher = Connection::open(&db).unwrap();
+        publisher.execute_batch("PRAGMA busy_timeout=0;").unwrap();
+        {
+            let _lease = store.acquire_membership_lease(&witness).unwrap();
+            let blocked = publisher.execute_batch(
+                "BEGIN IMMEDIATE; UPDATE scan_membership SET generation = 99; COMMIT;",
+            );
+            assert!(blocked.is_err(), "no writer may commit under the lease");
+            let _ = publisher.execute_batch("ROLLBACK;");
+        }
+        publisher
+            .execute_batch("BEGIN IMMEDIATE; UPDATE scan_membership SET generation = 99; COMMIT;")
+            .expect("the same write succeeds once the lease is released");
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A plan far past SQLite's 32766-variable ceiling validates in the SAME number of
+    /// statements as a two-group plan: the witness travels as one JSON array, members come
+    /// back one per row, and nothing is chunked, truncated or queried per group.
+    #[test]
+    fn a_forty_thousand_group_witness_validates_with_the_same_statements() {
+        const GROUPS: i64 = 40_000;
+        let dir = temp_dir("lease_bulk");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = store
+            .begin_scan(&ScanConfig::new(vec![dir.clone()]))
+            .unwrap();
+        // Seeded straight into the authority tables: this pins the lease's cost, and building
+        // 40 000 real published groups would measure the publisher instead.
+        {
+            let tx = store.conn.transaction().unwrap();
+            {
+                let mut summary = tx
+                    .prepare(
+                        "INSERT INTO file_group(scan_id, rank, hash, file_count, size, reclaim,
+                                                object_count, reclaim_state)
+                         VALUES (?1, ?2, ?3, 2, 4096, 4096, 2, 1)",
+                    )
+                    .unwrap();
+                let mut member = tx
+                    .prepare(
+                        "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
+                         VALUES (?1, ?2, ?3, 1)",
+                    )
+                    .unwrap();
+                for rank in 0..GROUPS {
+                    summary
+                        .execute(params![scan_id, rank, format!("{rank:064x}")])
+                        .unwrap();
+                    for side in ['a', 'b'] {
+                        member
+                            .execute(params![scan_id, rank, format!("/pool/{rank}/{side}.bin")])
+                            .unwrap();
+                    }
+                }
+            }
+            tx.execute(
+                "INSERT INTO scan_membership(scan_id, mode, generation) VALUES (?1, 2, 1)",
+                params![scan_id],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let witness = PlanWitness {
+            scan_id,
+            generation: 1,
+            groups: (0..GROUPS)
+                .map(|rank| GroupWitness {
+                    id: GroupId {
+                        scan_id,
+                        rank,
+                        generation: 1,
+                    },
+                    digest: format!("{rank:064x}"),
+                    members: vec![
+                        PathBuf::from(format!("/pool/{rank}/a.bin")),
+                        PathBuf::from(format!("/pool/{rank}/b.bin")),
+                    ],
+                })
+                .collect(),
+        };
+
+        let before = store.membership_statement_count();
+        {
+            let lease = store
+                .acquire_membership_lease(&witness)
+                .expect("40 000 groups validate");
+            assert_eq!(
+                lease.statements_so_far() - before,
+                4,
+                "the same four statements a two-group plan spends"
+            );
+        }
+
+        // And it still refuses a single corrupted member among the forty thousand.
+        let mut forged = witness;
+        forged.groups[39_999].members[1] = PathBuf::from("/pool/39999/c.bin");
+        assert!(matches!(
+            store.acquire_membership_lease(&forged),
+            Err(LeaseRefusal::MembershipChanged { .. })
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A witness that is malformed in itself never reaches the database: a foreign scan, a
+    /// mixed generation, a negative rank, a repeated rank and an empty member list are all
+    /// refused before the write lock is taken.
+    #[test]
+    fn a_malformed_witness_is_refused_before_the_lock() {
+        let dir = temp_dir("lease_witness");
+        let digest = [131u8; 32];
+        let a = write(&dir, "a.bin", b"witness");
+        let b = write(&dir, "b.bin", b"witness");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &[(a, digest), (b, digest)]);
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        let id = GroupId {
+            scan_id,
+            rank: 0,
+            generation: 1,
+        };
+        let good = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            witness_of(&snapshot, &[id])
+        };
+
+        let mut foreign = good.clone();
+        foreign.groups[0].id.scan_id = scan_id + 1;
+        let mut mixed = good.clone();
+        mixed.groups[0].id.generation = 2;
+        let mut negative = good.clone();
+        negative.groups[0].id.rank = -1;
+        let mut twice = good.clone();
+        twice.groups.push(good.groups[0].clone());
+        let mut empty_members = good.clone();
+        empty_members.groups[0].members.clear();
+        let mut no_groups = good.clone();
+        no_groups.groups.clear();
+
+        let before = store.membership_statement_count();
+        for (label, witness) in [
+            ("foreign scan", foreign),
+            ("mixed generation", mixed),
+            ("negative rank", negative),
+            ("repeated rank", twice),
+            ("no members", empty_members),
+            ("no groups", no_groups),
+        ] {
+            assert!(
+                matches!(
+                    store.acquire_membership_lease(&witness),
+                    Err(LeaseRefusal::Inconsistent { .. })
+                ),
+                "{label} must be refused"
+            );
+        }
+        assert_eq!(
+            store.membership_statement_count(),
+            before,
+            "a malformed witness costs no statement and takes no lock"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
