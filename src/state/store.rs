@@ -209,6 +209,19 @@ pub struct LiveDirSignature {
 /// Checkpoint store: a SQLite DB with the scan state and the file manifest.
 pub struct ScanStore {
     conn: Connection,
+    /// The configured database path and what it named when this store opened it. `None` for an
+    /// in-memory store, which has no path to be replaced. Compared before every trusted
+    /// membership answer, so a checkpoint swapped underneath a live connection is refused
+    /// instead of answered from the orphaned inode.
+    db_identity: Option<(PathBuf, crate::paths::PathIdentity)>,
+    /// The one cached whole-authority validation of the active scan. A single slot, not a map:
+    /// the UI activates one checkpoint at a time, so a slot cannot grow and cannot serve a
+    /// scan it was not computed for.
+    ///
+    /// Interior mutability for the same reason the counters use it: the snapshot borrows
+    /// `conn` for its transaction, so recording the verdict cannot also take `&mut self`. It
+    /// keeps `membership_snapshot`'s public signature unchanged as well.
+    membership_cache: std::cell::RefCell<Option<MembershipCacheEntry>>,
     /// Test-only: how many set-based digest-propagation statements this store has issued. The
     /// hashing phase must spend one per batch, never one per alias, and a counter on the store
     /// itself proves that without a dependency, rusqlite tracing, or a timing measurement. Per
@@ -220,6 +233,30 @@ pub struct ScanStore {
     /// number. Same per-instance shape as `propagations`, for the same reason.
     #[cfg(test)]
     membership_statements: std::cell::Cell<u64>,
+    /// Test-only: how many times this store ran the FULL whole-authority validation. Per
+    /// instance, deliberately not a process-wide counter: parallel tests and unrelated opens
+    /// would pollute a global one, and «this store validated once» is the only claim a store
+    /// unit test can honestly make. Proving «only one browsing store exists» belongs to the
+    /// future actor commit and needs its own scoped seam.
+    #[cfg(test)]
+    full_validations: std::cell::Cell<u64>,
+}
+
+/// One cached whole-authority validation, valid only while the connection still sees the same
+/// database state that produced it.
+///
+/// The key is the whole tuple. `data_version` alone is not enough (it does not move for this
+/// connection's own writes, which is why the concrete writers revoke explicitly), and
+/// mode/generation alone are not enough (the accepted corruption tests mutate rows without
+/// bumping the generation).
+struct MembershipCacheEntry {
+    scan_id: i64,
+    mode: MembershipMode,
+    generation: i64,
+    data_version: i64,
+    /// Either the completed integrity result, or a deterministic refusal — a verdict that is a
+    /// pure function of the database state this key pins. Transient failures never land here.
+    outcome: std::result::Result<AuthorityIntegrity, MembershipMiss>,
 }
 
 /// Process role. `false` — operator (may write), `true` — observer.
@@ -694,6 +731,43 @@ fn record_scan_reclaim(tx: &Connection, scan_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Closes the identity bracket around `Connection::open*` and returns what the store retains.
+///
+/// `before` is the probe taken immediately before the open. A writable open may legitimately
+/// have created the file, so `require_before` is false there and `None` is accepted; a
+/// read-only open of an existing database requires both halves. If both exist and disagree, the
+/// path was replaced across the open itself and the store refuses rather than binding to
+/// whichever inode SQLite happened to get.
+///
+/// What this does NOT prove, stated here rather than discovered later: it brackets the open
+/// with two probes of the PATH. `rusqlite::Connection` exposes no portable OS descriptor at
+/// this version, and reading SQLite's private `unixFile` layout to find one would be
+/// VFS-dependent unsafe code, so nothing here identifies the inode SQLite itself opened. An
+/// adversarial replace-and-restore between the two probes is not detected. Ordinary
+/// replacement — the case an operator actually hits — is.
+fn settled_identity(
+    db_path: &Path,
+    before: Option<crate::paths::PathIdentity>,
+    require_before: bool,
+) -> Result<Option<(PathBuf, crate::paths::PathIdentity)>> {
+    if require_before && before.is_none() {
+        return Err(AppError::msg(format!(
+            "dedcom.db could not be identified before opening it: {}",
+            crate::textsan::terminal(&db_path.display().to_string())
+        )));
+    }
+    let after = crate::paths::probe_existing_db_file(db_path)?;
+    if let Some(before) = before {
+        if before != after {
+            return Err(AppError::msg(format!(
+                "dedcom.db was replaced while it was being opened: {}. Try again.",
+                crate::textsan::terminal(&db_path.display().to_string())
+            )));
+        }
+    }
+    Ok(Some((db_path.to_path_buf(), after)))
+}
+
 /// Runs the one set-based propagation statement on an open transaction and returns the rows it
 /// filled in. One statement per call — never a loop over aliases.
 fn propagate_trusted_digests(tx: &Connection, scan_id: i64) -> Result<u64> {
@@ -703,12 +777,23 @@ fn propagate_trusted_digests(tx: &Connection, scan_id: i64) -> Result<u64> {
 
 impl ScanStore {
     fn new(conn: Connection) -> Self {
+        Self::with_identity(conn, None)
+    }
+
+    fn with_identity(
+        conn: Connection,
+        db_identity: Option<(PathBuf, crate::paths::PathIdentity)>,
+    ) -> Self {
         Self {
             conn,
+            db_identity,
+            membership_cache: std::cell::RefCell::new(None),
             #[cfg(test)]
             propagations: std::cell::Cell::new(0),
             #[cfg(test)]
             membership_statements: std::cell::Cell::new(0),
+            #[cfg(test)]
+            full_validations: std::cell::Cell::new(0),
         }
     }
 
@@ -716,6 +801,45 @@ impl ScanStore {
     #[cfg(test)]
     pub fn propagation_statements(&self) -> u64 {
         self.propagations.get()
+    }
+
+    /// Test-only: full whole-authority validations this store has run (see the field).
+    #[cfg(test)]
+    pub fn full_validation_count(&self) -> u64 {
+        self.full_validations.get()
+    }
+
+    /// Test-only: edit the tables directly, the way an outside process or a hand edit would,
+    /// and drop the cached verdict because this bypassed every legitimate writer.
+    ///
+    /// A corruption fixture is simulating something that did NOT come through a store method,
+    /// so it also misses the revocation those methods perform — and `PRAGMA data_version` never
+    /// moves for a connection's own commit, so nothing else would notice either. Making that
+    /// explicit here keeps every corruption test honest about which mechanism it is exercising:
+    /// the validator, not the cache. Production has no such path — every membership write in the
+    /// binary goes through one of the revoking methods.
+    #[cfg(test)]
+    pub(crate) fn corrupt_directly<P: rusqlite::Params>(&self, sql: &str, params: P) -> usize {
+        let changed = self.conn.execute(sql, params).expect("corruption fixture");
+        self.revoke_membership_cache();
+        changed
+    }
+
+    /// Drops the cached whole-authority result.
+    ///
+    /// Called by the concrete writers that mutate membership state, immediately BEFORE their
+    /// own transaction begins — never after the commit. A connection's own commit does not move
+    /// its `data_version`, so the token cannot see these writes at all; and revoking first means
+    /// a failed or rolled-back write leaves the cache empty rather than stale. The cost of
+    /// revoking too early is one extra validation; the cost of revoking too late is a trusted
+    /// answer that is false.
+    ///
+    /// Deliberately NOT called from `ensure_materialized`, `prepare_completed_scans` or
+    /// `prepare_legacy_for_viewing`: those usually only read or return at once, and revoking on
+    /// their entry would turn ordinary browsing into false misses. Their real write paths reach
+    /// one of the concrete hooks instead.
+    fn revoke_membership_cache(&self) {
+        *self.membership_cache.borrow_mut() = None;
     }
 
     /// Test-only: apply-lease statements issued so far (see the field).
@@ -738,6 +862,8 @@ impl ScanStore {
     /// `PRAGMA query_only`, so SQLite itself rejects any write. Deliberately does none of the
     /// operator's setup: no WAL flip, no migration, no chmod — all of them write.
     pub fn open_read_only(db_path: &Path) -> Result<Self> {
+        // The opening half of the bracket around `Connection::open*` — see `settled_identity`.
+        let before = crate::paths::probe_existing_db_file(db_path).ok();
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(db_path, flags).map_err(|err| {
             AppError::msg(format!(
@@ -753,7 +879,10 @@ impl ScanStore {
         // Migrating needs a writer, so an out-of-date DB is reported here rather than as a
         // «no such column» from some query later on.
         schema::ensure_migrated(&conn)?;
-        Ok(Self::new(conn))
+        // The closing half of the bracket: an existing file must still be the same file. An
+        // observer never creates one, so both probes are required here.
+        let identity = settled_identity(db_path, before, true)?;
+        Ok(Self::with_identity(conn, identity))
     }
 
     /// Opens (creates) the DB, enables WAL, applies the schema.
@@ -767,6 +896,10 @@ impl ScanStore {
         // Refuse if the DB file is a symlink (opening by the link would write the target outside
         // the state-dir), and create with 0600. O_NOFOLLOW on the final component.
         crate::paths::prepare_db_file(db_path)?;
+        // The opening half of the bracket. `prepare_db_file` has just created the file when it
+        // was absent, so a `None` here means the probe itself could not run — the closing half
+        // still requires a regular file.
+        let before = crate::paths::probe_existing_db_file(db_path).ok();
         let conn = Connection::open(db_path)?;
         // First, and before the refusal below: the declared relationships are only worth what this
         // connection enforces, and the pragma is connection state — nothing is written, so a DB
@@ -783,7 +916,11 @@ impl ScanStore {
         // 0600 on the DB file and WAL/SHM (created by enabling WAL above): the contents — the paths of all
         // pool files — are for the owner only (errors are propagated, not best-effort).
         crate::paths::enforce_db_perms_0600(db_path)?;
-        Ok(Self::new(conn))
+        // The closing half of the bracket. A writable open may legitimately have created the
+        // file, so a missing «before» is allowed — but after the open the path must name a
+        // regular file, and if it named one before it must name the SAME one.
+        let identity = settled_identity(db_path, before, false)?;
+        Ok(Self::with_identity(conn, identity))
     }
 
     /// Opens an in-memory DB — for unit tests.
@@ -1063,6 +1200,7 @@ impl ScanStore {
     /// no longer exists, and a delete whose meaning lives only in a cascade is a delete no reader
     /// of this function can check.
     pub fn purge_scan(&mut self, scan_id: i64) -> Result<()> {
+        self.revoke_membership_cache();
         let tx = self.conn.transaction()?;
         for table in [
             "scan_stats",
@@ -1220,6 +1358,9 @@ impl ScanStore {
     /// re-walking. Idempotent: a scan whose roots are already registered keeps their rows, and
     /// their generations have just been zeroed anyway.
     pub fn clear_files(&mut self, scan_id: i64) -> Result<()> {
+        // Membership is about to change; this connection's own write is invisible to the token,
+        // so the verdict is dropped BEFORE the attempt and never restored by it.
+        self.revoke_membership_cache();
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM file WHERE scan_id = ?1", params![scan_id])?;
         delete_ledger_tx(&tx, scan_id, &ClearScope::WholeScan)?;
@@ -1260,6 +1401,7 @@ impl ScanStore {
 
     /// Batch-adds files to the manifest (walk phase). hash = NULL.
     pub fn record_files(&mut self, scan_id: i64, files: &[ManifestRow]) -> Result<()> {
+        self.revoke_membership_cache();
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
@@ -1305,6 +1447,7 @@ impl ScanStore {
     /// path/size/mtime/device/inode, there is no point duplicating them (scan.db does not bloat).
     /// The table is kept defined for compatibility; we clean up legacy rows.
     pub fn record_file_results(&mut self, scan_id: i64, groups: &[DuplicateGroup]) -> Result<()> {
+        self.revoke_membership_cache();
         // Every figure first, before anything is written: an allocation nobody can measure has to
         // stop the whole result, not half of it. Groups of fewer than two allocations are not
         // duplicates of anything and never reach a row — the same rule the SQL path applies with
@@ -1377,6 +1520,7 @@ impl ScanStore {
     /// `lower(hex(hash))` (string order == BLOB order). `MIN(size)` — within a group the size is
     /// single (identical content). NOT the write path (apply/revalidate).
     pub fn materialize_file_groups(&mut self, scan_id: i64) -> Result<()> {
+        self.revoke_membership_cache();
         let tx = self.conn.transaction()?;
         // Before any row: nothing about this scan's allocations may be in doubt.
         refuse_untrustworthy_group_objects(&tx, scan_id)?;
@@ -1756,6 +1900,7 @@ impl ScanStore {
     /// setting hashes by path (move semantics, version=0 → not a source of inheritance).
     #[cfg(test)]
     pub fn record_hashes(&mut self, scan_id: i64, hashes: &[(PathBuf, [u8; 32])]) -> Result<()> {
+        self.revoke_membership_cache();
         let tx = self.conn.transaction()?;
         {
             let mut stmt =
@@ -1781,6 +1926,9 @@ impl ScanStore {
         scan_id: i64,
         rows: &[(ManifestRow, [u8; 32])],
     ) -> Result<PersistedHashes> {
+        // Before the counter is borrowed: revocation needs `&mut self`, and the borrow below
+        // holds a shared reference for the rest of the call.
+        self.revoke_membership_cache();
         // Borrowed before the transaction takes `conn`: disjoint fields, so the counter stays
         // reachable while the transaction is open.
         #[cfg(test)]
@@ -1839,6 +1987,7 @@ impl ScanStore {
     /// that inherited from different past scans cannot both be right, and picking by row order
     /// would be choosing a random answer to a data-safety question.
     pub fn propagate_inherited_hashes(&mut self, scan_id: i64) -> Result<u64> {
+        self.revoke_membership_cache();
         #[cfg(test)]
         let counter = &self.propagations;
         let tx = self.conn.transaction()?;
@@ -2435,6 +2584,7 @@ impl ScanStore {
     /// object's still-null pathnames — and more than one distinct digest among them is an
     /// unanswerable question, not a value to pick.
     pub fn inherit_hashes(&mut self, scan_id: i64) -> Result<u64> {
+        self.revoke_membership_cache();
         let tx = self.conn.transaction()?;
         let conflicts = conflicting_inheritance_objects(&tx, scan_id)?;
         if conflicts > 0 {
@@ -3749,6 +3899,13 @@ pub enum MembershipMiss {
     Inconsistent {
         detail: String,
     },
+    /// The database file at this store's configured path is no longer the one it opened, so the
+    /// connection is reading an orphaned inode. Only a fresh verified open recovers; this is
+    /// deliberately not an `Inconsistent`, because nothing about the membership rows is wrong —
+    /// they simply belong to a database nobody is looking at any more.
+    ReopenRequired {
+        detail: String,
+    },
     /// The database read itself failed.
     Store {
         detail: String,
@@ -4227,7 +4384,15 @@ impl ScanStore {
         scan_id: i64,
     ) -> std::result::Result<MembershipSnapshot<'_>, MembershipMiss> {
         use rusqlite::OptionalExtension;
+        // Before the token, before the cache, before any membership row: is the path still the
+        // file this connection opened? A replaced checkpoint leaves the old inode alive behind
+        // our own descriptor, so answering from it would be a confident report about a database
+        // that no longer exists at that path. A mismatch drops the cache AND refuses.
+        self.ensure_db_identity()?;
         let tx = self.conn.unchecked_transaction()?;
+        // Read inside the transaction, so the token and every row below describe ONE database
+        // state rather than a check-then-read pair.
+        let data_version: i64 = tx.query_row("PRAGMA data_version", [], |row| row.get(0))?;
         let exists: i64 = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM scan WHERE id = ?1)",
             params![scan_id],
@@ -4248,11 +4413,26 @@ impl ScanStore {
             Some((mode_value, generation_value)) => decode_authority(mode_value, generation_value)
                 .map_err(|detail| MembershipMiss::Inconsistent { detail })?,
         };
-        // ONE whole-authority integrity result, computed here, under this transaction, and
-        // shared by every trusted method. Nothing below re-derives a subset of it: a page, a
-        // reverse lookup or a membership test that validated only what it happened to read is
-        // exactly how corruption outside the read escapes.
-        let integrity = validate_authority(&tx, scan_id, mode, generation)?;
+        // ONE whole-authority integrity result, shared by every trusted method. Nothing below
+        // re-derives a subset of it: a page, a reverse lookup or a membership test that
+        // validated only what it happened to read is exactly how corruption outside the read
+        // escapes. Recomputed only when this connection's key changed — the transaction itself
+        // is always fresh and short, and only the VERDICT is reused.
+        let integrity = match self.cached_integrity(scan_id, mode, generation, data_version) {
+            Some(cached) => cached?,
+            None => {
+                // Counted only when there is something to validate: `validate_authority`
+                // returns at once for an Unknown authority, so counting that would report work
+                // nobody did.
+                #[cfg(test)]
+                if mode != MembershipMode::Unknown {
+                    self.full_validations.set(self.full_validations.get() + 1);
+                }
+                let outcome = validate_authority(&tx, scan_id, mode, generation);
+                self.remember_integrity(scan_id, mode, generation, data_version, &outcome);
+                outcome?
+            }
+        };
         Ok(MembershipSnapshot {
             tx,
             scan_id,
@@ -4260,6 +4440,79 @@ impl ScanStore {
             generation,
             integrity,
         })
+    }
+
+    /// Refuses when the configured path no longer names the file this store opened. In-memory
+    /// stores have no path and are exempt. The cache is dropped on the way out, so a later
+    /// verified reopen cannot inherit a verdict computed against the previous file.
+    fn ensure_db_identity(&self) -> std::result::Result<(), MembershipMiss> {
+        let Some((path, opened_as)) = self.db_identity.as_ref() else {
+            return Ok(());
+        };
+        let refusal = |detail: String| MembershipMiss::ReopenRequired { detail };
+        match crate::paths::probe_existing_db_file(path) {
+            Ok(now) if now == *opened_as => Ok(()),
+            Ok(_) => {
+                self.revoke_membership_cache();
+                Err(refusal(format!(
+                    "dedcom.db at {} is no longer the file this connection opened",
+                    crate::textsan::terminal(&path.display().to_string())
+                )))
+            }
+            Err(err) => {
+                self.revoke_membership_cache();
+                Err(refusal(format!(
+                    "dedcom.db at {} can no longer be identified: {err}",
+                    crate::textsan::terminal(&path.display().to_string())
+                )))
+            }
+        }
+    }
+
+    /// The cached verdict, if it was computed for exactly this key on this connection.
+    fn cached_integrity(
+        &self,
+        scan_id: i64,
+        mode: MembershipMode,
+        generation: i64,
+        data_version: i64,
+    ) -> Option<std::result::Result<AuthorityIntegrity, MembershipMiss>> {
+        let slot = self.membership_cache.borrow();
+        let entry = slot.as_ref()?;
+        (entry.scan_id == scan_id
+            && entry.mode == mode
+            && entry.generation == generation
+            && entry.data_version == data_version)
+            .then(|| entry.outcome.clone())
+    }
+
+    /// Stores a completed verdict. Only two kinds are cacheable: a finished integrity result,
+    /// and a deterministic `Inconsistent` — a pure function of the state this key pins. A
+    /// transient `Store` failure is a reason to retry, never a verdict, and `Unknown` is the
+    /// absence of authority rather than a validation at all (it costs nothing to recompute).
+    fn remember_integrity(
+        &self,
+        scan_id: i64,
+        mode: MembershipMode,
+        generation: i64,
+        data_version: i64,
+        outcome: &std::result::Result<AuthorityIntegrity, MembershipMiss>,
+    ) {
+        let cacheable = match outcome {
+            Ok(_) => mode != MembershipMode::Unknown,
+            Err(MembershipMiss::Inconsistent { .. }) => true,
+            Err(_) => false,
+        };
+        if !cacheable {
+            return;
+        }
+        *self.membership_cache.borrow_mut() = Some(MembershipCacheEntry {
+            scan_id,
+            mode,
+            generation,
+            data_version,
+            outcome: outcome.clone(),
+        });
     }
 
     /// Opens the checkpoint for the destructive apply lease — and does nothing else. The path
@@ -4415,6 +4668,7 @@ impl ScanStore {
     #[allow(dead_code)] // R4B-2 repoints both production publication call sites here.
     pub fn publish_results(&mut self, scan_id: i64, mode: PublishMode<'_>) -> Result<i64> {
         use rusqlite::OptionalExtension;
+        self.revoke_membership_cache();
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -4618,6 +4872,7 @@ fn describe_miss(miss: &MembershipMiss) -> String {
             format!("the plan carries generation {expected}, the database {found}")
         }
         MembershipMiss::Inconsistent { detail } => detail.clone(),
+        MembershipMiss::ReopenRequired { detail } => detail.clone(),
         MembershipMiss::Store { detail } => detail.clone(),
     }
 }
@@ -14779,13 +15034,10 @@ mod membership_staging_tests {
         };
 
         // The summary now claims three members while the membership still holds two.
-        store
-            .conn
-            .execute(
-                "UPDATE file_group SET file_count = 3 WHERE scan_id = ?1 AND rank = 0",
-                params![scan_id],
-            )
-            .unwrap();
+        store.corrupt_directly(
+            "UPDATE file_group SET file_count = 3 WHERE scan_id = ?1 AND rank = 0",
+            params![scan_id],
+        );
 
         let snapshot = store.membership_snapshot(scan_id).unwrap();
         let summaries = snapshot.summaries().unwrap();
@@ -15843,14 +16095,11 @@ mod membership_staging_tests {
     /// Moves one member row to another generation without touching the authority — the shape
     /// a partially-applied republication or a hand edit leaves behind.
     fn corrupt_member_generation(store: &ScanStore, scan_id: i64, path: &Path) {
-        let changed = store
-            .conn
-            .execute(
-                "UPDATE file_group_member SET generation = generation + 98
-                  WHERE scan_id = ?1 AND path = ?2",
-                params![scan_id, path.to_string_lossy()],
-            )
-            .unwrap();
+        let changed = store.corrupt_directly(
+            "UPDATE file_group_member SET generation = generation + 98
+              WHERE scan_id = ?1 AND path = ?2",
+            params![scan_id, path.to_string_lossy()],
+        );
         assert_eq!(changed, 1, "the fixture must really corrupt one member row");
     }
 
@@ -16408,6 +16657,7 @@ mod membership_staging_tests {
                 params![scan_id],
             )
             .unwrap();
+        store.revoke_membership_cache(); // the INSERT above bypassed every legitimate writer
         match store.membership_snapshot(scan_id) {
             Err(MembershipMiss::Inconsistent { detail }) => {
                 assert!(detail.contains("two group summaries"), "{detail}")
@@ -16497,13 +16747,10 @@ mod membership_staging_tests {
                 "the control lease succeeds before the mutation ({label})"
             );
 
-            store
-                .conn
-                .execute(
-                    "UPDATE file SET hash = ?3 WHERE scan_id = ?1 AND path = ?2",
-                    params![scan_id, paths[1].to_string_lossy(), forged],
-                )
-                .unwrap();
+            store.corrupt_directly(
+                "UPDATE file SET hash = ?3 WHERE scan_id = ?1 AND path = ?2",
+                params![scan_id, paths[1].to_string_lossy(), forged],
+            );
             let (class, length): (String, Option<i64>) = store
                 .conn
                 .query_row(
@@ -16541,6 +16788,427 @@ mod membership_staging_tests {
         }
     }
 
+    // --- R4B-CACHE-1: the connection-local validation cache and path-identity refusal ---
+
+    /// A file-backed published Explicit scan: the cache and the path-identity check both need a
+    /// real file, which `open_in_memory` has no way to provide.
+    fn published_on_disk(tag: &str) -> (PathBuf, PathBuf, ScanStore, i64, Vec<PathBuf>) {
+        let dir = temp_dir(tag);
+        let db_path = dir.join("dedcom.db");
+        let digest = [5u8; 32];
+        let paths: Vec<PathBuf> = (0..2)
+            .map(|i| write(&dir, &format!("f{i}.bin"), b"identical"))
+            .collect();
+        let mut store = ScanStore::open_writable(&db_path).unwrap();
+        let files: Vec<(PathBuf, [u8; 32])> = paths.iter().map(|p| (p.clone(), digest)).collect();
+        let scan_id = seed(&mut store, &dir, &files);
+        let verified =
+            crate::pipeline::verify::verify_groups(store.duplicate_groups(scan_id).unwrap())
+                .unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .unwrap();
+        (dir, db_path, store, scan_id, paths)
+    }
+
+    /// Takes and drops one snapshot, returning whether it was trusted.
+    fn snap_ok(store: &ScanStore, scan_id: i64) -> bool {
+        store.membership_snapshot(scan_id).is_ok()
+    }
+
+    /// Evidence 1 and 5: an unchanged store validates once however many snapshots are taken,
+    /// and an ordinary `file_mark` write on that same store — which cannot change membership —
+    /// does not cost a revalidation.
+    #[test]
+    fn an_unchanged_store_validates_once_and_marks_do_not_revalidate() {
+        let _guard = role_guard();
+        let (dir, _db, mut store, scan_id, paths) = published_on_disk("cache_once");
+        for _ in 0..8 {
+            assert!(snap_ok(&store, scan_id));
+        }
+        assert_eq!(
+            store.full_validation_count(),
+            1,
+            "one epoch, one full validation"
+        );
+
+        let mut marked = store
+            .group_files(
+                scan_id,
+                &[5u8; 32].iter().fold(String::new(), |mut acc, b| {
+                    use std::fmt::Write;
+                    let _ = write!(acc, "{b:02x}");
+                    acc
+                }),
+            )
+            .unwrap();
+        assert_eq!(marked.len(), 2, "the fixture's group is readable");
+        marked[0].is_keeper = true;
+        store.save_marks(scan_id, marked.iter()).unwrap();
+        assert!(snap_ok(&store, scan_id));
+        assert_eq!(
+            store.full_validation_count(),
+            1,
+            "a mark is intent, not membership — no revalidation"
+        );
+        assert!(paths.len() == 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Evidence 2: a second connection changing the manifest digest, a member row, a summary or
+    /// the authority is seen by the token, so the next request cannot reuse the old trust.
+    #[test]
+    fn a_second_connection_write_forces_revalidation() {
+        for (label, sql) in [
+            (
+                "manifest digest",
+                "UPDATE file SET hash = X'0102' WHERE scan_id = ?1",
+            ),
+            (
+                "member row",
+                "UPDATE file_group_member SET generation = 9 WHERE scan_id = ?1",
+            ),
+            (
+                "summary",
+                "UPDATE file_group SET file_count = 9 WHERE scan_id = ?1",
+            ),
+            (
+                "authority",
+                "UPDATE scan_membership SET generation = 9 WHERE scan_id = ?1",
+            ),
+        ] {
+            let _guard = role_guard();
+            let (dir, db, store, scan_id, _paths) =
+                published_on_disk(&format!("cache_ext_{}", label.replace(' ', "_")));
+            assert!(snap_ok(&store, scan_id));
+            assert_eq!(store.full_validation_count(), 1);
+            {
+                let other = ScanStore::open_writable(&db).unwrap();
+                other
+                    .conn
+                    .execute_batch("PRAGMA ignore_check_constraints=1;")
+                    .unwrap();
+                other.conn.execute(sql, params![scan_id]).unwrap();
+            }
+            let _ = store.membership_snapshot(scan_id);
+            assert_eq!(
+                store.full_validation_count(),
+                2,
+                "an external {label} change must not reuse the old verdict"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Evidence 3: the concrete same-store membership writers revoke before their own write —
+    /// the token cannot see them, so nothing else would.
+    #[test]
+    fn same_store_membership_writers_revoke_before_writing() {
+        let _guard = role_guard();
+        let (dir, _db, mut store, scan_id, _paths) = published_on_disk("cache_writers");
+        assert!(snap_ok(&store, scan_id));
+        assert_eq!(store.full_validation_count(), 1);
+
+        // Each writer is checked twice: the slot is empty the instant it returns (the
+        // revocation happened before its write, not after its commit), and the next snapshot
+        // really re-runs the validator.
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        assert!(
+            store.membership_cache.borrow().is_none(),
+            "publication revoked"
+        );
+        assert!(snap_ok(&store, scan_id));
+        assert_eq!(store.full_validation_count(), 2);
+
+        store.materialize_file_groups(scan_id).unwrap();
+        assert!(
+            store.membership_cache.borrow().is_none(),
+            "materialization revoked"
+        );
+        assert!(snap_ok(&store, scan_id));
+        assert_eq!(store.full_validation_count(), 3);
+
+        // `clear_files` takes the authority with the manifest, so the scan reads Unknown
+        // afterwards — the point here is that the slot is empty before that write lands.
+        store.clear_files(scan_id).unwrap();
+        assert!(
+            store.membership_cache.borrow().is_none(),
+            "clear_files revoked"
+        );
+        assert!(matches!(
+            store.membership_snapshot(scan_id).map(|s| s.mode()),
+            Ok(MembershipMode::Unknown)
+        ));
+        assert_eq!(
+            store.full_validation_count(),
+            3,
+            "an authority that no longer exists validates nothing"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Evidence 4: revocation happens before the attempt, so a write that fails mid-transaction
+    /// and rolls back cannot leave the previous verdict standing.
+    #[test]
+    fn a_rolled_back_write_does_not_resurrect_the_cache() {
+        let _guard = role_guard();
+        let (dir, _db, mut store, scan_id, _paths) = published_on_disk("cache_rollback");
+        assert!(snap_ok(&store, scan_id));
+        assert_eq!(store.full_validation_count(), 1);
+
+        let fault = ClearFault::armed();
+        assert!(
+            store.clear_files(scan_id).is_err(),
+            "the injected fault fails the write"
+        );
+        assert!(fault.fired(), "the seam was actually reached");
+        drop(fault);
+        // The rows are back (rollback), and the verdict is not.
+        assert!(snap_ok(&store, scan_id), "the rollback restored the rows");
+        assert_eq!(
+            store.full_validation_count(),
+            2,
+            "the cache was revoked before the attempt and never restored by it"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Evidence 6 and 7: replacing, removing, symlinking or retyping the database path makes the
+    /// old connection refuse with the typed reopen-required miss even though its cache was hot —
+    /// it must never answer from the orphaned inode — and a verified reopen recovers with
+    /// exactly one validation.
+    #[test]
+    fn a_replaced_database_path_refuses_until_a_verified_reopen() {
+        for label in ["replaced", "removed", "symlinked", "directory"] {
+            let _guard = role_guard();
+            let (dir, db, store, scan_id, _paths) = published_on_disk(&format!("cache_id_{label}"));
+            assert!(snap_ok(&store, scan_id), "hot cache first");
+            assert_eq!(store.full_validation_count(), 1);
+
+            let spare = dir.join("spare.db");
+            std::fs::copy(&db, &spare).unwrap();
+            std::fs::remove_file(&db).unwrap();
+            match label {
+                "replaced" => std::fs::rename(&spare, &db).unwrap(),
+                "removed" => {}
+                "symlinked" => std::os::unix::fs::symlink(&spare, &db).unwrap(),
+                "directory" => std::fs::create_dir(&db).unwrap(),
+                other => panic!("unlisted case {other}"),
+            }
+
+            match store.membership_snapshot(scan_id) {
+                Err(MembershipMiss::ReopenRequired { .. }) => {}
+                Err(other) => panic!("expected ReopenRequired, got {other:?} ({label})"),
+                Ok(_) => panic!("the orphaned connection must not answer ({label})"),
+            }
+            assert_eq!(
+                store.full_validation_count(),
+                1,
+                "the refusal happens before any membership read ({label})"
+            );
+            drop(store);
+
+            if label == "replaced" {
+                let reopened = ScanStore::open_writable(&db).unwrap();
+                assert!(snap_ok(&reopened, scan_id), "a verified reopen recovers");
+                assert_eq!(
+                    reopened.full_validation_count(),
+                    1,
+                    "and pays exactly one validation"
+                );
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Evidence 8, 9 and 10: `Unknown` is never cached as authority, a deterministic
+    /// inconsistency is, a transient store failure is not, and a cache entry is bound to its own
+    /// scan id.
+    #[test]
+    fn only_deterministic_verdicts_are_cached() {
+        let _guard = role_guard();
+        let (dir, _db, mut store, scan_id, _paths) = published_on_disk("cache_policy");
+
+        // Unknown: a scan with no authority row. Every request re-asks; nothing is promoted.
+        let other_scan = seed(&mut store, &dir, &[]);
+        for _ in 0..3 {
+            assert!(matches!(
+                store.membership_snapshot(other_scan).map(|s| s.mode()),
+                Ok(MembershipMode::Unknown)
+            ));
+        }
+        assert_eq!(
+            store.full_validation_count(),
+            0,
+            "Unknown validates nothing and caches nothing"
+        );
+
+        // A deterministic inconsistency IS cached: the second request reuses the refusal. A
+        // domain violation is used rather than a count disagreement, because the latter is
+        // reported by identity instead of refusing the snapshot.
+        store.corrupt_directly(
+            "UPDATE file_group SET reclaim_state = 99 WHERE scan_id = ?1",
+            params![scan_id],
+        );
+        assert!(matches!(
+            store.membership_snapshot(scan_id),
+            Err(MembershipMiss::Inconsistent { .. })
+        ));
+        let after_first = store.full_validation_count();
+        assert!(matches!(
+            store.membership_snapshot(scan_id),
+            Err(MembershipMiss::Inconsistent { .. })
+        ));
+        assert_eq!(
+            store.full_validation_count(),
+            after_first,
+            "a deterministic refusal is a verdict, not a retry"
+        );
+
+        // The policy itself, stated where a caller can see it: a transient store failure and an
+        // Unknown result never become entries, whatever the key.
+        let integrity = AuthorityIntegrity::default();
+        store.revoke_membership_cache();
+        store.remember_integrity(
+            scan_id,
+            MembershipMode::Explicit,
+            1,
+            7,
+            &Err(MembershipMiss::Store {
+                detail: "disk hiccup".into(),
+            }),
+        );
+        assert!(
+            store.membership_cache.borrow().is_none(),
+            "a transient failure is retried, never cached"
+        );
+        store.remember_integrity(scan_id, MembershipMode::Unknown, 0, 7, &Ok(integrity));
+        assert!(
+            store.membership_cache.borrow().is_none(),
+            "Unknown is the absence of authority, not a cached authority"
+        );
+
+        // And an entry never answers for another scan id.
+        store.revoke_membership_cache();
+        assert!(store
+            .cached_integrity(scan_id, MembershipMode::Explicit, 1, 7)
+            .is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Evidence 11: a writer landing while a snapshot is open cannot produce a mixed answer —
+    /// the snapshot's own transaction pins one database state, and the NEXT snapshot sees the
+    /// change because the token moved.
+    #[test]
+    fn a_writer_mid_snapshot_cannot_mix_states() {
+        let _guard = role_guard();
+        let (dir, db, store, scan_id, _paths) = published_on_disk("cache_seam");
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        assert!(
+            snapshot.summaries().unwrap().inconsistent.is_empty(),
+            "the control: this state is consistent"
+        );
+        // A second connection makes the summary disagree with its membership WHILE the snapshot
+        // is open.
+        {
+            let other = ScanStore::open_writable(&db).unwrap();
+            other
+                .conn
+                .execute(
+                    "UPDATE file_group SET file_count = 9 WHERE scan_id = ?1 AND rank = 0",
+                    params![scan_id],
+                )
+                .unwrap();
+        }
+        assert!(
+            snapshot.summaries().unwrap().inconsistent.is_empty(),
+            "the open snapshot answers from its own database state, never a mixture"
+        );
+        drop(snapshot);
+        // And the next request sees it, because the external commit moved the token. A count
+        // disagreement is the one contradiction the contract reports by identity instead of
+        // refusing outright, so it surfaces in `inconsistent` rather than as an error.
+        let after = store.membership_snapshot(scan_id).unwrap();
+        assert_eq!(
+            after.summaries().unwrap().inconsistent.len(),
+            1,
+            "the next snapshot names the rank the external write broke"
+        );
+        drop(after);
+        assert_eq!(
+            store.full_validation_count(),
+            2,
+            "the second request revalidated rather than reusing the first verdict"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Evidence 13: the wrapper paths that usually only read must not throw the cache away —
+    /// that was the whole point of hooking the concrete writers instead of their callers.
+    #[test]
+    fn read_only_wrappers_do_not_revoke_a_hot_cache() {
+        let _guard = role_guard();
+        let (dir, _db, mut store, scan_id, _paths) = published_on_disk("cache_wrappers");
+        assert!(snap_ok(&store, scan_id));
+        assert_eq!(store.full_validation_count(), 1);
+
+        // Already prepared: `ensure_materialized` returns at the marker.
+        store.ensure_materialized(scan_id).unwrap();
+        // Nothing pending: the loop body never runs.
+        store.prepare_completed_scans().unwrap();
+        // Already authoritative: preparation validates and no-ops.
+        store.prepare_legacy_for_viewing(scan_id).unwrap();
+
+        assert!(snap_ok(&store, scan_id));
+        assert_eq!(
+            store.full_validation_count(),
+            1,
+            "read-only wrapper paths keep the epoch"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Evidence 12: the apply lease is untouched by any of this — it opens its own connection,
+    /// spends its own statements and consults no cache.
+    #[test]
+    fn the_apply_lease_is_unaffected_by_the_cache() {
+        let _guard = role_guard();
+        let (dir, db, store, scan_id, _paths) = published_on_disk("cache_lease");
+        let witness = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            witness_of(
+                &snapshot,
+                &[GroupId {
+                    scan_id,
+                    rank: 0,
+                    generation: 1,
+                }],
+            )
+        };
+        assert_eq!(store.full_validation_count(), 1);
+        drop(store);
+
+        let mut leased = ScanStore::open_for_apply_lease(&db).unwrap();
+        let before = leased.membership_statement_count();
+        {
+            let lease = leased.acquire_membership_lease(&witness).unwrap();
+            assert_eq!(
+                lease.statements_so_far() - before,
+                4,
+                "the lease still spends its own four statements"
+            );
+        }
+        assert_eq!(
+            leased.full_validation_count(),
+            0,
+            "the lease never runs the resolver's validation"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// An explicit member whose manifest row carries a DIFFERENT digest is a foreign import.
     /// Every other structural rule still agrees — count, generation, manifest presence,
     /// non-empty path, unique rank — which is what made this shape trusted before.
@@ -16570,13 +17238,10 @@ mod membership_staging_tests {
             .unwrap();
         assert!(store.membership_snapshot(scan_id).is_ok(), "the control");
 
-        let moved = store
-            .conn
-            .execute(
-                "UPDATE file_group_member SET path = ?2 WHERE scan_id = ?1 AND path = ?3",
-                params![scan_id, outsider.to_string_lossy(), a2.to_string_lossy()],
-            )
-            .unwrap();
+        let moved = store.corrupt_directly(
+            "UPDATE file_group_member SET path = ?2 WHERE scan_id = ?1 AND path = ?3",
+            params![scan_id, outsider.to_string_lossy(), a2.to_string_lossy()],
+        );
         assert_eq!(moved, 1, "one member row was redirected");
         let backed: i64 = store
             .conn

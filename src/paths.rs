@@ -205,6 +205,29 @@ pub fn enforce_db_perms_0600(db_path: &Path) -> io::Result<()> {
 /// Staged by R4B-1; `ScanStore::open_for_apply_lease` is its only caller until R4B-2 wires the
 /// worker route.
 pub fn verify_existing_db_file(db_path: &Path) -> io::Result<()> {
+    probe_existing_db_file(db_path).map(|_| ())
+}
+
+/// Which file the database path names right now — `(st_dev, st_ino)` of the regular file behind
+/// it, read through the same no-follow descriptor the verifier above uses and returned instead
+/// of discarded.
+///
+/// The pair is what lets a store notice that the file at its configured path is no longer the
+/// one it opened: a replaced checkpoint (`unlink` + `rename`, or a restored backup) keeps the
+/// old inode alive behind the connection's own descriptor, so the path is the only thing that
+/// can still be compared.
+///
+/// **This is a probe of the PATH, not of SQLite's descriptor.** `rusqlite::Connection` exposes
+/// no portable OS descriptor at this version, and reaching SQLite's private `unixFile` layout to
+/// find one would be VFS- and layout-dependent unsafe code. So this proves what the path names
+/// before and after an open, never which inode SQLite itself holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+pub fn probe_existing_db_file(db_path: &Path) -> io::Result<PathIdentity> {
     let c = cstring(db_path)?;
     let fd = unsafe {
         libc::open(
@@ -237,7 +260,10 @@ pub fn verify_existing_db_file(db_path: &Path) -> io::Result<()> {
             ),
         ));
     }
-    Ok(())
+    Ok(PathIdentity {
+        device: st.st_dev as u64,
+        inode: st.st_ino as u64,
+    })
 }
 
 fn cstring(path: &Path) -> io::Result<CString> {
