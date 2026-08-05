@@ -208,19 +208,21 @@ pub fn verify_existing_db_file(db_path: &Path) -> io::Result<()> {
     probe_existing_db_file(db_path).map(|_| ())
 }
 
-/// Which file the database path names right now — `(st_dev, st_ino)` of the regular file behind
-/// it, read through the same no-follow descriptor the verifier above uses and returned instead
-/// of discarded.
+/// The regular-file identity — `(st_dev, st_ino)` — that the configured path names at the
+/// moment of one probe, read through the same no-follow descriptor the verifier above uses and
+/// returned instead of discarded.
 ///
-/// The pair is what lets a store notice that the file at its configured path is no longer the
-/// one it opened: a replaced checkpoint (`unlink` + `rename`, or a restored backup) keeps the
-/// old inode alive behind the connection's own descriptor, so the path is the only thing that
-/// can still be compared.
+/// One probe is a single observation. Its value is in comparing several: a pair taken before and
+/// after an open, or a later pair against the retained one, shows whether the path still names
+/// the same file. A changed identity — a replaced checkpoint (`unlink` + `rename`, a restored
+/// backup) — is therefore detectable, and the store's answer to it is to refuse and require a
+/// reopen.
 ///
-/// **This is a probe of the PATH, not of SQLite's descriptor.** `rusqlite::Connection` exposes
-/// no portable OS descriptor at this version, and reaching SQLite's private `unixFile` layout to
-/// find one would be VFS- and layout-dependent unsafe code. So this proves what the path names
-/// before and after an open, never which inode SQLite itself holds.
+/// **What this does not establish.** It says nothing about which inode SQLite's own private
+/// descriptor holds: `rusqlite::Connection` exposes no portable OS descriptor at this version,
+/// and reaching SQLite's internal `unixFile` layout to find one would be VFS- and
+/// layout-dependent unsafe code. It is an observation of the path, at each probe. A replacement
+/// that is undone again between two probes is likewise outside what comparing them can prove.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathIdentity {
     pub device: u64,
