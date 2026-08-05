@@ -209,10 +209,11 @@ pub struct LiveDirSignature {
 /// Checkpoint store: a SQLite DB with the scan state and the file manifest.
 pub struct ScanStore {
     conn: Connection,
-    /// The configured database path and what it named when this store opened it. `None` for an
-    /// in-memory store, which has no path to be replaced. Compared before every trusted
-    /// membership answer, so a checkpoint swapped underneath a live connection is refused
-    /// instead of answered from the orphaned inode.
+    /// The configured database path and the identity that path carried, observed immediately
+    /// around the open. Not a claim about SQLite's own descriptor — see `settled_identity`.
+    /// `None` for an in-memory store, which has no path to be replaced. Re-checked before every
+    /// trusted membership answer, so a checkpoint swapped underneath a live connection is
+    /// refused rather than answered.
     db_identity: Option<(PathBuf, crate::paths::PathIdentity)>,
     /// The one cached whole-authority validation of the active scan. A single slot, not a map:
     /// the UI activates one checkpoint at a time, so a slot cannot grow and cannot serve a
@@ -3974,10 +3975,10 @@ pub enum MembershipMiss {
     Inconsistent {
         detail: String,
     },
-    /// The database file at this store's configured path is no longer the one it opened, so the
-    /// connection is reading an orphaned inode. Only a fresh verified open recovers; this is
-    /// deliberately not an `Inconsistent`, because nothing about the membership rows is wrong —
-    /// they simply belong to a database nobody is looking at any more.
+    /// The store's configured path no longer names the file it named when the store opened it,
+    /// so no trusted answer may be given from this connection. Only a fresh verified open
+    /// recovers. Deliberately not an `Inconsistent`: nothing about the membership rows is
+    /// wrong — they simply belong to a database that is no longer at that path.
     ReopenRequired {
         detail: String,
     },
@@ -4459,10 +4460,11 @@ impl ScanStore {
         scan_id: i64,
     ) -> std::result::Result<MembershipSnapshot<'_>, MembershipMiss> {
         use rusqlite::OptionalExtension;
-        // Before the token, before the cache, before any membership row: is the path still the
-        // file this connection opened? A replaced checkpoint leaves the old inode alive behind
-        // our own descriptor, so answering from it would be a confident report about a database
-        // that no longer exists at that path. A mismatch drops the cache AND refuses.
+        // Before the token, before the cache, before any membership row: does the path still
+        // name the file it named when this store opened it? A replaced checkpoint leaves the
+        // previous inode alive behind an already-open descriptor, so answering would be a
+        // confident report about a database that is no longer at that path. A mismatch drops the
+        // cache AND refuses; only a fresh verified open recovers.
         self.ensure_db_identity()?;
         let tx = self.conn.unchecked_transaction()?;
         // Read inside the transaction, so the token and every row below describe ONE database
@@ -4536,7 +4538,7 @@ impl ScanStore {
             Ok(_) => {
                 self.revoke_membership_cache();
                 Err(refusal(format!(
-                    "dedcom.db at {} is no longer the file this connection opened",
+                    "dedcom.db at {} no longer names the file it named when it was opened; reopen required",
                     crate::textsan::terminal(&path.display().to_string())
                 )))
             }
@@ -17288,7 +17290,7 @@ mod membership_staging_tests {
         drop(ScanStore::open_writable(&db_path).unwrap());
 
         // A different, deliberately untouched regular database file, with a mode no opener
-        // would leave behind and no WAL/SHM sidecars.
+        // would leave behind.
         let replacement = dir.join("other.db");
         drop(ScanStore::open_writable(&replacement).unwrap());
         for suffix in ["-wal", "-shm"] {
@@ -17296,6 +17298,23 @@ mod membership_staging_tests {
         }
         std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o640)).unwrap();
         let before_bytes = std::fs::read(&replacement).unwrap();
+
+        // SQLite names its journal companions after the pathname it was ASKED to open, not
+        // after the inode behind it. The swap replaces `dedcom.db`, so a WAL flip against the
+        // replacement would create `dedcom.db-wal`/`-shm` — checking `other.db-*` would be
+        // checking names SQLite would never write.
+        let sidecars: Vec<PathBuf> = ["-wal", "-shm"]
+            .iter()
+            .map(|suffix| PathBuf::from(format!("{}{suffix}", db_path.display())))
+            .collect();
+        for sidecar in &sidecars {
+            std::fs::remove_file(sidecar).ok();
+            assert!(
+                !sidecar.exists(),
+                "the fixture starts with no {} — otherwise the assertion below proves nothing",
+                sidecar.display()
+            );
+        }
 
         let swap_to = replacement.clone();
         let target = db_path.clone();
@@ -17326,13 +17345,20 @@ mod membership_staging_tests {
             before_bytes,
             "no migration or WAL flip wrote to the replacement"
         );
-        for suffix in ["-wal", "-shm"] {
-            let sidecar = PathBuf::from(format!("{}{suffix}", replacement.display()));
+        // The names SQLite would actually have created had the WAL flip run against the swapped
+        // path.
+        for sidecar in &sidecars {
             assert!(
                 !sidecar.exists(),
-                "no sidecar may be created for the replacement: {}",
+                "no journal companion may be created for the swapped path: {}",
                 sidecar.display()
             );
+        }
+        // Kept as a secondary check only: these names would never appear anyway, so they do not
+        // stand in for the ones above.
+        for suffix in ["-wal", "-shm"] {
+            let named_after_the_inode = PathBuf::from(format!("{}{suffix}", replacement.display()));
+            assert!(!named_after_the_inode.exists());
         }
         std::fs::remove_dir_all(&dir).ok();
     }
