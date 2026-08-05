@@ -733,39 +733,109 @@ fn record_scan_reclaim(tx: &Connection, scan_id: i64) -> Result<()> {
 
 /// Closes the identity bracket around `Connection::open*` and returns what the store retains.
 ///
-/// `before` is the probe taken immediately before the open. A writable open may legitimately
-/// have created the file, so `require_before` is false there and `None` is accepted; a
-/// read-only open of an existing database requires both halves. If both exist and disagree, the
-/// path was replaced across the open itself and the store refuses rather than binding to
-/// whichever inode SQLite happened to get.
+/// `before` is the probe taken immediately before the open; both openers now require it, so a
+/// failure there is a refusal rather than an «unknown» that weakens the comparison. If the two
+/// probes disagree, the path was replaced across the open itself and the store refuses instead
+/// of proceeding — which is why every caller runs this as its FIRST action after the open, ahead
+/// of any pragma, migration or permission work that would otherwise act on the replacement.
 ///
-/// What this does NOT prove, stated here rather than discovered later: it brackets the open
-/// with two probes of the PATH. `rusqlite::Connection` exposes no portable OS descriptor at
-/// this version, and reading SQLite's private `unixFile` layout to find one would be
-/// VFS-dependent unsafe code, so nothing here identifies the inode SQLite itself opened. An
+/// What this does NOT prove, stated here rather than discovered later: it is the identity of the
+/// PATH observed immediately around the open, not of the file SQLite itself opened.
+/// `rusqlite::Connection` exposes no portable OS descriptor at this version, and reading
+/// SQLite's private `unixFile` layout to find one would be VFS-dependent unsafe code. An
 /// adversarial replace-and-restore between the two probes is not detected. Ordinary
 /// replacement — the case an operator actually hits — is.
 fn settled_identity(
     db_path: &Path,
-    before: Option<crate::paths::PathIdentity>,
-    require_before: bool,
+    before: crate::paths::PathIdentity,
 ) -> Result<Option<(PathBuf, crate::paths::PathIdentity)>> {
-    if require_before && before.is_none() {
+    let after = crate::paths::probe_existing_db_file(db_path)?;
+    if before != after {
         return Err(AppError::msg(format!(
-            "dedcom.db could not be identified before opening it: {}",
+            "dedcom.db was replaced while it was being opened: {}. Try again.",
             crate::textsan::terminal(&db_path.display().to_string())
         )));
     }
-    let after = crate::paths::probe_existing_db_file(db_path)?;
-    if let Some(before) = before {
-        if before != after {
-            return Err(AppError::msg(format!(
-                "dedcom.db was replaced while it was being opened: {}. Try again.",
-                crate::textsan::terminal(&db_path.display().to_string())
-            )));
-        }
-    }
     Ok(Some((db_path.to_path_buf(), after)))
+}
+
+// Test-only one-shot seam at the exact instant between a successful SQLite open and the
+// closing identity probe. It exists so a test can swap the pathname there and prove that the
+// refusal happens before WAL setup, migration or `enforce_db_perms_0600` can act on the
+// replacement — a race that no sleep or second thread could pin down deterministically.
+#[cfg(test)]
+thread_local! {
+    static OPEN_RACE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms the one-shot open-race hook for this thread and disarms it on drop.
+#[cfg(test)]
+pub(crate) struct OpenRace;
+
+#[cfg(test)]
+impl OpenRace {
+    pub(crate) fn armed(action: impl FnOnce() + 'static) -> Self {
+        OPEN_RACE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(action)));
+        OpenRace
+    }
+
+    /// Whether the armed shot was consumed. A test whose seam was never reached proved nothing.
+    pub(crate) fn fired(&self) -> bool {
+        OPEN_RACE_HOOK.with(|slot| slot.borrow().is_none())
+    }
+}
+
+#[cfg(test)]
+impl Drop for OpenRace {
+    fn drop(&mut self) {
+        OPEN_RACE_HOOK.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+// Test-only one-shot fault in the full-validator path, so a transient store failure can be
+// produced deterministically — the real thing is a disk or SQLite hiccup, which no test can
+// schedule. Proves the retry contract: such a failure is never cached.
+#[cfg(test)]
+thread_local! {
+    static VALIDATOR_FAULT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms the one-shot validator fault for this thread and disarms it on drop.
+#[cfg(test)]
+pub(crate) struct ValidatorFault;
+
+#[cfg(test)]
+impl ValidatorFault {
+    pub(crate) fn armed(detail: &str) -> Self {
+        VALIDATOR_FAULT.with(|slot| *slot.borrow_mut() = Some(detail.to_string()));
+        ValidatorFault
+    }
+
+    pub(crate) fn fired(&self) -> bool {
+        VALIDATOR_FAULT.with(|slot| slot.borrow().is_none())
+    }
+}
+
+#[cfg(test)]
+impl Drop for ValidatorFault {
+    fn drop(&mut self) {
+        VALIDATOR_FAULT.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn take_validator_fault() -> Option<String> {
+    VALIDATOR_FAULT.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(test)]
+fn take_open_race_hook() {
+    let action = OPEN_RACE_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+    }
 }
 
 /// Runs the one set-based propagation statement on an open transaction and returns the rows it
@@ -809,15 +879,16 @@ impl ScanStore {
         self.full_validations.get()
     }
 
-    /// Test-only: edit the tables directly, the way an outside process or a hand edit would,
-    /// and drop the cached verdict because this bypassed every legitimate writer.
+    /// Test-only: seed a stored-corruption state by editing the tables directly, then drop the
+    /// cached verdict so the validator is the thing under test.
     ///
-    /// A corruption fixture is simulating something that did NOT come through a store method,
-    /// so it also misses the revocation those methods perform — and `PRAGMA data_version` never
-    /// moves for a connection's own commit, so nothing else would notice either. Making that
-    /// explicit here keeps every corruption test honest about which mechanism it is exercising:
-    /// the validator, not the cache. Production has no such path — every membership write in the
-    /// binary goes through one of the revoking methods.
+    /// This is NOT a simulation of an outside process, and it does not exercise any
+    /// invalidation mechanism: the statement runs on THIS connection, which is exactly why
+    /// `PRAGMA data_version` would not move for it and why the revocation has to be explicit
+    /// here. Its only job is to put already-corrupt rows in front of the validator. Invalidation
+    /// by a second connection is proved separately, by the `data_version` test. Production has
+    /// no equivalent path — every membership write in the binary goes through one of the
+    /// revoking methods.
     #[cfg(test)]
     pub(crate) fn corrupt_directly<P: rusqlite::Params>(&self, sql: &str, params: P) -> usize {
         let changed = self.conn.execute(sql, params).expect("corruption fixture");
@@ -862,8 +933,10 @@ impl ScanStore {
     /// `PRAGMA query_only`, so SQLite itself rejects any write. Deliberately does none of the
     /// operator's setup: no WAL flip, no migration, no chmod — all of them write.
     pub fn open_read_only(db_path: &Path) -> Result<Self> {
-        // The opening half of the bracket around `Connection::open*` — see `settled_identity`.
-        let before = crate::paths::probe_existing_db_file(db_path).ok();
+        // The opening half of the bracket around `Connection::open*`. An observer opens an
+        // existing database, so this probe must succeed — its error is propagated with its own
+        // context rather than downgraded to «unknown».
+        let before = crate::paths::probe_existing_db_file(db_path)?;
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(db_path, flags).map_err(|err| {
             AppError::msg(format!(
@@ -871,6 +944,9 @@ impl ScanStore {
                 crate::textsan::terminal(&db_path.display().to_string())
             ))
         })?;
+        // The closing half of the bracket, FIRST — before any pragma, schema read or anything
+        // else that could act on a file that is no longer the one we probed.
+        let identity = settled_identity(db_path, before)?;
         // Before `query_only` and before either version check: connection-local state only, so a
         // future DB is still left untouched by the refusal below.
         schema::enforce_foreign_keys(&conn)?;
@@ -879,9 +955,6 @@ impl ScanStore {
         // Migrating needs a writer, so an out-of-date DB is reported here rather than as a
         // «no such column» from some query later on.
         schema::ensure_migrated(&conn)?;
-        // The closing half of the bracket: an existing file must still be the same file. An
-        // observer never creates one, so both probes are required here.
-        let identity = settled_identity(db_path, before, true)?;
         Ok(Self::with_identity(conn, identity))
     }
 
@@ -896,11 +969,17 @@ impl ScanStore {
         // Refuse if the DB file is a symlink (opening by the link would write the target outside
         // the state-dir), and create with 0600. O_NOFOLLOW on the final component.
         crate::paths::prepare_db_file(db_path)?;
-        // The opening half of the bracket. `prepare_db_file` has just created the file when it
-        // was absent, so a `None` here means the probe itself could not run — the closing half
-        // still requires a regular file.
-        let before = crate::paths::probe_existing_db_file(db_path).ok();
+        // The opening half of the bracket. `prepare_db_file` has just created or verified the
+        // file, so this probe must succeed — the absence-before-create case is already handled
+        // there, and a failure here is a real refusal rather than «unknown».
+        let before = crate::paths::probe_existing_db_file(db_path)?;
         let conn = Connection::open(db_path)?;
+        // The closing half, FIRST. Everything below writes to or about the file — WAL setup,
+        // migration, `enforce_db_perms_0600` — so a path swapped between `prepare_db_file` and
+        // here must be refused before any of it can touch the replacement.
+        #[cfg(test)]
+        take_open_race_hook();
+        let identity = settled_identity(db_path, before)?;
         // First, and before the refusal below: the declared relationships are only worth what this
         // connection enforces, and the pragma is connection state — nothing is written, so a DB
         // from a newer build is still left exactly as it was.
@@ -916,10 +995,6 @@ impl ScanStore {
         // 0600 on the DB file and WAL/SHM (created by enabling WAL above): the contents — the paths of all
         // pool files — are for the owner only (errors are propagated, not best-effort).
         crate::paths::enforce_db_perms_0600(db_path)?;
-        // The closing half of the bracket. A writable open may legitimately have created the
-        // file, so a missing «before» is allowed — but after the open the path must name a
-        // regular file, and if it named one before it must name the SAME one.
-        let identity = settled_identity(db_path, before, false)?;
         Ok(Self::with_identity(conn, identity))
     }
 
@@ -4428,6 +4503,12 @@ impl ScanStore {
                 if mode != MembershipMode::Unknown {
                     self.full_validations.set(self.full_validations.get() + 1);
                 }
+                #[cfg(test)]
+                let outcome = match take_validator_fault() {
+                    Some(detail) => Err(MembershipMiss::Store { detail }),
+                    None => validate_authority(&tx, scan_id, mode, generation),
+                };
+                #[cfg(not(test))]
                 let outcome = validate_authority(&tx, scan_id, mode, generation);
                 self.remember_integrity(scan_id, mode, generation, data_version, &outcome);
                 outcome?
@@ -17091,11 +17172,168 @@ mod membership_staging_tests {
             "Unknown is the absence of authority, not a cached authority"
         );
 
-        // And an entry never answers for another scan id.
-        store.revoke_membership_cache();
-        assert!(store
-            .cached_integrity(scan_id, MembershipMode::Explicit, 1, 7)
-            .is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The single slot belongs to one scan at a time: snapshotting A, then B, then A again
+    /// validates three times, and each answer is that scan's own — an entry never answers for
+    /// another scan id, and the replacement is what makes the third validation necessary.
+    #[test]
+    fn one_slot_cannot_answer_for_two_scans() {
+        let _guard = role_guard();
+        let dir = temp_dir("cache_two_scans");
+        let db_path = dir.join("dedcom.db");
+        let mut store = ScanStore::open_writable(&db_path).unwrap();
+
+        // Two authoritative scans on one store, with different member counts so a swapped
+        // answer could not pass unnoticed.
+        let mut publish = |tag: &str, count: usize| -> (i64, Vec<PathBuf>) {
+            let paths: Vec<PathBuf> = (0..count)
+                .map(|i| write(&dir, &format!("{tag}{i}.bin"), tag.as_bytes()))
+                .collect();
+            let digest = [tag.as_bytes()[0]; 32];
+            let files: Vec<(PathBuf, [u8; 32])> =
+                paths.iter().map(|p| (p.clone(), digest)).collect();
+            let scan_id = seed(&mut store, &dir, &files);
+            let verified =
+                crate::pipeline::verify::verify_groups(store.duplicate_groups(scan_id).unwrap())
+                    .unwrap();
+            store
+                .publish_results(scan_id, PublishMode::Explicit(&verified))
+                .unwrap();
+            (scan_id, paths)
+        };
+        let (scan_a, paths_a) = publish("a", 2);
+        let (scan_b, paths_b) = publish("b", 3);
+
+        let members = |store: &ScanStore, scan_id: i64| -> Vec<PathBuf> {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            let summaries = snapshot.summaries().unwrap();
+            assert_eq!(summaries.groups.len(), 1, "each scan publishes one group");
+            let id = summaries.groups[0].0;
+            member_paths(&snapshot.group(&id).expect("the group resolves"))
+        };
+
+        let baseline = store.full_validation_count();
+        assert_eq!(members(&store, scan_a), paths_a, "A answers for A");
+        assert_eq!(
+            store.full_validation_count() - baseline,
+            1,
+            "A validated once"
+        );
+        assert_eq!(members(&store, scan_b), paths_b, "B answers for B");
+        assert_eq!(
+            store.full_validation_count() - baseline,
+            2,
+            "B could not reuse A's entry"
+        );
+        assert_eq!(members(&store, scan_a), paths_a, "A still answers for A");
+        assert_eq!(
+            store.full_validation_count() - baseline,
+            3,
+            "and A could not reuse B's entry either"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A transient store failure is retried, not remembered: the first request fails, leaves
+    /// the slot empty, and the second runs the full validator again and succeeds.
+    #[test]
+    fn a_transient_validator_failure_is_retried_not_cached() {
+        let _guard = role_guard();
+        let (dir, _db, store, scan_id, _paths) = published_on_disk("cache_retry");
+        let baseline = store.full_validation_count();
+
+        let fault = ValidatorFault::armed("injected disk hiccup");
+        match store.membership_snapshot(scan_id) {
+            Err(MembershipMiss::Store { detail }) => {
+                assert!(detail.contains("injected disk hiccup"), "{detail}")
+            }
+            Err(other) => panic!("expected Store, got {other:?}"),
+            Ok(_) => panic!("the injected fault must fail the request"),
+        }
+        assert!(fault.fired(), "the seam was really reached");
+        drop(fault);
+        assert!(
+            store.membership_cache.borrow().is_none(),
+            "a transient failure leaves nothing behind"
+        );
+        assert_eq!(
+            store.full_validation_count() - baseline,
+            1,
+            "one attempted validation"
+        );
+
+        assert!(
+            snap_ok(&store, scan_id),
+            "the retry succeeds on unchanged data"
+        );
+        assert_eq!(
+            store.full_validation_count() - baseline,
+            2,
+            "the retry ran the validator again rather than reusing a refusal"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bracket closes before anything else: a pathname swapped at the exact instant after
+    /// SQLite opened must be refused before WAL setup, migration or the 0600 chmod can act on
+    /// the replacement.
+    #[test]
+    fn a_path_swapped_during_open_is_refused_before_any_side_effect() {
+        let _guard = role_guard();
+        let dir = temp_dir("open_race");
+        let db_path = dir.join("dedcom.db");
+        drop(ScanStore::open_writable(&db_path).unwrap());
+
+        // A different, deliberately untouched regular database file, with a mode no opener
+        // would leave behind and no WAL/SHM sidecars.
+        let replacement = dir.join("other.db");
+        drop(ScanStore::open_writable(&replacement).unwrap());
+        for suffix in ["-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", replacement.display())).ok();
+        }
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before_bytes = std::fs::read(&replacement).unwrap();
+
+        let swap_to = replacement.clone();
+        let target = db_path.clone();
+        let race = OpenRace::armed(move || {
+            std::fs::remove_file(&target).unwrap();
+            std::fs::hard_link(&swap_to, &target).unwrap();
+        });
+        let refused = ScanStore::open_writable(&db_path);
+        assert!(race.fired(), "the seam was really reached");
+        drop(race);
+        assert!(
+            refused.is_err(),
+            "a path replaced during the open must be refused"
+        );
+
+        // Nothing ran against the replacement: same mode, same bytes, no sidecars created.
+        assert_eq!(
+            std::fs::metadata(&replacement)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640,
+            "enforce_db_perms_0600 must not have reached the replacement"
+        );
+        assert_eq!(
+            std::fs::read(&replacement).unwrap(),
+            before_bytes,
+            "no migration or WAL flip wrote to the replacement"
+        );
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = PathBuf::from(format!("{}{suffix}", replacement.display()));
+            assert!(
+                !sidecar.exists(),
+                "no sidecar may be created for the replacement: {}",
+                sidecar.display()
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
