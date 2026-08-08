@@ -137,64 +137,123 @@ pub struct MarkTicket {
     pub before: Vec<(PathBuf, Option<MarkIntent>)>,
 }
 
-/// A refused mark send: the typed reason plus the complete before-image handed back, so the
-/// caller can settle its optimistic state locally without asking anyone.
-#[derive(Debug)]
-pub struct RefusedMarkSend {
-    pub reason: SendRefusal,
+/// The complete, unvalidated inputs of a mark send whose halves disagreed. Deliberately NOT a
+/// `MarkTicket` — its invariant never held — but nothing the caller supplied is discarded:
+/// settlement can still be decided locally from every field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedMarkInputs {
+    pub act: Activation,
+    pub req: RequestId,
+    pub paths: Vec<PathBuf>,
     pub before: Vec<(PathBuf, Option<MarkIntent>)>,
 }
 
-/// A refused long-operation send: the typed reason plus the caller's token back.
+/// A refused mark send: the typed reason plus the COMPLETE attempted settlement state — the
+/// whole ticket when one could exist, the whole raw inputs when the constructor refused. The
+/// refusal is a self-contained ownership transfer back to the caller; no field the caller
+/// supplied is dropped anywhere on this path.
+#[derive(Debug)]
+pub enum RefusedMarkSend {
+    /// The halves disagreed; no ticket could exist. Everything supplied comes back raw.
+    Invalid {
+        reason: SendRefusal,
+        inputs: RejectedMarkInputs,
+    },
+    /// A valid ticket was refused — conflict, closing or a dead receiver. Here it is, whole.
+    Refused {
+        reason: SendRefusal,
+        ticket: MarkTicket,
+    },
+}
+
+impl RefusedMarkSend {
+    pub fn reason(&self) -> &SendRefusal {
+        match self {
+            RefusedMarkSend::Invalid { reason, .. } | RefusedMarkSend::Refused { reason, .. } => {
+                reason
+            }
+        }
+    }
+
+    pub fn before(&self) -> &[(PathBuf, Option<MarkIntent>)] {
+        match self {
+            RefusedMarkSend::Invalid { inputs, .. } => &inputs.before,
+            RefusedMarkSend::Refused { ticket, .. } => &ticket.before,
+        }
+    }
+}
+
+/// A refused long-operation send: the typed reason plus the complete `LongOperation` — the
+/// activation, the request id and the ORIGINAL request-scoped token, not a token detached
+/// from the request it belonged to.
 #[derive(Debug)]
 pub struct RefusedAutoSelect {
     pub reason: SendRefusal,
-    pub cancel: CancelToken,
+    pub long_op: LongOperation,
 }
 
 impl MarkTicket {
     /// The only constructor. Validates that `paths` is duplicate-free and that `before`
     /// describes exactly the same set — a ticket whose halves disagree could «settle» a path
-    /// it never covered, or forget one it did.
+    /// it never covered, or forget one it did. A refusal returns every supplied field.
     pub fn new(
         act: Activation,
         req: RequestId,
         paths: Vec<PathBuf>,
         before: Vec<(PathBuf, Option<MarkIntent>)>,
     ) -> std::result::Result<MarkTicket, RefusedMarkSend> {
-        let mut seen: std::collections::BTreeSet<&PathBuf> = std::collections::BTreeSet::new();
-        for path in &paths {
-            if !seen.insert(path) {
-                return Err(RefusedMarkSend {
-                    reason: SendRefusal::DuplicatePath { path: path.clone() },
+        let invalid = |reason: SendRefusal,
+                       paths: Vec<PathBuf>,
+                       before: Vec<(PathBuf, Option<MarkIntent>)>| {
+            RefusedMarkSend::Invalid {
+                reason,
+                inputs: RejectedMarkInputs {
+                    act,
+                    req,
+                    paths,
                     before,
-                });
+                },
             }
+        };
+        let duplicate = {
+            let mut seen: std::collections::BTreeSet<&PathBuf> = std::collections::BTreeSet::new();
+            paths.iter().find(|path| !seen.insert(path)).cloned()
+        };
+        if let Some(path) = duplicate {
+            return Err(invalid(SendRefusal::DuplicatePath { path }, paths, before));
         }
-        let mut image: std::collections::BTreeSet<&PathBuf> = std::collections::BTreeSet::new();
-        for (path, _) in &before {
-            if !image.insert(path) {
-                return Err(RefusedMarkSend {
-                    reason: SendRefusal::DuplicatePath { path: path.clone() },
-                    before,
-                });
-            }
+        let doubled = {
+            let mut image: std::collections::BTreeSet<&PathBuf> = std::collections::BTreeSet::new();
+            before
+                .iter()
+                .map(|(path, _)| path)
+                .find(|path| !image.insert(path))
+                .cloned()
+        };
+        if let Some(path) = doubled {
+            return Err(invalid(SendRefusal::DuplicatePath { path }, paths, before));
         }
-        let disagree = paths
-            .iter()
-            .find(|path| !image.contains(path))
-            .or_else(|| {
-                before
-                    .iter()
-                    .map(|(path, _)| path)
-                    .find(|path| !seen.contains(path))
-            })
-            .cloned();
+        let disagree = {
+            let requested: std::collections::BTreeSet<&PathBuf> = paths.iter().collect();
+            let imaged: std::collections::BTreeSet<&PathBuf> =
+                before.iter().map(|(path, _)| path).collect();
+            paths
+                .iter()
+                .find(|path| !imaged.contains(path))
+                .or_else(|| {
+                    before
+                        .iter()
+                        .map(|(path, _)| path)
+                        .find(|path| !requested.contains(path))
+                })
+                .cloned()
+        };
         if let Some(path) = disagree {
-            return Err(RefusedMarkSend {
-                reason: SendRefusal::BeforeImageMismatch { path },
+            return Err(invalid(
+                SendRefusal::BeforeImageMismatch { path },
+                paths,
                 before,
-            });
+            ));
         }
         Ok(MarkTicket {
             act,
@@ -255,7 +314,8 @@ impl Inflight {
     }
 
     /// Registers a mark ticket, refusing a duplicate request id or any path intersection with
-    /// a live ticket. Never overwrites: the older entry always survives a refused newcomer.
+    /// a live ticket. Never overwrites: the older entry always survives, and a refused
+    /// newcomer comes back to its sender WHOLE.
     fn register_marks(&self, ticket: MarkTicket) -> std::result::Result<(), RefusedMarkSend> {
         let mut state = self.locked();
         if state.tickets.contains_key(&ticket.req.0)
@@ -264,19 +324,20 @@ impl Inflight {
                 .as_ref()
                 .is_some_and(|long| long.req == ticket.req)
         {
-            return Err(RefusedMarkSend {
+            return Err(RefusedMarkSend::Refused {
                 reason: SendRefusal::RequestAlreadyLive,
-                before: ticket.before,
+                ticket,
             });
         }
-        if let Some(path) = ticket
+        let conflict = ticket
             .paths
             .iter()
             .find(|path| state.locks.contains_key(*path))
-        {
-            return Err(RefusedMarkSend {
-                reason: SendRefusal::PathAlreadyLive { path: path.clone() },
-                before: ticket.before,
+            .cloned();
+        if let Some(path) = conflict {
+            return Err(RefusedMarkSend::Refused {
+                reason: SendRefusal::PathAlreadyLive { path },
+                ticket,
             });
         }
         for path in &ticket.paths {
@@ -340,18 +401,30 @@ impl Inflight {
 /// The consumer's end of one actor: the request queue, the shared closing flag, the send gate
 /// and the settlement ledger. Cheap to clone; every clone talks to the same actor and shares
 /// the same gate, which is what makes closing linearizable against all of them.
+///
+/// Lock order, everywhere both locks are needed: **send gate → inflight mutex**. The gate is
+/// taken by every enqueue, by `begin_close`, by settlement and by terminal drain; the inflight
+/// mutex only ever nests inside it (or stands alone). No path takes them in reverse, so the
+/// pair cannot deadlock — and, more importantly, no observer can see the intermediate state
+/// «registered but not yet accepted/refused»: registration, the closing check, the channel
+/// send and the rollback of a typed send all live inside ONE gate acquisition.
 #[derive(Clone)]
 pub struct BrowseHandle {
     actor: ActorId,
     tx: Sender<BrowseRequest>,
     closing: Arc<AtomicBool>,
     inflight: Arc<Inflight>,
-    /// The one send gate. Every enqueue and `begin_close` take it, so each request is
-    /// linearized strictly before or strictly after the close: before → it sits in the queue
-    /// ahead of the one `Shutdown` and receives its typed settlement; after → it is rejected
-    /// to the caller and was never accepted. The `Empty`-then-drop loss window cannot exist,
-    /// because nothing can enter the queue behind `Shutdown`.
+    /// The one send gate — see the lock-order note above. Every request is linearized
+    /// strictly before or strictly after the close: before → it sits in the queue ahead of
+    /// the one `Shutdown` and receives its typed settlement; after → it is rejected to the
+    /// caller and was never accepted. The `Empty`-then-drop loss window cannot exist, because
+    /// nothing can enter the queue behind `Shutdown`.
     gate: Arc<Mutex<()>>,
+    /// Test-only rendezvous fired between registration and the channel send, while the gate
+    /// is held — the seam that lets a test PROVE terminal drain cannot pass in that window.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)] // the same seam-cell shape TestHooks uses
+    typed_send_hook: Arc<Mutex<Option<Box<dyn FnMut() + Send>>>>,
 }
 
 impl BrowseHandle {
@@ -359,22 +432,46 @@ impl BrowseHandle {
         self.actor
     }
 
-    /// The one gated enqueue every send path uses. On refusal the request comes back whole,
-    /// so a typed entry point can recover its settlement payload.
-    fn enqueue(
+    fn gate_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The send step of an already-linearized caller: the closing check and the channel send,
+    /// with the gate ALREADY held. Never takes a lock itself, so the typed entry points can
+    /// keep one gate acquisition across registration, send and rollback.
+    fn send_under_gate(
         &self,
         request: BrowseRequest,
     ) -> std::result::Result<(), (SendRefusal, BrowseRequest)> {
-        let _linearized = self
-            .gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.closing.load(Ordering::SeqCst) {
             return Err((SendRefusal::Closing, request));
         }
         self.tx
             .send(request)
             .map_err(|refused| (SendRefusal::Disconnected, refused.0))
+    }
+
+    #[cfg(test)]
+    fn fire_typed_send_hook(&self) {
+        if let Some(hook) = self
+            .typed_send_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+        {
+            hook();
+        }
+    }
+
+    /// Test-only: installs the between-registration-and-send rendezvous.
+    #[cfg(test)]
+    pub(crate) fn on_typed_send(&self, hook: impl FnMut() + Send + 'static) {
+        *self
+            .typed_send_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
     }
 
     /// Enqueues a request that carries no consumer-side settlement state. `SetMarks` and
@@ -389,21 +486,27 @@ impl BrowseHandle {
             BrowseRequest::Shutdown => return Err(SendRefusal::ShutdownReserved),
             _ => {}
         }
-        self.enqueue(request).map_err(|(reason, _)| reason)
+        let _linearized = self.gate_lock();
+        self.send_under_gate(request).map_err(|(reason, _)| reason)
     }
 
     /// Test-only raw enqueue for exhaustive protocol routing: still gated, still refused
     /// after close, but without the tracking discipline. Production code has no such door.
     #[cfg(test)]
     pub(crate) fn send_raw(&self, request: BrowseRequest) -> bool {
-        self.enqueue(request).is_ok()
+        let _linearized = self.gate_lock();
+        self.send_under_gate(request).is_ok()
     }
 
-    /// Registers the ticket and enqueues the matching `SetMarks` as ONE operation: the ticket
-    /// is in the ledger before the request can run, the request is built from the same
-    /// entries the ticket's path set came from, and a failed enqueue rolls the registration
-    /// back and returns the complete before-image for local settlement. An accepted request
-    /// is owned from here on by the actor's reply or by terminal retirement — never neither.
+    /// Registers the ticket and enqueues the matching `SetMarks` under ONE gate acquisition:
+    /// the closing check, the registration, the channel send and — on a send failure — the
+    /// rollback are a single critical section, so a terminal drain can never observe (or
+    /// steal) a ticket whose request was not yet accepted. Exactly three outcomes exist:
+    /// accepted with the ticket retained until reply/terminal; rejected before registration
+    /// because closing already won; or registered, send failed, registration removed and the
+    /// COMPLETE ticket returned — all before terminal drain can pass the gate. The ledger
+    /// keeps a clone and the sender keeps the original, so every refusal path returns the
+    /// caller's own object without fabricating anything.
     pub fn send_set_marks(
         &self,
         act: Activation,
@@ -413,56 +516,82 @@ impl BrowseHandle {
     ) -> std::result::Result<(), RefusedMarkSend> {
         let paths: Vec<PathBuf> = entries.iter().map(|entry| entry.path.clone()).collect();
         let ticket = MarkTicket::new(act, req, paths, before)?;
-        self.inflight.register_marks(ticket)?;
-        if let Err((reason, _request)) = self.enqueue(BrowseRequest::SetMarks { act, req, entries })
+        let _linearized = self.gate_lock();
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(RefusedMarkSend::Refused {
+                reason: SendRefusal::Closing,
+                ticket,
+            });
+        }
+        self.inflight.register_marks(ticket.clone())?;
+        #[cfg(test)]
+        self.fire_typed_send_hook();
+        if let Err((reason, _request)) =
+            self.send_under_gate(BrowseRequest::SetMarks { act, req, entries })
         {
-            let before = match self.inflight.settle(req) {
-                Some(Settled::Marks(ticket)) => ticket.before,
-                // The ledger cannot lose a just-registered ticket; empty keeps this total.
-                Some(Settled::Long(_)) | None => Vec::new(),
-            };
-            return Err(RefusedMarkSend { reason, before });
+            // Still inside the gate: the registration is removed before any drain can run,
+            // and the sender's own original goes back whole.
+            let _ = self.inflight.settle(req);
+            return Err(RefusedMarkSend::Refused { reason, ticket });
         }
         Ok(())
     }
 
-    /// Registers the long operation and enqueues the matching `AutoSelect` as ONE operation,
-    /// under the same rollback contract as `send_set_marks`. The stored token is a clone of
-    /// the request's own — cancelling through the ledger cancels the sweep, and nothing ever
-    /// resets it.
+    /// Registers the long operation and enqueues the matching `AutoSelect` under the same
+    /// single gate acquisition and rollback contract as `send_set_marks`. The ledger and the
+    /// request each carry a clone of the caller's request-scoped token; every refusal returns
+    /// the complete `LongOperation` built around the ORIGINAL token.
     pub fn send_auto_select(
         &self,
         act: Activation,
         req: RequestId,
         cancel: CancelToken,
     ) -> std::result::Result<(), RefusedAutoSelect> {
+        let long_op = LongOperation { act, req, cancel };
+        let _linearized = self.gate_lock();
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(RefusedAutoSelect {
+                reason: SendRefusal::Closing,
+                long_op,
+            });
+        }
         if let Err(reason) = self.inflight.register_long(LongOperation {
             act,
             req,
-            cancel: cancel.clone(),
+            cancel: long_op.cancel.clone(),
         }) {
-            return Err(RefusedAutoSelect { reason, cancel });
+            return Err(RefusedAutoSelect { reason, long_op });
         }
-        if let Err((reason, request)) = self.enqueue(BrowseRequest::AutoSelect { act, req, cancel })
-        {
-            let cancel = match (self.inflight.settle(req), request) {
-                (_, BrowseRequest::AutoSelect { cancel, .. }) => cancel,
-                (Some(Settled::Long(long)), _) => long.cancel,
-                _ => CancelToken::new(),
-            };
-            return Err(RefusedAutoSelect { reason, cancel });
+        #[cfg(test)]
+        self.fire_typed_send_hook();
+        if let Err((reason, _request)) = self.send_under_gate(BrowseRequest::AutoSelect {
+            act,
+            req,
+            cancel: long_op.cancel.clone(),
+        }) {
+            let _ = self.inflight.settle(req);
+            return Err(RefusedAutoSelect { reason, long_op });
         }
         Ok(())
     }
 
-    /// Registers a ticket without enqueueing — the seam a consumer needs when it must adopt
-    /// settlement state it created elsewhere. Refusals are the same typed conflicts.
-    pub fn register_ticket(&self, ticket: MarkTicket) -> std::result::Result<(), RefusedMarkSend> {
+    /// Test-only ledger seeding. Production has NO ungated registration seam: a ticket can
+    /// only enter the ledger through `send_set_marks`' single gated critical section, so
+    /// evidence without a future terminal owner is unrepresentable at runtime.
+    #[cfg(test)]
+    pub(crate) fn register_ticket(
+        &self,
+        ticket: MarkTicket,
+    ) -> std::result::Result<(), RefusedMarkSend> {
+        let _linearized = self.gate_lock();
         self.inflight.register_marks(ticket)
     }
 
     /// Settles one request id, releasing its ticket (and path locks) or the long operation.
+    /// Takes the gate first — the one documented lock order — so settlement can never
+    /// interleave with a typed send's registration window either.
     pub fn settle(&self, req: RequestId) -> Option<Settled> {
+        let _linearized = self.gate_lock();
         self.inflight.settle(req)
     }
 
@@ -472,8 +601,11 @@ impl BrowseHandle {
     }
 
     /// Takes every unsettled ticket and the live long operation at once — the retirement step
-    /// after this actor's terminal. Complete evidence, locks released.
+    /// after this actor's terminal. Takes the gate first, so a retirement can only ever see a
+    /// settled boundary: everything it drains was accepted, and everything a typed send rolled
+    /// back is already gone.
     pub fn drain_tickets(&self) -> DrainedInflight {
+        let _linearized = self.gate_lock();
         self.inflight.drain()
     }
 
@@ -482,10 +614,7 @@ impl BrowseHandle {
     /// `false` means the receiver is already gone — the terminal path is then synthesised by
     /// the fleet, which owns exactly that case.
     fn begin_close_send(&self) -> bool {
-        let _linearized = self
-            .gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _linearized = self.gate_lock();
         self.closing.store(true, Ordering::SeqCst);
         self.tx.send(BrowseRequest::Shutdown).is_ok()
     }
@@ -1547,6 +1676,8 @@ impl BrowseActor {
             closing: closing.clone(),
             inflight: Arc::new(Inflight::default()),
             gate: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            typed_send_hook: Arc::new(Mutex::new(None)),
         };
         let join = std::thread::Builder::new()
             .name("dedcom-browse".to_string())
@@ -5357,23 +5488,31 @@ mod tests {
             vec![(a.clone(), None)],
         )
         .expect_err("a duplicated pathname is refused");
-        assert_eq!(dup.reason, SendRefusal::DuplicatePath { path: a.clone() });
+        assert_eq!(
+            *dup.reason(),
+            SendRefusal::DuplicatePath { path: a.clone() }
+        );
         let missing = MarkTicket::new(
-            Activation(1),
-            RequestId(1),
+            Activation(7),
+            RequestId(9),
             vec![a.clone(), b.clone()],
             vec![(a.clone(), None)],
         )
         .expect_err("a before-image that skips a path is refused");
         assert_eq!(
-            missing.reason,
+            *missing.reason(),
             SendRefusal::BeforeImageMismatch { path: b.clone() }
         );
-        assert_eq!(
-            missing.before,
-            vec![(a.clone(), None)],
-            "the before-image comes back with the refusal"
-        );
+        // The rejected-input carrier discards NOTHING the caller supplied.
+        match &missing {
+            RefusedMarkSend::Invalid { inputs, .. } => {
+                assert_eq!(inputs.act, Activation(7));
+                assert_eq!(inputs.req, RequestId(9));
+                assert_eq!(inputs.paths, vec![a.clone(), b.clone()]);
+                assert_eq!(inputs.before, vec![(a.clone(), None)]);
+            }
+            other => panic!("a constructor refusal carries the raw inputs: {other:?}"),
+        }
         let extra = MarkTicket::new(
             Activation(1),
             RequestId(1),
@@ -5382,8 +5521,13 @@ mod tests {
         )
         .expect_err("a before-image that invents a path is refused");
         assert_eq!(
-            extra.reason,
+            *extra.reason(),
             SendRefusal::BeforeImageMismatch { path: b.clone() }
+        );
+        assert_eq!(
+            extra.before().to_vec(),
+            vec![(a.clone(), None), (b.clone(), Some(MarkIntent::Keeper))],
+            "the before-image comes back with the refusal"
         );
         let doubled = MarkTicket::new(
             Activation(1),
@@ -5392,7 +5536,7 @@ mod tests {
             vec![(a.clone(), None), (a.clone(), None)],
         )
         .expect_err("a doubled before-image row is refused");
-        assert_eq!(doubled.reason, SendRefusal::DuplicatePath { path: a });
+        assert_eq!(*doubled.reason(), SendRefusal::DuplicatePath { path: a });
     }
 
     /// Mandates 1 and 2: an intersecting path set and a duplicate request id are refused
@@ -5437,20 +5581,30 @@ mod tests {
                 vec![(a2.clone(), Some(MarkIntent::Keeper))],
             )
             .expect_err("a live path must refuse the second registration");
-        assert_eq!(
-            refused.reason,
-            SendRefusal::PathAlreadyLive { path: a2.clone() }
-        );
-        assert_eq!(
-            refused.before,
-            vec![(a2.clone(), Some(MarkIntent::Keeper))],
-            "the before-image comes back for local settlement"
-        );
+        // The refused newcomer comes back COMPLETE and unchanged.
+        match &refused {
+            RefusedMarkSend::Refused { reason, ticket } => {
+                assert_eq!(*reason, SendRefusal::PathAlreadyLive { path: a2.clone() });
+                assert_eq!(ticket.act, Activation(1));
+                assert_eq!(ticket.req, second);
+                assert_eq!(ticket.paths, vec![a2.clone()]);
+                assert_eq!(ticket.before, vec![(a2.clone(), Some(MarkIntent::Keeper))]);
+            }
+            other => panic!("a conflict returns the whole newcomer ticket: {other:?}"),
+        }
+        let elsewhere = rig.dir.join("elsewhere.bin");
         let dup = rig
             .handle
-            .register_ticket(mark_ticket(1, first.0, &rig.dir.join("elsewhere.bin")))
+            .register_ticket(mark_ticket(1, first.0, &elsewhere))
             .expect_err("a live request id must refuse a second ticket");
-        assert_eq!(dup.reason, SendRefusal::RequestAlreadyLive);
+        match &dup {
+            RefusedMarkSend::Refused { reason, ticket } => {
+                assert_eq!(*reason, SendRefusal::RequestAlreadyLive);
+                assert_eq!(ticket.req, first, "the newcomer comes back whole");
+                assert_eq!(ticket.paths, vec![elsewhere.clone()]);
+            }
+            other => panic!("a duplicate id returns the whole newcomer ticket: {other:?}"),
+        }
         go_tx.send(()).unwrap();
         match rig.recv() {
             BrowseEvent::MarkAck {
@@ -5535,8 +5689,15 @@ mod tests {
                 vec![(a1.clone(), Some(MarkIntent::Keeper))],
             )
             .expect_err("a post-close mutation is never accepted");
-        assert_eq!(refused.reason, SendRefusal::Closing);
-        assert_eq!(refused.before, vec![(a1.clone(), Some(MarkIntent::Keeper))]);
+        match &refused {
+            RefusedMarkSend::Refused { reason, ticket } => {
+                assert_eq!(*reason, SendRefusal::Closing);
+                assert_eq!(ticket.req, req);
+                assert_eq!(ticket.paths, vec![a1.clone()]);
+                assert_eq!(ticket.before, vec![(a1.clone(), Some(MarkIntent::Keeper))]);
+            }
+            other => panic!("the complete ticket comes back on Closing: {other:?}"),
+        }
         // No lock leaked: the same path registers cleanly again.
         rig.handle
             .register_ticket(mark_ticket(1, req.0 + 10, &a1))
@@ -5548,6 +5709,11 @@ mod tests {
             .send_auto_select(Activation(1), RequestId(req.0 + 20), CancelToken::new())
             .expect_err("a post-close sweep is never accepted");
         assert_eq!(denied.reason, SendRefusal::Closing);
+        assert_eq!(
+            denied.long_op.req,
+            RequestId(req.0 + 20),
+            "the refusal carries the complete long operation"
+        );
         let again = rig
             .handle
             .send_auto_select(Activation(1), RequestId(req.0 + 21), CancelToken::new())
@@ -5747,6 +5913,282 @@ mod tests {
         assert!(rig.events.try_recv().is_err());
         rig.join.take().unwrap().join().unwrap();
         std::fs::remove_dir_all(&rig.dir).ok();
+    }
+
+    // ---- R4B-2b2a: one atomic ownership boundary ----------------------------------------------
+
+    /// The Codex interleaving, permanent. The actor is already dead, a typed mark send parks
+    /// between registration and the channel send WHILE OWNING THE GATE, and a terminal drain
+    /// runs concurrently: it cannot pass the gate during the window, the dead receiver then
+    /// rejects the enqueue, the sender receives its COMPLETE ticket — and the drain sees no
+    /// copy of it. Red on `e5f3864`: the drain stole the just-registered ticket and the
+    /// sender was refused with `before = []` out of the loss-hiding fallback.
+    #[test]
+    fn a_terminal_cannot_take_a_ticket_between_registration_and_enqueue() {
+        let _lock = crate::panics::test_lock();
+        let mut rig = Rig::new("boundary_marks", BrowseRole::Operator);
+        rig.open(1);
+        let [a1, ..] = rig.files.clone();
+        // Kill the actor: the receiver is dropped before its Closed is observable.
+        rig.hooks.on_dispatch(|| panic!("boom for the boundary"));
+        assert!(rig.handle.send_raw(BrowseRequest::LatestScan {
+            act: Activation(0),
+            req: RequestId(900),
+        }));
+        match rig.recv() {
+            BrowseEvent::Closed {
+                cause: CloseCause::Panicked(_),
+                ..
+            } => {}
+            other => panic!("the actor must die first: {other:?}"),
+        }
+        rig.join.take().unwrap().join().unwrap();
+        // Park the typed send at the boundary, gate held.
+        let (parked_tx, parked) = crossbeam_channel::bounded::<()>(1);
+        let (go_tx, go) = crossbeam_channel::bounded::<()>(1);
+        let mut fired = false;
+        rig.handle.on_typed_send(move || {
+            // One-shot: a later typed send in the same test must not park again.
+            if fired {
+                return;
+            }
+            fired = true;
+            let _ = parked_tx.send(());
+            let _ = go.recv();
+        });
+        let req = rig.req();
+        let sender = {
+            let handle = rig.handle.clone();
+            let path = a1.clone();
+            std::thread::spawn(move || {
+                handle.send_set_marks(
+                    Activation(1),
+                    req,
+                    vec![keeper_entry(&path)],
+                    vec![(path.clone(), None)],
+                )
+            })
+        };
+        parked
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the sender must park at the boundary");
+        // The concurrent terminal drain — serialized strictly after the sender's whole
+        // critical section by the gate.
+        let drainer = {
+            let handle = rig.handle.clone();
+            std::thread::spawn(move || handle.drain_tickets())
+        };
+        go_tx.send(()).unwrap();
+        let refused = sender
+            .join()
+            .unwrap()
+            .expect_err("the dead receiver rejects the enqueue");
+        match refused {
+            RefusedMarkSend::Refused { reason, ticket } => {
+                assert_eq!(reason, SendRefusal::Disconnected);
+                assert_eq!(ticket.act, Activation(1));
+                assert_eq!(ticket.req, req);
+                assert_eq!(ticket.paths, vec![a1.clone()]);
+                assert_eq!(
+                    ticket.before,
+                    vec![(a1.clone(), None)],
+                    "the rejected sender must receive its complete before-image, \
+                     not an empty vector"
+                );
+            }
+            other => panic!("the complete ticket comes back: {other:?}"),
+        }
+        let drained = drainer.join().unwrap();
+        assert!(
+            drained.tickets.is_empty() && drained.long_op.is_none(),
+            "the retirement must not own a ticket for a request that was never accepted"
+        );
+        std::fs::remove_dir_all(&rig.dir).ok();
+    }
+
+    /// The long-operation twin: terminal drain cannot steal the record between registration
+    /// and enqueue; on the dead receiver the sender receives the exact `act`, `req` and the
+    /// ORIGINAL token, and no long-op slot leaks.
+    #[test]
+    fn a_terminal_cannot_take_the_long_operation_between_registration_and_enqueue() {
+        let _lock = crate::panics::test_lock();
+        let mut rig = Rig::new("boundary_long", BrowseRole::Operator);
+        rig.open(1);
+        rig.hooks.on_dispatch(|| panic!("boom for the boundary"));
+        assert!(rig.handle.send_raw(BrowseRequest::LatestScan {
+            act: Activation(0),
+            req: RequestId(901),
+        }));
+        match rig.recv() {
+            BrowseEvent::Closed {
+                cause: CloseCause::Panicked(_),
+                ..
+            } => {}
+            other => panic!("the actor must die first: {other:?}"),
+        }
+        rig.join.take().unwrap().join().unwrap();
+        let (parked_tx, parked) = crossbeam_channel::bounded::<()>(1);
+        let (go_tx, go) = crossbeam_channel::bounded::<()>(1);
+        let mut fired = false;
+        rig.handle.on_typed_send(move || {
+            // One-shot: a later typed send in the same test must not park again.
+            if fired {
+                return;
+            }
+            fired = true;
+            let _ = parked_tx.send(());
+            let _ = go.recv();
+        });
+        let req = rig.req();
+        let token = CancelToken::new();
+        let sender = {
+            let handle = rig.handle.clone();
+            let token = token.clone();
+            std::thread::spawn(move || handle.send_auto_select(Activation(1), req, token))
+        };
+        parked
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the sender must park at the boundary");
+        let drainer = {
+            let handle = rig.handle.clone();
+            std::thread::spawn(move || handle.drain_tickets())
+        };
+        go_tx.send(()).unwrap();
+        let refused = sender
+            .join()
+            .unwrap()
+            .expect_err("the dead receiver rejects the enqueue");
+        assert_eq!(refused.reason, SendRefusal::Disconnected);
+        assert_eq!(refused.long_op.act, Activation(1));
+        assert_eq!(refused.long_op.req, req);
+        refused.long_op.cancel.cancel();
+        assert!(
+            token.cancelled(),
+            "the refusal carries the ORIGINAL request-scoped token, not a substitute"
+        );
+        let drained = drainer.join().unwrap();
+        assert!(
+            drained.long_op.is_none() && drained.tickets.is_empty(),
+            "the retirement must not own a long operation whose request was never accepted"
+        );
+        // No slot leaked: the next attempt fails on the dead channel, not on a stuck slot.
+        let follow = rig
+            .handle
+            .send_auto_select(Activation(1), rig.ids.allocate(), CancelToken::new())
+            .expect_err("the channel is still dead");
+        assert_eq!(follow.reason, SendRefusal::Disconnected);
+        std::fs::remove_dir_all(&rig.dir).ok();
+    }
+
+    /// Close versus typed sends, two clones, full ownership accounting: every mark attempt
+    /// is either rejected with its complete ticket, or accepted — and an accepted one appears
+    /// in exactly one reply AND in the retirement exactly once.
+    #[test]
+    fn every_typed_send_is_owned_exactly_once_across_close() {
+        let mut rig = Rig::new("ownership_race", BrowseRole::Operator);
+        rig.open(1);
+        let files = rig.files.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut lanes = Vec::new();
+        for lane in 0..2usize {
+            let handle = rig.handle.clone();
+            let barrier = barrier.clone();
+            let mine: Vec<PathBuf> = vec![files[lane * 2].clone(), files[lane * 2 + 1].clone()];
+            lanes.push(std::thread::spawn(move || {
+                let mut accepted: Vec<RequestId> = Vec::new();
+                barrier.wait();
+                for (slot, path) in mine.iter().enumerate() {
+                    let req = RequestId(2_000 + (lane as u64) * 10 + slot as u64);
+                    match handle.send_set_marks(
+                        Activation(1),
+                        req,
+                        vec![keeper_entry(path)],
+                        vec![(path.clone(), None)],
+                    ) {
+                        Ok(()) => accepted.push(req),
+                        Err(RefusedMarkSend::Refused { reason, ticket }) => {
+                            assert_eq!(reason, SendRefusal::Closing);
+                            assert_eq!(ticket.req, req);
+                            assert_eq!(ticket.paths, vec![path.clone()]);
+                            assert_eq!(ticket.before, vec![(path.clone(), None)]);
+                        }
+                        Err(other) => {
+                            panic!("only complete Closing refusals exist here: {other:?}")
+                        }
+                    }
+                }
+                accepted
+            }));
+        }
+        let closer = {
+            let handle = rig.handle.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                assert!(handle.begin_close_send());
+            })
+        };
+        let mut accepted: Vec<RequestId> = Vec::new();
+        for lane in lanes {
+            accepted.extend(lane.join().unwrap());
+        }
+        closer.join().unwrap();
+        let mut answered: Vec<RequestId> = Vec::new();
+        loop {
+            match rig.recv() {
+                BrowseEvent::Closed {
+                    cause: CloseCause::Requested,
+                    ..
+                } => break,
+                BrowseEvent::MarkAck { req, .. } => answered.push(req),
+                other => panic!("only MarkAck replies and one Closed exist: {other:?}"),
+            }
+        }
+        accepted.sort();
+        answered.sort();
+        assert_eq!(
+            accepted, answered,
+            "every accepted mutation settles exactly once"
+        );
+        let mut retired: Vec<RequestId> = rig
+            .handle
+            .drain_tickets()
+            .tickets
+            .into_iter()
+            .map(|ticket| ticket.req)
+            .collect();
+        retired.sort();
+        assert_eq!(
+            retired, accepted,
+            "the retirement holds exactly the accepted tickets"
+        );
+        rig.join.take().unwrap().join().unwrap();
+        std::fs::remove_dir_all(&rig.dir).ok();
+    }
+
+    /// The production API has no ungated registration seam: `register_ticket` exists only
+    /// under `cfg(test)`, so runtime evidence can only enter the ledger through the gated
+    /// typed sends.
+    #[test]
+    fn production_has_no_ungated_registration_seam() {
+        let source = include_str!("browse.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .map(|(production, _)| production)
+            .unwrap_or(source);
+        let at = production
+            .find("fn register_ticket")
+            .expect("the seeding seam exists");
+        let preceding = &production[at.saturating_sub(400)..at];
+        assert!(
+            preceding.contains("#[cfg(test)]"),
+            "register_ticket must be test-only"
+        );
+        assert_eq!(
+            production.matches("fn register_ticket").count(),
+            1,
+            "exactly one seeding seam exists"
+        );
     }
 
     // ---- 12. the probe matrix, pinned by counters ---------------------------------------------
