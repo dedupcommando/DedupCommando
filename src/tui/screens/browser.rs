@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use crate::app::{App, PathStyle};
 use crate::model::action::ActionKind;
 use crate::model::duplicate::{AttributedDirGroup, DirGroup, DirTrust, DuplicateGroup};
+use crate::model::plan::GroupId;
 use crate::state::{AttributedDirGroupSummary, GroupClaim, GroupSummary};
 use crate::tui::human_bytes;
 
@@ -27,6 +28,17 @@ pub enum BrowserTab {
 }
 
 /// Duplicate-browsing screen: a groups panel + a files panel. The header is as in
+/// What the header prints for «Marked».
+///
+/// `—` while the count is being re-read or after a read that failed. A refusal rendered as `0`
+/// is indistinguishable from «nothing is marked», and the operator would plan against it.
+fn marked_count_cell(app: &App) -> String {
+    match app.browser.marked_count {
+        Some(count) => count.to_string(),
+        None => "—".to_string(),
+    }
+}
+
 /// (brand + ` Duplicates ` in the frame title); the `[1] Folders` /
 /// `[2] Files` tabs are embedded in the left panel's title.
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -63,7 +75,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 " Groups: {}   Scanned: {}   Marked: {} ",
                 app.browser.group_summaries.len(),
                 app.browser.summary.files_scanned,
-                app.browser.marked_count,
+                marked_count_cell(app),
             ),
             format!(
                 " {}   already linked sets: {} ",
@@ -91,7 +103,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                     groups,
                     app.browser.summary.files_scanned,
                     human_bytes(app.browser.dir_groups_reclaim_total),
-                    app.browser.marked_count,
+                    marked_count_cell(app),
                 )
             },
             format!(
@@ -436,7 +448,7 @@ where
 pub(crate) fn render_group_list(
     frame: &mut Frame,
     area: Rect,
-    groups: &[GroupSummary],
+    groups: &[(GroupId, GroupSummary)],
     state: &mut ListState,
     focused: bool,
     title: Line<'static>,
@@ -455,14 +467,16 @@ pub(crate) fn render_group_list(
     let columns = claim_columns(area.width);
     let items: Vec<ListItem> = groups[start..end]
         .iter()
-        .map(|group| {
+        .map(|(id, group)| {
+            // The rank shown is the identity's own — what the authority assigned this group in
+            // the publication the window is looking at.
             // The counters first: pathnames and allocations are different questions — «6 files»
             // is what the operator sees, «3 objects» is what the filesystem frees. The claim gets
             // the lines below to itself rather than being the thing that gets cut, because a
             // number whose qualifier fell off the right edge is the defect, not the layout.
             let mut lines = vec![Line::from(format!(
                 "#{:<4} {} files · {} · {}",
-                group.rank,
+                id.rank,
                 group.file_count,
                 crate::tui::objects_cell(group.object_count, group.reclaim),
                 human_bytes(group.size_bytes),
@@ -621,59 +635,6 @@ pub(crate) fn render_group_files(
 }
 
 /// Draws the list of duplicate-directory groups — for the
-/// commander panel in DirGroupList mode (summaries from the commander's DB cache).
-pub(crate) fn render_dir_group_list(
-    frame: &mut Frame,
-    area: Rect,
-    groups: &[AttributedDirGroup],
-    state: &mut ListState,
-    focused: bool,
-    title: &str,
-) {
-    // Virtualization — as in render_group_list. Separators every 25 are
-    // NOT drawn: the dir-group list is the same summaries with `#N`, separators are redundant.
-    let rows = (area.height as usize).saturating_sub(2);
-    let (start, local_sel) = crate::tui::visible_window(state, groups.len(), rows);
-    let end = (start + rows).min(groups.len());
-    let items: Vec<ListItem> = groups[start..end]
-        .iter()
-        .map(|attributed| {
-            let group = &attributed.group;
-            // An unverified candidate makes no reclaim claim: no `free`, no byte figure, and the
-            // qualifier sits right after the rank so the narrowest panel (36 columns) cannot
-            // truncate it away. Trusted rows stay byte-identical to the parent.
-            match attributed.trust {
-                DirTrust::Trusted => ListItem::new(format!(
-                    "#{:<4} {} directories · {} files · {} · free {}",
-                    group.id,
-                    group.paths.len(),
-                    group.file_count,
-                    human_bytes(group.size_per_dir),
-                    human_bytes(group.reclaimable_bytes()),
-                )),
-                DirTrust::Untrusted => ListItem::new(format!(
-                    "#{:<4} rescan required · {} directories · {} files",
-                    group.id,
-                    group.paths.len(),
-                    group.file_count,
-                )),
-            }
-        })
-        .collect();
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title.to_string())
-                .border_style(focus_style(focused)),
-        )
-        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("▶ ");
-    let mut local = ListState::default();
-    local.select(local_sel);
-    frame.render_stateful_widget(list, area, &mut local);
-}
-
 /// Draws the directory paths of group `group` — for the commander panel
 /// in DirGroupFiles mode. The first directory is marked as the "keeper" (★).
 /// `member_trust`, when supplied, is one entry per path in the same order; an `Untrusted` member
@@ -946,15 +907,22 @@ pub(crate) mod tests {
             .collect()
     }
 
-    fn summary_row(rank: i64, reclaim: ReclaimEstimate) -> GroupSummary {
-        GroupSummary {
-            rank,
-            hash: format!("h{rank}"),
-            file_count: 3,
-            size_bytes: 4096,
-            object_count: 2,
-            reclaim,
-        }
+    fn summary_row(rank: i64, reclaim: ReclaimEstimate) -> (GroupId, GroupSummary) {
+        (
+            GroupId {
+                scan_id: 1,
+                rank,
+                generation: 1,
+            },
+            GroupSummary {
+                rank,
+                hash: format!("h{rank}"),
+                file_count: 3,
+                size_bytes: 4096,
+                object_count: 2,
+                reclaim,
+            },
+        )
     }
 
     /// The list row shows both counts and never labels a ceiling as freed. This is the row the
@@ -1023,7 +991,7 @@ pub(crate) mod tests {
     }
 
     /// One group list drawn into a frame of exactly this size.
-    fn drawn_list(area: Rect, groups: &[GroupSummary]) -> ratatui::buffer::Buffer {
+    fn drawn_list(area: Rect, groups: &[(GroupId, GroupSummary)]) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         let mut list = ListState::default();
         terminal
@@ -1042,14 +1010,14 @@ pub(crate) mod tests {
     }
 
     /// The same, for a list rendered into the whole frame.
-    fn drawn_entry(width: u16, entry: usize, groups: &[GroupSummary]) -> String {
+    fn drawn_entry(width: u16, entry: usize, groups: &[(GroupId, GroupSummary)]) -> String {
         let area = Rect::new(0, 0, width, 12);
         entry_text(&drawn_list(area, groups), area, entry, group_rows(width))
     }
 
     /// Every entry of one list, each read from its own rows. The frame is made tall enough for the
     /// whole fixture, so a case cannot pass by being scrolled out of the window instead of drawn.
-    pub(crate) fn drawn_entries(width: u16, groups: &[GroupSummary]) -> Vec<String> {
+    pub(crate) fn drawn_entries(width: u16, groups: &[(GroupId, GroupSummary)]) -> Vec<String> {
         let rows = group_rows(width);
         let area = Rect::new(0, 0, width, 2 + rows * groups.len() as u16);
         let buffer = drawn_list(area, groups);
@@ -1123,22 +1091,29 @@ pub(crate) mod tests {
         object_count: u64,
         size_bytes: u64,
         reclaim: ReclaimEstimate,
-    ) -> GroupSummary {
-        GroupSummary {
-            rank,
-            hash: format!("h{rank}"),
-            file_count,
-            size_bytes,
-            object_count,
-            reclaim,
-        }
+    ) -> (GroupId, GroupSummary) {
+        (
+            GroupId {
+                scan_id: 1,
+                rank,
+                generation: 1,
+            },
+            GroupSummary {
+                rank,
+                hash: format!("h{rank}"),
+                file_count,
+                size_bytes,
+                object_count,
+                reclaim,
+            },
+        )
     }
 
     /// The four rows the count wording has to tell apart, with every number distinct: a row that
     /// lost its own text cannot be rescued by a neighbour's. `object_count == 0` is the migrated
     /// sentinel only where nothing about the row is established — the second row has a real count
     /// and an untrusted figure, and keeps its number.
-    fn count_cases() -> [(&'static str, GroupSummary, &'static str); 4] {
+    fn count_cases() -> [(&'static str, (GroupId, GroupSummary), &'static str); 4] {
         [
             (
                 "migrated legacy",
@@ -1176,7 +1151,8 @@ pub(crate) mod tests {
     #[test]
     fn a_migrated_group_counts_its_objects_as_unknown_and_the_rest_keep_theirs() {
         let cases = count_cases();
-        let groups: Vec<GroupSummary> = cases.iter().map(|(_, row, _)| row.clone()).collect();
+        let groups: Vec<(GroupId, GroupSummary)> =
+            cases.iter().map(|(_, row, _)| row.clone()).collect();
         for width in [52, 40] {
             let entries = drawn_entries(width, &groups);
             for (entry, (name, group, phrase)) in cases.iter().enumerate() {
@@ -1191,17 +1167,17 @@ pub(crate) mod tests {
                 );
                 // The rest of the row is the point of the wording: the claim, the size and the
                 // pathname count all have to survive the phrase that replaced the number.
-                let claim = crate::tui::reclaim_cell(group.reclaim);
+                let claim = crate::tui::reclaim_cell(group.1.reclaim);
                 assert!(
                     text.contains(&claim),
                     "the {name} row must still state «{claim}» at {width} columns: {text}"
                 );
                 assert!(
-                    text.contains(&human_bytes(group.size_bytes)),
+                    text.contains(&human_bytes(group.1.size_bytes)),
                     "the {name} row must still show its size at {width} columns: {text}"
                 );
                 assert!(
-                    text.contains(&format!("{} files", group.file_count)),
+                    text.contains(&format!("{} files", group.1.file_count)),
                     "the {name} row must still show its pathnames at {width} columns: {text}"
                 );
             }
@@ -1579,25 +1555,33 @@ pub(crate) mod tests {
     #[test]
     fn commander_dir_rows_survive_the_36_column_floor() {
         let groups = vec![
-            attributed_group(
-                DirTrust::Trusted,
-                vec![DirTrust::Trusted, DirTrust::Trusted],
-            ),
-            AttributedDirGroup {
-                group: DirGroup {
-                    id: 2,
-                    signature: "u".to_string(),
-                    paths: vec![PathBuf::from("/t/u1"), PathBuf::from("/t/u2")],
-                    file_count: 4,
-                    size_per_dir: 2048,
-                },
-                member_trust: vec![DirTrust::Untrusted, DirTrust::Untrusted],
+            AttributedDirGroupSummary {
+                rank: 1,
+                signature: "t".to_string(),
+                dir_count: 2,
+                file_count: 4,
+                size_per_dir: 2048,
+                trust: DirTrust::Trusted,
+            },
+            AttributedDirGroupSummary {
+                rank: 2,
+                signature: "u".to_string(),
+                dir_count: 2,
+                file_count: 4,
+                size_per_dir: 2048,
                 trust: DirTrust::Untrusted,
             },
         ];
         let rendered = drawn(36, 8, |frame| {
             let mut state = ListState::default();
-            render_dir_group_list(frame, frame.area(), &groups, &mut state, true, " dirs ");
+            render_dir_group_summary_list(
+                frame,
+                frame.area(),
+                &groups,
+                &mut state,
+                true,
+                Line::from(" dirs "),
+            );
         });
         assert!(
             rendered.contains("#2    rescan required"),

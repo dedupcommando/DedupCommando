@@ -9,7 +9,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::model::duplicate::{hex_encode, DirTrust};
-use crate::state::{DedupRow, LiveDirSignature};
+use crate::model::plan::GroupId;
+use crate::state::browse::PanelData;
+use crate::state::{LiveDirSignature, PanelFile, PanelFileStatus};
 
 /// File status with respect to deduplication (color semaphore).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,14 +20,19 @@ pub enum DedupStatus {
     NotInScan,
     /// In the manifest, but not yet hashed.
     Unhashed,
-    /// Hashed, no duplicates.
+    /// Hashed and in the manifest, but a member of no current group — including an alias-only
+    /// set, which is ONE physical object and therefore a duplicate of nothing.
     HashedUnique,
     /// Not hashed, but size+mtime matched another — a likely duplicate (F4 needed).
     LikelyDuplicate,
-    /// Hashed, a byte-for-byte duplicate confirmed.
+    /// A member of a published group: a duplicate the authority vouches for.
     VerifiedDup,
-    /// Hash matched, but the devices differ — a hardlink is impossible (caution).
+    /// A member of a published group whose allocations sit on different devices — a hardlink
+    /// is impossible (caution).
     DangerousDup,
+    /// No trusted answer for this row: the scan has no published authority, or the authority
+    /// named this group inconsistent. It takes no part in exact matching.
+    Unavailable,
 }
 
 impl DedupStatus {
@@ -38,33 +45,32 @@ impl DedupStatus {
             DedupStatus::LikelyDuplicate => '≈',
             DedupStatus::VerifiedDup => '=',
             DedupStatus::DangerousDup => '⚠',
+            DedupStatus::Unavailable => '?',
         }
     }
 
-    /// Pure classification of the dedup status from a DB row. 6 semaphore branches;
-    /// `NotInScan` is returned by the caller when the file is not in the map (no row at all).
-    pub fn classify(row: &DedupRow) -> DedupStatus {
-        match &row.hashed {
-            // Not hashed: size+mtime matched another → a likely duplicate (F4).
-            None => {
-                if row.size_mtime_count >= 2 {
-                    DedupStatus::LikelyDuplicate
+    /// The semaphore, derived from MEMBERSHIP rather than from a digest count.
+    ///
+    /// The distinction that used to be missing: `=` means «this file is a member of a group the
+    /// authority published», not «some row shares its digest». An alias-only set — two pathnames
+    /// of one allocation — is one physical object, so it is `-` and never `=`; and a pathname
+    /// byte verification rejected has no membership at all, so nothing can call it a duplicate.
+    pub fn from_membership(status: &PanelFileStatus) -> DedupStatus {
+        match status {
+            PanelFileStatus::NotInScan => DedupStatus::NotInScan,
+            PanelFileStatus::NotHashed => DedupStatus::Unhashed,
+            PanelFileStatus::LikelyBySizeMtime { .. } => DedupStatus::LikelyDuplicate,
+            PanelFileStatus::InGroup {
+                distinct_devices, ..
+            } => {
+                if *distinct_devices > 1 {
+                    DedupStatus::DangerousDup
                 } else {
-                    DedupStatus::Unhashed
+                    DedupStatus::VerifiedDup
                 }
             }
-            // Hashed: a duplicate by hash; the devices differ → a hardlink is impossible.
-            Some(_) => {
-                if row.dup_count >= 2 {
-                    if row.distinct_devices > 1 {
-                        DedupStatus::DangerousDup
-                    } else {
-                        DedupStatus::VerifiedDup
-                    }
-                } else {
-                    DedupStatus::HashedUnique
-                }
-            }
+            PanelFileStatus::NotGrouped => DedupStatus::HashedUnique,
+            PanelFileStatus::Unavailable(_) => DedupStatus::Unavailable,
         }
     }
 }
@@ -76,8 +82,12 @@ impl DedupStatus {
 pub struct DirDedup {
     /// file path → dedup status.
     pub status: HashMap<PathBuf, DedupStatus>,
-    /// file path → hex hash (hashed only).
+    /// file path → hex hash (hashed only). Display and the F4 overlay only: a digest is content,
+    /// never the key of a match.
     pub hashes: HashMap<PathBuf, String>,
+    /// file path → the identity of the published group it belongs to. THIS is what cross-panel
+    /// matching is keyed on, so two verified populations sharing one digest never merge.
+    pub groups: HashMap<PathBuf, GroupId>,
     /// subdirectory path → total size of scan files under it.
     pub dir_sizes: HashMap<PathBuf, u64>,
     /// subdirectory path → content signature WITH the trust the ledger vouched at read time.
@@ -87,6 +97,42 @@ pub struct DirDedup {
 }
 
 impl DirDedup {
+    /// Everything one panel refresh answered, in the shape the panel renders.
+    ///
+    /// One actor pass produced all of it — the membership half, the directory sizes and the
+    /// directory signatures — so no row here can describe a different database state than its
+    /// neighbour.
+    pub fn from_panel(data: PanelData) -> Self {
+        let PanelData {
+            files,
+            dir_sizes,
+            dir_signatures,
+        } = data;
+        let mut status = HashMap::with_capacity(files.len());
+        let mut hashes = HashMap::new();
+        let mut groups = HashMap::new();
+        for (path, file) in files {
+            let PanelFile {
+                status: membership,
+                hash_text,
+            } = file;
+            if let PanelFileStatus::InGroup { id, .. } = &membership {
+                groups.insert(path.clone(), *id);
+            }
+            if let Some(hash) = hash_text {
+                hashes.insert(path.clone(), hash);
+            }
+            status.insert(path, DedupStatus::from_membership(&membership));
+        }
+        DirDedup {
+            status,
+            hashes,
+            groups,
+            dir_sizes,
+            dir_signatures,
+        }
+    }
+
     /// Status of file `path` (not in the map → NotInScan).
     pub fn status_for(&self, path: &Path) -> DedupStatus {
         self.status
@@ -95,9 +141,14 @@ impl DirDedup {
             .unwrap_or(DedupStatus::NotInScan)
     }
 
-    /// hex hash of file `path`, if it is hashed.
+    /// hex hash of file `path`, if it is hashed. For display and comparison heuristics only.
     pub fn hash_for(&self, path: &Path) -> Option<&str> {
         self.hashes.get(path).map(String::as_str)
+    }
+
+    /// The published identity of file `path`'s group — the only key an exact match may use.
+    pub fn group_of(&self, path: &Path) -> Option<GroupId> {
+        self.groups.get(path).copied()
     }
 
     /// Total size of scan files under subdirectory `path`.
@@ -186,11 +237,14 @@ impl DedupCache {
         self.by_cwd.retain(|cwd, _| keep.contains(cwd));
     }
 
-    /// Adds a hash computed on demand for a file into its directory's cache (F4/after a
-    /// move). A duplicate is determined within the same directory: entering a group for
-    /// the authoritative picture still reads the DB. If the directory is not yet in the
-    /// cache — creates a lightweight entry with just this file. Fresh information supersedes a
-    /// cached error: the hash was just computed, so the entry restarts from it.
+    /// Adds a hash computed on demand for a file into its directory's cache (F4/after a move).
+    ///
+    /// What this can say is bounded by what it knows: a hash computed here is compared with the
+    /// other hashes of the SAME directory, which is a candidate signal, not membership. So two
+    /// matching digests become `≈` — «likely, verify it» — and never `=`, which now means «the
+    /// authority published these as one group». Entering the group still reads the authority.
+    /// Fresh information supersedes a cached error: the hash was just computed, so the entry
+    /// restarts from it.
     pub fn insert_hash(&mut self, path: PathBuf, hash: [u8; 32]) {
         let Some(parent) = path.parent().map(Path::to_path_buf) else {
             return;
@@ -212,11 +266,21 @@ impl DedupCache {
             .map(|(p, _)| p.clone())
             .collect();
         let status = if same.len() >= 2 {
-            DedupStatus::VerifiedDup
+            DedupStatus::LikelyDuplicate
         } else {
             DedupStatus::HashedUnique
         };
         for peer in same {
+            // A row the authority already vouched for keeps its membership verdict: a local
+            // digest comparison must not downgrade a published group.
+            if dir.status.get(&peer).is_some_and(|current| {
+                matches!(
+                    current,
+                    DedupStatus::VerifiedDup | DedupStatus::DangerousDup
+                )
+            }) {
+                continue;
+            }
             dir.status.insert(peer, status);
         }
     }
@@ -226,51 +290,71 @@ impl DedupCache {
 mod tests {
     use super::*;
 
-    fn row(hashed: Option<&str>, dup: u32, devices: u32, sm: u32) -> DedupRow {
-        DedupRow {
-            hashed: hashed.map(str::to_string),
-            dup_count: dup,
-            distinct_devices: devices,
-            size_mtime_count: sm,
+    fn gid(rank: i64) -> GroupId {
+        GroupId {
+            scan_id: 1,
+            rank,
+            generation: 1,
         }
     }
 
+    /// Every semaphore state, from membership rather than from a digest count.
     #[test]
-    fn classify_covers_six_variants() {
-        // Not hashed, size is unique → just Unhashed.
+    fn the_semaphore_is_derived_from_membership() {
         assert_eq!(
-            DedupStatus::classify(&row(None, 0, 0, 1)),
+            DedupStatus::from_membership(&PanelFileStatus::NotInScan),
+            DedupStatus::NotInScan
+        );
+        assert_eq!(
+            DedupStatus::from_membership(&PanelFileStatus::NotHashed),
             DedupStatus::Unhashed
         );
-        // Not hashed, size+mtime repeats → a likely duplicate.
         assert_eq!(
-            DedupStatus::classify(&row(None, 0, 0, 2)),
+            DedupStatus::from_membership(&PanelFileStatus::LikelyBySizeMtime { peers: 2 }),
             DedupStatus::LikelyDuplicate
         );
-        // Hashed, only one such → unique.
         assert_eq!(
-            DedupStatus::classify(&row(Some("aa"), 1, 1, 0)),
-            DedupStatus::HashedUnique
-        );
-        // Hashed, a duplicate, one device → a confirmed duplicate.
-        assert_eq!(
-            DedupStatus::classify(&row(Some("aa"), 2, 1, 0)),
+            DedupStatus::from_membership(&PanelFileStatus::InGroup {
+                id: gid(0),
+                members: 2,
+                distinct_devices: 1
+            }),
             DedupStatus::VerifiedDup
         );
-        // Hashed, a duplicate, different devices → dangerous (no hardlink possible).
         assert_eq!(
-            DedupStatus::classify(&row(Some("aa"), 2, 2, 0)),
+            DedupStatus::from_membership(&PanelFileStatus::InGroup {
+                id: gid(0),
+                members: 2,
+                distinct_devices: 2
+            }),
             DedupStatus::DangerousDup
         );
-        // NotInScan — not from classify: DirDedup returns it when the file is not in the map.
+        // The accepted visible consequence: an alias-only set is ONE physical object, so
+        // membership puts it outside every group and it shows `-`, never `=`.
+        assert_eq!(
+            DedupStatus::from_membership(&PanelFileStatus::NotGrouped),
+            DedupStatus::HashedUnique
+        );
+        assert_eq!(DedupStatus::HashedUnique.glyph(), '-');
+        // No authority, or an authority that named this rank inconsistent: unavailable, and it
+        // enters no exact match.
+        assert_eq!(
+            DedupStatus::from_membership(&PanelFileStatus::Unavailable(
+                crate::state::store::PanelMiss::Unknown
+            )),
+            DedupStatus::Unavailable
+        );
+        // NotInScan is also what a file absent from the map answers.
         assert_eq!(
             DirDedup::default().status_for(Path::new("/none")),
             DedupStatus::NotInScan
         );
     }
 
+    /// A hash computed on demand knows only its own directory, so it may say «likely» — never
+    /// «verified». Only published membership earns the `=` glyph.
     #[test]
-    fn insert_hash_marks_same_dir_duplicate() {
+    fn a_locally_computed_hash_is_a_candidate_signal_only() {
         let mut cache = DedupCache::default();
         cache.insert_hash(PathBuf::from("/d/x"), [9u8; 32]);
         assert_eq!(
@@ -280,14 +364,24 @@ mod tests {
                 .status_for(Path::new("/d/x")),
             DedupStatus::HashedUnique
         );
-        // A second file with the same hash in the same directory → both VerifiedDup.
         cache.insert_hash(PathBuf::from("/d/y"), [9u8; 32]);
         let dir = cache.dir(Path::new("/d")).unwrap();
-        assert_eq!(dir.status_for(Path::new("/d/x")), DedupStatus::VerifiedDup);
-        assert_eq!(dir.status_for(Path::new("/d/y")), DedupStatus::VerifiedDup);
+        assert_eq!(
+            dir.status_for(Path::new("/d/x")),
+            DedupStatus::LikelyDuplicate,
+            "a same-directory digest match is a candidate, not a published group"
+        );
+        assert_eq!(
+            dir.status_for(Path::new("/d/y")),
+            DedupStatus::LikelyDuplicate
+        );
         assert_eq!(
             dir.hash_for(Path::new("/d/x")),
             dir.hash_for(Path::new("/d/y"))
+        );
+        assert!(
+            dir.group_of(Path::new("/d/x")).is_none(),
+            "and it carries no identity, so it cannot enter exact matching"
         );
     }
 

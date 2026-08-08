@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use crate::model::duplicate::DirSigAlgo;
 use crate::model::omission::OmissionSummary;
 use crate::model::reclaim::ReclaimEstimate;
-use crate::state::GroupSummary;
 
 /// Quarantine directory name (excluded from scanning).
 pub const QUARANTINE_DIR_NAME: &str = ".dedcom-quarantine";
@@ -359,15 +358,16 @@ pub enum OmissionAccounting {
     Unavailable,
 }
 
-/// Scan result: lightweight group summaries + the scan summary. Full
-/// `DuplicateGroup`s are no longer returned to the UI (on /tank — gigabytes); group
-/// members are read from the DB on demand (`store::group_files`).
+/// What a completed run reports: which scan it published and that scan's own summary.
+///
+/// No group list travels here. The published groups are read through the membership
+/// authority by whoever shows them — the browsing actor for the UI, a snapshot of its own
+/// store for the headless listing — so there is exactly one channel for a result, and a
+/// second, non-authoritative copy cannot drift from it.
 #[derive(Debug, Clone)]
 pub struct ScanResults {
     /// The result's scan_id — so that action marks are saved to the right scan.
     pub scan_id: i64,
-    /// Lightweight group summaries "by benefit" (read from `file_group` after materialization).
-    pub summaries: Vec<GroupSummary>,
     pub summary: ScanSummary,
 }
 

@@ -3,10 +3,9 @@
 
 use crate::app::{App, AppMode};
 use crate::model::dataset::Dataset;
-use crate::model::plan::{MarkIntent, PlanRefusal, RequestedMark};
-use crate::state::ScanStore;
+use crate::model::plan::{ActionPlan, MarkIntent, RequestedMark};
 
-use super::state::{ConfirmScroll, ConfirmTab, Mark, Overlay};
+use super::state::{ConfirmScript, ConfirmScroll, ConfirmTab, Mark, Overlay};
 
 /// F11: submits the panels' marks to the one plan authority and opens the confirmation.
 ///
@@ -25,34 +24,28 @@ pub fn prepare_execution(app: &mut App) {
         app.commander.status = "No marked files (F5/F6/F7/F8)".to_string();
         return;
     }
-    let Some(scan_id) = app.commander.dedup_scan_id else {
+    if app.commander.dedup_scan_id.is_none() {
         app.commander.status =
             "No scan is loaded — load one (F2/F12) before executing actions".to_string();
         return;
-    };
-    let store = match ScanStore::open(&app.db_path) {
-        Ok(store) => store,
-        Err(err) => {
-            app.commander.status = format!("dedcom.db could not be opened: {err}");
-            return;
-        }
-    };
-    let plan = match store.build_action_plan(scan_id, &requested) {
-        Ok(plan) => plan,
-        Err(PlanRefusal::NoMarks) => {
-            app.commander.status = "No marked files (F5/F6/F7/F8)".to_string();
-            return;
-        }
-        Err(refusal) => {
-            // Every refusal is visible and leaves nothing behind: no overlay, no pending plan, no
-            // script, no worker.
-            clear_pending(app);
-            app.commander.status = refusal.to_string();
-            return;
-        }
-    };
-    // Shell-script preview — datasets are needed for quarantine
-    // and snapshot paths, as in apply_batch.
+    }
+    // A plan may not overtake a mark the database has not accepted yet.
+    if let Some(reason) = app.plan_gate_refusal() {
+        app.commander.status = reason;
+        return;
+    }
+    // The plan is built by the ONE store owner, over the complete persisted evidence of every
+    // referenced group. The answer arrives as an event and seats itself; nothing is shown in
+    // the meantime that could be confirmed.
+    if app.request_commander_plan(requested) {
+        app.commander.status = "Building the plan…".to_string();
+    }
+}
+
+/// Seats a plan the authority just built: its script, its digest and its overlay, together.
+pub(crate) fn seat_plan(app: &mut App, plan: ActionPlan) {
+    // Shell-script preview — datasets are needed for quarantine and snapshot paths, as in the
+    // batch itself.
     let datasets: Vec<Dataset> = app
         .zfs
         .pools
@@ -71,7 +64,7 @@ pub fn prepare_execution(app: &mut App) {
         total: script.lines().count(),
         rows: 0,
     };
-    app.commander.confirm_script = script;
+    app.commander.confirm_script = ConfirmScript::Ready(script);
     app.commander.confirm_digest = plan.digest();
     app.commander.pending_plan = Some(plan);
     app.commander.status.clear();
@@ -87,8 +80,15 @@ pub fn confirm_execution(app: &mut App) {
         app.commander.overlay = Overlay::None;
         return;
     }
+    // A seat whose evidence moved may not be executed. The plan stays visible with the reason
+    // beside it, so the operator sees what was invalidated rather than a batch that silently
+    // did not run.
+    if let Some(reason) = app.commander.confirm_script.invalidated() {
+        app.commander.status = format!("The confirmation is no longer valid: {reason}");
+        return;
+    }
     let plan = app.commander.pending_plan.take();
-    app.commander.confirm_script.clear();
+    app.commander.confirm_script = ConfirmScript::None;
     app.commander.overlay = Overlay::None;
     let Some(plan) = plan else {
         return;
@@ -110,9 +110,9 @@ pub fn cancel_execution(app: &mut App) {
 
 /// Drops everything that describes a plan, together. A script left beside a plan that is gone is a
 /// screen quoting something nobody can execute.
-fn clear_pending(app: &mut App) {
+pub(crate) fn clear_pending(app: &mut App) {
     app.commander.pending_plan = None;
-    app.commander.confirm_script.clear();
+    app.commander.confirm_script = ConfirmScript::None;
     app.commander.confirm_digest = crate::model::plan::PlanDigest::default();
     app.commander.confirm_scroll = ConfirmScroll::default();
 }
@@ -145,20 +145,26 @@ fn requested_marks(app: &App) -> Vec<RequestedMark> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::test_app_with_db;
+    use crate::app::{drain, open_and_settle, pump_until, test_app_with_db, OpenIntent};
     use crate::model::action::ActionKind;
     use crate::state::store::role_guard;
     use crate::testfixtures::PlanScenario;
+    use crate::tui::event::AppEvent;
+    use crossbeam_channel::Receiver;
     use std::path::PathBuf;
 
     /// A commander over a scenario's database, with the same marks in the panel and in the DB —
     /// which is what F11 now requires: the window submits what it believes, and the store checks
     /// it against what is durable.
+    ///
+    /// The scan is opened through the actor, because since R4B-2c that is the only thing that
+    /// gives the commander a scan to plan against: the id, the summaries and the browsing store
+    /// all arrive in one payload.
     fn commander_over(
         tag: &str,
         marks: &[(&str, Mark)],
         extra: &[&str],
-    ) -> (PlanScenario, App, Vec<PathBuf>) {
+    ) -> (PlanScenario, App, Receiver<AppEvent>, Vec<PathBuf>) {
         let scenario = PlanScenario::new(tag);
         let mut paths: Vec<PathBuf> = marks.iter().map(|(name, _)| scenario.file(name)).collect();
         paths.extend(extra.iter().map(|name| scenario.file(name)));
@@ -175,12 +181,29 @@ mod tests {
         }
         drop(store);
 
-        let (mut app, _rx) = test_app_with_db(scenario.db_path.clone());
-        app.commander.dedup_scan_id = Some(scan_id);
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        assert_eq!(
+            app.commander.dedup_scan_id,
+            Some(scan_id),
+            "the fixture's scan must open: {}",
+            app.commander.status
+        );
+        drain(&mut app, &rx);
         for ((_, mark), path) in marks.iter().zip(paths.iter()) {
             app.commander.panels[0].marks.insert(path.clone(), *mark);
         }
-        (scenario, app, paths)
+        (scenario, app, rx, paths)
+    }
+
+    /// Asks for the plan exactly as F11 does, and settles the actor's answer.
+    ///
+    /// `prepare_execution` sends `BuildPlan` and returns; the plan — or its refusal — arrives as
+    /// `PlanReady`/`PlanRefused`. A local gate refusal sends nothing, and then there is nothing
+    /// to wait for, which is why the predicate is «no plan in flight» rather than «a plan».
+    fn prepare_and_settle(app: &mut App, rx: &Receiver<AppEvent>) {
+        prepare_execution(app);
+        pump_until(app, rx, "the plan reply", |app| app.routes.plan.is_none());
     }
 
     /// The review's failure scenario: F8 landed where F7 was meant, so the batch deletes the
@@ -189,7 +212,7 @@ mod tests {
     #[test]
     fn the_confirmation_digest_names_a_mis_marked_batch() {
         let _role = role_guard();
-        let (_scenario, mut app, paths) = commander_over(
+        let (_scenario, mut app, rx, paths) = commander_over(
             "mismarked",
             &[
                 ("keeper.bin", Mark::Keeper),
@@ -199,7 +222,7 @@ mod tests {
             &[],
         );
 
-        prepare_execution(&mut app);
+        prepare_and_settle(&mut app, &rx);
 
         assert!(
             matches!(app.commander.overlay, Overlay::Confirm { .. }),
@@ -226,7 +249,7 @@ mod tests {
     #[test]
     fn a_second_plan_replaces_the_first_digest() {
         let _role = role_guard();
-        let (scenario, mut app, paths) = commander_over(
+        let (scenario, mut app, rx, paths) = commander_over(
             "replace",
             &[
                 ("keeper.bin", Mark::Keeper),
@@ -235,13 +258,13 @@ mod tests {
             ],
             &[],
         );
-        prepare_execution(&mut app);
+        prepare_and_settle(&mut app, &rx);
         assert_eq!(app.commander.confirm_digest.counts.len(), 1);
 
         // The operator backs out and re-marks one file as a hardlink instead.
         cancel_execution(&mut app);
         assert!(app.commander.pending_plan.is_none());
-        assert!(app.commander.confirm_script.is_empty());
+        assert!(app.commander.confirm_script.ready().is_none());
         {
             let scan_id = app.commander.dedup_scan_id.unwrap();
             let mut store = scenario.store();
@@ -258,7 +281,7 @@ mod tests {
         app.commander.panels[0]
             .marks
             .insert(paths[1].clone(), Mark::Hardlink);
-        prepare_execution(&mut app);
+        prepare_and_settle(&mut app, &rx);
 
         assert_eq!(
             app.commander.confirm_digest.counts,
@@ -292,12 +315,13 @@ mod tests {
         );
         drop(store);
 
-        let (mut app, _rx) = test_app_with_db(scenario.db_path.clone());
-        app.commander.dedup_scan_id = Some(scan_id);
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        drain(&mut app, &rx);
         app.commander.panels[0].marks.insert(keeper, Mark::Keeper);
         app.commander.panels[0].marks.insert(alias_a, Mark::Delete);
 
-        prepare_execution(&mut app);
+        prepare_and_settle(&mut app, &rx);
 
         let plan = app
             .commander
@@ -397,34 +421,48 @@ mod tests {
         );
     }
 
-    /// A store that cannot be opened leaves the commander with nothing pending — and says so,
+    /// A store that cannot be read leaves the commander with nothing pending — and says so,
     /// rather than reporting the operator's marks as absent.
+    ///
+    /// The checkpoint is replaced under the live view, so the failure is met where it really
+    /// happens: at the door of the actor that owns the connection. Pointing `db_path` at an
+    /// unopenable file would prove nothing now — the actor is already open on the real one.
     #[test]
     fn an_unreadable_store_leaves_no_pending_plan_and_no_script() {
         let _role = role_guard();
-        let (scenario, mut app, _paths) = commander_over(
+        let (scenario, mut app, rx, _paths) = commander_over(
             "store_error",
             &[("keeper.bin", Mark::Keeper), ("dup1.bin", Mark::Delete)],
             &[],
         );
-        prepare_execution(&mut app);
+        prepare_and_settle(&mut app, &rx);
         assert!(app.commander.pending_plan.is_some(), "the fixture plans");
         cancel_execution(&mut app);
 
-        // A regular file where the DB's directory should be is ENOTDIR for anyone, root included.
-        let blocker = scenario.outside.join("not-a-directory");
-        std::fs::write(&blocker, b"x").unwrap();
-        app.db_path = blocker.join("dedcom.db");
+        // The file the view was opened over is replaced by one nothing can identify.
+        std::fs::remove_file(&scenario.db_path).unwrap();
+        std::fs::create_dir(&scenario.db_path).unwrap();
 
-        prepare_execution(&mut app);
+        prepare_and_settle(&mut app, &rx);
 
         assert!(matches!(app.commander.overlay, Overlay::None));
         assert!(app.commander.pending_plan.is_none());
-        assert!(app.commander.confirm_script.is_empty());
+        assert!(app.commander.confirm_script.ready().is_none());
         assert!(app.apply.is_none(), "no worker may have been dispatched");
         assert!(
-            app.commander.status.contains("could not be opened"),
+            app.commander.status.contains("could not be read")
+                && app.commander.status.contains("dedcom.db"),
             "the operator is told what happened: {}",
+            app.commander.status
+        );
+        assert!(
+            !app.commander.status.contains("No marked files"),
+            "a store failure is not an absence of marks: {}",
+            app.commander.status
+        );
+        assert!(
+            !app.commander.status.contains("Building the plan"),
+            "and the in-flight line is not the answer: {}",
             app.commander.status
         );
     }
@@ -434,7 +472,7 @@ mod tests {
     #[test]
     fn a_mark_outside_the_manifest_refuses_the_whole_plan() {
         let _role = role_guard();
-        let (scenario, mut app, _paths) = commander_over(
+        let (scenario, mut app, rx, _paths) = commander_over(
             "outside",
             &[("keeper.bin", Mark::Keeper), ("dup1.bin", Mark::Delete)],
             &[],
@@ -445,14 +483,14 @@ mod tests {
             .marks
             .insert(stranger.clone(), Mark::Delete);
 
-        prepare_execution(&mut app);
+        prepare_and_settle(&mut app, &rx);
 
         assert!(
             matches!(app.commander.overlay, Overlay::None),
             "no confirmation may open over a plan that was refused"
         );
         assert!(app.commander.pending_plan.is_none());
-        assert!(app.commander.confirm_script.is_empty());
+        assert!(app.commander.confirm_script.ready().is_none());
         assert!(
             app.commander
                 .status

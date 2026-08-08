@@ -270,13 +270,19 @@ impl MarkTicket {
 /// reset, never shared with a later operation.
 #[derive(Debug, Clone)]
 pub struct LongOperation {
+    /// The activation the sweep was started under. The consumer keys its own settlement on the
+    /// reply's activation, so this is the record's own provenance rather than a routing field.
+    #[allow(dead_code)]
     pub act: Activation,
     pub req: RequestId,
     pub cancel: CancelToken,
 }
 
-/// What settling one request id released.
+/// What settling one request id released. The consumer settles from the REPLY (which carries
+/// the authoritative after-image) and releases the ledger entry here, so the released value is
+/// evidence for a caller that wants it rather than something the settlement depends on.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum Settled {
     Marks(MarkTicket),
     Long(LongOperation),
@@ -410,6 +416,10 @@ impl Inflight {
 /// send and the rollback of a typed send all live inside ONE gate acquisition.
 #[derive(Clone)]
 pub struct BrowseHandle {
+    /// Which actor this handle talks to. Terminals are routed by the id the `Closed` event
+    /// carries, so the consumer never has to ask a handle who it is — the field keeps the
+    /// handle self-describing for a caller that does.
+    #[allow(dead_code)]
     actor: ActorId,
     tx: Sender<BrowseRequest>,
     closing: Arc<AtomicBool>,
@@ -428,6 +438,7 @@ pub struct BrowseHandle {
 }
 
 impl BrowseHandle {
+    #[allow(dead_code)] // see the `actor` field: terminals are routed by the event's own id
     pub fn actor(&self) -> ActorId {
         self.actor
     }
@@ -639,6 +650,12 @@ impl RequestIds {
     pub(crate) fn starting_at(next: u64) -> Self {
         RequestIds { next }
     }
+
+    /// Test-only: how many ids have been handed out.
+    #[cfg(test)]
+    pub(crate) fn issued(&self) -> u64 {
+        self.next
+    }
 }
 
 /// Actor ids come from one process-wide checked counter, because `BrowseActor::spawn` is the
@@ -685,6 +702,9 @@ pub enum BrowseRequest {
         req: RequestId,
         id: GroupId,
     },
+    /// Reverse lookup by identity. The App asks `FileInfo` instead, which answers the same
+    /// question AND separates «not in this scan» from «in the scan, in no group».
+    #[allow(dead_code)]
     GroupOfPath {
         act: Activation,
         req: RequestId,
@@ -739,6 +759,9 @@ pub enum BrowseRequest {
         req: RequestId,
         cwd: PathBuf,
     },
+    /// The App never issues it: the creation time arrives inside the one `Open` payload, so the
+    /// header costs no request at all.
+    #[allow(dead_code)]
     ScanCreatedAt {
         act: Activation,
         req: RequestId,
@@ -781,6 +804,8 @@ pub enum BrowseEvent {
         req: RequestId,
         result: std::result::Result<u64, MembershipMiss>,
     },
+    /// The reply to the request the App does not issue (see `BrowseRequest::GroupOfPath`).
+    #[allow(dead_code)]
     GroupOfPath {
         act: Activation,
         req: RequestId,
@@ -842,6 +867,8 @@ pub enum BrowseEvent {
         cwd: PathBuf,
         result: std::result::Result<Option<i64>, StoreMiss>,
     },
+    /// The reply to the request the App does not issue (see `BrowseRequest::ScanCreatedAt`).
+    #[allow(dead_code)]
     ScanCreatedAt {
         act: Activation,
         req: RequestId,
@@ -849,7 +876,11 @@ pub enum BrowseEvent {
         result: std::result::Result<Option<String>, StoreMiss>,
     },
     CacheHashAck {
+        /// The identity-cache write is fire-and-forget: only its failure is acted on, so the
+        /// stamps travel for the log rather than for routing.
+        #[allow(dead_code)]
         act: Activation,
+        #[allow(dead_code)]
         req: RequestId,
         result: std::result::Result<(), StoreMiss>,
     },
@@ -917,6 +948,10 @@ pub enum MarkOutcome {
     Settled {
         after: Vec<(PathBuf, Option<MarkIntent>)>,
     },
+    /// A write that refused while an authoritative after-image WAS readable. The store's
+    /// settled writer refuses before it writes, so today every refusal is `Unreadable`; the
+    /// variant stays because the consumer must keep handling the case where an image exists.
+    #[allow(dead_code)]
     Failed {
         error: MarkWriteError,
         after: Vec<(PathBuf, Option<MarkIntent>)>,
@@ -1017,6 +1052,9 @@ pub enum BrowseOpenFailure {
     Open {
         detail: String,
     },
+    /// The actor's own role forbids the open. Unreachable while the fleet opens by the role it
+    /// was spawned with; kept so the class exists for a caller that gains one.
+    #[allow(dead_code)]
     Role,
     Closing,
     /// The path changed during the open or during candidate construction. Always class B.
@@ -1189,8 +1227,8 @@ pub enum FleetPhase {
 
 /// Owns the one browsing actor and the strictly serialized replacement protocol.
 ///
-/// Dormant in this commit: `App` holds one, initialized `Idle`, and nothing in production
-/// calls anything else on it until R4B-2c.
+/// Since R4B-2c this is the application's only browsing surface: `App` holds one, spawns the
+/// actor into it on the first request, and every browsing answer the UI installs came through it.
 pub struct BrowseFleet {
     state: FleetState,
     /// The successor to spawn after the current terminal settles. Kept beside the state, not
@@ -1224,7 +1262,10 @@ impl BrowseFleet {
         }
     }
 
-    /// True while an actor is closing and its terminal has not settled yet.
+    /// True while an actor is closing and its terminal has not settled yet. The shutdown
+    /// machine asks `terminal_owed` instead — it covers the live actor too — so this is the
+    /// narrower question, kept for a caller that wants exactly it.
+    #[allow(dead_code)]
     pub fn busy(&self) -> bool {
         matches!(self.state, FleetState::Draining { .. })
     }
@@ -1240,6 +1281,24 @@ impl BrowseFleet {
 
     pub fn next_request(&mut self) -> RequestId {
         self.requests.allocate()
+    }
+
+    /// Test-only: which actor is live. A test that watches this across a whole interaction is
+    /// watching for a replacement nobody asked for.
+    #[cfg(test)]
+    pub(crate) fn live_actor(&self) -> Option<ActorId> {
+        match &self.state {
+            FleetState::Live { actor, .. } => Some(*actor),
+            FleetState::Idle | FleetState::Draining { .. } => None,
+        }
+    }
+
+    /// Test-only: how many requests this fleet has ever handed out. The counter is monotonic and
+    /// allocated exactly once per enqueued request, so a difference across an interaction IS the
+    /// number of round trips that interaction cost.
+    #[cfg(test)]
+    pub(crate) fn requests_issued(&self) -> u64 {
+        self.requests.issued()
     }
 
     /// The live handle, for enqueueing. `None` while `Idle` or `Draining` — a draining actor
@@ -1643,6 +1702,9 @@ impl TestHooks {
 pub struct BrowseActor;
 
 impl BrowseActor {
+    /// The direct constructor. Production spawns through `BrowseFleet`, which is what enforces
+    /// «at most one actor over the database»; this is the unmanaged door its tests use.
+    #[allow(dead_code)]
     pub fn spawn(
         db: PathBuf,
         role: BrowseRole,
@@ -6268,12 +6330,26 @@ mod tests {
         at = expect(&door, at, 1, "reconcile_marks_after_batch");
         door.upsert_hash(1, 2, 3, 4, &[6u8; 32]).unwrap();
         at = expect(&door, at, 1, "upsert_hash");
+        // Since R4B-2c the plan is built from a membership snapshot, so this is the one door
+        // operation that opens a snapshot of its own: the door's probe, then the snapshot's. The
+        // expected cost is DERIVED from the snapshot line of this same table rather than written
+        // as a larger constant — if a snapshot ever stops costing one probe, this moves with it.
+        let snapshot_cost = {
+            let before = door.identity_probes();
+            {
+                let _ = door.membership_snapshot(scan_id).unwrap();
+            }
+            door.identity_probes() - before
+        };
+        assert_eq!(snapshot_cost, 1, "a snapshot is one probe (row 2 above)");
+        // The measurement itself spent that probe; the running table carries on from there.
+        at += snapshot_cost;
         let _ = door.build_action_plan(scan_id, &[]).unwrap();
         let _ = expect(
             &door,
             at,
-            1,
-            "build_action_plan (the probe, whatever the plan says)",
+            1 + snapshot_cost,
+            "build_action_plan (the door's probe plus the snapshot it opens)",
         );
         drop(door);
         std::fs::remove_dir_all(&dir).ok();
@@ -6336,44 +6412,98 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---- 13. structural dormancy ---------------------------------------------------------------
+    // ---- 13. the structural production inventory -----------------------------------------------
 
-    /// Production spawns no actor and routes nothing through it; the carrier exists beside a
-    /// still-live `ResultsLoaded`; the actor itself never consults the process-global role
-    /// opener. Textual, deliberately: the module privacy is compiler-enforced, and this pins
-    /// the half the compiler cannot see.
+    /// Everything before the first test module of a source file.
+    fn production_half(source: &'static str) -> &'static str {
+        source
+            .split_once("\n#[cfg(test)]\nmod ")
+            .map(|(production, _)| production)
+            .unwrap_or(source)
+    }
+
+    /// The cutover's structural half: what R4B-2c REMOVED, which no call can prove gone.
+    ///
+    /// This replaces `production_spawns_no_actor_and_the_carrier_stays_dormant`, whose whole
+    /// content was the dormancy the cutover exists to end — it asserted that nothing spawns an
+    /// actor, that the carrier arm is a no-op and that `ResultsLoaded` is still live, and every
+    /// one of those is now false by the accepted contract. Its counterpart in the other
+    /// direction — production spawns exactly ONE actor and browsing rides it — is behavioural and
+    /// lives in `app::actor_route_tests`; only the absences are textual, because a deleted
+    /// route cannot be exercised.
     #[test]
-    fn production_spawns_no_actor_and_the_carrier_stays_dormant() {
-        let app = include_str!("../app.rs");
+    fn production_keeps_no_retired_browsing_route() {
+        let app = production_half(include_str!("../app.rs"));
         assert!(
             app.contains("browse: crate::state::browse::BrowseFleet"),
-            "the dormant fleet field exists"
+            "the fleet field is the app's only browsing seam"
+        );
+        assert_eq!(
+            app.matches("fn ensure_browse_actor").count(),
+            1,
+            "one place spawns the actor"
+        );
+        assert_eq!(
+            app.matches("fn send_browse").count(),
+            1,
+            "and one place enqueues a request"
         );
         assert!(
-            !app.contains("BrowseActor::spawn") && !app.contains(".browse.spawn"),
-            "nothing in the App spawns an actor yet"
+            !app.contains("AppEvent::Browse(_) => {}"),
+            "the dormant-era no-op carrier arm is gone"
         );
         assert!(
-            app.contains("AppEvent::Browse(_) => {}"),
-            "the carrier arm is a no-op until R4B-2c"
+            !app.contains("browse_store") && !app.contains("browse_conn"),
+            "the app holds no browsing connection of its own"
         );
-        let events = include_str!("../tui/event.rs");
+        assert_eq!(
+            app.matches("apply_worker::spawn").count(),
+            1,
+            "one apply entry, and it is the guarded worker"
+        );
+
+        let events = production_half(include_str!("../tui/event.rs"));
         assert!(
-            events.contains("ResultsLoaded(i64, Vec<GroupSummary>, ScanSummary, bool)"),
-            "ResultsLoaded stays live beside the carrier"
+            !events.contains("ResultsLoaded"),
+            "the second result channel is gone"
         );
         assert!(events.contains("Browse(Box<crate::state::browse::BrowseEvent>)"));
-        let browse = include_str!("browse.rs");
-        let production = browse
-            .split_once("\n#[cfg(test)]\nmod tests")
-            .map(|(production, _)| production)
-            .unwrap_or(browse);
+
+        let actions = production_half(include_str!("../actions/mod.rs"));
         assert!(
-            !production.contains("ScanStore::open("),
+            !actions.contains("fn apply_batch("),
+            "the unguarded batch entry is gone; `apply_guarded_with` is the only way in"
+        );
+        assert_eq!(actions.matches("fn apply_guarded_with").count(), 1);
+
+        let store = production_half(include_str!("store.rs"));
+        for retired in [
+            "fn materialize_file_groups",
+            "fn ensure_materialized",
+            "fn record_file_results",
+            "fn dup_files_inside",
+            "fn dir_dedup_status",
+            "fn plan_group",
+            "fn group_files",
+            "fn group_summaries",
+        ] {
+            assert!(
+                !store.contains(retired),
+                "{retired} outlived the readers that called it"
+            );
+        }
+        assert!(
+            store.contains("fn group_claim(&self, id: &GroupId)"),
+            "the surviving claim reader is keyed by identity, never by a digest"
+        );
+
+        let browse = production_half(include_str!("browse.rs"));
+        assert!(
+            !browse.contains("ScanStore::open("),
             "the actor opens by its own role, never by the mutable global"
         );
         assert_eq!(
-            production.matches("inner: ScanStore").count(),
+            browse.matches("inner: ScanStore").count(),
             1,
             "exactly one raw-store field exists, inside the guarded door"
         );

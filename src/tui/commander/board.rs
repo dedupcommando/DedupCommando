@@ -71,7 +71,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     };
 
     let dir_sizes = &app.commander.dir_size_cache;
-    let cross: HashSet<String> = HashSet::new();
+    let cross: HashSet<super::MatchKey> = HashSet::new();
     let focus = board.focus;
 
     let source_dedup = app.commander.dedup.dir(&board.source.cwd);

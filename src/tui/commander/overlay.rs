@@ -10,7 +10,7 @@ use ratatui::{
 };
 
 use super::panel::ellipsize_left;
-use super::state::{ConfirmScroll, ConfirmTab, PlanDigest};
+use super::state::{ConfirmScript, ConfirmScroll, ConfirmTab, PlanDigest};
 use crate::model::scan::ResumeInfo;
 use crate::tui::centered;
 
@@ -49,10 +49,15 @@ pub fn render_menu(frame: &mut Frame, cursor: usize, labels: &[&str]) {
 pub fn render_confirm(
     frame: &mut Frame,
     tab: ConfirmTab,
-    script: &str,
+    seat: &ConfirmScript,
     digest: &PlanDigest,
     scroll: &mut ConfirmScroll,
 ) {
+    // A seat whose plan the database has moved out from under may not be executed, and the
+    // overlay says so instead of showing a script that reads as runnable. The decision hint
+    // stays: what the operator may still do is the part that must never be the casualty.
+    let script = seat.ready().unwrap_or("");
+    let invalidated = seat.invalidated();
     let tabs = Line::from(vec![
         Span::raw("  "),
         tab_span("Summary", matches!(tab, ConfirmTab::Summary)),
@@ -127,6 +132,14 @@ pub fn render_confirm(
     let mut content = vec![tabs];
     if gaps {
         content.push(Line::from(""));
+    }
+    // The invalidation goes ABOVE the body, in its own colour: whatever the tab is showing, the
+    // first thing read must be that this confirmation may no longer be executed.
+    if let Some(reason) = invalidated {
+        content.push(Line::from(Span::styled(
+            format!(" This confirmation is no longer valid: {reason} "),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
     }
     content.extend(body);
     if gaps {
@@ -542,6 +555,11 @@ mod confirm_summary_tests {
         ActionPlan::try_new(
             1,
             vec![PlanGroupInput {
+                id: crate::model::plan::GroupId {
+                    scan_id: 1,
+                    rank: 0,
+                    generation: 1,
+                },
                 hash: "ab".repeat(32),
                 members,
             }],
@@ -560,7 +578,15 @@ mod confirm_summary_tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut scroll = ConfirmScroll::default();
         terminal
-            .draw(|frame| render_confirm(frame, ConfirmTab::Summary, "", digest, &mut scroll))
+            .draw(|frame| {
+                render_confirm(
+                    frame,
+                    ConfirmTab::Summary,
+                    &ConfirmScript::None,
+                    digest,
+                    &mut scroll,
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..height)
@@ -706,7 +732,15 @@ mod confirm_summary_tests {
         let digest = digest_of(&[(ActionKind::Delete, "/tank/dup.bin")]);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| render_confirm(frame, ConfirmTab::Commands, text, &digest, scroll))
+            .draw(|frame| {
+                render_confirm(
+                    frame,
+                    ConfirmTab::Commands,
+                    &ConfirmScript::Ready(text.to_string()),
+                    &digest,
+                    scroll,
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..height)

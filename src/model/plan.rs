@@ -61,6 +61,14 @@ pub enum PlanRefusal {
     },
     #[error("{} is marked both as the keeper and for an action. Re-mark it, or move the old dedcom.db aside.", .path.display())]
     ContradictoryMark { path: PathBuf },
+    #[error("{} is marked but belongs to no published group — the results changed since it was marked; rescan required", .path.display())]
+    NotAMember { path: PathBuf },
+    #[error("the plan references scan {found} while planning scan {expected} — rescan required")]
+    ForeignScan { expected: i64, found: i64 },
+    #[error("the plan mixes publication generations {expected} and {found} — rescan required")]
+    MixedGeneration { expected: i64, found: i64 },
+    #[error("the plan references an invalid group rank {rank} — rescan required")]
+    NegativeRank { rank: i64 },
     #[error("the group {hash} has two keepers ({} and {}) — exactly one file is kept", .first.display(), .second.display())]
     MultipleKeepers {
         hash: String,
@@ -301,6 +309,10 @@ impl PlanMemberEvidence {
 /// it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanGroupInput {
+    /// The authoritative identity of the published group this evidence came from. The plan is
+    /// keyed by it — never by the digest, which two Explicit ranks may legitimately share.
+    pub id: GroupId,
+    /// The digest the group's CURRENT summary carried at planning time (lower hex).
     pub hash: String,
     pub members: Vec<PlanMemberEvidence>,
 }
@@ -311,9 +323,10 @@ pub struct PlanGroupInput {
 /// rank; and the digest is deliberately NOT here — it is content, not identity, and two explicit
 /// ranks may legitimately share one.
 ///
-/// Staged by R4B-1 with no production caller; R4B-2 wires it into `PlanGroupInput` and the
-/// destructive routes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Since R4B-2c this is the key of `PlanGroupInput`, of every published summary row the UI
+/// holds, and of every group answer the browsing actor gives — including the cross-panel match
+/// set, which is why it hashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GroupId {
     pub scan_id: i64,
     pub rank: i64,
@@ -613,6 +626,10 @@ pub struct ActionPlan {
     objects: Vec<PlannedObject>,
     actions: Vec<PlanAction>,
     summary: PlanSummary,
+    /// What the apply lease revalidates before the batch may begin. Derived from the same
+    /// group inputs the actions were folded from, so the plan and its witness cannot describe
+    /// two different populations.
+    witness: PlanWitness,
 }
 
 impl ActionPlan {
@@ -625,15 +642,56 @@ impl ActionPlan {
         if groups.is_empty() {
             return Err(PlanRefusal::NoMarks);
         }
+        // Identity first: every group must belong to THIS scan and to ONE publication, and a
+        // rank below zero names nothing. Checked before any evidence is read, so nothing can
+        // be folded from a group the plan had no right to reference.
+        let generation = groups[0].id.generation;
+        for group in &groups {
+            if group.id.scan_id != scan_id {
+                return Err(PlanRefusal::ForeignScan {
+                    expected: scan_id,
+                    found: group.id.scan_id,
+                });
+            }
+            if group.id.rank < 0 {
+                return Err(PlanRefusal::NegativeRank {
+                    rank: group.id.rank,
+                });
+            }
+            if group.id.generation != generation {
+                return Err(PlanRefusal::MixedGeneration {
+                    expected: generation,
+                    found: group.id.generation,
+                });
+            }
+        }
         // One normalisation up front, so every check below and every figure that follows reads the
-        // same evidence in the same order.
-        groups.sort_by(|left, right| left.hash.cmp(&right.hash));
+        // same evidence in the same order. Rank is the identity order of one publication.
+        groups.sort_by_key(|group| group.id.rank);
         for group in &mut groups {
             group
                 .members
                 .sort_by(|left, right| left.path.cmp(&right.path));
         }
         Self::check_global_evidence(&groups)?;
+        // The witness is derived from the same inputs the actions are folded from below —
+        // one source, so the lease revalidates exactly what was planned.
+        let witness = PlanWitness {
+            scan_id,
+            generation,
+            groups: groups
+                .iter()
+                .map(|group| GroupWitness {
+                    id: group.id,
+                    digest: group.hash.clone(),
+                    members: group
+                        .members
+                        .iter()
+                        .map(|member| member.path.clone())
+                        .collect(),
+                })
+                .collect(),
+        };
 
         let mut objects: Vec<PlannedObject> = Vec::new();
         let mut actions: Vec<PlanAction> = Vec::new();
@@ -752,6 +810,7 @@ impl ActionPlan {
             objects,
             actions,
             summary,
+            witness,
         })
     }
 
@@ -761,8 +820,10 @@ impl ActionPlan {
     /// merge, pick a winner from or count twice — it is a damaged database, and the plan refuses.
     /// Checked before any total or action is folded, so nothing is derived from it first.
     fn check_global_evidence(groups: &[PlanGroupInput]) -> PlanResult<()> {
+        // Input identity is the GroupId, not the digest: two Explicit ranks may legitimately
+        // share one digest and are two different groups.
         for pair in groups.windows(2) {
-            if pair[0].hash == pair[1].hash {
+            if pair[0].id == pair[1].id {
                 return Err(PlanRefusal::DuplicateGroupInput {
                     hash: pair[0].hash.clone(),
                 });
@@ -801,6 +862,11 @@ impl ActionPlan {
 
     pub fn scan_id(&self) -> i64 {
         self.scan_id
+    }
+
+    /// The witness the guarded apply revalidates. Borrowed: it lives and dies with the plan.
+    pub fn witness(&self) -> &PlanWitness {
+        &self.witness
     }
 
     pub fn objects(&self) -> &[PlannedObject] {
@@ -1612,8 +1678,17 @@ mod tests {
             .expect("the fixture is well formed")
     }
 
+    fn gid(rank: i64) -> GroupId {
+        GroupId {
+            scan_id: 1,
+            rank,
+            generation: 1,
+        }
+    }
+
     fn group(members: Vec<PlanMemberEvidence>) -> PlanGroupInput {
         PlanGroupInput {
+            id: gid(0),
             hash: "ab".repeat(32),
             members,
         }
@@ -1919,6 +1994,7 @@ mod tests {
             ),
         ]);
         second.hash = "bb".repeat(32);
+        second.id = gid(1);
         let refusal = ActionPlan::try_new(1, vec![first, second]).expect_err("two maxima");
         assert!(
             matches!(refusal, PlanRefusal::Arithmetic { .. }),
@@ -2053,6 +2129,7 @@ mod tests {
             member("/x/alias_1.bin", shared, 2, false, Some(ActionKind::Delete)),
         ]);
         second.hash = "bb".repeat(32);
+        second.id = gid(1);
 
         assert_eq!(
             ActionPlan::try_new(1, vec![first, second]).expect_err("one inode, two digests"),
@@ -2088,12 +2165,132 @@ mod tests {
 
         let mut second = twice();
         second.hash = "cd".repeat(32);
+        second.id = gid(1);
         assert_eq!(
             ActionPlan::try_new(1, vec![twice(), second])
                 .expect_err("one pathname under two digests"),
             PlanRefusal::DuplicatePathEvidence {
                 path: PathBuf::from("/x/keeper.bin")
             }
+        );
+    }
+
+    /// The plan is keyed by identity: a foreign scan, a mixed generation and a negative rank
+    /// each refuse the whole plan, typed, before any evidence is folded.
+    #[test]
+    fn plan_identity_refusals_are_typed() {
+        let well_formed = || {
+            vec![
+                member("/x/keeper.bin", key(10, S), 1, true, None),
+                member(
+                    "/x/twin.bin",
+                    key(11, S),
+                    1,
+                    false,
+                    Some(ActionKind::Delete),
+                ),
+            ]
+        };
+        let mut foreign = group(well_formed());
+        foreign.id = GroupId {
+            scan_id: 2,
+            rank: 0,
+            generation: 1,
+        };
+        assert_eq!(
+            ActionPlan::try_new(1, vec![foreign]).expect_err("scan 2 in a plan for scan 1"),
+            PlanRefusal::ForeignScan {
+                expected: 1,
+                found: 2
+            }
+        );
+
+        let mut negative = group(well_formed());
+        negative.id = gid(-1);
+        assert_eq!(
+            ActionPlan::try_new(1, vec![negative]).expect_err("rank -1 names nothing"),
+            PlanRefusal::NegativeRank { rank: -1 }
+        );
+
+        let first = group(well_formed());
+        let mut second = group(vec![
+            member("/y/keeper.bin", key(20, S), 1, true, None),
+            member(
+                "/y/twin.bin",
+                key(21, S),
+                1,
+                false,
+                Some(ActionKind::Delete),
+            ),
+        ]);
+        second.hash = "cd".repeat(32);
+        second.id = GroupId {
+            scan_id: 1,
+            rank: 1,
+            generation: 2,
+        };
+        assert_eq!(
+            ActionPlan::try_new(1, vec![first, second]).expect_err("two publications"),
+            PlanRefusal::MixedGeneration {
+                expected: 1,
+                found: 2
+            }
+        );
+    }
+
+    /// The witness is derived from the same inputs the actions were folded from: same scan,
+    /// same generation, one entry per group with its digest and every member pathname in
+    /// member order — so the lease revalidates exactly what was planned.
+    #[test]
+    fn the_plan_owns_the_witness_it_was_folded_from() {
+        let mut second = group(vec![
+            member(
+                "/y/b_twin.bin",
+                key(21, S),
+                1,
+                false,
+                Some(ActionKind::Delete),
+            ),
+            member("/y/a_keeper.bin", key(20, S), 1, true, None),
+        ]);
+        second.hash = "cd".repeat(32);
+        second.id = gid(1);
+        let plan = ActionPlan::try_new(
+            1,
+            vec![
+                second,
+                group(vec![
+                    member("/x/keeper.bin", key(10, S), 1, true, None),
+                    member(
+                        "/x/twin.bin",
+                        key(11, S),
+                        1,
+                        false,
+                        Some(ActionKind::Delete),
+                    ),
+                ]),
+            ],
+        )
+        .unwrap();
+        let witness = plan.witness();
+        assert_eq!(witness.scan_id, 1);
+        assert_eq!(witness.generation, 1);
+        assert_eq!(witness.groups.len(), 2);
+        assert_eq!(witness.groups[0].id, gid(0), "rank order, not input order");
+        assert_eq!(witness.groups[0].digest, "ab".repeat(32));
+        assert_eq!(
+            witness.groups[0].members,
+            vec![PathBuf::from("/x/keeper.bin"), PathBuf::from("/x/twin.bin")]
+        );
+        assert_eq!(witness.groups[1].id, gid(1));
+        assert_eq!(witness.groups[1].digest, "cd".repeat(32));
+        assert_eq!(
+            witness.groups[1].members,
+            vec![
+                PathBuf::from("/y/a_keeper.bin"),
+                PathBuf::from("/y/b_twin.bin")
+            ],
+            "member pathnames travel sorted"
         );
     }
 

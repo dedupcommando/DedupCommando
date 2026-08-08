@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Background application of a batch of actions (mirror of `scan/worker.rs`): the UI doesn't freeze.
-//! The worker thread calls [`apply_batch`], a separate poller sends `ApplyProgress` ~6/s,
-//! at the end — `ApplyFinished` with `BatchResult`. Cancellation (Esc) is a flag in `ApplyShared`,
-//! checked at the action boundary: the snapshot is already made, what was applied is in quarantine.
+//! The worker thread enters through the GUARDED boundary — [`apply_guarded_with`] opens its own
+//! apply lease, revalidates the plan's witness against the live membership and holds the lease
+//! across the whole batch — a separate poller sends `ApplyProgress` ~6/s, at the end —
+//! `ApplyFinished` with the typed [`ApplyOutcome`]. Cancellation (Esc) is a flag in
+//! `ApplyShared`, checked at the action boundary: the snapshot is already made, what was applied
+//! is in quarantine.
 
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
@@ -11,14 +15,13 @@ use std::time::Duration;
 
 use crossbeam_channel::Sender;
 
-use crate::error::Result;
-use crate::model::action::{BatchResult, RevalidationMode};
+use crate::model::action::RevalidationMode;
 use crate::model::dataset::Dataset;
 use crate::model::plan::ActionPlan;
 use crate::panics;
 use crate::tui::event::AppEvent;
 
-use super::{apply_batch, ApplyPhase, ApplyShared};
+use super::{apply_guarded_with, ApplyOutcome, ApplyPhase, ApplyShared, GuardedApply, RealOps};
 
 /// Control over a running apply: cancellation at the action boundary.
 pub struct ApplyHandle {
@@ -33,12 +36,14 @@ impl ApplyHandle {
     }
 }
 
-/// Starts applying a plan in the background. Progress and result go to `events`.
+/// Starts applying a plan in the background, through the guarded boundary. Progress and the
+/// typed outcome go to `events`.
 ///
-/// The worker takes the whole owning [`ActionPlan`], not a vector of actions: the evidence that
-/// justifies an action is what the preflights, the ledger and the post-run accounting all read, and
-/// a worker handed the actions alone could not check any of it.
+/// The worker takes the whole owning [`ActionPlan`]: the witness it owns is what the lease
+/// revalidates, and a refusal hands exactly this plan back to its window inside
+/// [`ApplyOutcome::Refused`] with zero filesystem work done.
 pub fn spawn(
+    db_path: PathBuf,
     plan: ActionPlan,
     datasets: Vec<Dataset>,
     reflink_safe: bool,
@@ -46,20 +51,36 @@ pub fn spawn(
     events: Sender<AppEvent>,
 ) -> ApplyHandle {
     spawn_job(events, move |shared| {
-        apply_batch(&plan, &datasets, reflink_safe, shared, mode)
+        match apply_guarded_with(
+            &RealOps,
+            &db_path,
+            &plan,
+            &datasets,
+            reflink_safe,
+            shared,
+            mode,
+        ) {
+            GuardedApply::Refused(refusal) => ApplyOutcome::Refused {
+                refusal,
+                plan: Box::new(plan),
+            },
+            GuardedApply::Ran(Ok(batch)) => ApplyOutcome::Finished(batch),
+            GuardedApply::Ran(Err(err)) => ApplyOutcome::Failed(err.to_string()),
+        }
     })
 }
 
-/// The worker itself: poller, panic containment, terminal event. `spawn` hands it the real batch;
-/// the tests hand it a job that panics, which is the only way in to the containment.
+/// The worker itself: poller, panic containment, terminal event. `spawn` hands it the real
+/// guarded batch; the tests hand it a job that panics, which is the only way in to the
+/// containment.
 fn spawn_job<F>(events: Sender<AppEvent>, job: F) -> ApplyHandle
 where
-    F: FnOnce(&ApplyShared) -> Result<BatchResult> + Send + 'static,
+    F: FnOnce(&ApplyShared) -> ApplyOutcome + Send + 'static,
 {
     let shared = Arc::new(ApplyShared::default());
 
     // Poller: ~6 progress snapshots per second, until the phase is Done. A separate thread —
-    // apply_batch is a tight loop without a natural callback (unlike run_scan).
+    // the batch is a tight loop without a natural callback (unlike run_scan).
     let poll_shared = shared.clone();
     let poll_events = events.clone();
     thread::spawn(move || loop {
@@ -72,15 +93,18 @@ where
         thread::sleep(Duration::from_millis(150));
     });
 
-    // Worker thread: applies the batch and sends the result. A panic used to unwind it alone —
+    // Worker thread: applies the batch and sends the outcome. A panic used to unwind it alone —
     // no ApplyFinished, and the Applying screen has no other way out.
     let work_shared = shared.clone();
     thread::spawn(move || {
-        let result = panics::guard("the apply worker", || job(&work_shared));
-        // We guarantee the Done phase even if apply_batch exited with an error BEFORE it
+        let outcome = match panics::guard_value("the apply worker", || job(&work_shared)) {
+            Ok(outcome) => outcome,
+            Err(text) => ApplyOutcome::Failed(text),
+        };
+        // We guarantee the Done phase even if the batch exited with an error BEFORE it
         // (for example, a snapshot failure) — otherwise the poller would spin forever.
         work_shared.set_phase(ApplyPhase::Done);
-        let _ = events.send(AppEvent::ApplyFinished(result));
+        let _ = events.send(AppEvent::ApplyFinished(Box::new(outcome)));
     });
 
     ApplyHandle { shared }
@@ -89,12 +113,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::action::{ActionKind, BatchResult, RevalidationMode};
+    use crate::model::action::{ActionKind, RevalidationMode};
+    use crate::state::store::role_guard;
     use crate::testfixtures::PlanScenario;
 
-    /// A real one-action plan over real files. Handed no datasets, so the action is refused for
-    /// want of a mountpoint and nothing on the filesystem is touched — safe in Docker without a
-    /// pool, while still exercising the whole preflight/ledger path.
+    /// A real one-action plan over real files, published and planned through the production
+    /// authority. Handed no datasets, so the action is refused for want of a mountpoint and
+    /// nothing on the filesystem is touched — safe in Docker without a pool, while still
+    /// exercising the whole lease/preflight/ledger path.
     fn one_action_plan(tag: &str) -> (PlanScenario, ActionPlan) {
         let scenario = PlanScenario::new(tag);
         let keeper = scenario.file("keeper.bin");
@@ -108,37 +134,97 @@ mod tests {
         (scenario, plan)
     }
 
-    /// spawn → applying a plan → `ApplyFinished(Ok(BatchResult))` arrives.
-    #[test]
-    fn spawn_sends_finished() {
-        let (_scenario, plan) = one_action_plan("worker_finished");
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let _handle = spawn(plan, Vec::new(), false, RevalidationMode::Hybrid, tx);
-
-        let mut finished: Option<std::result::Result<BatchResult, String>> = None;
+    fn recv_outcome(rx: &crossbeam_channel::Receiver<AppEvent>) -> ApplyOutcome {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(AppEvent::ApplyFinished(result)) => {
-                    finished = Some(result);
-                    break;
-                }
+                Ok(AppEvent::ApplyFinished(outcome)) => return *outcome,
                 Ok(_) => {}
                 Err(_) => {}
             }
         }
-        let result = finished.expect("ApplyFinished must arrive");
-        let batch = result.expect("a plan the preflight accepts — Ok");
-        assert_eq!(batch.outcomes.len(), 1);
-        assert_eq!(batch.failed(), 1, "no dataset, so nothing is applied");
+        panic!("ApplyFinished must arrive");
+    }
+
+    /// spawn → the guarded batch runs → `ApplyFinished(Finished(BatchResult))` arrives.
+    #[test]
+    fn spawn_sends_finished() {
+        let _role = role_guard();
+        let (scenario, plan) = one_action_plan("worker_finished");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let _handle = spawn(
+            scenario.db_path.clone(),
+            plan,
+            Vec::new(),
+            false,
+            RevalidationMode::Hybrid,
+            tx,
+        );
+
+        match recv_outcome(&rx) {
+            ApplyOutcome::Finished(batch) => {
+                assert_eq!(batch.outcomes.len(), 1);
+                assert_eq!(batch.failed(), 1, "no dataset, so nothing is applied");
+            }
+            ApplyOutcome::Refused { refusal, .. } => {
+                panic!("a fresh plan over its own publication must not refuse: {refusal:?}")
+            }
+            ApplyOutcome::Failed(err) => panic!("the batch must run: {err}"),
+        }
+    }
+
+    /// The worker catches membership drift with zero filesystem work: a republication after
+    /// planning refuses the batch and hands the exact plan back.
+    #[test]
+    fn a_republished_membership_refuses_before_any_work() {
+        use crate::state::PublishMode;
+        let _role = role_guard();
+        let (scenario, plan) = one_action_plan("worker_stale");
+        {
+            let mut store = scenario.store();
+            let scan_id = plan.scan_id();
+            store
+                .publish_results(scan_id, PublishMode::Derived)
+                .unwrap();
+        }
+        let expected = plan.clone();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let _handle = spawn(
+            scenario.db_path.clone(),
+            plan,
+            Vec::new(),
+            false,
+            RevalidationMode::Hybrid,
+            tx,
+        );
+
+        match recv_outcome(&rx) {
+            ApplyOutcome::Refused { refusal, plan } => {
+                assert!(
+                    matches!(refusal, crate::actions::ApplyRefusal::Stale { .. }),
+                    "generation drift is the typed reason: {refusal:?}"
+                );
+                assert_eq!(*plan, expected, "the exact plan comes back to its window");
+            }
+            ApplyOutcome::Finished(_) => panic!("a stale witness must never enter the batch"),
+            ApplyOutcome::Failed(err) => panic!("a refusal is typed, not a failure: {err}"),
+        }
     }
 
     /// Progress arrives and the phase reaches Done (the poller sends at least one snapshot).
     #[test]
     fn progress_reaches_done() {
-        let (_scenario, plan) = one_action_plan("worker_progress");
+        let _role = role_guard();
+        let (scenario, plan) = one_action_plan("worker_progress");
         let (tx, rx) = crossbeam_channel::unbounded();
-        let _handle = spawn(plan, Vec::new(), false, RevalidationMode::Hybrid, tx);
+        let _handle = spawn(
+            scenario.db_path.clone(),
+            plan,
+            Vec::new(),
+            false,
+            RevalidationMode::Hybrid,
+            tx,
+        );
 
         let mut saw_done = false;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -149,8 +235,8 @@ mod tests {
                     break;
                 }
                 Ok(AppEvent::ApplyFinished(_)) => {
-                    // The result arrived — the Done snapshot may have preceded it or come right after;
-                    // we read out the remaining events until the deadline.
+                    // The outcome arrived — the Done snapshot may have preceded it or come right
+                    // after; we read out the remaining events until the deadline.
                 }
                 Ok(_) => {}
                 Err(_) => {}
@@ -168,24 +254,27 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let _handle = spawn_job(tx, |_shared| panic!("boom in the batch"));
 
-        let mut finished: Option<std::result::Result<BatchResult, String>> = None;
+        let mut finished: Option<ApplyOutcome> = None;
         let mut saw_done = false;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline && (finished.is_none() || !saw_done) {
             match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(AppEvent::ApplyFinished(result)) => finished = Some(result),
+                Ok(AppEvent::ApplyFinished(outcome)) => finished = Some(*outcome),
                 Ok(AppEvent::ApplyProgress(p)) if p.phase == ApplyPhase::Done => saw_done = true,
                 Ok(_) => {}
                 Err(_) => {}
             }
         }
-        let err = finished
-            .expect("ApplyFinished must arrive even when the batch panics")
-            .expect_err("a panic is an error, not a result");
-        assert!(
-            err.contains("boom in the batch"),
-            "the screen must show what happened: {err}"
-        );
+        match finished.expect("ApplyFinished must arrive even when the batch panics") {
+            ApplyOutcome::Failed(err) => assert!(
+                err.contains("boom in the batch"),
+                "the screen must show what happened: {err}"
+            ),
+            other => panic!(
+                "a panic is a failure, not a result: {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
         assert!(saw_done, "the poller must reach Done and stop");
     }
 }

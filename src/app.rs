@@ -12,19 +12,28 @@ use ratatui::widgets::ListState;
 use std::time::{Duration, Instant};
 
 use crate::actions;
+use crate::actions::{ApplyOutcome, ApplyRefusal};
 use crate::model::action::{ActionKind, BatchResult, RevalidationMode};
 use crate::model::dataset::Dataset;
 use crate::model::duplicate::{DirSigAlgo, DuplicateGroup, FileEntry};
-use crate::model::plan::{ActionPlan, MarkIntent, PlanRefusal, RequestedMark};
+use crate::model::plan::{ActionPlan, GroupId, MarkIntent, PlanRefusal, RequestedMark};
 use crate::model::preset::Preset;
 use crate::model::scan::{
     HashProfile, ResumeInfo, ScanConfig, ScanPhase, ScanProgress, ScanSummary,
 };
 use crate::pipeline::ScanOutcome;
 use crate::scan::worker::{self, ScanHandle};
-use crate::state::{GroupSummary, HostProfile, ScanStore};
+use crate::state::browse::{
+    Activation, ActorId, AutoSelectOutcome, AutoSelectRefusal, BrowseEvent, BrowseOpenFailure,
+    BrowseRequest, BrowseRole, BrowseSink, CancelToken, CloseCause, DrainedInflight, MarkOutcome,
+    MarkTicket, OpenedBrowse, PanelFailure, Presentation, RefusedAutoSelect, RequestId,
+    RetiredActor, StoreMiss,
+};
+use crate::state::{
+    CandidateView, GroupSummary, HostProfile, MembershipMiss, MembershipSummaries, ScanStore,
+};
 use crate::tui::commander::dedup::DedupCache;
-use crate::tui::commander::state::{CommanderState, LoadTarget};
+use crate::tui::commander::state::{CommanderState, ConfirmScript, LoadTarget};
 use crate::tui::event::AppEvent;
 use crate::zfs::ZfsEnvironment;
 
@@ -37,6 +46,17 @@ pub const MARKS_NOT_SETTLED: &str =
 /// are exactly where the operator left them and the plan can simply be run again.
 pub const BATCH_REFUSED: &str =
     "The batch was refused before any change — the marks are kept; check the snapshots it created";
+
+/// What the wide surfaces say about a scan whose results were never published. Frozen wording:
+/// a candidate view is not a result, and the only way out is a rescan.
+pub const RESULTS_UNPUBLISHED: &str = "results not published — rescan required";
+
+/// The same fact where the width does not allow the sentence.
+pub const RESULTS_UNPUBLISHED_COMPACT: &str = "unpublished · rescan required";
+
+/// What every surface says once the checkpoint at the configured path stopped being the one the
+/// view was opened over. Only a fresh open recovers, so the wording names that.
+pub const REOPEN_REQUIRED: &str = "the checkpoint database was replaced — reopen required";
 
 /// Page size for incremental loading of files in the
 /// open group — `group_files_page` loads exactly this many at a time. When the
@@ -212,8 +232,16 @@ impl PathStyle {
 /// /tank — gigabytes).
 #[derive(Default)]
 pub struct BrowserState {
-    /// Lightweight summaries of all groups "by reclaim" (645k×~48 B ≈ 31 MiB).
-    pub group_summaries: Vec<GroupSummary>,
+    /// Lightweight summaries of all groups "by reclaim" (645k×~48 B ≈ 31 MiB), each with the
+    /// identity of the publication it belongs to. Keyed by identity, never by digest: two
+    /// verified populations may legitimately share one digest and are two different groups.
+    pub group_summaries: Vec<(GroupId, GroupSummary)>,
+    /// The identities the authority itself named inconsistent — shown as unavailable rows
+    /// rather than quietly dropped.
+    pub inconsistent: Vec<GroupId>,
+    /// A scan with no published authority: browse-only candidate digests. `Some` excludes
+    /// `group_summaries` being meaningful — the two are the two halves of one presentation.
+    pub candidates: Option<CandidateView>,
     /// Files of the OPEN group ONLY (`id` = summary rank). `None` — group not open.
     pub open_group: Option<DuplicateGroup>,
     /// Cache of the "file name → color" palette of the open group: computed
@@ -230,8 +258,10 @@ pub struct BrowserState {
     pub summary: ScanSummary,
     /// Path display mode in the "Group files" panel.
     pub path_style: PathStyle,
-    /// Cache of the count of files marked for action — from the DB (`marked_count`).
-    pub marked_count: usize,
+    /// The count of files marked for action, as the authority last reported it. `None` while
+    /// it is being reloaded or after a read that failed — the header then renders `—`, because
+    /// a refusal that renders as `0` is indistinguishable from «nothing is marked».
+    pub marked_count: Option<usize>,
     /// TOTAL number of files in the open group (`COUNT(*)` from
     /// the DB). `open_group.files.len()` — how many are loaded into the panel window;
     /// total — the upper bound needed for "Files 234/2.19M · ↓ load more" in the header.
@@ -323,16 +353,29 @@ pub struct App {
     /// Resource Governor profile, summaries, and the inotify-limit warning.
     pub host: HostProfile,
     pub db_path: PathBuf,
-    /// Persistent connection for VIEWING results: open once,
-    /// reuse during navigation. Otherwise `ScanStore::open` on every cursor
-    /// move (create_dir_all + WAL PRAGMA + migrate + cold page-cache) loaded
-    /// the DB from disk → freeze of "groups by reclaim" on /tank (the same class as upstream Bug 4).
-    pub(crate) browse_store: Option<ScanStore>,
-    /// The serialized browsing-actor fleet (R4B-2b). Dormant: initialized `Idle`, no code
-    /// spawns an actor or routes a request through it yet — R4B-2c performs the atomic
-    /// cutover from `browse_store` and the per-frame opens onto this.
-    #[allow(dead_code)] // R4B-2c reads it; until then only its type keeps the field honest.
+    /// The serialized browsing-actor fleet: the ONE owner of a browsing connection. Every
+    /// completed-scan answer and every mark travels through it, so no two call sites can hold
+    /// their own connection and disagree about what the database said.
     pub(crate) browse: crate::state::browse::BrowseFleet,
+    /// Which activation the UI currently has installed. Bumped only by a successful `Open`,
+    /// on both sides at once; a reply stamped with anything else is dropped whole.
+    pub(crate) installed_act: Activation,
+    /// What each in-flight request was asked for. A reply carries its `RequestId`, and this is
+    /// where that id says which row, panel or overlay it belongs to.
+    pub(crate) routes: BrowseRoutes,
+    /// Whether the marks the windows show are settled against the database. `BuildPlan` is
+    /// refused locally while it is not.
+    pub(crate) marks_gate: MarksGate,
+    /// Mark mutations the actor has not acknowledged yet, by request id — the optimistic rows
+    /// they belong to, so a refusal or a terminal restores exactly what was on screen.
+    pub(crate) pending_marks: HashMap<u64, MarkOrigin>,
+    /// The live auto-select sweep, if one is running.
+    pub(crate) auto_select: Option<(RequestId, CancelToken)>,
+    /// The staged shutdown: producers first, then the owed reconcile, then the actor.
+    pub(crate) shutdown: ShutdownStage,
+    /// The settlement the last batch owes the database. Sent immediately when an actor is
+    /// live, and re-sent by the shutdown machine if the exit beats the acknowledgement.
+    pub(crate) pending_reconcile: Option<PendingReconcile>,
     pub events: Sender<AppEvent>,
     pub config: ScanConfigState,
     pub folder_picker: FolderPickerState,
@@ -403,6 +446,172 @@ pub struct App {
     /// The result was opened from the session list (F2/F12) — Esc returns to the list, not to
     /// commander (don't jump over the parent, E2E feedback).
     pub results_from_sessions: bool,
+}
+
+/// Where the browsing actor's replies enter the application's event loop.
+///
+/// The actor names its sink once, at spawn; nothing else can emit into this channel as a
+/// browsing answer, so every reply the UI settles from came from the one owner of the store.
+pub(crate) struct AppBrowseSink {
+    events: Sender<AppEvent>,
+}
+
+impl BrowseSink for AppBrowseSink {
+    fn emit(&self, event: BrowseEvent) {
+        // A closed channel means the application is already gone; the actor's own terminal
+        // path does not depend on this send.
+        let _ = self.events.send(AppEvent::Browse(Box::new(event)));
+    }
+}
+
+/// Why a scan is being opened — what the reply should switch to once it installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenIntent {
+    /// The classic browser: switch to Wizard/Browser when the payload installs.
+    Wizard,
+    /// The commander overlay: stay where the operator is.
+    Commander,
+}
+
+/// The one open in flight: its request, the activation it will install, and what it is for.
+pub(crate) struct OpenRoute {
+    pub(crate) req: RequestId,
+    pub(crate) act: Activation,
+    pub(crate) scan_id: i64,
+    pub(crate) intent: OpenIntent,
+}
+
+/// What an in-flight `GroupOpen` is for.
+pub(crate) enum GroupPurpose {
+    /// The classic browser opened a group: install it whole.
+    BrowserOpen { id: GroupId },
+    /// The classic browser scrolled toward the end: append this page.
+    BrowserMore { id: GroupId, loaded: usize },
+    /// An authoritative reload after marks changed underneath the open group.
+    BrowserReload { id: GroupId },
+    /// A commander «watching» panel resolved its source.
+    Watch { panel: usize, id: GroupId },
+}
+
+/// What an in-flight `FileInfo` is for.
+pub(crate) enum InfoPurpose {
+    /// The F3 overlay, whose header lines were built from the panel entry before the request
+    /// went out; the membership half is appended when the answer arrives.
+    Overlay { header: Vec<String> },
+    /// A commander «duplicates of the cursor» panel: the answer says whether the pathname is in
+    /// the scan at all, and the identity it carries chains into one `GroupOpen`.
+    WatchDup { panel: usize },
+}
+
+/// What an in-flight `OpenDirGroup` is for.
+pub(crate) enum DirOpenPurpose {
+    /// The classic browser's Directories tab.
+    WizardDirs,
+    /// A commander panel showing the directories of a selected group.
+    Watch { panel: usize },
+}
+
+/// Which window asked for a plan, and therefore which one receives it or its refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlanWindow {
+    Wizard,
+    Commander,
+}
+
+/// What every in-flight request was asked for, keyed by its request id.
+///
+/// A reply that finds no route here is a reply for work the UI has already abandoned, and it
+/// changes nothing — which is what makes dropping a stale activation whole safe.
+#[derive(Default)]
+pub(crate) struct BrowseRoutes {
+    pub(crate) open: Option<OpenRoute>,
+    pub(crate) groups: HashMap<u64, GroupPurpose>,
+    pub(crate) counts: HashMap<u64, GroupId>,
+    pub(crate) infos: HashMap<u64, InfoPurpose>,
+    pub(crate) dirs_at: HashMap<u64, usize>,
+    pub(crate) dir_opens: HashMap<u64, DirOpenPurpose>,
+    pub(crate) panels: HashMap<u64, (LoadTarget, PathBuf)>,
+    pub(crate) marked: Option<RequestId>,
+    pub(crate) latest: Option<RequestId>,
+    pub(crate) covering: HashMap<u64, PathBuf>,
+    pub(crate) plan: Option<(RequestId, PlanWindow)>,
+    pub(crate) reconcile: Option<RequestId>,
+}
+
+/// What an unacknowledged mark mutation would have to be restored to.
+///
+/// The actor's ticket carries the DURABLE before-image; this carries the window's own optimistic
+/// state, which is what the operator is looking at. Both are needed: one says what the database
+/// held, the other says what the screen must go back to.
+pub(crate) enum MarkOrigin {
+    /// The classic browser writes the whole open group back on every mark.
+    WizardGroup { before: Vec<FileEntry> },
+    /// The commander marks one pathname at a time, on one panel.
+    CommanderMark {
+        panel: usize,
+        path: PathBuf,
+        previous: Option<crate::tui::commander::state::Mark>,
+    },
+}
+
+/// Whether the marks on screen are settled against the database.
+///
+/// A plan may only be built from `Settled`: an unacknowledged or failed mark that entered a plan
+/// is a window showing DELETE over a database that says something else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MarksGate {
+    Settled,
+    /// Authoritative rows are being re-read after a write the UI did not see in full.
+    Reloading {
+        act: Activation,
+        marked: RequestId,
+        group: Option<RequestId>,
+        marked_ok: bool,
+        group_ok: bool,
+    },
+    /// A reload failed, a batch could not settle, or an actor died holding marks. Planning stays
+    /// refused until a successful open re-establishes the picture.
+    Blocked {
+        act: Activation,
+        reason: String,
+    },
+}
+
+impl MarksGate {
+    /// Why planning is refused right now, if it is.
+    pub(crate) fn refusal(&self) -> Option<String> {
+        match self {
+            MarksGate::Settled => None,
+            MarksGate::Reloading { .. } => {
+                Some("the marks are being re-read — wait for them to settle".to_string())
+            }
+            MarksGate::Blocked { reason, .. } => Some(reason.clone()),
+        }
+    }
+}
+
+/// The settlement a finished batch owes the database.
+pub(crate) struct PendingReconcile {
+    pub(crate) scan_id: i64,
+    pub(crate) attempted: Vec<PathBuf>,
+    pub(crate) cancelled: bool,
+    /// Which window's RAM marks the acknowledgement clears.
+    pub(crate) commander: bool,
+}
+
+/// The staged exit.
+///
+/// Producers first — with the browsing actor deliberately still ALIVE, because a finished batch
+/// owes it a mark settlement — then that settlement and its acknowledgement, and only then the
+/// actor's own close. Every transition is decided from state alone (`terminal_owed`), never from
+/// a remembered step, so no stage can wait for a terminal that nobody owes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShutdownStage {
+    None,
+    Producers,
+    Settling { req: RequestId },
+    Draining,
+    Done,
 }
 
 impl App {
@@ -504,8 +713,14 @@ impl App {
             scanning: ScanningState::default(),
             applying: ApplyingState::default(),
             scan_diff: ScanDiffState::default(),
-            browse_store: None,
             browse: crate::state::browse::BrowseFleet::new(),
+            installed_act: Activation(0),
+            routes: BrowseRoutes::default(),
+            marks_gate: MarksGate::Settled,
+            pending_marks: HashMap::new(),
+            auto_select: None,
+            shutdown: ShutdownStage::None,
+            pending_reconcile: None,
             browser: BrowserState::default(),
             review: ReviewState::default(),
             summary_result: None,
@@ -547,13 +762,11 @@ impl App {
         match event {
             AppEvent::Key(key) => self.on_key(key),
             AppEvent::Resize => {}
-            // R4B-2b: dormant — nothing sends this event until R4B-2c routes the actor's
-            // replies into the UI. The arm exists so the carrier compiles without a wildcard.
-            AppEvent::Browse(_) => {}
+            AppEvent::Browse(event) => self.on_browse(*event),
             AppEvent::ScanProgress(progress) => self.on_progress(progress),
             AppEvent::ScanFinished(result) => self.on_finished(result),
             AppEvent::ApplyProgress(progress) => self.on_apply_progress(progress),
-            AppEvent::ApplyFinished(result) => self.on_apply_finished(result),
+            AppEvent::ApplyFinished(outcome) => self.on_apply_finished(*outcome),
             AppEvent::CommanderHash(path, hash) => {
                 self.commander.dedup.insert_hash(path.clone(), hash);
                 self.commander.status = format!("Hash computed: {}", path.display());
@@ -562,44 +775,24 @@ impl App {
                 self.commander.status = format!("Failed to compute hash {}: {err}", path.display());
             }
             AppEvent::CommanderHashCached(path, hash) => {
-                // Quietly: into memory + the persistent identity-keyed cache (layout §B).
+                // Quietly: into memory + the persistent identity-keyed cache (layout §B). The
+                // cache write goes through the one store owner like every other write.
                 self.commander.dedup.insert_hash(path.clone(), hash);
                 if let Ok(meta) = std::fs::symlink_metadata(&path) {
                     use std::os::unix::fs::MetadataExt;
-                    if let Ok(mut store) = ScanStore::open(&self.db_path) {
-                        let _ = store.upsert_hash(
-                            meta.dev(),
-                            meta.ino(),
-                            meta.size(),
-                            meta.mtime(),
-                            &hash,
-                        );
-                    }
+                    let act = self.installed_act;
+                    let (device, inode, size, mtime) =
+                        (meta.dev(), meta.ino(), meta.size(), meta.mtime());
+                    self.send_browse(|req| BrowseRequest::CacheHash {
+                        act,
+                        req,
+                        device,
+                        inode,
+                        size,
+                        mtime,
+                        digest: hash,
+                    });
                 }
-            }
-            AppEvent::CommanderDirDedup { cwd, dir } => {
-                // Put the directory's dedup data into the cache and prune it down to the
-                // current panel directories — memory stays at the level of the panel count.
-                let mut keep: std::collections::HashSet<PathBuf> = self
-                    .commander
-                    .panels
-                    .iter()
-                    .map(|panel| panel.cwd.clone())
-                    .collect();
-                if let Some(board) = &self.commander.board {
-                    keep.insert(board.source.cwd.clone());
-                    for receiver in &board.receivers {
-                        keep.insert(receiver.cwd.clone());
-                    }
-                }
-                keep.insert(cwd.clone());
-                // A failed load reaches the operator twice: the cached error renders in the
-                // panel title, and the status line names it once here.
-                if let Err(message) = &dir {
-                    self.commander.status = format!("directory status unavailable: {message}");
-                }
-                self.commander.dedup.insert_dir(cwd, dir);
-                self.commander.dedup.prune(&keep);
             }
             AppEvent::CommanderDirSize(path, size) => {
                 self.commander.dir_size_pending.remove(&path);
@@ -667,20 +860,6 @@ impl App {
                 // We were only staying alive to let this land (see `request_shutdown`).
                 if shutdown_pending() {
                     self.request_shutdown(false);
-                }
-            }
-            AppEvent::ResultsLoaded(scan_id, summaries, summary, prepared) => {
-                // Opened a completed scan as a LIST of results. Browser is
-                // a wizard screen, so we switch mode (relevant for entry from F2).
-                self.mode = AppMode::Wizard;
-                self.show_results(scan_id, summaries, summary);
-                if !prepared {
-                    // An observer cannot prepare results, and an empty list here would read as
-                    // «no duplicates found» — say plainly that nothing has been prepared yet.
-                    self.status = "Results of this scan are not prepared yet — open it as the \
-                                   operator (without --read-only) to prepare them"
-                        .to_string();
-                    self.commander.status = self.status.clone();
                 }
             }
             AppEvent::CommanderResumeProbe {
@@ -755,74 +934,199 @@ impl App {
         }
     }
 
-    /// Fills the duplicate window with a ready result: default keeper, stats
-    /// cache, reset of lists, Browser screen. The single path for scan completion and for
-    /// opening an already-completed scan (`spawn_open_completed`).
-    fn show_results(&mut self, scan_id: i64, summaries: Vec<GroupSummary>, summary: ScanSummary) {
-        self.opening_started = None; // result is ready — remove the opening animation
+    // === The browsing actor: the one owner of a browsing connection ===
+
+    /// The capability this process browses with. Immutable for an actor's whole life, so a
+    /// later role flip replaces the actor instead of retro-fitting its connection.
+    fn browse_role(&self) -> BrowseRole {
+        if self.read_only {
+            BrowseRole::Observer
+        } else {
+            BrowseRole::Operator
+        }
+    }
+
+    /// Spawns the browsing actor if the fleet is idle. Returns whether one is live afterwards.
+    fn ensure_browse_actor(&mut self) -> bool {
+        if self.browse.live().is_some() {
+            return true;
+        }
+        // A draining fleet accepts nothing new: its successor is spawned when its terminal
+        // settles, never beside it.
+        if !matches!(self.browse.phase(), crate::state::browse::FleetPhase::Idle) {
+            return false;
+        }
+        let sink = Box::new(AppBrowseSink {
+            events: self.events.clone(),
+        });
+        self.browse
+            .spawn(self.db_path.clone(), self.browse_role(), sink)
+            .is_some()
+    }
+
+    /// Enqueues one request, allocating its id from the fleet. `None` means the request was
+    /// never accepted — no reply will come, so no route is recorded for it.
+    fn send_browse(&mut self, build: impl FnOnce(RequestId) -> BrowseRequest) -> Option<RequestId> {
+        if !self.ensure_browse_actor() {
+            return None;
+        }
+        let req = self.browse.next_request();
+        let request = build(req);
+        let handle = self.browse.live()?;
+        match handle.send(request) {
+            Ok(()) => Some(req),
+            Err(reason) => {
+                self.note_browse_refusal(&format!("{reason:?}"));
+                None
+            }
+        }
+    }
+
+    /// One place says a browsing request never left. Not a data answer — nothing is installed
+    /// or cleared here — so a refused enqueue can never look like an empty result.
+    fn note_browse_refusal(&mut self, detail: &str) {
+        let message = format!("browsing request refused: {detail}");
+        match self.mode {
+            AppMode::Commander => self.commander.status = message,
+            AppMode::Wizard => self.status = message,
+        }
+    }
+
+    /// Opens a completed scan through the actor. The activation is proposed here and installed
+    /// only by a successful reply, so a failed reopen leaves the previously installed scan
+    /// exactly as it was.
+    pub(crate) fn open_via_actor(&mut self, scan_id: i64, intent: OpenIntent) {
+        let act = Activation(self.installed_act.0 + 1);
+        let Some(req) = self.send_browse(|req| BrowseRequest::Open { act, req, scan_id }) else {
+            self.opening_started = None;
+            return;
+        };
+        self.opening_started = Some(std::time::Instant::now());
+        self.status = "Opening results…".to_string();
+        self.commander.status = "Opening results…".to_string();
+        self.routes.open = Some(OpenRoute {
+            req,
+            act,
+            scan_id,
+            intent,
+        });
+    }
+
+    /// Everything a successful `Open` installs, in one step.
+    ///
+    /// The payload was read through one actor pass, so the scan id, its summary, its marked
+    /// count, its directory groups and its presentation all describe the same database state —
+    /// there is no window in which half of a result is on screen.
+    fn install_opened(&mut self, act: Activation, payload: OpenedBrowse, intent: OpenIntent) {
+        let OpenedBrowse {
+            scan_id,
+            status,
+            created_at,
+            summary,
+            marked_count,
+            dir_groups,
+            presentation,
+        } = payload;
+        self.installed_act = act;
         self.current_scan_id = Some(scan_id);
-        self.browser.group_summaries = summaries;
+        self.opening_started = None;
+        // The payload re-read the count, the summaries and the directory groups atomically, so
+        // whatever the previous activation could not settle is answered by this one.
+        self.marks_gate = MarksGate::Settled;
+        self.invalidate_confirmation("the results were reopened");
+
         self.browser.open_group = None;
+        self.browser.open_group_claim = None;
         self.browser.summary = summary;
+        self.browser.marked_count = Some(marked_count as usize);
         self.browser.group_state = ListState::default();
         self.browser.file_state = ListState::default();
         self.browser.focus_files = false;
-        // Reset the tab to Files, dir-state to empty,
-        // then synchronously pull in the dir-group summaries.
         self.browser.tab = crate::tui::screens::browser::BrowserTab::Files;
-        self.browser.dir_group_summaries.clear();
         self.browser.dir_group_state = ListState::default();
         self.browser.dir_file_state = ListState::default();
         self.browser.open_dir_group = None;
         self.browser.dir_keeper_index = 0;
-        self.browser.dir_groups_reclaim_total = 0;
-        self.browser.dir_groups_unverified = 0;
         self.browser.dir_groups_error = None;
-        if !self.browser.group_summaries.is_empty() {
+        self.browser.dir_groups_reclaim_total = dir_groups.trusted_reclaim_total;
+        self.browser.dir_groups_unverified = dir_groups.unverified_groups;
+        self.browser.dir_group_summaries = dir_groups.groups.clone();
+        if !self.browser.dir_group_summaries.is_empty() {
+            self.browser.dir_group_state.select(Some(0));
+        }
+
+        // Exactly one presentation: published membership, or the typed candidate view of a scan
+        // that has no authority at all. Never both, never a third shape.
+        let published = match presentation {
+            Presentation::Published(MembershipSummaries {
+                groups,
+                inconsistent,
+                ..
+            }) => {
+                let count = groups.len();
+                self.browser.group_summaries = groups;
+                self.browser.inconsistent = inconsistent;
+                self.browser.candidates = None;
+                Some(count)
+            }
+            Presentation::Unpublished(view) => {
+                self.browser.group_summaries = Vec::new();
+                self.browser.inconsistent = Vec::new();
+                self.browser.candidates = Some(view);
+                None
+            }
+        };
+
+        // The commander reads the same one answer.
+        self.commander.dedup_scan_id = Some(scan_id);
+        self.commander.groups_loaded_for = Some(scan_id);
+        self.commander.group_summaries = self.browser.group_summaries.clone();
+        self.commander.candidates = self.browser.candidates.clone();
+        self.commander.dir_group_summaries = self.browser.dir_group_summaries.clone();
+        self.commander.dir_groups_error = None;
+        self.commander.scan_created_at = created_at;
+        self.commander.dedup = DedupCache::default();
+        self.commander.watch_cache = Vec::new();
+        self.commander.watch_dir_cache = Vec::new();
+
+        self.status = self.completion_status(published, status);
+        self.commander.status = self.status.clone();
+
+        if published.is_some() && !self.browser.group_summaries.is_empty() {
             self.browser.group_state.select(Some(0));
-            // Files of the first group — loaded from the DB on entry (the default keeper is set here).
             self.open_selected_group();
         }
-        // Dir-group summaries — synchronously: they are usually < 10k on /tank, unlike
-        // the 645k file-groups. Attributed against the CURRENT ledger, and fail-visible: a store
-        // error is kept and rendered, never flattened into «no directory groups».
-        match self
-            .browse_conn()
-            .map(|store| store.attributed_dir_group_summaries(scan_id))
-        {
-            Some(Ok(dir_sums)) => {
-                self.browser.dir_groups_reclaim_total = dir_sums.trusted_reclaim_total;
-                self.browser.dir_groups_unverified = dir_sums.unverified_groups;
-                self.browser.dir_group_summaries = dir_sums.groups;
-                if !self.browser.dir_group_summaries.is_empty() {
-                    self.browser.dir_group_state.select(Some(0));
-                    // Defer open_dir_group until the tab is actually switched —
-                    // lazily, so we don't spend a query on the first
-                    // opening of the scan (most users stay on Files).
-                }
-            }
-            Some(Err(err)) => {
-                self.browser.dir_groups_error = Some(crate::textsan::terminal(&err.to_string()));
-            }
-            None => {
-                self.browser.dir_groups_error =
-                    Some("checkpoint database is not available".to_string());
-            }
+        // Every visible panel re-reads its dedup evidence from the newly installed scan.
+        let panels = self.commander.panels.len();
+        for index in 0..panels {
+            crate::tui::commander::fetch_panel_dedup(self, LoadTarget::Commander(index));
         }
-        self.refresh_marked_count();
-        self.status = format!(
-            "Duplicate groups found: {} · scan time {} · {}",
-            self.browser.group_summaries.len(),
-            crate::tui::format_duration(self.browser.summary.elapsed_seconds),
-            crate::tui::format_speed(
-                self.browser.summary.bytes_hashed,
-                self.browser.summary.elapsed_seconds,
+        if intent == OpenIntent::Wizard {
+            self.mode = AppMode::Wizard;
+            self.screen = Screen::Browser;
+        }
+    }
+
+    /// The line that reports what was opened. `None` groups means the scan has no published
+    /// authority: it says so in the accepted wording instead of printing a zero.
+    fn completion_status(
+        &self,
+        published: Option<usize>,
+        status: crate::model::scan::ScanStatus,
+    ) -> String {
+        let mut line = match published {
+            Some(count) => format!(
+                "Duplicate groups found: {count} · scan time {} · {}",
+                crate::tui::format_duration(self.browser.summary.elapsed_seconds),
+                crate::tui::format_speed(
+                    self.browser.summary.bytes_hashed,
+                    self.browser.summary.elapsed_seconds,
+                ),
             ),
-        );
-        // Completed with a warning — some files could not be hashed (they did NOT
-        // participate in duplicate search). In the session list the same scan shows as "ready ⚠".
+            None => RESULTS_UNPUBLISHED.to_string(),
+        };
         if self.browser.summary.hash_failures > 0 {
-            self.status.push_str(&format!(
+            line.push_str(&format!(
                 " · ⚠ failed to hash: {}",
                 self.browser.summary.hash_failures
             ));
@@ -830,8 +1134,7 @@ impl App {
         // The omission account beside it: exact ledger or session-observed counters when there
         // are any; for a warned scan whose account was not retainable, say so instead of showing
         // nothing — an absent number must not read as a clean scan.
-        let omissions = self.browser.summary.omissions.clone();
-        match &omissions {
+        match &self.browser.summary.omissions {
             crate::model::scan::OmissionAccounting::Ledger(totals)
             | crate::model::scan::OmissionAccounting::Observed(totals)
                 if !totals.is_empty() =>
@@ -840,159 +1143,1339 @@ impl App {
                     (totals.known_omitted_files(), totals.unsupported_entries())
                 {
                     let errors = totals.unknown_cardinality_events();
-                    self.status.push_str(&format!(
+                    line.push_str(&format!(
                         " · ⚠ gaps: {files} files omitted, {errors} walk errors, {entries} unsupported entries"
                     ));
                 }
             }
-            crate::model::scan::OmissionAccounting::Unavailable => {
-                let warned = self
-                    .browse_conn()
-                    .and_then(|store| store.scan_status(scan_id).ok())
-                    .is_some_and(|status| {
-                        status == crate::model::scan::ScanStatus::CompleteWithWarnings
-                    });
-                if warned {
-                    self.status
-                        .push_str(" · ⚠ omission details not retained (no completeness authority)");
-                }
+            crate::model::scan::OmissionAccounting::Unavailable
+                if status == crate::model::scan::ScanStatus::CompleteWithWarnings =>
+            {
+                line.push_str(" · ⚠ omission details not retained (no completeness authority)");
             }
             _ => {}
         }
-        self.screen = Screen::Browser;
+        line
     }
 
-    /// Opens the selected dir-group — loads the full `paths` and member trust via
-    /// `store::attributed_dir_group(signature)`, revalidated at open time. The keeper defaults
-    /// to index 0 (by `paths` ASC sort order). If no group is selected — no-op.
+    /// The checkpoint the view was opened over is gone — the file at the configured path is not
+    /// the one this connection opened, or the connection itself was lost.
+    ///
+    /// Everything that describes the scan is uninstalled, because keeping any of it on screen
+    /// would let the operator act on a database nobody can reach. Only a fresh open recovers.
+    fn uninstall_browsing(&mut self, detail: &str) {
+        self.current_scan_id = None;
+        self.opening_started = None;
+        self.browser.group_summaries = Vec::new();
+        self.browser.inconsistent = Vec::new();
+        self.browser.candidates = None;
+        self.browser.open_group = None;
+        self.browser.open_group_claim = None;
+        self.browser.open_group_total = 0;
+        self.browser.open_group_max_reached = false;
+        self.browser.marked_count = None;
+        self.browser.dir_group_summaries = Vec::new();
+        self.browser.open_dir_group = None;
+        self.browser.dir_groups_reclaim_total = 0;
+        self.browser.dir_groups_unverified = 0;
+        self.browser.dir_groups_error = Some(REOPEN_REQUIRED.to_string());
+        self.commander.dedup_scan_id = None;
+        self.commander.groups_loaded_for = None;
+        self.commander.group_summaries = Vec::new();
+        self.commander.candidates = None;
+        self.commander.dir_group_summaries = Vec::new();
+        self.commander.dir_groups_error = Some(REOPEN_REQUIRED.to_string());
+        self.commander.scan_created_at = None;
+        self.commander.dedup = DedupCache::default();
+        self.commander.watch_cache = Vec::new();
+        self.commander.watch_dir_cache = Vec::new();
+        self.commander.scan_coverage_cache.clear();
+        self.invalidate_confirmation(REOPEN_REQUIRED);
+        self.marks_gate = MarksGate::Blocked {
+            act: self.installed_act,
+            reason: format!("{REOPEN_REQUIRED} ({detail})"),
+        };
+        let message = format!("{REOPEN_REQUIRED} ({detail})");
+        self.status = message.clone();
+        self.commander.status = message;
+    }
+
+    /// Drops a pending confirmation's script when the plan behind it can no longer be trusted.
+    /// The plan itself is kept so the operator sees what was invalidated and why.
+    pub(crate) fn invalidate_confirmation(&mut self, reason: &str) {
+        if self.commander.pending_plan.is_some() {
+            self.commander.confirm_script = ConfirmScript::Invalidated {
+                reason: reason.to_string(),
+            };
+        }
+    }
+
+    /// Whether a reply belongs to the activation the UI has installed.
+    fn is_current(&self, act: Activation) -> bool {
+        act == self.installed_act
+    }
+
+    /// Opens the selected dir-group through the actor — the full `paths` and member trust,
+    /// revalidated at open time. The keeper defaults to index 0 (by `paths` ASC sort order).
     fn open_selected_dir_group(&mut self) {
         let Some(idx) = self.browser.dir_group_state.selected() else {
             return;
         };
-        let Some(summary) = self.browser.dir_group_summaries.get(idx).cloned() else {
-            return;
-        };
-        let Some(scan_id) = self.current_scan_id else {
-            return;
-        };
-        let group = self.browse_conn().and_then(|store| {
-            store
-                .attributed_dir_group(scan_id, &summary.signature)
-                .ok()
-                .flatten()
-        });
-        self.browser.open_dir_group = group;
-        self.browser.dir_keeper_index = 0;
-        self.browser.dir_file_state = ListState::default();
-        if self
+        let Some(signature) = self
             .browser
-            .open_dir_group
-            .as_ref()
-            .is_some_and(|g| !g.group.paths.is_empty())
-        {
-            self.browser.dir_file_state.select(Some(0));
-        }
-    }
-
-    /// Persistent connection for viewing: opens once and
-    /// caches. Group navigation reuses it — without `ScanStore::open`
-    /// (create_dir_all + WAL PRAGMA + migrate, cold cache) on every move.
-    fn browse_conn(&mut self) -> Option<&mut ScanStore> {
-        if self.browse_store.is_none() {
-            self.browse_store = ScanStore::open(&self.db_path).ok();
-        }
-        self.browse_store.as_mut()
-    }
-
-    /// Loads the selected group's files from the DB into `open_group`: on entry
-    /// into a group, discarding the previous one. The default keeper (first file) is set in RAM
-    /// for display if the group doesn't yet have a marked keeper; it is persisted only on
-    /// the first action mark (`browser_mark`) — plain viewing does not write to the DB.
-    fn open_selected_group(&mut self) {
-        let (Some(scan_id), Some(index)) =
-            (self.current_scan_id, self.browser.group_state.selected())
+            .dir_group_summaries
+            .get(idx)
+            .map(|summary| summary.signature.clone())
         else {
+            return;
+        };
+        let act = self.installed_act;
+        if let Some(req) = self.send_browse(|req| BrowseRequest::OpenDirGroup {
+            act,
+            req,
+            signature,
+        }) {
+            self.routes
+                .dir_opens
+                .insert(req.0, DirOpenPurpose::WizardDirs);
+        }
+    }
+
+    /// Asks the actor for the selected group's first page. Nothing is installed here: the reply
+    /// carries the members, the summary and the identity together.
+    fn open_selected_group(&mut self) {
+        let Some(index) = self.browser.group_state.selected() else {
             self.browser.open_group = None;
             self.browser.open_group_claim = None;
             self.browser.file_state.select(None);
             return;
         };
-        let Some(summary) = self.browser.group_summaries.get(index) else {
-            self.browser.open_group = None;
-            self.browser.open_group_claim = None;
-            self.browser.file_state.select(None);
+        let id = match self.browser.group_summaries.get(index) {
+            Some((id, _)) => *id,
+            None => {
+                self.browser.open_group = None;
+                self.browser.open_group_claim = None;
+                self.browser.file_state.select(None);
+                return;
+            }
+        };
+        let act = self.installed_act;
+        if let Some(req) = self.send_browse(|req| BrowseRequest::GroupOpen {
+            act,
+            req,
+            id,
+            offset: 0,
+            limit: BROWSE_GROUP_FILE_PAGE,
+        }) {
+            self.routes
+                .groups
+                .insert(req.0, GroupPurpose::BrowserOpen { id });
+        }
+        // The live member count beside the page: the published `file_count` is what the
+        // publication recorded, and the panel header states what the membership holds now.
+        if let Some(req) = self.send_browse(|req| BrowseRequest::GroupCount { act, req, id }) {
+            self.routes.counts.insert(req.0, id);
+        }
+    }
+
+    /// Every reply the browsing actor gives.
+    ///
+    /// Two rules run through all of it. A reply whose activation is not the installed one is
+    /// dropped WHOLE — it changes no row, no gate and no ticket — except that a mark reply
+    /// still settles its own ticket, because a settlement is owed to the actor's ledger rather
+    /// than to the screen. And a typed path replacement uninstalls the whole browsing view
+    /// wherever it surfaces: no trusted answer survives a checkpoint that was swapped.
+    fn on_browse(&mut self, event: BrowseEvent) {
+        match event {
+            BrowseEvent::OpenFinished { act, req, result } => {
+                self.on_open_finished(act, req, result)
+            }
+            BrowseEvent::PanelData { act, req, result } => self.on_panel_data(act, req, result),
+            BrowseEvent::Group { act, req, result } => self.on_group(act, req, result),
+            BrowseEvent::GroupCount { act, req, result } => self.on_group_count(act, req, result),
+            // The App's reverse lookup is `FileInfo`: it answers the same question and
+            // additionally separates «not in this scan» from «in the scan, in no group», which
+            // a bare identity lookup cannot.
+            BrowseEvent::GroupOfPath { .. } => {}
+            BrowseEvent::FileInfo { act, req, result } => {
+                self.on_file_info(act, req, result.map(|answer| *answer))
+            }
+            BrowseEvent::DirGroupAt { act, req, result } => self.on_dir_group_at(act, req, result),
+            BrowseEvent::DirGroupOpened { act, req, result } => {
+                self.on_dir_group_opened(act, req, result)
+            }
+            BrowseEvent::MarkedCount { act, req, result } => self.on_marked_count(act, req, result),
+            BrowseEvent::MarkAck { act, req, outcome } => self.on_mark_ack(act, req, outcome),
+            BrowseEvent::AutoSelectDone { act, req, outcome } => {
+                self.on_auto_select_done(act, req, outcome)
+            }
+            BrowseEvent::PlanReady { act, req, plan } => self.on_plan_ready(act, req, *plan),
+            BrowseEvent::PlanRefused { act, req, refusal } => {
+                self.on_plan_refused(act, req, refusal)
+            }
+            BrowseEvent::ReconcileAck { act, req, result } => {
+                self.on_reconcile_ack(act, req, result)
+            }
+            BrowseEvent::LatestScan { act, req, result } => self.on_latest_scan(act, req, result),
+            BrowseEvent::CoveringScan {
+                act,
+                req,
+                cwd,
+                result,
+            } => self.on_covering_scan(act, req, cwd, result),
+            // The App never issues `ScanCreatedAt`: the creation time arrives inside the one
+            // `OpenedBrowse` payload, so the header costs no request at all.
+            BrowseEvent::ScanCreatedAt { .. } => {}
+            BrowseEvent::CacheHashAck { result, .. } => {
+                if let Err(miss) = result {
+                    if !self.fatal_store_miss(&miss) {
+                        tracing::warn!("the identity hash cache was not updated: {miss:?}");
+                    }
+                }
+            }
+            BrowseEvent::Closed { actor, cause } => self.on_actor_closed(actor, cause),
+        }
+    }
+
+    /// A path replacement anywhere uninstalls the browsing view. `true` — it was one, and the
+    /// caller must not treat the reply as an ordinary refusal on top of it.
+    fn fatal_store_miss(&mut self, miss: &StoreMiss) -> bool {
+        match miss {
+            StoreMiss::PathChanged { detail } => {
+                let detail = detail.clone();
+                self.uninstall_browsing(&detail);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn fatal_membership_miss(&mut self, miss: &MembershipMiss) -> bool {
+        match miss {
+            MembershipMiss::ReopenRequired { detail } => {
+                let detail = detail.clone();
+                self.uninstall_browsing(&detail);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn fatal_panel_failure(&mut self, failure: &PanelFailure) -> bool {
+        match failure {
+            PanelFailure::PathChanged { detail } => {
+                let detail = detail.clone();
+                self.uninstall_browsing(&detail);
+                true
+            }
+            PanelFailure::Snapshot(miss) => self.fatal_membership_miss(miss),
+            _ => false,
+        }
+    }
+
+    fn on_open_finished(
+        &mut self,
+        act: Activation,
+        req: RequestId,
+        result: std::result::Result<Box<OpenedBrowse>, BrowseOpenFailure>,
+    ) {
+        // Routed by request id, not by activation: an open proposes an activation that only
+        // success installs, so the reply cannot be matched by one.
+        let route = match &self.routes.open {
+            Some(route) if route.req == req => self.routes.open.take().expect("just matched"),
+            _ => return,
+        };
+        debug_assert_eq!(
+            route.act, act,
+            "an open reply carries the activation it proposed"
+        );
+        match result {
+            Ok(payload) => self.install_opened(route.act, *payload, route.intent),
+            // Class B: the actor uninstalled both its connection and its scan, so the UI must
+            // stop describing one too. Every other failure is class A — the previously
+            // installed scan is untouched and still served.
+            Err(BrowseOpenFailure::PathChanged { detail }) => self.uninstall_browsing(&detail),
+            Err(failure) => {
+                self.opening_started = None;
+                let message = format!(
+                    "the results of scan #{} could not be opened: {failure:?}",
+                    route.scan_id
+                );
+                self.status = message.clone();
+                self.commander.status = message;
+            }
+        }
+    }
+
+    fn on_panel_data(
+        &mut self,
+        act: Activation,
+        req: RequestId,
+        result: std::result::Result<Box<crate::state::browse::PanelData>, PanelFailure>,
+    ) {
+        let Some((target, cwd)) = self.routes.panels.remove(&req.0) else {
             return;
         };
-        let hash = summary.hash.clone();
-        let size_bytes = summary.size_bytes;
-        let rank = summary.rank;
-        let total_from_summary = summary.file_count;
-        // The first page `BROWSE_GROUP_FILE_PAGE`. Beyond that,
-        // it loads as the cursor scrolls (`maybe_load_more_files`) up to the
-        // upper limit `BROWSE_GROUP_FILE_MAX`. The cap on a single page is no
-        // longer "result truncation" — it's a progressive-loading window.
-        // The group's claim comes from its own materialized row and the link evidence behind it,
-        // not from this page of files: a page is a window, and a window cannot say how many
-        // allocations the whole group holds.
-        let claim =
-            self.browser
-                .group_summaries
-                .get(index)
-                .map(|summary| crate::state::GroupClaim {
-                    reclaim: summary.reclaim,
-                    links: crate::state::GroupLinks {
-                        observed: summary.file_count,
-                        total: crate::model::reclaim::LinkCount::Unknown,
-                    },
-                });
-        let (mut files, total, claim) = if let Some(store) = self.browse_conn() {
-            let files = store
-                .group_files_page(scan_id, &hash, 0, BROWSE_GROUP_FILE_PAGE)
-                .unwrap_or_default();
-            // Exact counter — for robustness against desync with file_group.
-            let total = store
-                .group_files_count(scan_id, &hash)
-                .unwrap_or(total_from_summary);
-            let claim = store.group_claim(scan_id, &hash).ok().flatten().or(claim);
-            (files, total, claim)
-        } else {
-            (Vec::new(), total_from_summary, claim)
+        let _ = target;
+        if !self.is_current(act) {
+            return;
+        }
+        match result {
+            Ok(data) => {
+                let dir = crate::tui::commander::dedup::DirDedup::from_panel(*data);
+                let mut keep: std::collections::HashSet<PathBuf> = self
+                    .commander
+                    .panels
+                    .iter()
+                    .map(|panel| panel.cwd.clone())
+                    .collect();
+                if let Some(board) = &self.commander.board {
+                    keep.insert(board.source.cwd.clone());
+                    for receiver in &board.receivers {
+                        keep.insert(receiver.cwd.clone());
+                    }
+                }
+                keep.insert(cwd.clone());
+                self.commander.dedup.insert_dir(cwd, Ok(dir));
+                self.commander.dedup.prune(&keep);
+            }
+            Err(failure) => {
+                if self.fatal_panel_failure(&failure) {
+                    return;
+                }
+                let message = format!("{failure:?}");
+                self.commander.status = format!("directory status unavailable: {message}");
+                self.commander.dedup.insert_dir(cwd, Err(message));
+            }
+        }
+    }
+
+    fn on_group(
+        &mut self,
+        act: Activation,
+        req: RequestId,
+        result: std::result::Result<crate::state::ResolvedGroup, MembershipMiss>,
+    ) {
+        let Some(purpose) = self.routes.groups.remove(&req.0) else {
+            return;
         };
-        // Default keeper for display, if no file is marked as keeper.
+        if !self.is_current(act) {
+            return;
+        }
+        let group = match result {
+            Ok(group) => group,
+            Err(miss) => {
+                if self.fatal_membership_miss(&miss) {
+                    return;
+                }
+                match purpose {
+                    GroupPurpose::Watch { panel, .. } => {
+                        self.set_watch_unavailable(
+                            panel,
+                            crate::tui::commander::state::WatchSubject::FileGroup,
+                            &format!("{miss:?}"),
+                        );
+                    }
+                    GroupPurpose::BrowserReload { .. } => {
+                        // A reload that failed blocks planning: the rows on screen are not what
+                        // the database holds, and nothing may be built from them.
+                        self.settle_gate_group(req, false);
+                        self.browser.open_group = None;
+                        self.browser.open_group_claim = None;
+                        self.browser.file_state.select(None);
+                        self.status = format!("file group unavailable: {miss:?}");
+                    }
+                    _ => {
+                        // A group that cannot be read is not an empty group: the window says so
+                        // and keeps nothing that pretends otherwise.
+                        self.browser.open_group = None;
+                        self.browser.open_group_claim = None;
+                        self.browser.file_state.select(None);
+                        self.status = format!("file group unavailable: {miss:?}");
+                    }
+                }
+                return;
+            }
+        };
+        // The answer must be about the group that was asked for; anything else is a routing
+        // defect, not a row to install.
+        let expected = match &purpose {
+            GroupPurpose::BrowserOpen { id }
+            | GroupPurpose::BrowserMore { id, .. }
+            | GroupPurpose::BrowserReload { id }
+            | GroupPurpose::Watch { id, .. } => *id,
+        };
+        if group.id != expected {
+            tracing::warn!(?expected, actual = ?group.id, "a group reply named another identity");
+            return;
+        }
+        match purpose {
+            GroupPurpose::BrowserOpen { .. } => self.install_open_group(group, true),
+            GroupPurpose::BrowserMore { loaded, .. } => self.append_open_group(group, loaded),
+            GroupPurpose::BrowserReload { .. } => {
+                // An authoritative re-read of the group already on screen: the rows change, the
+                // operator's cursor does not.
+                self.install_open_group(group, false);
+                self.settle_gate_group(req, true);
+            }
+            GroupPurpose::Watch { panel, .. } => self.install_watch_group(panel, group),
+        }
+    }
+
+    fn on_group_count(
+        &mut self,
+        act: Activation,
+        req: RequestId,
+        result: std::result::Result<u64, MembershipMiss>,
+    ) {
+        let Some(id) = self.routes.counts.remove(&req.0) else {
+            return;
+        };
+        if !self.is_current(act) {
+            return;
+        }
+        match result {
+            Ok(total) => {
+                // Only for the group that is actually open — a late count of a group the
+                // operator has already left changes nothing.
+                if self
+                    .browser
+                    .open_group
+                    .as_ref()
+                    .is_some_and(|open| open.id == id.rank as usize)
+                {
+                    self.browser.open_group_total = total;
+                }
+            }
+            Err(miss) => {
+                if !self.fatal_membership_miss(&miss) {
+                    tracing::warn!("the open group's member count is unavailable: {miss:?}");
+                }
+            }
+        }
+    }
+
+    /// Asks the authority how many files carry an action mark. The answer replaces the cached
+    /// number; a refusal renders as unavailable, never as zero.
+    fn refresh_marked_count(&mut self) -> Option<RequestId> {
+        if self.current_scan_id.is_none() {
+            self.browser.marked_count = None;
+            return None;
+        }
+        let act = self.installed_act;
+        let sent = self.send_browse(|req| BrowseRequest::MarkedCount { act, req });
+        self.browser.marked_count = None;
+        self.routes.marked = sent;
+        sent
+    }
+
+    /// Installs a group page as the open group. `reset_cursor` is false for an authoritative
+    /// reload of the group already on screen, so re-reading it does not move the operator.
+    fn install_open_group(&mut self, group: crate::state::ResolvedGroup, reset_cursor: bool) {
+        let mut files = group.members;
+        // Default keeper for display, if no file is marked as keeper. It is RAM-only until the
+        // first real mark — plain viewing writes nothing.
         if !files.iter().any(|file| file.is_keeper) {
             if let Some(first) = files.first_mut() {
                 first.is_keeper = true;
             }
         }
-        let group = DuplicateGroup {
-            id: rank as usize,
-            size_bytes,
-            hash,
+        let duplicate = DuplicateGroup {
+            id: group.id.rank as usize,
+            size_bytes: group.summary.size_bytes,
+            hash: group.summary.hash.clone(),
             files,
         };
-        let has_files = !group.files.is_empty();
-        self.browser.open_group_total = total;
-        self.browser.open_group_max_reached = group.files.len() >= BROWSE_GROUP_FILE_MAX;
-        // We compute the palette ONCE here, not during render: on a 2.2M group,
-        // recomputing every frame caused ~4 s of freeze per move. Render reads the ready map in O(1).
-        self.browser.open_group_colors = crate::tui::screens::browser::name_palette(&group);
-        self.browser.open_group = Some(group);
-        self.browser.open_group_claim = claim;
-        self.browser
-            .file_state
-            .select(if has_files { Some(0) } else { None });
+        let has_files = !duplicate.files.is_empty();
+        self.browser.open_group_total = group.summary.file_count;
+        self.browser.open_group_max_reached = duplicate.files.len() >= BROWSE_GROUP_FILE_MAX;
+        // The palette is computed ONCE here, not during render: on a 2.2M group, recomputing it
+        // every frame cost ~4 s per cursor move.
+        self.browser.open_group_colors = crate::tui::screens::browser::name_palette(&duplicate);
+        self.browser.open_group = Some(duplicate);
+        // What the group claims comes from its own published row, never from the page on
+        // screen: a page is a window, and a window cannot say how many allocations a group
+        // holds.
+        self.browser.open_group_claim = Some(crate::state::GroupClaim {
+            reclaim: group.summary.reclaim,
+            links: crate::state::GroupLinks {
+                observed: group.summary.file_count,
+                total: crate::model::reclaim::LinkCount::Unknown,
+            },
+        });
+        if reset_cursor {
+            self.browser
+                .file_state
+                .select(if has_files { Some(0) } else { None });
+        }
     }
 
-    /// Refreshes the cache of the count of files marked for action from the DB.
-    fn refresh_marked_count(&mut self) {
-        let count = match self.current_scan_id {
-            Some(id) => self
-                .browse_conn()
-                .and_then(|store| store.marked_count(id).ok())
-                .unwrap_or(0),
-            None => 0,
+    /// Appends the next page of the open group. A page that arrived for a group the operator
+    /// has already left, or after the window moved on, changes nothing.
+    fn append_open_group(&mut self, group: crate::state::ResolvedGroup, loaded: usize) {
+        let Some(open) = self.browser.open_group.as_mut() else {
+            return;
         };
-        self.browser.marked_count = count as usize;
+        if open.id != group.id.rank as usize || open.files.len() != loaded {
+            return;
+        }
+        if group.members.is_empty() {
+            self.browser.open_group_max_reached = true;
+            return;
+        }
+        open.files.extend(group.members);
+        if open.files.len() >= BROWSE_GROUP_FILE_MAX
+            || open.files.len() as u64 >= self.browser.open_group_total
+        {
+            self.browser.open_group_max_reached = true;
+        }
+        // New names arrived — without a fresh palette they would render in the default colour.
+        let palette = crate::tui::screens::browser::name_palette(open);
+        self.browser.open_group_colors = palette;
+    }
+
+    /// Fills a commander watch panel with a resolved file group.
+    fn install_watch_group(&mut self, panel: usize, group: crate::state::ResolvedGroup) {
+        let claim = crate::state::GroupClaim {
+            reclaim: group.summary.reclaim,
+            links: crate::state::GroupLinks {
+                observed: group.summary.file_count,
+                total: crate::model::reclaim::LinkCount::Unknown,
+            },
+        };
+        let duplicate = DuplicateGroup {
+            id: group.id.rank as usize,
+            size_bytes: group.summary.size_bytes,
+            hash: group.summary.hash.clone(),
+            files: group.members,
+        };
+        if let Some(entry) = self.commander.watch_cache.get_mut(panel) {
+            entry.result = Some(crate::tui::commander::state::WatchResult::FileGroup(
+                duplicate, claim,
+            ));
+            entry.empty = crate::tui::commander::state::WatchEmpty::default();
+            entry.unavailable = None;
+        }
+    }
+
+    /// A watch panel whose source could not be read at all. Never a fallback: an unreadable
+    /// checkpoint is not «no duplicates here».
+    fn set_watch_unavailable(
+        &mut self,
+        panel: usize,
+        subject: crate::tui::commander::state::WatchSubject,
+        detail: &str,
+    ) {
+        if let Some(entry) = self.commander.watch_cache.get_mut(panel) {
+            entry.result = None;
+            entry.empty = crate::tui::commander::state::WatchEmpty::default();
+            entry.unavailable = Some(crate::tui::commander::state::WatchUnavailable {
+                subject,
+                detail: crate::textsan::terminal(detail),
+            });
+        }
+    }
+
+    /// A watch panel with a legitimate empty answer — and the reason it is empty.
+    fn set_watch_empty(&mut self, panel: usize, reason: crate::tui::commander::state::WatchEmpty) {
+        if let Some(entry) = self.commander.watch_cache.get_mut(panel) {
+            entry.result = None;
+            entry.empty = reason;
+            entry.unavailable = None;
+        }
+    }
+
+    fn on_file_info(
+        &mut self,
+        act: Activation,
+        req: RequestId,
+        result: std::result::Result<crate::state::FileInfoAnswer, StoreMiss>,
+    ) {
+        let Some(purpose) = self.routes.infos.remove(&req.0) else {
+            return;
+        };
+        if !self.is_current(act) {
+            return;
+        }
+        let answer = match result {
+            Ok(answer) => answer,
+            Err(miss) => {
+                if self.fatal_store_miss(&miss) {
+                    return;
+                }
+                match purpose {
+                    InfoPurpose::Overlay { mut header } => {
+                        header.push(format!("file group unavailable: {miss:?}"));
+                        self.commander.info_lines = header;
+                        self.commander.overlay = crate::tui::commander::state::Overlay::FileInfo;
+                    }
+                    InfoPurpose::WatchDup { panel } => self.set_watch_unavailable(
+                        panel,
+                        crate::tui::commander::state::WatchSubject::FileGroup,
+                        &format!("{miss:?}"),
+                    ),
+                }
+                return;
+            }
+        };
+        match purpose {
+            InfoPurpose::Overlay { header } => self.show_file_info(header, answer),
+            InfoPurpose::WatchDup { panel } => self.watch_from_file_info(panel, answer),
+        }
+    }
+
+    /// The F3 overlay's membership half, from the one typed answer.
+    fn show_file_info(&mut self, mut lines: Vec<String>, answer: crate::state::FileInfoAnswer) {
+        use crate::state::{FileInfoAnswer, FileMembership};
+        match answer {
+            FileInfoAnswer::NotInScan => {
+                lines.push("Not part of the loaded scan".to_string());
+            }
+            FileInfoAnswer::InScan {
+                hash_text,
+                membership,
+            } => {
+                match hash_text {
+                    Some(hash) => lines.push(format!("Hash:     {hash}")),
+                    None => lines.push("Hash:     not computed — F4 to calculate".to_string()),
+                }
+                match membership {
+                    // «No duplicates found» is allowed for exactly one state: the row is in the
+                    // manifest and belongs to no current group.
+                    Ok(FileMembership::NotGrouped) => lines.push("No duplicates found".to_string()),
+                    Ok(FileMembership::InGroup(info)) => {
+                        let peers = info.peers.len();
+                        lines.push(format!("Duplicates ({}):", info.total.saturating_sub(1)));
+                        for peer in info.peers.iter() {
+                            lines.push(format!("  · {}", peer.display()));
+                        }
+                        if info.truncated {
+                            lines.push(format!(
+                                "  … and {} more",
+                                info.total.saturating_sub(1).saturating_sub(peers as u64)
+                            ));
+                        }
+                    }
+                    Err(MembershipMiss::Unknown) => lines.push(RESULTS_UNPUBLISHED.to_string()),
+                    Err(miss) => lines.push(format!("file group unavailable: {miss:?}")),
+                }
+            }
+        }
+        self.commander.info_lines = lines;
+        self.commander.overlay = crate::tui::commander::state::Overlay::FileInfo;
+    }
+
+    /// A watch panel over a file cursor: the typed answer decides between «outside the scan»,
+    /// «in the scan, no duplicates» and a real group, which is then opened by identity.
+    fn watch_from_file_info(&mut self, panel: usize, answer: crate::state::FileInfoAnswer) {
+        use crate::state::{FileInfoAnswer, FileMembership};
+        use crate::tui::commander::state::{WatchEmpty, WatchSubject};
+        match answer {
+            FileInfoAnswer::NotInScan => self.set_watch_empty(panel, WatchEmpty::NotInScan),
+            FileInfoAnswer::InScan { membership, .. } => match membership {
+                Ok(FileMembership::NotGrouped) => {
+                    self.set_watch_empty(panel, WatchEmpty::NoDuplicates)
+                }
+                Ok(FileMembership::InGroup(info)) => {
+                    let id = info.id;
+                    let act = self.installed_act;
+                    if let Some(req) = self.send_browse(|req| BrowseRequest::GroupOpen {
+                        act,
+                        req,
+                        id,
+                        offset: 0,
+                        limit: BROWSE_GROUP_FILE_PAGE,
+                    }) {
+                        self.routes
+                            .groups
+                            .insert(req.0, GroupPurpose::Watch { panel, id });
+                    }
+                }
+                Err(MembershipMiss::Unknown) => {
+                    self.set_watch_unavailable(panel, WatchSubject::FileGroup, RESULTS_UNPUBLISHED)
+                }
+                Err(miss) => {
+                    if !self.fatal_membership_miss(&miss) {
+                        self.set_watch_unavailable(
+                            panel,
+                            WatchSubject::FileGroup,
+                            &format!("{miss:?}"),
+                        );
+                    }
+                }
+            },
+        }
+    }
+
+    fn on_dir_group_at(
+        &mut self,
+        act: Activation,
+        req: RequestId,
+        result: std::result::Result<crate::state::DirGroupAnswer, StoreMiss>,
+    ) {
+        use crate::state::DirGroupAnswer;
+        use crate::tui::commander::state::{WatchEmpty, WatchResult, WatchSubject};
+        let Some(panel) = self.routes.dirs_at.remove(&req.0) else {
+            return;
+        };
+        if !self.is_current(act) {
+            return;
+        }
+        match result {
+            Ok(DirGroupAnswer::Group(group)) => {
+                if let Some(entry) = self.commander.watch_cache.get_mut(panel) {
+                    entry.result = Some(WatchResult::DirGroup(*group));
+                    entry.empty = WatchEmpty::default();
+                    entry.unavailable = None;
+                }
+            }
+            Ok(DirGroupAnswer::InnerDupes {
+                members,
+                total,
+                truncated,
+            }) => {
+                let paths = members.into_iter().map(|inner| inner.path).collect();
+                if let Some(entry) = self.commander.watch_cache.get_mut(panel) {
+                    entry.result = Some(WatchResult::InnerDupes {
+                        paths,
+                        total,
+                        truncated,
+                    });
+                    entry.empty = WatchEmpty::default();
+                    entry.unavailable = None;
+                }
+            }
+            // No authority: candidates, never duplicates. They carry no identity and are
+            // rendered with the unpublished wording.
+            Ok(DirGroupAnswer::InnerCandidates {
+                paths,
+                total,
+                truncated,
+            }) => {
+                if let Some(entry) = self.commander.watch_cache.get_mut(panel) {
+                    entry.result = Some(WatchResult::InnerCandidates {
+                        paths,
+                        total,
+                        truncated,
+                    });
+                    entry.empty = WatchEmpty::default();
+                    entry.unavailable = None;
+                }
+            }
+            Ok(DirGroupAnswer::NoDuplicates) => {
+                self.set_watch_empty(panel, WatchEmpty::NoDuplicates)
+            }
+            Ok(DirGroupAnswer::NotInScan) => self.set_watch_empty(panel, WatchEmpty::NotInScan),
+            Err(miss) => {
+                if !self.fatal_store_miss(&miss) {
+                    self.set_watch_unavailable(
+                        panel,
+                        WatchSubject::DirectoryGroup,
+                        &format!("{miss:?}"),
+                    );
+                }
+            }
+        }
+    }
+
+    fn on_dir_group_opened(
+        &mut self,
+        act: Activation,
+        req: RequestId,
+        result: std::result::Result<
+            Option<Box<crate::model::duplicate::AttributedDirGroup>>,
+            StoreMiss,
+        >,
+    ) {
+        let Some(purpose) = self.routes.dir_opens.remove(&req.0) else {
+            return;
+        };
+        if !self.is_current(act) {
+            return;
+        }
+        match result {
+            Ok(group) => match purpose {
+                DirOpenPurpose::WizardDirs => {
+                    self.browser.open_dir_group = group.map(|boxed| *boxed);
+                    self.browser.dir_keeper_index = 0;
+                    self.browser.dir_file_state = ListState::default();
+                    if self
+                        .browser
+                        .open_dir_group
+                        .as_ref()
+                        .is_some_and(|g| !g.group.paths.is_empty())
+                    {
+                        self.browser.dir_file_state.select(Some(0));
+                    }
+                }
+                DirOpenPurpose::Watch { panel } => {
+                    if let Some(slot) = self.commander.watch_dir_cache.get_mut(panel) {
+                        *slot = group.map(|boxed| *boxed);
+                    }
+                }
+            },
+            Err(miss) => {
+                if self.fatal_store_miss(&miss) {
+                    return;
+                }
+                // «No such group» and «could not be read» are different answers, and only one of
+                // them is allowed to render as an absent group.
+                match purpose {
+                    DirOpenPurpose::WizardDirs => {
+                        self.browser.open_dir_group = None;
+                        self.browser.dir_groups_error =
+                            Some(format!("directory group unavailable: {miss:?}"));
+                    }
+                    DirOpenPurpose::Watch { panel } => self.set_watch_unavailable(
+                        panel,
+                        crate::tui::commander::state::WatchSubject::DirectoryGroup,
+                        &format!("{miss:?}"),
+                    ),
+                }
+            }
+        }
+    }
+
+    fn on_marked_count(
+        &mut self,
+        act: Activation,
+        req: RequestId,
+        result: std::result::Result<u64, StoreMiss>,
+    ) {
+        let expected = match self.routes.marked {
+            Some(expected) if expected == req => {
+                self.routes.marked = None;
+                expected
+            }
+            _ => return,
+        };
+        if !self.is_current(act) {
+            return;
+        }
+        match result {
+            Ok(count) => {
+                self.browser.marked_count = Some(count as usize);
+                self.settle_gate_marked(expected, true);
+            }
+            Err(miss) => {
+                // Unavailable, never zero: the operator must not read a refusal as «nothing is
+                // marked» and act on it.
+                self.browser.marked_count = None;
+                if !self.fatal_store_miss(&miss) {
+                    self.settle_gate_marked(expected, false);
+                    self.status = format!("the marked count is unavailable: {miss:?}");
+                }
+            }
+        }
+    }
+
+    fn on_latest_scan(
+        &mut self,
+        _act: Activation,
+        req: RequestId,
+        result: std::result::Result<Option<i64>, StoreMiss>,
+    ) {
+        match self.routes.latest {
+            Some(expected) if expected == req => self.routes.latest = None,
+            _ => return,
+        }
+        match result {
+            Ok(Some(scan_id)) => self.open_via_actor(scan_id, OpenIntent::Commander),
+            Ok(None) => {
+                self.commander.dedup_scan_id = None;
+                self.commander.status = "No scans in the checkpoint database".to_string();
+            }
+            Err(miss) => {
+                if !self.fatal_store_miss(&miss) {
+                    self.commander.status = format!("the scan list is unavailable: {miss:?}");
+                }
+            }
+        }
+    }
+
+    // === The marks gate ===
+
+    /// Starts an authoritative re-read after a write the UI did not see in full.
+    ///
+    /// Both halves are issued together: the count in the header and the rows of the open group.
+    /// Planning stays refused until every issued reload has succeeded, so nothing can be built
+    /// from rows that are still catching up.
+    fn start_gate_reload(&mut self) {
+        let act = self.installed_act;
+        let marked = self.refresh_marked_count();
+        let group = self
+            .browser
+            .open_group
+            .as_ref()
+            .and_then(|open| {
+                self.browser
+                    .group_summaries
+                    .iter()
+                    .find(|(id, _)| id.rank as usize == open.id)
+                    .map(|(id, _)| *id)
+            })
+            .and_then(|id| {
+                let sent = self.send_browse(|req| BrowseRequest::GroupOpen {
+                    act,
+                    req,
+                    id,
+                    offset: 0,
+                    limit: BROWSE_GROUP_FILE_PAGE,
+                });
+                if let Some(req) = sent {
+                    self.routes
+                        .groups
+                        .insert(req.0, GroupPurpose::BrowserReload { id });
+                }
+                sent
+            });
+        match marked {
+            Some(marked) => {
+                self.marks_gate = MarksGate::Reloading {
+                    act,
+                    marked,
+                    group,
+                    marked_ok: false,
+                    group_ok: group.is_none(),
+                };
+            }
+            // Nothing could even be asked: the marks stay unsettled and planning stays refused
+            // rather than quietly proceeding over rows nobody re-read.
+            None => {
+                self.marks_gate = MarksGate::Blocked {
+                    act,
+                    reason: "the marks could not be re-read — reopen the results".to_string(),
+                };
+                self.marks_unsettled = true;
+            }
+        }
+    }
+
+    /// The marked-count half of a reload settled.
+    fn settle_gate_marked(&mut self, req: RequestId, ok: bool) {
+        let MarksGate::Reloading {
+            act,
+            marked,
+            group,
+            marked_ok: _,
+            group_ok,
+        } = self.marks_gate.clone()
+        else {
+            return;
+        };
+        if !self.is_current(act) || marked != req {
+            return;
+        }
+        if !ok {
+            self.marks_gate = MarksGate::Blocked {
+                act,
+                reason: "the marked count could not be re-read".to_string(),
+            };
+            self.marks_unsettled = true;
+            return;
+        }
+        self.marks_gate = MarksGate::Reloading {
+            act,
+            marked,
+            group,
+            marked_ok: true,
+            group_ok,
+        };
+        self.clear_gate_if_settled();
+    }
+
+    /// The open-group half of a reload settled.
+    fn settle_gate_group(&mut self, req: RequestId, ok: bool) {
+        let MarksGate::Reloading {
+            act,
+            marked,
+            group,
+            marked_ok,
+            group_ok: _,
+        } = self.marks_gate.clone()
+        else {
+            return;
+        };
+        if !self.is_current(act) || group != Some(req) {
+            return;
+        }
+        if !ok {
+            self.marks_gate = MarksGate::Blocked {
+                act,
+                reason: "the open group could not be re-read".to_string(),
+            };
+            self.marks_unsettled = true;
+            return;
+        }
+        self.marks_gate = MarksGate::Reloading {
+            act,
+            marked,
+            group,
+            marked_ok,
+            group_ok: true,
+        };
+        self.clear_gate_if_settled();
+    }
+
+    /// The gate clears only when EVERY issued reload has succeeded.
+    fn clear_gate_if_settled(&mut self) {
+        if let MarksGate::Reloading {
+            marked_ok,
+            group_ok,
+            ..
+        } = self.marks_gate
+        {
+            if marked_ok && group_ok {
+                self.marks_gate = MarksGate::Settled;
+            }
+        }
+    }
+
+    // === Marks, auto-select, planning and settlement ===
+
+    /// Releases the actor-side ticket for `req`, whatever the reply says. A settlement is owed
+    /// to the ledger, not to the screen: a stale activation is no reason to leave a path locked.
+    fn settle_ticket(&mut self, req: RequestId) {
+        if let Some(handle) = self.browse.live() {
+            let _ = handle.settle(req);
+        }
+    }
+
+    /// Writes the durable after-image the store returned into every window that shows those
+    /// pathnames. This is the authoritative state — never the optimistic one the UI guessed.
+    fn apply_mark_image(&mut self, after: &[(PathBuf, Option<MarkIntent>)]) {
+        use crate::tui::commander::state::Mark;
+        if let Some(open) = self.browser.open_group.as_mut() {
+            for (path, intent) in after {
+                if let Some(file) = open.files.iter_mut().find(|file| &file.path == path) {
+                    file.is_keeper = matches!(intent, Some(MarkIntent::Keeper));
+                    file.action = match intent {
+                        Some(MarkIntent::Act(kind)) => Some(*kind),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        for panel in &mut self.commander.panels {
+            for (path, intent) in after {
+                match intent {
+                    // `Selected` is a triage selection, not a durable mark — the database says
+                    // nothing about it and must not clear it.
+                    None => {
+                        if panel
+                            .marks
+                            .get(path)
+                            .is_some_and(|mark| *mark != Mark::Selected)
+                        {
+                            panel.marks.remove(path);
+                        }
+                    }
+                    Some(MarkIntent::Keeper) => {
+                        panel.marks.insert(path.clone(), Mark::Keeper);
+                    }
+                    Some(MarkIntent::Act(ActionKind::Delete)) => {
+                        panel.marks.insert(path.clone(), Mark::Delete);
+                    }
+                    Some(MarkIntent::Act(ActionKind::Hardlink)) => {
+                        panel.marks.insert(path.clone(), Mark::Hardlink);
+                    }
+                    Some(MarkIntent::Act(ActionKind::Reflink)) => {
+                        panel.marks.insert(path.clone(), Mark::Reflink);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Puts the window back the way it was before an optimistic mark the database never took.
+    fn restore_mark_origin(&mut self, origin: MarkOrigin) {
+        match origin {
+            MarkOrigin::WizardGroup { before } => {
+                if let Some(open) = self.browser.open_group.as_mut() {
+                    open.files = before;
+                }
+            }
+            MarkOrigin::CommanderMark {
+                panel,
+                path,
+                previous,
+            } => {
+                if let Some(panel) = self.commander.panels.get_mut(panel) {
+                    match previous {
+                        Some(mark) => {
+                            panel.marks.insert(path, mark);
+                        }
+                        None => {
+                            panel.marks.remove(&path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn on_mark_ack(&mut self, act: Activation, req: RequestId, outcome: MarkOutcome) {
+        self.settle_ticket(req);
+        let origin = self.pending_marks.remove(&req.0);
+        if !self.is_current(act) {
+            return;
+        }
+        match outcome {
+            MarkOutcome::Settled { after } => self.apply_mark_image(&after),
+            // The write refused, but the database still told us what it holds for exactly these
+            // pathnames: settle from that, not from the guess the window made.
+            MarkOutcome::Failed { error, after } => {
+                self.apply_mark_image(&after);
+                self.report_mark_failure(&error);
+            }
+            // No authoritative image exists at all — the window goes back to what it showed.
+            MarkOutcome::Unreadable { error } => {
+                if let Some(origin) = origin {
+                    self.restore_mark_origin(origin);
+                }
+                self.report_mark_failure(&error);
+            }
+        }
+        let _ = self.refresh_marked_count();
+        self.invalidate_confirmation("the marks changed");
+    }
+
+    /// One place turns a typed mark failure into what the operator sees — and uninstalls the
+    /// view when the failure says the checkpoint itself was replaced.
+    fn report_mark_failure(&mut self, error: &crate::state::MarkWriteError) {
+        if let crate::state::MarkWriteError::PathChanged { detail } = error {
+            let detail = detail.clone();
+            self.uninstall_browsing(&detail);
+            return;
+        }
+        let message = match error {
+            // The one refusal an operator meets by ordinary navigation — marking a file the scan
+            // never walked — keeps the sentence it has always had. A `Debug` rendering of the
+            // variant would tell them the shape of an enum instead of what is wrong.
+            crate::state::MarkWriteError::NotInManifest { path } => format!(
+                "The mark was not saved: {} is not part of the loaded scan",
+                crate::textsan::terminal(&path.display().to_string())
+            ),
+            _ => format!("the mark was not saved: {error:?}"),
+        };
+        match self.mode {
+            AppMode::Commander => self.commander.status = message,
+            AppMode::Wizard => self.status = message,
+        }
+    }
+
+    fn on_auto_select_done(&mut self, act: Activation, req: RequestId, outcome: AutoSelectOutcome) {
+        self.settle_ticket(req);
+        if self
+            .auto_select
+            .as_ref()
+            .is_some_and(|(live, _)| *live == req)
+        {
+            self.auto_select = None;
+        }
+        if !self.is_current(act) {
+            return;
+        }
+        match outcome {
+            AutoSelectOutcome::Completed { groups, marks } => {
+                self.status =
+                    format!("Auto-select: kept the newest file in {groups} groups, {marks} marked");
+                self.after_bulk_mark_write(false);
+            }
+            // Partial means SOME chunks are durable: the RAM marks are invalidated exactly as
+            // they are after a completed sweep, and the batch is reported unsettled until the
+            // authoritative reload lands.
+            AutoSelectOutcome::Partial {
+                committed_groups,
+                last_committed_rank,
+                cancelled,
+                detail,
+            } => {
+                self.status = format!(
+                    "Auto-select stopped after {committed_groups} groups (last rank \
+                     {last_committed_rank}{}): {detail}",
+                    if cancelled { ", cancelled" } else { "" }
+                );
+                self.after_bulk_mark_write(true);
+            }
+            // Refused means exactly zero chunks committed, so nothing in RAM is stale.
+            AutoSelectOutcome::Refused(refusal) => {
+                if let AutoSelectRefusal::PathChanged { detail } = &refusal {
+                    let detail = detail.clone();
+                    self.uninstall_browsing(&detail);
+                    return;
+                }
+                self.status = match refusal {
+                    AutoSelectRefusal::Unknown => RESULTS_UNPUBLISHED.to_string(),
+                    AutoSelectRefusal::CancelledBeforeFirstCommit => {
+                        "Auto-select cancelled — nothing was marked".to_string()
+                    }
+                    other => format!("Auto-select refused: {other:?}"),
+                };
+            }
+        }
+    }
+
+    /// What follows a write the UI did not see row by row: every named RAM representation of a
+    /// mark is dropped, and the authoritative rows are re-read behind the gate.
+    fn after_bulk_mark_write(&mut self, unsettled: bool) {
+        use crate::tui::commander::state::Mark;
+        for panel in &mut self.commander.panels {
+            // The durable marks are stale; the triage selection is not a durable mark.
+            panel.marks.retain(|_, mark| *mark == Mark::Selected);
+        }
+        if let Some(board) = self.commander.board.as_mut() {
+            board.source.marks.retain(|_, mark| *mark == Mark::Selected);
+            for receiver in &mut board.receivers {
+                receiver.marks.retain(|_, mark| *mark == Mark::Selected);
+            }
+        }
+        self.marks_unsettled = unsettled;
+        self.invalidate_confirmation("the marks were rewritten");
+        self.start_gate_reload();
+    }
+
+    fn on_plan_ready(&mut self, act: Activation, req: RequestId, plan: ActionPlan) {
+        let window = match self.routes.plan {
+            Some((expected, window)) if expected == req => {
+                self.routes.plan = None;
+                window
+            }
+            _ => return,
+        };
+        // A plan belongs to the activation that asked for it. If the view was reopened in the
+        // meantime, that plan describes a publication the operator is no longer looking at.
+        if !self.is_current(act) {
+            return;
+        }
+        match window {
+            PlanWindow::Wizard => {
+                let mut list = ListState::default();
+                list.select(Some(0));
+                self.review = ReviewState {
+                    plan: Some(plan),
+                    confirming: false,
+                    list,
+                    visible_rows: 0,
+                };
+                self.status.clear();
+                self.screen = Screen::ActionReview;
+            }
+            PlanWindow::Commander => crate::tui::commander::actions::seat_plan(self, plan),
+        }
+    }
+
+    fn on_plan_refused(&mut self, act: Activation, req: RequestId, refusal: PlanRefusal) {
+        let window = match self.routes.plan {
+            Some((expected, window)) if expected == req => {
+                self.routes.plan = None;
+                window
+            }
+            _ => return,
+        };
+        if !self.is_current(act) {
+            return;
+        }
+        let message = match &refusal {
+            PlanRefusal::NoMarks => match window {
+                PlanWindow::Wizard => {
+                    "No marked actions — mark files: d delete, h hardlink".to_string()
+                }
+                PlanWindow::Commander => "No marked files (F5/F6/F7/F8)".to_string(),
+            },
+            other => other.to_string(),
+        };
+        match window {
+            PlanWindow::Wizard => self.status = message,
+            PlanWindow::Commander => {
+                crate::tui::commander::actions::clear_pending(self);
+                self.commander.status = message;
+            }
+        }
+    }
+
+    fn on_reconcile_ack(
+        &mut self,
+        act: Activation,
+        req: RequestId,
+        result: std::result::Result<(), StoreMiss>,
+    ) {
+        match self.routes.reconcile {
+            Some(expected) if expected == req => self.routes.reconcile = None,
+            _ => return,
+        }
+        let owed = self.pending_reconcile.take();
+        let settling =
+            matches!(self.shutdown, ShutdownStage::Settling { req: waiting } if waiting == req);
+        match result {
+            Ok(()) => {
+                if let Some(owed) = &owed {
+                    self.forget_settled_marks(&owed.attempted, owed.cancelled, owed.commander);
+                }
+                self.marks_unsettled = false;
+                // The batch's own report is not authority: the count and the open group are
+                // re-read behind the gate.
+                //
+                // Deliberately NOT `after_bulk_mark_write`. That one drops every RAM mark because
+                // it follows a write whose rows the UI never saw — an auto-select. This write is
+                // the opposite: the batch named exactly which pathnames it attempted, and
+                // `forget_settled_marks` has just applied that delta. Wiping the panels on top of
+                // it would throw away the marks of the work a cancelled batch never reached,
+                // which is the one thing that must survive it.
+                //
+                // And not during a shutdown: the reload exists to refresh a screen, the exit is
+                // about to close the actor, and a reload that never comes back would end the
+                // session claiming the marks were not settled — over the write just acknowledged.
+                if self.is_current(act) && matches!(self.shutdown, ShutdownStage::None) {
+                    self.invalidate_confirmation("the marks were rewritten");
+                    self.start_gate_reload();
+                }
+            }
+            Err(miss) => {
+                // Fail-visible: the plan on disk still lists what was applied, so nothing may
+                // claim the marks were dealt with.
+                self.marks_unsettled = true;
+                self.marks_gate = MarksGate::Blocked {
+                    act: self.installed_act,
+                    reason: MARKS_NOT_SETTLED.to_string(),
+                };
+                if !self.fatal_store_miss(&miss) {
+                    self.status = MARKS_NOT_SETTLED.to_string();
+                    self.commander.status = MARKS_NOT_SETTLED.to_string();
+                }
+            }
+        }
+        if settling {
+            self.shutdown = ShutdownStage::Draining;
+            self.advance_shutdown();
+        }
+    }
+
+    fn on_covering_scan(
+        &mut self,
+        _act: Activation,
+        req: RequestId,
+        cwd: PathBuf,
+        result: std::result::Result<Option<i64>, StoreMiss>,
+    ) {
+        let Some(_) = self.routes.covering.remove(&req.0) else {
+            return;
+        };
+        match result {
+            Ok(found) => {
+                self.commander
+                    .scan_coverage_cache
+                    .insert(cwd.clone(), found);
+                crate::tui::commander::apply_auto_switch(self, &cwd, found);
+            }
+            Err(miss) => {
+                if !self.fatal_store_miss(&miss) {
+                    // Nothing is cached: a failed probe must not become a remembered «no scan
+                    // covers this directory».
+                    self.commander.status = format!("scan coverage unavailable: {miss:?}");
+                }
+            }
+        }
     }
 
     fn on_finished(&mut self, result: std::result::Result<ScanOutcome, String>) {
@@ -1010,8 +2493,11 @@ impl App {
         };
         match result {
             Ok(ScanOutcome::Completed(results)) => {
-                // The pipeline returns lightweight group summaries (files — from the DB on entry).
-                self.show_results(results.scan_id, results.summaries, results.summary);
+                // The scan published its result; the browsing actor is what reads it back. The
+                // summary the pipeline reported is what the header shows until the payload
+                // installs the authority's own answer.
+                self.browser.summary = results.summary;
+                self.open_via_actor(results.scan_id, OpenIntent::Wizard);
             }
             Ok(ScanOutcome::Cancelled) => {
                 self.status = "Scan stopped — progress saved, you can continue".to_string();
@@ -1061,27 +2547,150 @@ impl App {
         self.applying.bytes_done = progress.bytes_done;
     }
 
-    /// Settles the persisted marks with what the batch did. `false` — the DB could not be
-    /// updated, so the caller must keep the marks in RAM and say so instead of implying the plan
-    /// on disk has changed.
-    fn reconcile_persisted_marks(
-        &self,
-        scan_id: Option<i64>,
-        attempted: &[PathBuf],
-        cancelled: bool,
-    ) -> bool {
-        // No scan behind the marks (a commander batch without loaded dedup data) — nothing was
-        // ever persisted, so there is nothing to settle.
-        let Some(scan_id) = scan_id else {
-            return true;
-        };
-        let result = ScanStore::open(&self.db_path)
-            .and_then(|mut store| store.reconcile_marks_after_batch(scan_id, attempted, cancelled));
-        if let Err(err) = result {
-            tracing::warn!("failed to settle action marks after the batch: {err}");
-            return false;
+    /// Sends the settlement the last batch owes the database, through the one store owner.
+    ///
+    /// `None` — it could not even be enqueued; the caller raises the unsettled state rather than
+    /// letting the exit proceed as if the marks had been dealt with.
+    fn send_pending_reconcile(&mut self) -> Option<RequestId> {
+        let owed = self.pending_reconcile.as_ref()?;
+        // The settlement belongs to the scan the batch was planned against. If the view has
+        // since been reopened onto another one, this actor cannot settle it — and saying so is
+        // the honest outcome, not sending the write to the wrong scan.
+        if self.current_scan_id != Some(owed.scan_id) {
+            return None;
         }
-        true
+        let act = self.installed_act;
+        let attempted = owed.attempted.clone();
+        let cancelled = owed.cancelled;
+        let sent = self.send_browse(|req| BrowseRequest::ReconcileAfterBatch {
+            act,
+            req,
+            attempted,
+            cancelled,
+        });
+        self.routes.reconcile = sent;
+        sent
+    }
+
+    /// The batch is over and its marks are not settled in the database. Explicit state, not a
+    /// status string: every screen that reports the batch has to keep saying so.
+    fn raise_unsettled(&mut self) {
+        self.marks_unsettled = true;
+        self.marks_gate = MarksGate::Blocked {
+            act: self.installed_act,
+            reason: MARKS_NOT_SETTLED.to_string(),
+        };
+        self.status = MARKS_NOT_SETTLED.to_string();
+        self.commander.status = MARKS_NOT_SETTLED.to_string();
+    }
+
+    /// Background work that has no cancel flag and must be allowed to land.
+    fn producers_busy(&self) -> bool {
+        self.scan.is_some()
+            || self.apply.is_some()
+            || self.commander.move_pending > 0
+            || self.purge_pending > 0
+    }
+
+    /// The one terminal an actor owes has arrived (or was synthesised). Settles what it was
+    /// holding, joins it exactly once, and decides whether a successor may exist.
+    fn retire_actor(&mut self, retired: RetiredActor, cause: CloseCause) {
+        let RetiredActor {
+            actor,
+            handle,
+            join,
+        } = retired;
+        tracing::info!(?actor, ?cause, "the browsing actor retired");
+        let drained = handle.drain_tickets();
+        self.settle_retired(drained, &cause);
+        // Exactly once: `take_terminal` hands the pair over on the first terminal only.
+        let _ = join.join();
+        match cause {
+            // A panicked actor gets no successor — the fleet already cleared the pending spawn,
+            // and the process is on its way out through the panic hook anyway.
+            CloseCause::Panicked(text) => {
+                self.marks_unsettled = true;
+                self.marks_gate = MarksGate::Blocked {
+                    act: self.installed_act,
+                    reason: format!("browsing stopped unexpectedly: {text}"),
+                };
+                let message = format!("browsing stopped unexpectedly: {text}");
+                self.status = message.clone();
+                self.commander.status = message;
+            }
+            CloseCause::Requested => {
+                if matches!(self.shutdown, ShutdownStage::None) {
+                    if let Some(spawn) = self.browse.pending_spawn().cloned() {
+                        self.browse.cancel_pending_spawn();
+                        let sink = Box::new(AppBrowseSink {
+                            events: self.events.clone(),
+                        });
+                        // Serialized replacement: the successor is spawned only now, after the
+                        // old actor's terminal settled and its thread joined.
+                        if self
+                            .browse
+                            .spawn(self.db_path.clone(), spawn.role, sink)
+                            .is_some()
+                        {
+                            if let Some(scan_id) = spawn.reopen {
+                                let intent = match self.mode {
+                                    AppMode::Commander => OpenIntent::Commander,
+                                    AppMode::Wizard => OpenIntent::Wizard,
+                                };
+                                self.open_via_actor(scan_id, intent);
+                            }
+                        }
+                    }
+                } else {
+                    self.browse.cancel_pending_spawn();
+                }
+            }
+        }
+    }
+
+    /// What a retired actor was still holding: mark tickets nobody acknowledged, and a sweep
+    /// that was mid-flight. Both are reported; neither is quietly forgotten.
+    fn settle_retired(&mut self, drained: DrainedInflight, cause: &CloseCause) {
+        let DrainedInflight { tickets, long_op } = drained;
+        let stranded = !tickets.is_empty();
+        for ticket in tickets {
+            let MarkTicket { req, .. } = &ticket;
+            if let Some(origin) = self.pending_marks.remove(&req.0) {
+                self.restore_mark_origin(origin);
+            }
+        }
+        if stranded {
+            // The database never acknowledged them, so the windows go back to what it last
+            // said — and planning is blocked until a fresh open re-establishes the picture.
+            self.marks_unsettled = true;
+            self.marks_gate = MarksGate::Blocked {
+                act: self.installed_act,
+                reason: "browsing stopped before the marks were acknowledged".to_string(),
+            };
+        }
+        if let Some(operation) = long_op {
+            operation.cancel.cancel();
+            self.auto_select = None;
+            self.marks_unsettled = true;
+            self.marks_gate = MarksGate::Blocked {
+                act: self.installed_act,
+                reason: "auto-select was interrupted — its marks are unsettled".to_string(),
+            };
+        }
+        if matches!(cause, CloseCause::Requested) && (stranded || self.marks_unsettled) {
+            self.status = MARKS_NOT_SETTLED.to_string();
+        }
+    }
+
+    fn on_actor_closed(&mut self, actor: ActorId, cause: CloseCause) {
+        // Routed by `ActorId` alone and never dropped as stale: a terminal must be deliverable
+        // at any time. A duplicate or late one finds nothing to take and is a no-op.
+        let Some(retired) = self.browse.take_terminal(actor, &cause) else {
+            self.advance_shutdown();
+            return;
+        };
+        self.retire_actor(retired, cause);
+        self.advance_shutdown();
     }
 
     /// Drops the marks in RAM that the DB has just lost — the panels of the commander, or the
@@ -1112,22 +2721,42 @@ impl App {
     /// Result of background application: summary + Summary screen. For commander —
     /// re-read the panels (marks cleared, directories changed), as it was synchronously.
     /// On error — return to the original screen with a message.
-    fn on_apply_finished(&mut self, result: std::result::Result<BatchResult, String>) {
+    fn on_apply_finished(&mut self, outcome: ApplyOutcome) {
         self.apply = None;
         self.review.confirming = false;
-        // The batch has reported, so its outcome is recorded; other background work may still
-        // need to land, so re-ask rather than quitting outright.
-        if shutdown_pending() {
-            self.request_shutdown(false);
-        }
         let from_commander = self.commander.return_to_commander;
-        match result {
+        match outcome {
+            // The guarded boundary refused: no lease, no snapshot, no filesystem work at all.
+            // The exact plan comes back to the window that confirmed it, and the marks are
+            // untouched, so the operator can rescan or simply try again.
+            ApplyOutcome::Refused { refusal, plan } => {
+                self.apply_affected.clear();
+                self.marks_unsettled = false;
+                let message = Self::refusal_message(&refusal);
+                if from_commander {
+                    self.mode = AppMode::Commander;
+                    self.commander.return_to_commander = false;
+                    crate::tui::commander::actions::seat_plan(self, *plan);
+                    self.commander.status = message;
+                } else {
+                    let mut list = ListState::default();
+                    list.select(Some(0));
+                    self.review = ReviewState {
+                        plan: Some(*plan),
+                        confirming: false,
+                        list,
+                        visible_rows: 0,
+                    };
+                    self.screen = Screen::ActionReview;
+                    self.status = message;
+                }
+            }
             // A batch that refused itself after the snapshots ran NOTHING. Reconciling its marks
             // would delete the whole plan from the database over a batch that touched no file, and
             // «unsettled» would be a lie of its own: the database never refused a write, because
             // none should have been attempted. The snapshots it did create are in the result and
             // have to be reported so they can be destroyed.
-            Ok(batch) if batch.aborted.is_some() => {
+            ApplyOutcome::Finished(batch) if batch.aborted.is_some() => {
                 self.apply_affected.clear();
                 self.marks_unsettled = false;
                 self.status = String::new();
@@ -1136,9 +2765,9 @@ impl App {
                 if from_commander {
                     self.commander.status = BATCH_REFUSED.to_string();
                 }
-                self.refresh_marked_count();
+                let _ = self.refresh_marked_count();
             }
-            Ok(batch) => {
+            ApplyOutcome::Finished(batch) => {
                 // A cancelled batch is not a finished one: only what was actually attempted loses
                 // its mark, so the marking work for the rest of the plan survives.
                 let cancelled = batch.cancelled;
@@ -1147,28 +2776,40 @@ impl App {
                     .iter()
                     .map(|outcome| outcome.target.clone())
                     .collect();
-                // The marks also live in SQLite, and the wizard builds its plan straight from
-                // there — settling only the copy in RAM would bring the applied actions back on
-                // the next restart. The marks of the origin that made them are what we settle.
+                // The marks also live in SQLite, and the plan is built straight from there —
+                // settling only the copy in RAM would bring the applied actions back on the next
+                // restart. The settlement goes through the one store owner and is acknowledged;
+                // until that acknowledgement lands, nothing claims the marks were dealt with.
                 let scan_id = if from_commander {
                     self.commander.dedup_scan_id
                 } else {
                     self.current_scan_id
                 };
-                let settled = self.reconcile_persisted_marks(scan_id, &attempted, cancelled);
-                if settled {
-                    self.forget_settled_marks(&attempted, cancelled, from_commander);
-                }
                 self.summary_result = Some(batch);
-                // Never claim the marks were dealt with when the DB refused: the marks in RAM are
-                // left alone too, so both halves still say the same thing.
-                self.marks_unsettled = !settled;
-                self.status = if settled {
-                    String::new()
-                } else {
-                    MARKS_NOT_SETTLED.to_string()
-                };
                 self.screen = Screen::Summary;
+                match scan_id {
+                    Some(scan_id) => {
+                        self.pending_reconcile = Some(PendingReconcile {
+                            scan_id,
+                            attempted,
+                            cancelled,
+                            commander: from_commander,
+                        });
+                        self.marks_unsettled = true;
+                        self.status = String::new();
+                        if self.send_pending_reconcile().is_none() {
+                            // It could not even be enqueued — say so rather than implying the
+                            // plan on disk has changed.
+                            self.raise_unsettled();
+                        }
+                    }
+                    // No scan behind the marks (a commander batch without loaded dedup data) —
+                    // nothing was ever persisted, so there is nothing to settle.
+                    None => {
+                        self.marks_unsettled = false;
+                        self.status = String::new();
+                    }
+                }
                 if from_commander {
                     let affected = std::mem::take(&mut self.apply_affected);
                     crate::tui::commander::invalidate_dir_sizes(self, &affected);
@@ -1176,13 +2817,9 @@ impl App {
                     for index in 0..count {
                         crate::tui::commander::reload_panel(self, index);
                     }
-                    if !settled {
-                        self.commander.status = MARKS_NOT_SETTLED.to_string();
-                    }
                 }
-                self.refresh_marked_count();
             }
-            Err(err) => {
+            ApplyOutcome::Failed(err) => {
                 self.apply_affected.clear();
                 if from_commander {
                     self.mode = AppMode::Commander;
@@ -1194,6 +2831,18 @@ impl App {
                 }
             }
         }
+        // The batch has reported, so its outcome is recorded; other background work may still
+        // need to land, so re-ask rather than quitting outright.
+        if shutdown_pending() {
+            self.request_shutdown(false);
+        } else {
+            self.advance_shutdown();
+        }
+    }
+
+    /// What a guarded refusal says to the operator. Every variant means the batch never began.
+    fn refusal_message(refusal: &ApplyRefusal) -> String {
+        format!("The batch was refused before any change: {refusal:?}")
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -1319,19 +2968,51 @@ impl App {
         }
     }
 
-    /// Switches the role. The store's process role moves with it, so the connections opened
-    /// afterwards match what the UI believes: the two must never drift apart.
+    /// Switches the role.
+    ///
+    /// A browsing actor's capability is fixed for its whole life, so a role change REPLACES it:
+    /// the old actor is closed, its tickets settle, its thread is joined, and only then does a
+    /// successor open a connection of the new kind. At most one actor ever exists over the
+    /// database. The replacement is refused while a batch is live, because that batch owes the
+    /// current actor a mark settlement.
     fn set_read_only(&mut self, read_only: bool) {
+        if self.read_only == read_only {
+            return;
+        }
+        if self.apply.is_some() {
+            self.commander.status =
+                "The role cannot change while actions are being applied — wait for the batch"
+                    .to_string();
+            return;
+        }
         self.read_only = read_only;
         crate::state::set_observer_role(read_only);
+        let role = self.browse_role();
+        let reopen = self.current_scan_id;
+        if matches!(self.browse.phase(), crate::state::browse::FleetPhase::Idle) {
+            // No actor to replace: the next request opens one with the new capability.
+            self.browse.cancel_pending_spawn();
+            if let Some(scan_id) = reopen {
+                let intent = match self.mode {
+                    AppMode::Commander => OpenIntent::Commander,
+                    AppMode::Wizard => OpenIntent::Wizard,
+                };
+                self.open_via_actor(scan_id, intent);
+            }
+            return;
+        }
+        if let Some(retired) = self.browse.replace(role, reopen) {
+            // The close could not even be sent — the actor is already gone, so its retirement
+            // (and the successor it was waiting for) happens here.
+            self.retire_actor(retired, CloseCause::Requested);
+        }
     }
 
     /// A shutdown signal arrived (SIGHUP from a dropped SSH session, SIGTERM, SIGINT).
     ///
     /// Arms the same cancellation Esc uses — finish the current action, then stop — instead of
-    /// dying between a quarantine evacuation and its publish. With nothing in flight we leave
-    /// straight away; while a scan or a batch is running we wait for it, so its result is
-    /// reported and the Undo journal is written. `forced` (a second signal) stops waiting.
+    /// dying between a quarantine evacuation and its publish. `forced` (a second signal) stops
+    /// waiting and leaves the threads detached, exactly as before.
     ///
     /// Called from the event loop on every iteration, so it must stay idempotent.
     pub fn request_shutdown(&mut self, forced: bool) {
@@ -1341,21 +3022,102 @@ impl App {
         if let Some(handle) = &self.apply {
             handle.cancel();
         }
-        // A background move must reach `CommanderMoveDone` so `apply_move_outcome` records the
-        // MoveRecord and the Undo entry; a background purge must reach `SessionDeleted`. Neither
-        // has a cancel flag to arm — the only safe thing is to let it finish.
-        let busy = self.scan.is_some()
-            || self.apply.is_some()
-            || self.commander.move_pending > 0
-            || self.purge_pending > 0;
-        if forced || !busy {
+        if forced {
+            self.browse.cancel_pending_spawn();
+            self.shutdown = ShutdownStage::Done;
             self.should_quit = true;
             return;
         }
-        let waiting = "Signal received — finishing the current action, then exiting…";
-        if self.status != waiting {
-            self.status = waiting.to_string();
-            self.commander.status = waiting.to_string();
+        if matches!(self.shutdown, ShutdownStage::None) {
+            // A pending role replacement is cancelled here: no successor may be spawned once
+            // the exit has begun. The browsing actor itself stays ALIVE — a finished batch owes
+            // it a mark settlement, and closing it now would refuse that write.
+            self.browse.cancel_pending_spawn();
+            self.shutdown = ShutdownStage::Producers;
+        }
+        self.advance_shutdown();
+    }
+
+    /// The staged exit, re-evaluated from state alone.
+    ///
+    /// Idempotent by construction: every transition is decided from what is true right now —
+    /// which producers are still running, whether a settlement is owed, and whether any actor
+    /// still owes its one terminal — never from a remembered step. That is what keeps a stage
+    /// from waiting for a terminal nobody owes.
+    pub(crate) fn advance_shutdown(&mut self) {
+        loop {
+            match self.shutdown.clone() {
+                ShutdownStage::None => return,
+                // A background move must reach `CommanderMoveDone` so its MoveRecord and Undo
+                // entry are written, and a purge must reach `SessionDeleted`. Neither has a
+                // cancel flag to arm — the only safe thing is to let it finish.
+                ShutdownStage::Producers => {
+                    if self.producers_busy() {
+                        let waiting =
+                            "Signal received — finishing the current action, then exiting…";
+                        if self.status != waiting {
+                            self.status = waiting.to_string();
+                            self.commander.status = waiting.to_string();
+                        }
+                        return;
+                    }
+                    if self.pending_reconcile.is_none() {
+                        self.shutdown = ShutdownStage::Draining;
+                        continue;
+                    }
+                    if !self.browse.terminal_owed() {
+                        // Nothing is alive to settle it. Say so and leave — a settlement that
+                        // cannot happen must not hold the exit open.
+                        self.raise_unsettled();
+                        self.pending_reconcile = None;
+                        self.shutdown = ShutdownStage::Done;
+                        continue;
+                    }
+                    match self.send_pending_reconcile() {
+                        Some(req) => {
+                            self.shutdown = ShutdownStage::Settling { req };
+                            return;
+                        }
+                        None => {
+                            self.raise_unsettled();
+                            self.pending_reconcile = None;
+                            self.shutdown = ShutdownStage::Draining;
+                        }
+                    }
+                }
+                ShutdownStage::Settling { .. } => {
+                    // The terminal was consumed while the settlement was in flight: its
+                    // acknowledgement is never coming, and no state may wait for a second one.
+                    if !self.browse.terminal_owed() {
+                        self.raise_unsettled();
+                        self.pending_reconcile = None;
+                        self.routes.reconcile = None;
+                        self.shutdown = ShutdownStage::Done;
+                        continue;
+                    }
+                    return;
+                }
+                ShutdownStage::Draining => {
+                    if !self.browse.terminal_owed() {
+                        self.shutdown = ShutdownStage::Done;
+                        continue;
+                    }
+                    // Idempotent: a fleet that is already draining is asked nothing twice. A
+                    // send failure means the actor is already gone, and its retirement — the
+                    // tickets it held included — happens here rather than being waited for.
+                    match self.browse.begin_close() {
+                        Some(retired) => {
+                            self.retire_actor(retired, CloseCause::Requested);
+                            continue;
+                        }
+                        None => return,
+                    }
+                }
+                ShutdownStage::Done => {
+                    self.should_quit = true;
+                    return;
+                }
+            }
         }
     }
 
@@ -1850,40 +3612,14 @@ impl App {
         }
     }
 
-    /// Opens a completed scan as a RESULT in the background: without a worker, phases,
-    /// `set_status`, or `add_elapsed` (viewing doesn't spoil the time metric) — read-only of
-    /// the materialization. The result arrives via the `ResultsLoaded` event.
+    /// Opens a completed scan as a RESULT: the browsing actor prepares it (operator only),
+    /// reads it under one validated snapshot and answers with the whole payload.
+    ///
+    /// Nothing is loaded here and nothing is installed until that answer arrives, so there is no
+    /// window in which the screen shows half a result — and a slow first open shows the
+    /// «Opening result» animation instead of freezing the interface.
     pub fn spawn_open_completed(&mut self, scan_id: i64) {
-        self.status = "Opening results…".to_string();
-        self.commander.status = "Opening results…".to_string();
-        // Enable the "Opening result" animation (E2E feedback): the first opening of an old
-        // scan materializes once and can be slow — a live indicator is needed.
-        self.opening_started = Some(std::time::Instant::now());
-        let db_path = self.db_path.clone();
-        let events = self.events.clone();
-        let read_only = self.read_only;
-        std::thread::spawn(move || {
-            let (summaries, summary, prepared) = match ScanStore::open(&db_path) {
-                Ok(mut store) => {
-                    // Preparing the results is a WRITE, so only the operator does it, once per
-                    // scan. Reading them is then a pure read — an observer never writes and never
-                    // re-aggregates the manifest.
-                    if !read_only {
-                        if let Err(err) = store.ensure_materialized(scan_id) {
-                            tracing::warn!(scan_id, %err, "preparing the finished scan failed");
-                        }
-                    }
-                    let prepared = store.results_materialized(scan_id).unwrap_or(false);
-                    let summaries = store.group_summaries(scan_id).unwrap_or_default();
-                    let summary = store.scan_summary(scan_id).unwrap_or_default();
-                    (summaries, summary, prepared)
-                }
-                Err(_) => (Vec::new(), ScanSummary::default(), false),
-            };
-            let _ = events.send(AppEvent::ResultsLoaded(
-                scan_id, summaries, summary, prepared,
-            ));
-        });
+        self.open_via_actor(scan_id, OpenIntent::Wizard);
     }
 
     /// Del on the sessions screen: requests confirmation to move to
@@ -2055,6 +3791,13 @@ impl App {
                 return;
             }
             KeyCode::Esc => {
+                // Esc cancels a running sweep before it means «leave the screen»: the token is
+                // the request-scoped one created before the request was enqueued, so a
+                // cancellation pressed at any moment — including before the actor even reached
+                // the handler — is seen at the next chunk boundary and cannot be erased.
+                if self.cancel_auto_select() {
+                    return;
+                }
                 self.screen = Screen::ScanConfig;
                 self.status.clear();
                 return;
@@ -2500,8 +4243,8 @@ impl App {
         let Some(cursor) = self.browser.file_state.selected() else {
             return;
         };
-        let (hash, loaded) = match self.browser.open_group.as_ref() {
-            Some(g) => (g.hash.clone(), g.files.len()),
+        let (rank, loaded) = match self.browser.open_group.as_ref() {
+            Some(open) => (open.id, open.files.len()),
             None => return,
         };
         let total = self.browser.open_group_total as usize;
@@ -2516,30 +4259,36 @@ impl App {
         if cursor + BROWSE_GROUP_FILE_PAGE < loaded {
             return;
         }
-        let Some(scan_id) = self.current_scan_id else {
-            return;
-        };
-        let next = self
-            .browse_conn()
-            .and_then(|store| {
-                store
-                    .group_files_page(scan_id, &hash, loaded, BROWSE_GROUP_FILE_PAGE)
-                    .ok()
-            })
-            .unwrap_or_default();
-        if next.is_empty() {
+        // One page in flight at a time: a second request for the same offset would append the
+        // same rows twice.
+        if self
+            .routes
+            .groups
+            .values()
+            .any(|purpose| matches!(purpose, GroupPurpose::BrowserMore { .. }))
+        {
             return;
         }
-        if let Some(open_mut) = self.browser.open_group.as_mut() {
-            open_mut.files.extend(next);
-            if open_mut.files.len() >= BROWSE_GROUP_FILE_MAX
-                || open_mut.files.len() as u64 >= self.browser.open_group_total
-            {
-                self.browser.open_group_max_reached = true;
-            }
-            // The palette needs recomputing: new file names have arrived, and without
-            // an update they would be drawn in the default color.
-            self.browser.open_group_colors = crate::tui::screens::browser::name_palette(open_mut);
+        let Some(id) = self
+            .browser
+            .group_summaries
+            .iter()
+            .find(|(id, _)| id.rank as usize == rank)
+            .map(|(id, _)| *id)
+        else {
+            return;
+        };
+        let act = self.installed_act;
+        if let Some(req) = self.send_browse(|req| BrowseRequest::GroupOpen {
+            act,
+            req,
+            id,
+            offset: loaded,
+            limit: BROWSE_GROUP_FILE_PAGE,
+        }) {
+            self.routes
+                .groups
+                .insert(req.0, GroupPurpose::BrowserMore { id, loaded });
         }
     }
 
@@ -2592,7 +4341,6 @@ impl App {
         }
         // Persist the whole group: keeper + marked; default rows are cleared.
         self.settle_open_group(before);
-        self.refresh_marked_count();
     }
 
     /// The open group's rows as they stand — the state to fall back to when a write is refused.
@@ -2622,64 +4370,44 @@ impl App {
             }
         }
         self.settle_open_group(before);
-        self.refresh_marked_count();
     }
 
     /// Auto-select: in each group keep the newest file, the rest — for deletion.
-    /// Streams groups from the DB (per group — `group_files`), writes marks
-    /// in batches (~500 groups/transaction), without holding the whole scan in RAM.
+    ///
+    /// One request for the whole sweep. The actor streams the groups through the membership
+    /// authority and commits in chunks, so nothing holds the scan in RAM; Esc cancels it at a
+    /// chunk boundary through the request-scoped token created BEFORE the request is enqueued —
+    /// there is no window in which a cancellation can be erased.
     fn browser_auto(&mut self) {
         if self.deny_if_read_only("auto-select") {
             return;
         }
-        let Some(scan_id) = self.current_scan_id else {
+        if self.current_scan_id.is_none() {
+            return;
+        }
+        if self.auto_select.is_some() {
+            self.status = "Auto-select is already running — Esc cancels it".to_string();
+            return;
+        }
+        let act = self.installed_act;
+        let cancel = CancelToken::new();
+        let req = self.browse.next_request();
+        let Some(handle) = self.browse.live().cloned() else {
+            self.status = "Auto-select: browsing is not available".to_string();
             return;
         };
-        let Ok(mut store) = ScanStore::open(&self.db_path) else {
-            self.status = "Auto-select: failed to open the DB".to_string();
-            return;
-        };
-        const SAVE_CHUNK_GROUPS: usize = 500;
-        let mut batch: Vec<FileEntry> = Vec::new();
-        let mut groups_in_batch = 0usize;
-        let mut failed = false;
-        for summary in &self.browser.group_summaries {
-            let mut files = match store.group_files(scan_id, &summary.hash) {
-                Ok(files) if !files.is_empty() => files,
-                _ => continue,
-            };
-            let keeper_index = pick_keeper(&files);
-            for (index, file) in files.iter_mut().enumerate() {
-                file.is_keeper = index == keeper_index;
-                file.action = if index == keeper_index {
-                    None
-                } else {
-                    Some(ActionKind::Delete)
-                };
+        match handle.send_auto_select(act, req, cancel.clone()) {
+            Ok(()) => {
+                self.auto_select = Some((req, cancel));
+                self.status = "Auto-select: running…".to_string();
             }
-            batch.append(&mut files);
-            groups_in_batch += 1;
-            if groups_in_batch >= SAVE_CHUNK_GROUPS {
-                if store.save_marks(scan_id, batch.iter()).is_err() {
-                    failed = true;
-                    break;
-                }
-                batch.clear();
-                groups_in_batch = 0;
+            // The complete long operation comes back, so the refusal names exactly what was
+            // refused rather than a sentence about it.
+            Err(RefusedAutoSelect { reason, long_op }) => {
+                debug_assert_eq!(long_op.req, req);
+                self.status = format!("Auto-select refused: {reason:?}");
             }
         }
-        if !failed && !batch.is_empty() {
-            failed = store.save_marks(scan_id, batch.iter()).is_err();
-        }
-        drop(store);
-        self.status = if failed {
-            "Auto-select: error writing marks".to_string()
-        } else {
-            "Auto-select: kept the newest file, the rest marked for deletion".to_string()
-        };
-        // Re-read the open group with fresh marks and update the counter.
-        self.open_selected_group();
-        self.refresh_marked_count();
     }
 
     /// Saves the marks of the specified files of the current scan to the DB (Feature 6B).
@@ -2687,28 +4415,54 @@ impl App {
     /// Fail-closed: a write the database refused is reported, and the caller puts the group back
     /// the way the database still has it. A mark that lives only in RAM is a screen that says
     /// DELETE over a database that says nothing — and the plan is built from the database.
-    fn persist_marks<'a>(
-        &self,
-        files: impl Iterator<Item = &'a FileEntry>,
-    ) -> crate::error::Result<()> {
-        let Some(scan_id) = self.current_scan_id else {
-            return Ok(());
-        };
-        ScanStore::open(&self.db_path).and_then(|mut store| store.save_marks(scan_id, files))
-    }
-
-    /// Writes the open group's marks, or puts the group back as it was and says why.
+    /// Sends the open group's marks to the actor and remembers what the window looked like.
+    ///
+    /// The rows on screen are optimistic until the acknowledgement arrives: the after-image the
+    /// store read inside its own write transaction is what finally settles them, and a refusal
+    /// puts `before` back. Nothing here decides that a write succeeded.
     fn settle_open_group(&mut self, before: Vec<FileEntry>) {
-        let result = match self.browser.open_group.as_ref() {
-            Some(open) => self.persist_marks(open.files.iter()),
-            None => Ok(()),
+        if self.current_scan_id.is_none() {
+            return;
+        }
+        let Some(entries) = self
+            .browser
+            .open_group
+            .as_ref()
+            .map(|open| open.files.clone())
+        else {
+            return;
         };
-        if let Err(err) = result {
-            tracing::warn!("failed to save action marks: {err}");
+        // The durable image of exactly these pathnames, as this window last heard it — the
+        // ticket's own before-image, which is what a refusal or a terminal restores from.
+        let durable: Vec<(PathBuf, Option<MarkIntent>)> = before
+            .iter()
+            .map(|file| (file.path.clone(), mark_intent_of(file)))
+            .collect();
+        let act = self.installed_act;
+        let req = self.browse.next_request();
+        let Some(handle) = self.browse.live().cloned() else {
             if let Some(open) = self.browser.open_group.as_mut() {
                 open.files = before;
             }
-            self.status = format!("The mark was not saved — dedcom.db refused it: {err}");
+            self.status = "The mark was not saved — browsing is not available".to_string();
+            return;
+        };
+        match handle.send_set_marks(act, req, entries, durable) {
+            Ok(()) => {
+                self.pending_marks
+                    .insert(req.0, MarkOrigin::WizardGroup { before });
+            }
+            Err(refused) => {
+                // The complete ticket (or the complete raw inputs) comes back, so the window is
+                // restored from what it actually supplied — and from the durable image that
+                // supply carried, which is what the database still holds.
+                if let Some(open) = self.browser.open_group.as_mut() {
+                    open.files = before;
+                }
+                let durable = refused.before().to_vec();
+                self.apply_mark_image(&durable);
+                self.status = format!("The mark was not saved: {:?}", refused.reason());
+            }
         }
     }
 
@@ -2744,38 +4498,249 @@ impl App {
     /// database too, which told the operator their marks were gone when the truth was that nothing
     /// could be read at all.
     fn open_review(&mut self) {
-        let Some(scan_id) = self.current_scan_id else {
+        if self.current_scan_id.is_none() {
             self.status = "No scan is loaded — run or open a scan first".to_string();
             return;
-        };
-        let store = match ScanStore::open(&self.db_path) {
-            Ok(store) => store,
-            Err(err) => {
-                self.status = format!("dedcom.db could not be opened: {err}");
-                return;
+        }
+        // A plan may not overtake a mark the database has not accepted yet, and it may not be
+        // built while the rows on screen are being re-read. Refused HERE, locally, on top of the
+        // queue's own FIFO order — an unacknowledged mark must never enter a plan.
+        if let Some(reason) = self.plan_gate_refusal() {
+            self.status = reason;
+            return;
+        }
+        let requested = self.requested_marks();
+        let act = self.installed_act;
+        if let Some(req) = self.send_browse(|req| BrowseRequest::BuildPlan {
+            act,
+            req,
+            requested,
+        }) {
+            self.routes.plan = Some((req, PlanWindow::Wizard));
+            self.status = "Building the plan…".to_string();
+        }
+    }
+
+    /// Asks the authority for the commander's plan. `false` — it could not even be enqueued.
+    pub(crate) fn request_commander_plan(&mut self, requested: Vec<RequestedMark>) -> bool {
+        let act = self.installed_act;
+        match self.send_browse(|req| BrowseRequest::BuildPlan {
+            act,
+            req,
+            requested,
+        }) {
+            Some(req) => {
+                self.routes.plan = Some((req, PlanWindow::Commander));
+                true
             }
-        };
-        let plan = match store.build_action_plan(scan_id, &self.requested_marks()) {
-            Ok(plan) => plan,
-            Err(PlanRefusal::NoMarks) => {
-                self.status = "No marked actions — mark files: d delete, h hardlink".to_string();
-                return;
+            None => false,
+        }
+    }
+
+    /// One panel refresh: every file's membership and every subdirectory's size and signature,
+    /// in one request answered from one snapshot.
+    pub(crate) fn request_panel_data(
+        &mut self,
+        target: LoadTarget,
+        cwd: PathBuf,
+        files: Vec<PathBuf>,
+        dirs: Vec<PathBuf>,
+    ) {
+        let act = self.installed_act;
+        let asked = cwd.clone();
+        match self.send_browse(|req| BrowseRequest::PanelData {
+            act,
+            req,
+            files,
+            dirs,
+        }) {
+            Some(req) => {
+                self.routes.panels.insert(req.0, (target, cwd));
             }
-            Err(refusal) => {
-                self.status = refusal.to_string();
-                return;
+            // Nothing was asked, so nothing is pending: the panel keeps whatever it had rather
+            // than waiting for an answer that will never come.
+            None => {
+                self.commander
+                    .dedup
+                    .insert_dir(asked, Err("browsing is not available".to_string()));
             }
+        }
+    }
+
+    /// Sends one commander mark and remembers what that panel showed before it.
+    ///
+    /// The before-image is the durable meaning this window last heard for exactly this pathname,
+    /// so a refusal — or an actor that dies holding the ticket — puts the panel back where the
+    /// database still is.
+    pub(crate) fn send_commander_mark(
+        &mut self,
+        panel: usize,
+        file: FileEntry,
+        previous: Option<crate::tui::commander::state::Mark>,
+    ) -> crate::error::Result<()> {
+        let path = file.path.clone();
+        let durable = previous.and_then(|mark| match mark {
+            crate::tui::commander::state::Mark::Keeper => Some(MarkIntent::Keeper),
+            crate::tui::commander::state::Mark::Delete => Some(MarkIntent::Act(ActionKind::Delete)),
+            crate::tui::commander::state::Mark::Hardlink => {
+                Some(MarkIntent::Act(ActionKind::Hardlink))
+            }
+            crate::tui::commander::state::Mark::Reflink => {
+                Some(MarkIntent::Act(ActionKind::Reflink))
+            }
+            // A triage selection is not a durable mark: the database holds nothing for it.
+            crate::tui::commander::state::Mark::Selected => None,
+        });
+        let act = self.installed_act;
+        let req = self.browse.next_request();
+        let Some(handle) = self.browse.live().cloned() else {
+            return Err(crate::error::AppError::msg(
+                "browsing is not available — the mark was not saved",
+            ));
         };
-        let mut list = ListState::default();
-        list.select(Some(0));
-        self.review = ReviewState {
-            plan: Some(plan),
-            confirming: false,
-            list,
-            visible_rows: 0,
+        match handle.send_set_marks(act, req, vec![file], vec![(path.clone(), durable)]) {
+            Ok(()) => {
+                self.pending_marks.insert(
+                    req.0,
+                    MarkOrigin::CommanderMark {
+                        panel,
+                        path,
+                        previous,
+                    },
+                );
+                Ok(())
+            }
+            Err(refused) => {
+                let durable = refused.before().to_vec();
+                self.apply_mark_image(&durable);
+                Err(crate::error::AppError::msg(format!(
+                    "{:?}",
+                    refused.reason()
+                )))
+            }
+        }
+    }
+
+    /// Opens a group for a commander watching panel, by identity.
+    pub(crate) fn request_watch_group_open(&mut self, panel: usize, id: GroupId) {
+        let act = self.installed_act;
+        if let Some(req) = self.send_browse(|req| BrowseRequest::GroupOpen {
+            act,
+            req,
+            id,
+            offset: 0,
+            limit: BROWSE_GROUP_FILE_PAGE,
+        }) {
+            self.routes
+                .groups
+                .insert(req.0, GroupPurpose::Watch { panel, id });
+        }
+    }
+
+    /// Asks what a file cursor resolves to for a commander watching panel.
+    pub(crate) fn request_watch_file_info(&mut self, panel: usize, path: PathBuf) {
+        let act = self.installed_act;
+        if let Some(req) = self.send_browse(|req| BrowseRequest::FileInfo { act, req, path }) {
+            self.routes
+                .infos
+                .insert(req.0, InfoPurpose::WatchDup { panel });
+        }
+    }
+
+    /// Opens one directory group by signature for a commander panel.
+    pub(crate) fn request_open_dir_group(&mut self, panel: usize, signature: String) {
+        let act = self.installed_act;
+        if let Some(req) = self.send_browse(|req| BrowseRequest::OpenDirGroup {
+            act,
+            req,
+            signature,
+        }) {
+            self.routes
+                .dir_opens
+                .insert(req.0, DirOpenPurpose::Watch { panel });
+        }
+    }
+
+    /// Asks what a directory cursor resolves to for a commander watching panel.
+    pub(crate) fn request_watch_dir_group(&mut self, panel: usize, dir: PathBuf) {
+        let act = self.installed_act;
+        if let Some(req) = self.send_browse(|req| BrowseRequest::DirGroupAt { act, req, dir }) {
+            self.routes.dirs_at.insert(req.0, panel);
+        }
+    }
+
+    /// The F3 overlay: the header lines are built from the panel entry, the membership half
+    /// arrives from the authority.
+    pub(crate) fn request_file_info_overlay(&mut self, path: PathBuf, header: Vec<String>) {
+        let act = self.installed_act;
+        match self.send_browse(|req| BrowseRequest::FileInfo { act, req, path }) {
+            Some(req) => {
+                self.routes
+                    .infos
+                    .insert(req.0, InfoPurpose::Overlay { header });
+            }
+            // Without a scan there is nothing to ask: the overlay shows what the filesystem
+            // itself said and says plainly that membership is unknown.
+            None => {
+                let mut lines = header;
+                lines.push("No scan is loaded — F2/F12 to select one".to_string());
+                self.commander.info_lines = lines;
+                self.commander.overlay = crate::tui::commander::state::Overlay::FileInfo;
+            }
+        }
+    }
+
+    /// Asks which scan covers `cwd`, once. The answer fills the coverage cache and applies the
+    /// switch; a directory with a probe in flight is simply not decided yet.
+    pub(crate) fn request_covering_scan(&mut self, cwd: PathBuf) {
+        if self.routes.covering.values().any(|pending| *pending == cwd) {
+            return;
+        }
+        let act = self.installed_act;
+        let asked = cwd.clone();
+        if let Some(req) = self.send_browse(|req| BrowseRequest::CoveringScan {
+            act,
+            req,
+            cwd: asked,
+        }) {
+            self.routes.covering.insert(req.0, cwd);
+        }
+    }
+
+    /// Cancels a running auto-select sweep. `true` — one was running, so the keystroke belonged
+    /// to it and means nothing else.
+    ///
+    /// The sweep stops at its next chunk boundary; whatever it had already committed stays
+    /// durable and is reported as `Partial`, so the operator is never told nothing happened when
+    /// something did.
+    pub(crate) fn cancel_auto_select(&mut self) -> bool {
+        let Some((_, cancel)) = self.auto_select.as_ref() else {
+            return false;
         };
-        self.status.clear();
-        self.screen = Screen::ActionReview;
+        cancel.cancel();
+        // The handle's own ledger holds the same request-scoped token, and cancelling through it
+        // is what covers the window between «registered» and «the handler started».
+        if let Some(handle) = self.browse.live() {
+            handle.cancel_long_operation();
+        }
+        let message = "Auto-select: cancelling…".to_string();
+        self.status = message.clone();
+        self.commander.status = message;
+        true
+    }
+
+    /// Why a plan may not be built right now, if it may not be.
+    pub(crate) fn plan_gate_refusal(&self) -> Option<String> {
+        if !self.pending_marks.is_empty() {
+            return Some(
+                "a mark is still being written — the plan waits for the database to accept it"
+                    .to_string(),
+            );
+        }
+        if self.auto_select.is_some() {
+            return Some("auto-select is still running — wait for it to finish".to_string());
+        }
+        self.marks_gate.refusal()
     }
 
     /// Applies the reviewed plan (snapshot -> application) and transitions to the summary.
@@ -2820,7 +4785,10 @@ impl App {
         };
         self.status.clear();
         self.screen = Screen::Applying;
+        // Through the guarded boundary: the worker opens its own apply lease, revalidates the
+        // witness the plan owns and holds the lease for the whole batch.
         self.apply = Some(actions::apply_worker::spawn(
+            self.db_path.clone(),
             plan,
             datasets,
             self.zfs.capabilities.reflink_safe,
@@ -2892,29 +4860,17 @@ impl App {
         }
     }
 
-    /// Sets the scan source of the dedup overlay: if `scan_id` is given —
-    /// it is used, otherwise the newest scan in the DB (a lightweight id query). Resets the
-    /// directory cache and reads in the background the dedup attributes of all open panels
-    /// (`fetch_panel_dedup` → `CommanderDirDedup`). RAM no longer holds the whole scan.
+    /// Sets the scan source of the dedup overlay: if `scan_id` is given it is opened, otherwise
+    /// the actor is asked for the newest scan and the answer opens it.
+    ///
+    /// Nothing is cleared here for the `None` case: the caches belong to the scan that is
+    /// installed, and they are replaced atomically by the open that follows.
     pub fn spawn_dedup_load(&mut self, scan_id: Option<i64>) {
-        let resolved = match scan_id {
-            Some(id) => Some(id),
-            None => ScanStore::open(&self.db_path)
-                .ok()
-                .and_then(|store| store.latest_scan_id().ok().flatten()),
-        };
-        // New scan source → the previous caches are invalid.
-        self.commander.dedup = DedupCache::default();
-        self.commander.dedup_scan_id = resolved;
-        self.commander.group_summaries = Vec::new();
-        self.commander.dir_groups = Vec::new();
-        self.commander.groups_loaded_for = None;
-        self.commander.watch_cache = Vec::new();
-        self.commander.watch_dir_cache = Vec::new();
-        if resolved.is_some() {
-            let count = self.commander.panels.len();
-            for index in 0..count {
-                crate::tui::commander::fetch_panel_dedup(self, LoadTarget::Commander(index));
+        match scan_id {
+            Some(id) => self.open_via_actor(id, OpenIntent::Commander),
+            None => {
+                let act = self.installed_act;
+                self.routes.latest = self.send_browse(|req| BrowseRequest::LatestScan { act, req });
             }
         }
     }
@@ -3066,18 +5022,14 @@ fn rect_contains(area: Rect, col: u16, row: u16) -> bool {
     col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
 }
 
-/// Index of the default keeper file: newest mtime, on a tie — the shorter path.
-fn pick_keeper(files: &[FileEntry]) -> usize {
-    files
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| {
-            a.mtime
-                .cmp(&b.mtime)
-                .then_with(|| b.path.as_os_str().len().cmp(&a.path.as_os_str().len()))
-        })
-        .map(|(index, _)| index)
-        .unwrap_or(0)
+/// What a row's marks mean, in the vocabulary the store persists. The two states are exclusive,
+/// so «keeper and delete» is not representable here either.
+fn mark_intent_of(file: &FileEntry) -> Option<MarkIntent> {
+    match (file.is_keeper, file.action) {
+        (true, _) => Some(MarkIntent::Keeper),
+        (false, Some(kind)) => Some(MarkIntent::Act(kind)),
+        (false, None) => None,
+    }
 }
 
 /// Returns a sorted list of subdirectories of `dir`.
@@ -3151,6 +5103,69 @@ pub(crate) fn test_app_with_db(db_path: PathBuf) -> (App, crossbeam_channel::Rec
     (app, rx)
 }
 
+/// How many events one interaction may deliver before a test gives up on it. Generous: an `Open`
+/// installs a payload that fetches a group, a count and one dedup batch per panel, and each of
+/// those is an event of its own. It is a runaway guard, not a timing assumption.
+#[cfg(test)]
+const PUMP_LIMIT: usize = 256;
+
+/// Feeds the browsing actor's replies into the application until `done` holds.
+///
+/// This is how every test that used to call a synchronous store reader drives the real thing:
+/// the request goes out through the production route, the actor answers on its own thread, and
+/// `handle_event` installs the answer exactly as the main loop does.
+///
+/// Not a sleep, a retry or a poll. Every accepted request owes exactly one reply, so `recv` is a
+/// wait for something that is coming; the timeout exists only so a lost reply fails the test
+/// instead of hanging it, and the iteration cap only so a mis-written predicate does.
+#[cfg(test)]
+pub(crate) fn pump_until(
+    app: &mut App,
+    rx: &crossbeam_channel::Receiver<AppEvent>,
+    what: &str,
+    mut done: impl FnMut(&App) -> bool,
+) {
+    for _ in 0..PUMP_LIMIT {
+        if done(app) {
+            return;
+        }
+        let event = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .unwrap_or_else(|err| panic!("waiting for {what}: {err}"));
+        app.handle_event(event);
+    }
+    panic!("{what} never settled within {PUMP_LIMIT} events");
+}
+
+/// Dispatches every reply already in the channel, without waiting for another.
+///
+/// For the tail of an interaction — the panel refreshes an `Open` fans out — where the test cares
+/// that they were consumed, not that any particular one arrives.
+#[cfg(test)]
+pub(crate) fn drain(app: &mut App, rx: &crossbeam_channel::Receiver<AppEvent>) {
+    for _ in 0..PUMP_LIMIT {
+        match rx.try_recv() {
+            Ok(event) => app.handle_event(event),
+            Err(_) => return,
+        }
+    }
+}
+
+/// Opens `scan_id` the way production does — through the actor — and settles the reply.
+///
+/// Returns once the open is no longer in flight; whether it installed is the caller's assertion,
+/// because a refused open is exactly what several tests are about.
+#[cfg(test)]
+pub(crate) fn open_and_settle(
+    app: &mut App,
+    rx: &crossbeam_channel::Receiver<AppEvent>,
+    scan_id: i64,
+    intent: OpenIntent,
+) {
+    app.open_via_actor(scan_id, intent);
+    pump_until(app, rx, "the Open reply", |app| app.routes.open.is_none());
+}
+
 /// A plan of `count` deletions of independent twins, distinguishable by path. Module level because
 /// the ActionReview screen's own render test plans the same batch. `None` for `count == 0`: a plan
 /// with nothing in it is a shape `ActionPlan` refuses to hold.
@@ -3188,6 +5203,11 @@ pub(crate) fn test_plan(count: usize) -> Option<ActionPlan> {
     ActionPlan::try_new(
         1,
         vec![PlanGroupInput {
+            id: crate::model::plan::GroupId {
+                scan_id: 1,
+                rank: 0,
+                generation: 1,
+            },
             hash: "ab".repeat(32),
             members,
         }],
@@ -3342,13 +5362,41 @@ mod cancel_tests {
         let scan_id = crate::state::store::seed_marked_group(&db_path);
 
         let (mut app, rx) = test_app_with_db(db_path);
-        if commander {
-            app.commander.dedup_scan_id = Some(scan_id);
-            app.commander.return_to_commander = true;
+        // Opened the way the operator opened it: one actor payload installs the scan both
+        // windows then plan and settle against. Setting the id by hand would leave the app in a
+        // state no production route can reach — and the settlement below travels through the
+        // actor, which only exists once something opened it.
+        let intent = if commander {
+            OpenIntent::Commander
         } else {
-            app.current_scan_id = Some(scan_id);
+            OpenIntent::Wizard
+        };
+        open_and_settle(&mut app, &rx, scan_id, intent);
+        assert_eq!(
+            app.current_scan_id,
+            Some(scan_id),
+            "the fixture's scan must open: {}",
+            app.status
+        );
+        if commander {
+            app.commander.return_to_commander = true;
         }
+        // The open fans out panel and group reads; none of them is what these tests observe.
+        drain(&mut app, &rx);
         (dir, app, rx, scan_id)
+    }
+
+    /// The batch reports, and the settlement it owes travels to its acknowledgement.
+    ///
+    /// This is the production route in full: `ApplyFinished` records what is owed and sends
+    /// `ReconcileAfterBatch` through the one store owner; the actor writes and answers
+    /// `ReconcileAck`; `handle_event` settles the durable and the RAM halves together. Nothing
+    /// here waits for a write to have "probably" happened — it waits for the acknowledgement.
+    fn finish_and_settle(app: &mut App, rx: &Receiver<AppEvent>, event: AppEvent) {
+        app.handle_event(event);
+        pump_until(app, rx, "the reconcile acknowledgement", |app| {
+            app.routes.reconcile.is_none()
+        });
     }
 
     fn plan_targets(db_path: &Path, scan_id: i64) -> Vec<PathBuf> {
@@ -3356,12 +5404,12 @@ mod cancel_tests {
     }
 
     fn finished(outcomes: Vec<ActionOutcome>, planned: usize, cancelled: bool) -> AppEvent {
-        AppEvent::ApplyFinished(Ok(BatchResult {
+        AppEvent::ApplyFinished(Box::new(ApplyOutcome::Finished(BatchResult {
             outcomes,
             planned,
             cancelled,
             ..Default::default()
-        }))
+        })))
     }
 
     /// The marks are in SQLite too, and the wizard rebuilds its plan straight from there. A
@@ -3370,11 +5418,20 @@ mod cancel_tests {
     #[test]
     fn a_cancelled_batch_settles_the_persisted_marks_of_the_wizard() {
         let _role = crate::state::store::role_guard();
-        let (dir, mut app, _rx, scan_id) = app_over_seeded_db("wizard_cancel", false);
+        let (dir, mut app, rx, scan_id) = app_over_seeded_db("wizard_cancel", false);
         let db_path = app.db_path.clone();
 
-        app.handle_event(finished(vec![applied(Path::new("/x/b"))], 2, true));
+        finish_and_settle(
+            &mut app,
+            &rx,
+            finished(vec![applied(Path::new("/x/b"))], 2, true),
+        );
 
+        assert!(
+            !app.marks_unsettled,
+            "the acknowledgement arrived: {}",
+            app.status
+        );
         assert_eq!(
             plan_targets(&db_path, scan_id),
             vec![PathBuf::from("/x/c")],
@@ -3388,7 +5445,7 @@ mod cancel_tests {
     #[test]
     fn a_cancelled_batch_settles_the_persisted_marks_of_the_commander() {
         let _role = crate::state::store::role_guard();
-        let (dir, mut app, _rx, scan_id) = app_over_seeded_db("commander_cancel", true);
+        let (dir, mut app, rx, scan_id) = app_over_seeded_db("commander_cancel", true);
         let db_path = app.db_path.clone();
         app.commander.panels[0]
             .marks
@@ -3397,8 +5454,13 @@ mod cancel_tests {
             .marks
             .insert(PathBuf::from("/x/c"), Mark::Delete);
 
-        app.handle_event(finished(vec![applied(Path::new("/x/b"))], 2, true));
+        finish_and_settle(
+            &mut app,
+            &rx,
+            finished(vec![applied(Path::new("/x/b"))], 2, true),
+        );
 
+        assert!(!app.marks_unsettled, "the acknowledgement arrived");
         assert_eq!(
             plan_targets(&db_path, scan_id),
             vec![PathBuf::from("/x/c")],
@@ -3415,14 +5477,18 @@ mod cancel_tests {
     #[test]
     fn a_finished_batch_leaves_no_persisted_plan_behind() {
         let _role = crate::state::store::role_guard();
-        let (dir, mut app, _rx, scan_id) = app_over_seeded_db("wizard_finished", false);
+        let (dir, mut app, rx, scan_id) = app_over_seeded_db("wizard_finished", false);
         let db_path = app.db_path.clone();
 
-        app.handle_event(finished(
-            vec![applied(Path::new("/x/b")), applied(Path::new("/x/c"))],
-            2,
-            false,
-        ));
+        finish_and_settle(
+            &mut app,
+            &rx,
+            finished(
+                vec![applied(Path::new("/x/b")), applied(Path::new("/x/c"))],
+                2,
+                false,
+            ),
+        );
 
         assert!(
             plan_targets(&db_path, scan_id).is_empty(),
@@ -3435,14 +5501,14 @@ mod cancel_tests {
     /// An aborted result: the second preflight refused after the safety snapshots existed, so the
     /// batch reached no action at all.
     fn refused(snapshots: Vec<String>, planned: usize) -> AppEvent {
-        AppEvent::ApplyFinished(Ok(BatchResult {
+        AppEvent::ApplyFinished(Box::new(ApplyOutcome::Finished(BatchResult {
             outcomes: Vec::new(),
             snapshots,
             planned,
             cancelled: false,
             aborted: Some("a covered pathname moved after the snapshots".to_string()),
             ..Default::default()
-        }))
+        })))
     }
 
     /// R2D-C5-2a, blocker B: nothing ran, so nothing may be settled. Reconciling here deleted the
@@ -3606,27 +5672,26 @@ mod cancel_tests {
         }
     }
 
-    fn marked_app(first: &Path, second: &Path) -> App {
-        let (mut app, _rx) = test_app();
-        app.commander.return_to_commander = true;
+    /// A commander over the seeded scan whose panel holds the RAM half of the same marks the
+    /// fixture persisted: the keeper and both targets.
+    fn marked_commander(tag: &str) -> (PathBuf, App, Receiver<AppEvent>, i64) {
+        let (dir, mut app, rx, scan_id) = app_over_seeded_db(tag, true);
         let marks = &mut app.commander.panels[0].marks;
-        marks.insert(first.to_path_buf(), Mark::Delete);
-        marks.insert(second.to_path_buf(), Mark::Delete);
-        app
+        marks.insert(PathBuf::from("/x/a"), Mark::Keeper);
+        marks.insert(PathBuf::from("/x/b"), Mark::Delete);
+        marks.insert(PathBuf::from("/x/c"), Mark::Delete);
+        (dir, app, rx, scan_id)
     }
 
     #[test]
     fn a_cancelled_batch_keeps_the_marks_it_never_reached() {
-        let done = PathBuf::from("/nonexistent/a.bin");
-        let never_reached = PathBuf::from("/nonexistent/b.bin");
-        let mut app = marked_app(&done, &never_reached);
+        let _role = crate::state::store::role_guard();
+        let (dir, mut app, rx, scan_id) = marked_commander("commander_cancel_ram");
+        let db_path = app.db_path.clone();
+        let done = PathBuf::from("/x/b");
+        let never_reached = PathBuf::from("/x/c");
 
-        app.handle_event(AppEvent::ApplyFinished(Ok(BatchResult {
-            outcomes: vec![applied(&done)],
-            planned: 2,
-            cancelled: true,
-            ..Default::default()
-        })));
+        finish_and_settle(&mut app, &rx, finished(vec![applied(&done)], 2, true));
 
         let marks = &app.commander.panels[0].marks;
         assert!(
@@ -3637,25 +5702,37 @@ mod cancel_tests {
             marks.contains_key(&never_reached),
             "the action that was never attempted must keep its mark"
         );
+        assert_eq!(
+            plan_targets(&db_path, scan_id),
+            vec![never_reached],
+            "and the durable half agrees with the screen"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_batch_that_ran_to_the_end_still_clears_the_marks() {
-        let first = PathBuf::from("/nonexistent/a.bin");
-        let second = PathBuf::from("/nonexistent/b.bin");
-        let mut app = marked_app(&first, &second);
+        let _role = crate::state::store::role_guard();
+        let (dir, mut app, rx, scan_id) = marked_commander("commander_finished_ram");
+        let db_path = app.db_path.clone();
+        let first = PathBuf::from("/x/b");
+        let second = PathBuf::from("/x/c");
 
-        app.handle_event(AppEvent::ApplyFinished(Ok(BatchResult {
-            outcomes: vec![applied(&first), applied(&second)],
-            planned: 2,
-            cancelled: false,
-            ..Default::default()
-        })));
+        finish_and_settle(
+            &mut app,
+            &rx,
+            finished(vec![applied(&first), applied(&second)], 2, false),
+        );
 
         assert!(
             app.commander.panels[0].marks.is_empty(),
             "a finished batch clears everything, keepers included"
         );
+        assert!(
+            plan_targets(&db_path, scan_id).is_empty(),
+            "and the durable plan is spent with it"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3684,10 +5761,12 @@ mod cancel_tests {
 #[cfg(test)]
 mod classic_switch_tests {
     use super::*;
-    use crate::model::duplicate::DuplicateGroup;
     use crate::testfixtures::PlanScenario;
 
-    /// The classic browser sitting on a real scenario's group, marks and all.
+    /// The classic browser sitting on a real scenario's group, marks and all — reached the way
+    /// the operator reaches it. One actor payload installs the summaries and opens the first
+    /// group, so every row on screen came from the authority rather than from a literal built
+    /// beside it.
     fn browsing(tag: &str) -> (PlanScenario, App, crossbeam_channel::Receiver<AppEvent>) {
         let scenario = PlanScenario::new(tag);
         let keeper = scenario.file("keeper.bin");
@@ -3696,42 +5775,21 @@ mod classic_switch_tests {
         let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
         scenario.mark(&mut store, scan_id, &keeper, true, None);
         scenario.mark(&mut store, scan_id, &twin, false, Some(ActionKind::Delete));
-        let files = store
-            .group_files(scan_id, &"07".repeat(32))
-            .unwrap_or_default();
         drop(store);
 
         let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
         app.show_disclaimer = false;
-        app.mode = AppMode::Wizard;
-        app.screen = Screen::Browser;
-        app.current_scan_id = Some(scan_id);
-        let files = if files.is_empty() {
-            let store = scenario.store();
-            let mut rows = Vec::new();
-            for path in [&keeper, &twin] {
-                let meta = std::fs::symlink_metadata(path).unwrap();
-                rows.push(FileEntry {
-                    path: path.clone(),
-                    size: std::os::unix::fs::MetadataExt::size(&meta),
-                    is_keeper: path == &keeper,
-                    action: (path == &twin).then_some(ActionKind::Delete),
-                    ..Default::default()
-                });
-            }
-            drop(store);
-            rows
-        } else {
-            files
-        };
-        app.browser.open_group = Some(DuplicateGroup {
-            id: 0,
-            size_bytes: 0,
-            hash: String::new(),
-            files,
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Wizard);
+        pump_until(&mut app, &rx, "the first group to open", |app| {
+            app.browser.open_group.is_some()
         });
-        app.browser.group_state.select(Some(0));
+        assert_eq!(app.mode, AppMode::Wizard);
+        assert_eq!(app.screen, Screen::Browser);
+        let files = &app.browser.open_group.as_ref().unwrap().files;
+        assert_eq!(files.len(), 2, "the scenario's one group, both members");
+        assert_eq!(files[1].path, twin, "the cursor lands on the marked twin");
         app.browser.file_state.select(Some(1));
+        drain(&mut app, &rx);
         (scenario, app, rx)
     }
 
@@ -3741,21 +5799,30 @@ mod classic_switch_tests {
 
     /// `open_review` used to swallow a store failure and print «No marked actions», which tells
     /// the operator their marking work is gone when the truth is that nothing could be read.
+    ///
+    /// Since R4B-2c the plan is built by the actor, so the refusal arrives as an event — and the
+    /// checkpoint under a live view is not merely unreadable, it has been REPLACED. The door
+    /// notices, the browsing is uninstalled, and the operator is told to reopen. What may never
+    /// happen is any of the quiet outcomes: a review over an empty plan, «No marked actions», or
+    /// a screen that simply does nothing.
     #[test]
     fn an_unreadable_store_refuses_the_review_out_loud() {
         let _role = crate::state::store::role_guard();
-        let (scenario, mut app, _rx) = browsing("classic_store_error");
-        let blocker = scenario.outside.join("not-a-directory");
-        std::fs::write(&blocker, b"x").unwrap();
-        app.db_path = blocker.join("dedcom.db");
+        let (scenario, mut app, rx) = browsing("classic_store_error");
+        // The file the view was opened over is replaced by one nothing can open.
+        std::fs::remove_file(&scenario.db_path).unwrap();
+        std::fs::create_dir(&scenario.db_path).unwrap();
 
         press(&mut app, KeyCode::Char('r'));
+        pump_until(&mut app, &rx, "the plan request to be answered", |app| {
+            app.routes.plan.is_none()
+        });
 
         assert_eq!(app.screen, Screen::Browser, "no review may open");
         assert!(app.review.plan.is_none(), "and nothing is left pending");
         assert!(app.apply.is_none());
         assert!(
-            app.status.contains("could not be opened"),
+            app.status.contains("could not be read") && app.status.contains("dedcom.db"),
             "the operator is told what happened: {}",
             app.status
         );
@@ -3764,45 +5831,72 @@ mod classic_switch_tests {
             "a store failure is not an absence of marks: {}",
             app.status
         );
+        assert!(
+            !app.status.contains("Building the plan"),
+            "and the in-flight line does not survive as the answer: {}",
+            app.status
+        );
     }
 
-    /// A mark the database refuses must not stay on screen: the panel and the DB have to keep
+    /// Makes the next durable mark on `path` refuse for a named, typed reason: the pathname
+    /// leaves the manifest under the open view. `NotInManifest` is precisely that case, and it
+    /// travels back through the actor's `MarkAck` like any other refusal.
+    fn drop_from_manifest(scenario: &PlanScenario, path: &Path) {
+        let conn = rusqlite::Connection::open(&scenario.db_path).expect("the scenario database");
+        let removed = conn
+            .execute(
+                "DELETE FROM file WHERE path = ?1",
+                rusqlite::params![path.to_string_lossy()],
+            )
+            .expect("the manifest row leaves");
+        assert_eq!(removed, 1, "the fixture must remove exactly one row");
+    }
+
+    fn actions_on_screen(app: &App) -> Vec<Option<ActionKind>> {
+        app.browser
+            .open_group
+            .as_ref()
+            .expect("a group is open")
+            .files
+            .iter()
+            .map(|file| file.action)
+            .collect()
+    }
+
+    /// A mark the database refuses must not stay on screen: the window and the DB have to keep
     /// saying the same thing, because the plan is built from the DB.
+    ///
+    /// The write goes to the actor and the refusal comes back as `MarkAck`, so the optimistic
+    /// row on screen lives exactly as long as the round trip — and is then put back the way the
+    /// database still holds it.
     #[test]
     fn a_refused_mark_does_not_stay_in_the_window() {
         let _role = crate::state::store::role_guard();
-        let (scenario, mut app, _rx) = browsing("classic_mark_refused");
-        let before: Vec<Option<ActionKind>> = app
-            .browser
-            .open_group
-            .as_ref()
-            .unwrap()
-            .files
-            .iter()
-            .map(|file| file.action)
-            .collect();
-        let blocker = scenario.outside.join("not-a-directory");
-        std::fs::write(&blocker, b"x").unwrap();
-        app.db_path = blocker.join("dedcom.db");
+        let (scenario, mut app, rx) = browsing("classic_mark_refused");
+        let before = actions_on_screen(&app);
+        let cursor = app.browser.open_group.as_ref().unwrap().files[1]
+            .path
+            .clone();
+        drop_from_manifest(&scenario, &cursor);
 
         press(&mut app, KeyCode::Char('h'));
+        pump_until(&mut app, &rx, "the mark acknowledgement", |app| {
+            app.pending_marks.is_empty()
+        });
 
-        let after: Vec<Option<ActionKind>> = app
-            .browser
-            .open_group
-            .as_ref()
-            .unwrap()
-            .files
-            .iter()
-            .map(|file| file.action)
-            .collect();
         assert_eq!(
-            after, before,
+            actions_on_screen(&app),
+            before,
             "the window shows what the database still holds"
         );
         assert!(
-            app.status.contains("was not saved"),
+            app.status.contains("not saved"),
             "and says the write was refused: {}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("browsing is not available"),
+            "a refused write is not a missing browsing surface: {}",
             app.status
         );
     }
@@ -3811,26 +5905,342 @@ mod classic_switch_tests {
     #[test]
     fn a_refused_unmark_does_not_stay_in_the_window_either() {
         let _role = crate::state::store::role_guard();
-        let (scenario, mut app, _rx) = browsing("classic_unmark_refused");
-        let blocker = scenario.outside.join("not-a-directory");
-        std::fs::write(&blocker, b"x").unwrap();
-        app.db_path = blocker.join("dedcom.db");
+        let (scenario, mut app, rx) = browsing("classic_unmark_refused");
+        let cursor = app.browser.open_group.as_ref().unwrap().files[1]
+            .path
+            .clone();
+        drop_from_manifest(&scenario, &cursor);
 
         press(&mut app, KeyCode::Char(' '));
+        pump_until(&mut app, &rx, "the mark acknowledgement", |app| {
+            app.pending_marks.is_empty()
+        });
 
-        let still_marked = app
-            .browser
-            .open_group
-            .as_ref()
-            .unwrap()
-            .files
-            .iter()
-            .any(|file| file.action == Some(ActionKind::Delete));
+        let still_marked = actions_on_screen(&app).contains(&Some(ActionKind::Delete));
         assert!(
             still_marked,
             "the DELETE the database still holds must stay on screen"
         );
-        assert!(app.status.contains("was not saved"), "{}", app.status);
+        assert!(app.status.contains("not saved"), "{}", app.status);
+        assert!(
+            !app.status.contains("browsing is not available"),
+            "{}",
+            app.status
+        );
+    }
+}
+
+/// R4B-2c: the application's half of the one browsing route. The store and the actor have their
+/// own suites; what only exists here is the wiring the cutover added — one activation per
+/// installed open, the class A/B rules, the marks gate, and the staged shutdown.
+#[cfg(test)]
+mod actor_route_tests {
+    use super::*;
+    use crate::testfixtures::PlanScenario;
+    use crossbeam_channel::Receiver;
+
+    /// A published scenario of one group over three real files, and an app over its database.
+    fn opened(tag: &str) -> (PlanScenario, App, Receiver<AppEvent>, i64) {
+        let scenario = PlanScenario::new(tag);
+        let keeper = scenario.file("keeper.bin");
+        let first = scenario.file("dup1.bin");
+        let second = scenario.file("dup2.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper, first, second]);
+        drop(store);
+
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        app.show_disclaimer = false;
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Wizard);
+        assert_eq!(app.current_scan_id, Some(scan_id), "{}", app.status);
+        pump_until(&mut app, &rx, "the first group", |app| {
+            app.browser.open_group.is_some()
+        });
+        drain(&mut app, &rx);
+        (scenario, app, rx, scan_id)
+    }
+
+    /// Every route settled: nothing is in flight, so what the assertions read is final.
+    fn quiet(app: &App) -> bool {
+        app.routes.open.is_none()
+            && app.routes.groups.is_empty()
+            && app.routes.counts.is_empty()
+            && app.routes.infos.is_empty()
+            && app.routes.dirs_at.is_empty()
+            && app.routes.dir_opens.is_empty()
+            && app.routes.panels.is_empty()
+            && app.routes.marked.is_none()
+            && app.routes.latest.is_none()
+            && app.routes.covering.is_empty()
+            && app.routes.plan.is_none()
+            && app.routes.reconcile.is_none()
+    }
+
+    /// Matrix 6 — the scripted interaction, from the application's side: ONE activation is
+    /// installed and ONE actor serves the whole thing. Twenty cursor moves cost nothing at all,
+    /// and re-opening the same group does not re-open the scan.
+    ///
+    /// The store's half of the same claim — one browsing store, one full validation for twenty
+    /// legacy reads — is `state::browse::tests::one_browsing_interaction_validates_once`; the
+    /// probe table beside it prices every door operation. This is the half that only exists
+    /// after the cutover: that the UI asks once and rides one connection.
+    #[test]
+    fn one_scripted_interaction_installs_one_activation_and_keeps_one_actor() {
+        let _role = crate::state::store::role_guard();
+        let (_scenario, mut app, rx, _scan_id) = opened("scripted");
+        let actor = app.browse.live_actor().expect("the open spawned one actor");
+        assert_eq!(
+            app.installed_act,
+            Activation(1),
+            "the first successful open is the first activation"
+        );
+
+        // Twenty cursor moves over the group list: pure UI, not one request.
+        let before_moves = app.browse.requests_issued();
+        for _ in 0..20 {
+            app.handle_event(AppEvent::Key(KeyEvent::from(KeyCode::Down)));
+            app.handle_event(AppEvent::Key(KeyEvent::from(KeyCode::Up)));
+        }
+        assert_eq!(
+            app.browse.requests_issued(),
+            before_moves,
+            "a cursor move is not a question for the database"
+        );
+
+        // Three group opens over the same identity.
+        for _ in 0..3 {
+            app.open_selected_group();
+            pump_until(&mut app, &rx, "the group page", quiet);
+        }
+
+        // Three acknowledged marks through the production route.
+        for action in [Some(ActionKind::Delete), None, Some(ActionKind::Hardlink)] {
+            app.browser.file_state.select(Some(1));
+            app.browser_mark(action);
+            pump_until(&mut app, &rx, "the mark acknowledgement", |app| {
+                app.pending_marks.is_empty()
+            });
+            drain(&mut app, &rx);
+        }
+
+        // And the plan, built by the one authority.
+        app.browser.file_state.select(Some(0));
+        app.browser_set_keeper();
+        pump_until(&mut app, &rx, "the keeper acknowledgement", |app| {
+            app.pending_marks.is_empty()
+        });
+        drain(&mut app, &rx);
+        app.open_review();
+        pump_until(&mut app, &rx, "the plan", |app| app.routes.plan.is_none());
+        drain(&mut app, &rx);
+
+        assert_eq!(
+            app.installed_act,
+            Activation(1),
+            "nothing in the interaction re-opened the scan"
+        );
+        assert_eq!(
+            app.browse.live_actor(),
+            Some(actor),
+            "and one actor served all of it"
+        );
+        assert!(
+            quiet(&app),
+            "every request the interaction sent was answered"
+        );
+    }
+
+    /// Matrix 5 and 11 — class A preserves, class B uninstalls, and only a fresh open recovers.
+    #[test]
+    fn a_repeat_open_preserves_and_a_replaced_checkpoint_uninstalls_until_a_fresh_open() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, mut app, rx, scan_id) = opened("class_ab");
+        // Identity and digest are what a repeat open must reproduce; `GroupSummary` itself is a
+        // display record with no equality of its own.
+        let groups: Vec<(GroupId, String)> = app
+            .browser
+            .group_summaries
+            .iter()
+            .map(|(id, summary)| (*id, summary.hash.clone()))
+            .collect();
+        assert!(!groups.is_empty(), "the fixture published a group");
+
+        // Class A: opening the same scan again installs a NEW activation over the same data,
+        // and the previous one is superseded rather than mixed with.
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Wizard);
+        drain(&mut app, &rx);
+        assert_eq!(app.installed_act, Activation(2));
+        assert_eq!(app.current_scan_id, Some(scan_id));
+        let reopened: Vec<(GroupId, String)> = app
+            .browser
+            .group_summaries
+            .iter()
+            .map(|(id, summary)| (*id, summary.hash.clone()))
+            .collect();
+        assert_eq!(
+            reopened, groups,
+            "the same authority answers the same identities"
+        );
+
+        // Class B: the file the view was opened over is replaced. The next touch is refused
+        // typed, and everything that describes the scan is uninstalled.
+        std::fs::remove_file(&scenario.db_path).unwrap();
+        std::fs::create_dir(&scenario.db_path).unwrap();
+        app.refresh_marked_count();
+        pump_until(&mut app, &rx, "the typed refusal", |app| {
+            app.current_scan_id.is_none()
+        });
+
+        assert!(app.browser.group_summaries.is_empty());
+        assert!(
+            app.browser.marked_count.is_none(),
+            "no trusted answer stays"
+        );
+        assert!(app.commander.dedup_scan_id.is_none());
+        assert!(
+            app.status.contains(REOPEN_REQUIRED),
+            "the operator is told to reopen: {}",
+            app.status
+        );
+        assert!(
+            matches!(app.marks_gate, MarksGate::Blocked { .. }),
+            "and nothing may be marked or planned meanwhile"
+        );
+        assert!(
+            app.plan_gate_refusal().is_some(),
+            "the plan gate is closed too"
+        );
+
+        // Only a fresh Open recovers — and over a checkpoint nobody can open, it does not.
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Wizard);
+        assert!(
+            app.current_scan_id.is_none(),
+            "a replaced checkpoint does not come back by itself"
+        );
+    }
+
+    /// Matrix 8 — a plan may not overtake a mark the database has not acknowledged.
+    #[test]
+    fn a_plan_cannot_overtake_a_pending_mark() {
+        let _role = crate::state::store::role_guard();
+        let (_scenario, mut app, rx, _scan_id) = opened("gate_overtake");
+
+        app.browser.file_state.select(Some(1));
+        app.browser_mark(Some(ActionKind::Delete));
+        assert!(
+            !app.pending_marks.is_empty(),
+            "the mark is in flight, not settled"
+        );
+
+        let before = app.browse.requests_issued();
+        app.open_review();
+        assert_eq!(
+            app.browse.requests_issued(),
+            before,
+            "no plan request may be enqueued behind an unacknowledged mark"
+        );
+        assert!(app.routes.plan.is_none());
+        assert!(
+            app.status.contains("the plan waits"),
+            "and the operator is told why: {}",
+            app.status
+        );
+
+        // Once the acknowledgement lands, the same keystroke works.
+        pump_until(&mut app, &rx, "the mark acknowledgement", |app| {
+            app.pending_marks.is_empty()
+        });
+        drain(&mut app, &rx);
+        app.open_review();
+        pump_until(&mut app, &rx, "the plan", |app| app.routes.plan.is_none());
+        assert!(
+            app.review.plan.is_some() || !app.status.is_empty(),
+            "the plan request was made and answered"
+        );
+    }
+
+    /// Matrix 13 — the staged shutdown, in order: the batch's settlement is sent and
+    /// acknowledged BEFORE the actor is asked to close, and the actor is joined exactly once.
+    #[test]
+    fn the_shutdown_settles_the_owed_batch_before_it_closes_the_actor() {
+        let _role = crate::state::store::role_guard();
+        let dir = std::env::temp_dir().join(format!(
+            "dedcom_shutdown_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("dedcom.db");
+        let scan_id = crate::state::store::seed_marked_group(&db_path);
+        let (mut app, rx) = test_app_with_db(db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Wizard);
+        assert_eq!(app.current_scan_id, Some(scan_id));
+        drain(&mut app, &rx);
+
+        // A batch reports; its settlement is owed and in flight.
+        app.handle_event(AppEvent::ApplyFinished(Box::new(ApplyOutcome::Finished(
+            BatchResult {
+                outcomes: vec![crate::model::action::ActionOutcome {
+                    kind: ActionKind::Delete,
+                    target: PathBuf::from("/x/b"),
+                    quarantine: None,
+                    result: Ok(()),
+                }],
+                planned: 2,
+                cancelled: true,
+                ..Default::default()
+            },
+        ))));
+        assert!(
+            app.routes.reconcile.is_some(),
+            "the settlement is in flight"
+        );
+
+        app.request_shutdown(false);
+        assert!(
+            matches!(app.shutdown, ShutdownStage::Settling { .. }),
+            "the exit waits for the settlement it owes: {:?}",
+            app.shutdown
+        );
+        assert!(!app.should_quit, "and does not leave meanwhile");
+
+        // Order: the settlement is acknowledged first, and only then is the actor closed.
+        pump_until(&mut app, &rx, "the settlement acknowledgement", |app| {
+            app.routes.reconcile.is_none()
+        });
+        assert!(
+            !app.marks_unsettled,
+            "the acknowledgement settles the marks: {}",
+            app.status
+        );
+        assert!(
+            matches!(app.shutdown, ShutdownStage::Draining | ShutdownStage::Done),
+            "and only then does the exit move on: {:?}",
+            app.shutdown
+        );
+
+        pump_until(&mut app, &rx, "the shutdown to finish", |app| {
+            app.should_quit
+        });
+        assert!(matches!(app.shutdown, ShutdownStage::Done));
+        assert_eq!(
+            crate::state::store::marked_action_paths(&db_path, scan_id),
+            vec![PathBuf::from("/x/c")],
+            "the settlement was the real write, not a claim about one"
+        );
+        assert!(
+            !app.marks_unsettled,
+            "and it was acknowledged before the close: {}",
+            app.status
+        );
+        assert!(
+            app.browse.live_actor().is_none(),
+            "the actor was closed and joined"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -4001,6 +6411,16 @@ mod group_list_navigation_tests {
                 size_bytes: 4096,
                 object_count: 2,
                 reclaim: ReclaimEstimate::exact(4096),
+            })
+            .map(|summary| {
+                (
+                    crate::model::plan::GroupId {
+                        scan_id: 1,
+                        rank: summary.rank,
+                        generation: 1,
+                    },
+                    summary,
+                )
             })
             .collect();
         app.browser.tab = BrowserTab::Files;

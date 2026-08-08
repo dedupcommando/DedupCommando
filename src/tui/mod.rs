@@ -785,7 +785,7 @@ mod plan_surface_parity_tests {
             crate::tui::commander::overlay::render_confirm(
                 frame,
                 ConfirmTab::Summary,
-                "",
+                &crate::tui::commander::state::ConfirmScript::None,
                 &digest,
                 &mut scroll,
             )

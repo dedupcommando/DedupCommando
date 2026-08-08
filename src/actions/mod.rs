@@ -8,9 +8,7 @@ use crate::model::action::{
     ActionKind, ActionOutcome, BatchResult, FileIdentity, RevalidationMode,
 };
 use crate::model::dataset::Dataset;
-use crate::model::plan::{
-    ActionPlan, ActionResult, PlanAction, PlanResult, PlanWitness, RuntimeLedger,
-};
+use crate::model::plan::{ActionPlan, ActionResult, PlanAction, PlanResult, RuntimeLedger};
 use crate::pipeline::hash;
 use crate::state::store::{LeaseRefusal, ScanStore};
 use crate::zfs::snapshots;
@@ -192,10 +190,11 @@ pub(crate) fn snapshot_suffix() -> String {
 }
 
 // ---------------------------------------------------------------------------------------------
-// R4B-1 — the staged guarded apply boundary (production-inert).
+// The guarded apply boundary — since R4B-2c the ONLY way a batch begins.
 //
-// Nothing below is called by the worker, the events or the UI: `apply_batch` and its call graph
-// stay byte-for-byte what they were. R4B-2 is the one atomic switch.
+// `apply_worker::spawn` enters through `apply_guarded_with`: the lease is taken, the plan's own
+// witness is revalidated against the database, and only then is `apply_batch_with` reached. The
+// unguarded entry the worker used before the cutover is gone.
 // ---------------------------------------------------------------------------------------------
 
 /// Why a batch never began. Pre-batch only: every variant means zero snapshots and zero actions,
@@ -295,7 +294,6 @@ impl ApplyRefusal {
 ///
 /// Deliberately NOT a `Result`, so `?` does not compile inside the pre-batch section: every
 /// fallible step there has to be an explicit match that keeps its classification.
-#[allow(dead_code)] // R4B-2 wires the worker closure onto these arms.
 pub enum GuardedApply {
     /// Nothing happened; the caller still owns the plan.
     Refused(ApplyRefusal),
@@ -304,9 +302,7 @@ pub enum GuardedApply {
     Ran(Result<BatchResult>),
 }
 
-/// What the owning window receives when a guarded batch ends. Staged whole so R4B-2 changes the
-/// event's payload once rather than growing it in steps.
-#[allow(dead_code)] // R4B-2 makes this the `ApplyFinished` payload.
+/// What the owning window receives when a guarded batch ends — the `ApplyFinished` payload.
 pub enum ApplyOutcome {
     /// The batch never began; the plan comes back to its window intact.
     Refused {
@@ -318,23 +314,16 @@ pub enum ApplyOutcome {
 }
 
 /// The guarded destructive entry: verify the checkpoint, take the whole-batch membership lease
-/// against the plan's witness, and only then run the batch — holding the lease across all of it,
-/// so no other writer can republish membership under a running batch.
+/// against the witness the plan owns, and only then run the batch — holding the lease across
+/// all of it, so no other writer can republish membership under a running batch.
 ///
 /// The plan is BORROWED: the caller keeps ownership, which is what lets a refusal hand the exact
 /// plan back to its window. A refusal is returned before `apply_batch_with` is called, so a
 /// refused run creates zero snapshots and applies zero actions.
-///
-/// `witness` is passed explicitly only until R4B-2 puts it inside `ActionPlan`.
-///
-/// Staged by R4B-1 with no production caller.
-#[allow(dead_code)] // R4B-2 repoints the apply worker here.
-#[allow(clippy::too_many_arguments)] // R4B-2 folds db_path/witness into the plan itself.
 pub fn apply_guarded_with(
     ops: &dyn ApplyOps,
     db_path: &Path,
     plan: &ActionPlan,
-    witness: &PlanWitness,
     datasets: &[Dataset],
     reflink_safe: bool,
     shared: &ApplyShared,
@@ -344,7 +333,7 @@ pub fn apply_guarded_with(
         Ok(store) => store,
         Err(refusal) => return GuardedApply::Refused(ApplyRefusal::from_lease(refusal)),
     };
-    let lease = match store.acquire_membership_lease(witness) {
+    let lease = match store.acquire_membership_lease(plan.witness()) {
         Ok(lease) => lease,
         Err(refusal) => return GuardedApply::Refused(ApplyRefusal::from_lease(refusal)),
     };
@@ -360,17 +349,6 @@ pub fn apply_guarded_with(
 // ---------------------------------------------------------------------------------------------
 // End of the R4B-1 staged guarded apply boundary.
 // ---------------------------------------------------------------------------------------------
-
-/// Applies a plan: preflight -> snapshot the affected datasets -> preflight again -> apply.
-pub fn apply_batch(
-    plan: &ActionPlan,
-    datasets: &[Dataset],
-    reflink_safe: bool,
-    shared: &ApplyShared,
-    mode: RevalidationMode,
-) -> Result<BatchResult> {
-    apply_batch_with(&RealOps, plan, datasets, reflink_safe, shared, mode)
-}
 
 /// The batch itself, over an injectable set of outside operations.
 ///
@@ -2279,15 +2257,15 @@ pub(crate) mod tests {
     }
 }
 
-/// R4B-1: the staged guarded apply boundary. Every test here drives `apply_guarded_with`, which
-/// no production route calls yet — the worker keeps using `apply_batch` until R4B-2. The
-/// concurrency cases are channel rendezvous: no sleep, no retry, no timing assumption.
+/// The guarded apply boundary. Every test here drives `apply_guarded_with` — since R4B-2c the
+/// same entry the worker itself uses. The concurrency cases are channel rendezvous: no sleep, no
+/// retry, no timing assumption.
 #[cfg(test)]
 mod guarded_staging_tests {
     use super::tests::dataset_over;
     use super::*;
     use crate::model::action::ActionKind;
-    use crate::model::plan::{GroupId, GroupWitness};
+    use crate::model::plan::{GroupId, GroupWitness, PlanWitness};
     use crate::state::store::{role_guard, PublishMode};
     use crate::testfixtures::PlanScenario;
     use std::sync::atomic::AtomicUsize;
@@ -2299,20 +2277,58 @@ mod guarded_staging_tests {
         plan: ActionPlan,
         witness: PlanWitness,
         scan_id: i64,
+        /// The generation the fixture published. Read from the publication rather than assumed:
+        /// how many times a fixture publishes is the fixture's business, and a test that spells
+        /// the number out breaks the moment one more publication is added anywhere above it.
+        generation: i64,
+        /// Explicit fixtures only: a byte-identical pathname the publication rejected. In the
+        /// manifest, outside the authority — the shape verification leaves behind.
+        rejected: Option<PathBuf>,
     }
 
     fn publish(tag: &str) -> Published {
+        published_with(tag, false)
+    }
+
+    /// The same fixture whose authority is the EXPLICIT population `--verify` publishes. That is
+    /// the one mode which stores member rows, so it is the only one in which a membership row
+    /// exists to be corrupted at all.
+    fn publish_explicit(tag: &str) -> Published {
+        published_with(tag, true)
+    }
+
+    fn published_with(tag: &str, explicit: bool) -> Published {
         let scenario = PlanScenario::new(tag);
         let keeper = scenario.file("keeper.bin");
         let twin = scenario.file("twin.bin");
+        // The explicit fixture also carries a byte-identical pathname the publication REJECTS —
+        // in the manifest, outside the authority. That is the shape verification leaves behind,
+        // and the only one in which a member row can be redirected onto a real same-digest file
+        // the witness never held.
+        let rejected = explicit.then(|| scenario.file("rejected.bin"));
+        let mut files = vec![keeper.clone(), twin.clone()];
+        files.extend(rejected.clone());
         let mut store = scenario.store();
-        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
+        let scan_id = scenario.seed(&mut store, &files);
         scenario.mark(&mut store, scan_id, &keeper, true, None);
         scenario.mark(&mut store, scan_id, &twin, false, Some(ActionKind::Delete));
-        // The staged publisher, so the scan has real v5 authority to lease against.
-        let generation = store
-            .publish_results(scan_id, PublishMode::Derived)
-            .unwrap();
+        // A second publication over the scenario's own: the lease leases against whatever the
+        // last one wrote, and the generation is carried rather than counted.
+        let generation = if explicit {
+            let mut groups = store.duplicate_groups(scan_id).unwrap();
+            for group in &mut groups {
+                group
+                    .files
+                    .retain(|file| Some(&file.path) != rejected.as_ref());
+            }
+            store
+                .publish_results(scan_id, PublishMode::Explicit(&groups))
+                .unwrap()
+        } else {
+            store
+                .publish_results(scan_id, PublishMode::Derived)
+                .unwrap()
+        };
         let id = GroupId {
             scan_id,
             rank: 0,
@@ -2340,6 +2356,8 @@ mod guarded_staging_tests {
             plan,
             witness,
             scan_id,
+            generation,
+            rejected,
         }
     }
 
@@ -2381,17 +2399,11 @@ mod guarded_staging_tests {
         }
     }
 
-    fn guarded(
-        ops: &dyn ApplyOps,
-        published: &Published,
-        witness: &PlanWitness,
-        datasets: &[Dataset],
-    ) -> GuardedApply {
+    fn guarded(ops: &dyn ApplyOps, published: &Published, datasets: &[Dataset]) -> GuardedApply {
         apply_guarded_with(
             ops,
             &published.scenario.db_path,
             &published.plan,
-            witness,
             datasets,
             true,
             &ApplyShared::default(),
@@ -2415,7 +2427,7 @@ mod guarded_staging_tests {
         let datasets = vec![dataset_over(&published.scenario.root, "tank/data")];
         let ops = CountingOps::default();
 
-        match guarded(&ops, &published, &published.witness, &datasets) {
+        match guarded(&ops, &published, &datasets) {
             GuardedApply::Ran(result) => {
                 let batch = result.expect("the batch itself succeeds");
                 assert_eq!(batch.outcomes.len(), 1, "the one planned action ran");
@@ -2444,10 +2456,10 @@ mod guarded_staging_tests {
         let ops = CountingOps::default();
 
         assert_eq!(
-            refusal(guarded(&ops, &published, &published.witness, &datasets)),
+            refusal(guarded(&ops, &published, &datasets)),
             ApplyRefusal::Stale {
-                expected: 1,
-                found: 2
+                expected: published.generation,
+                found: published.generation + 1,
             }
         );
         assert_eq!(ops.snapshots.load(Ordering::SeqCst), 0, "zero snapshots");
@@ -2468,7 +2480,7 @@ mod guarded_staging_tests {
         let ops = CountingOps::default();
 
         assert!(matches!(
-            refusal(guarded(&ops, &published, &published.witness, &datasets)),
+            refusal(guarded(&ops, &published, &datasets)),
             ApplyRefusal::Schema(_)
         ));
         assert_eq!(ops.snapshots.load(Ordering::SeqCst), 0);
@@ -2492,7 +2504,7 @@ mod guarded_staging_tests {
         let ops = CountingOps::default();
 
         assert_eq!(
-            refusal(guarded(&ops, &published, &published.witness, &datasets)),
+            refusal(guarded(&ops, &published, &datasets)),
             ApplyRefusal::DatabaseBusy
         );
         assert_eq!(ops.snapshots.load(Ordering::SeqCst), 0);
@@ -2514,7 +2526,6 @@ mod guarded_staging_tests {
 
         let db_path = published.scenario.db_path.clone();
         let a_plan = published.plan.clone();
-        let a_witness = published.witness.clone();
         let a_datasets = datasets.clone();
         let a_counter = Arc::clone(&a_snapshots);
         let worker_a = std::thread::spawn(move || {
@@ -2527,7 +2538,6 @@ mod guarded_staging_tests {
                 &ops,
                 &db_path,
                 &a_plan,
-                &a_witness,
                 &a_datasets,
                 true,
                 &ApplyShared::default(),
@@ -2542,7 +2552,7 @@ mod guarded_staging_tests {
         held_rx.recv().expect("worker A reached the lease");
         let b_ops = CountingOps::default();
         assert_eq!(
-            refusal(guarded(&b_ops, &published, &published.witness, &datasets)),
+            refusal(guarded(&b_ops, &published, &datasets)),
             ApplyRefusal::DatabaseBusy,
             "the second worker is refused, not queued"
         );
@@ -2583,7 +2593,7 @@ mod guarded_staging_tests {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            guarded(&PanickingOps, &published, &published.witness, &datasets)
+            guarded(&PanickingOps, &published, &datasets)
         }));
         std::panic::set_hook(previous);
         assert!(outcome.is_err(), "the panic propagated as a panic");
@@ -2597,21 +2607,42 @@ mod guarded_staging_tests {
 
     /// Membership corrupted without a generation bump refuses, and the refusal names the
     /// pathname rather than a sentence a caller would have to parse.
+    ///
+    /// Explicit authority on purpose: a derived publication has no member rows of its own, so
+    /// corrupting one there would move nothing and the test would pass over an untouched
+    /// database. The mode that stores the rows is the mode that must be corrupted.
     #[test]
     fn corrupt_membership_refuses_with_the_pathname_named() {
         let _guard = role_guard();
-        let published = publish("guarded_corrupt");
+        let published = publish_explicit("guarded_corrupt");
         let datasets = vec![dataset_over(&published.scenario.root, "tank/data")];
         let ops = CountingOps::default();
 
-        let mut forged = published.witness.clone();
-        let ghost = published.scenario.root.join("ghost.bin");
-        forged.groups[0].members = vec![ghost.clone(), ghost.clone()];
+        // The plan owns its witness, so nothing can hand in a foreign one: the drift is made
+        // where drift really happens — in the database, under a plan that already exists.
+        // The rejected pathname is a real, same-digest manifest row the authority left out, so
+        // every other structural rule still agrees after the move — count, generation, manifest
+        // presence, the member's own digest. What disagrees is the witness the plan owns.
+        let arrival = published.rejected.clone().expect("an explicit fixture");
+        let moved = published.scenario.root.join("twin.bin");
+        {
+            let store = published.scenario.store();
+            let changed = store.corrupt_directly(
+                "UPDATE file_group_member SET path = ?2 WHERE scan_id = ?1 AND path = ?3",
+                rusqlite::params![
+                    published.plan.scan_id(),
+                    arrival.to_string_lossy(),
+                    moved.to_string_lossy()
+                ],
+            );
+            assert_eq!(changed, 1, "the fixture must actually move a member row");
+        }
 
-        match refusal(guarded(&ops, &published, &forged, &datasets)) {
-            ApplyRefusal::MembershipChanged { path } => assert!(
-                path.starts_with(&published.scenario.root.to_string_lossy().into_owned()),
-                "the refusal names the pathname: {path}"
+        match refusal(guarded(&ops, &published, &datasets)) {
+            ApplyRefusal::MembershipChanged { path } => assert_eq!(
+                path,
+                crate::textsan::terminal(&arrival.display().to_string()),
+                "the refusal names the pathname that arrived"
             ),
             other => panic!("expected a named membership change, got {other:?}"),
         }
@@ -2659,7 +2690,7 @@ mod guarded_staging_tests {
         std::fs::remove_file(&published.scenario.db_path).unwrap();
 
         assert!(matches!(
-            refusal(guarded(&ops, &published, &published.witness, &datasets)),
+            refusal(guarded(&ops, &published, &datasets)),
             ApplyRefusal::Open(_)
         ));
         assert!(

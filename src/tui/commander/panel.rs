@@ -14,6 +14,7 @@ use ratatui::{
 
 use crate::app::PathStyle;
 use crate::model::duplicate::AttributedDirGroup;
+use crate::model::plan::GroupId;
 use crate::state::GroupSummary;
 use crate::tui::human_bytes_parts;
 use crate::tui::screens::browser;
@@ -22,13 +23,17 @@ use super::dedup::{DedupStatus, DirDedup};
 use super::state::{
     EntryKind, Mark, Panel, PanelEntry, PanelView, WatchEmpty, WatchEntry, WatchResult,
 };
+use super::MatchKey;
 
 /// Info about a neighboring panel's file for side-by-side comparison.
 /// Map key — the file name; value — what we compare content against.
 pub struct ComparePeer {
     pub size: u64,
     pub mtime: i64,
-    pub hash: Option<String>,
+    /// The published group this pathname belongs to, when the authority vouches for one.
+    /// `None` — the authority says nothing about it, and the comparison falls back to the
+    /// size/mtime heuristic rather than claiming an exact match.
+    pub group: Option<GroupId>,
 }
 
 /// Draws panel `panel` (numbered `index`) in area `area`.
@@ -42,10 +47,10 @@ pub fn render_panel(
     panel: &mut Panel,
     dedup: Option<&DirDedup>,
     dedup_error: Option<&str>,
-    cross: &HashSet<String>,
+    cross: &HashSet<MatchKey>,
     dir_sizes: &HashMap<PathBuf, u64>,
-    group_summaries: &[GroupSummary],
-    dir_groups: &[AttributedDirGroup],
+    group_summaries: &[(GroupId, GroupSummary)],
+    dir_group_summaries: &[crate::state::AttributedDirGroupSummary],
     dir_groups_error: Option<&str>,
     source: Option<&WatchEntry>,
     source_dir_group: Option<&AttributedDirGroup>,
@@ -196,7 +201,33 @@ pub fn render_panel(
                         &title,
                     );
                 }
-                (PanelView::DuplicatesOfCursor, Some(WatchResult::InnerDupes(paths))) => {
+                (
+                    PanelView::DuplicatesOfCursor,
+                    Some(WatchResult::InnerDupes {
+                        paths,
+                        total,
+                        truncated,
+                    }),
+                ) => {
+                    let title = if *truncated {
+                        format!(" {} · {} of {total} ", index + 1, paths.len())
+                    } else {
+                        title
+                    };
+                    render_inner_dupes(frame, area, paths, &mut panel.list, focused, &title);
+                }
+                // No authority: these are raw-digest CANDIDATES, not duplicates. They carry no
+                // identity, and the title says exactly that instead of implying a verdict.
+                (
+                    PanelView::DuplicatesOfCursor,
+                    Some(WatchResult::InnerCandidates {
+                        paths,
+                        total,
+                        truncated,
+                    }),
+                ) => {
+                    let title =
+                        unpublished_title(index, area.width, paths.len(), *total, *truncated);
                     render_inner_dupes(frame, area, paths, &mut panel.list, focused, &title);
                 }
                 (panel_view, _) => {
@@ -222,7 +253,7 @@ pub fn render_panel(
                     panel.view,
                     &format!("directory groups unavailable: {err}"),
                 );
-            } else if dir_groups.is_empty() {
+            } else if dir_group_summaries.is_empty() {
                 render_view_fallback(
                     frame,
                     area,
@@ -233,13 +264,13 @@ pub fn render_panel(
                 );
             } else {
                 let title = format!(" {} · directory groups (by savings) ", index + 1);
-                browser::render_dir_group_list(
+                browser::render_dir_group_summary_list(
                     frame,
                     area,
-                    dir_groups,
+                    dir_group_summaries,
                     &mut panel.list,
                     focused,
-                    &title,
+                    ratatui::text::Line::from(title),
                 );
             }
             return;
@@ -301,16 +332,17 @@ pub fn render_panel(
                 }
             };
             let mark = panel.marks.get(&entry.path).copied();
-            // Cross-panel match: for a file — by hash, for a directory —
-            // by TRUSTED content signature; an untrusted one may not look exact.
+            // Cross-panel match: for a file — the published group IDENTITY, for a directory —
+            // the TRUSTED content signature. A row the authority says nothing about contributes
+            // nothing, so it can never bright-highlight as an exact match.
             let is_cross = match entry.kind {
                 EntryKind::File => dedup
-                    .and_then(|d| d.hash_for(&entry.path))
-                    .map(|hash| cross.contains(hash))
+                    .and_then(|d| d.group_of(&entry.path))
+                    .map(|id| cross.contains(&MatchKey::Group(id)))
                     .unwrap_or(false),
                 EntryKind::Dir => dedup
                     .and_then(|d| d.trusted_dir_signature(&entry.path))
-                    .map(|sig| cross.contains(sig))
+                    .map(|sig| cross.contains(&MatchKey::Directory(sig.to_string())))
                     .unwrap_or(false),
                 EntryKind::Parent => false,
             };
@@ -480,7 +512,7 @@ fn name_color_for(entry: &PanelEntry, status: DedupStatus, mark: Option<Mark>) -
         DedupStatus::DangerousDup => Color::Red,
         DedupStatus::LikelyDuplicate => Color::Rgb(255, 140, 0),
         DedupStatus::HashedUnique => Color::Gray,
-        DedupStatus::Unhashed => Color::DarkGray,
+        DedupStatus::Unhashed | DedupStatus::Unavailable => Color::DarkGray,
         DedupStatus::NotInScan => Color::Reset,
     }
 }
@@ -505,6 +537,8 @@ fn confidence_percent(panel: &Panel, dedup: Option<&DirDedup>) -> Option<u8> {
         }
         files += 1;
         let status = dedup.map_or(DedupStatus::NotInScan, |d| d.status_for(&entry.path));
+        // What the machine can vouch for: a row whose membership is unavailable is exactly what
+        // confidence must NOT count.
         if matches!(
             status,
             DedupStatus::HashedUnique | DedupStatus::VerifiedDup | DedupStatus::DangerousDup
@@ -529,14 +563,13 @@ fn compare_glyph(
         // The name is absent in the neighboring panel — the file exists only here.
         return ('+', Color::Blue);
     };
-    match (
-        dedup.and_then(|d| d.hash_for(&entry.path)),
-        other.hash.as_deref(),
-    ) {
-        // Both hashed — exact content comparison.
+    match (dedup.and_then(|d| d.group_of(&entry.path)), other.group) {
+        // Both belong to a published group — identity decides, so two verified populations
+        // sharing a digest are `~`, not `=`.
         (Some(a), Some(b)) if a == b => ('=', Color::Green),
         (Some(_), Some(_)) => ('~', Color::Yellow),
-        // At least one not hashed — heuristic by size+mtime (like the F4 semaphore).
+        // At least one has no membership the authority vouches for — heuristic by size+mtime,
+        // exactly like the F4 semaphore, and never an exact claim.
         _ if entry.size == other.size && entry.mtime == other.mtime => {
             ('≈', Color::Rgb(255, 140, 0))
         }
@@ -572,7 +605,7 @@ fn status_color_for(status: DedupStatus) -> Color {
         DedupStatus::DangerousDup => Color::Red,
         DedupStatus::LikelyDuplicate => Color::Rgb(255, 140, 0),
         DedupStatus::HashedUnique => Color::Gray,
-        DedupStatus::Unhashed => Color::DarkGray,
+        DedupStatus::Unhashed | DedupStatus::Unavailable => Color::DarkGray,
         DedupStatus::NotInScan => Color::DarkGray,
     }
 }
@@ -693,6 +726,39 @@ fn unverified_dir_title(index: usize, width: u16) -> String {
         wide
     } else {
         format!(" {} · unverified · rescan required ", index + 1)
+    }
+}
+
+/// Title of an answer from a scan with NO published authority, sized the same way.
+///
+/// The remedy is the load-bearing half here too, so the compact form keeps «rescan required»
+/// and drops the noun. The count travels beside it when the answer was capped, because a page
+/// that says nothing about its own total reads as the whole truth.
+fn unpublished_title(
+    index: usize,
+    width: u16,
+    shown: usize,
+    total: u64,
+    truncated: bool,
+) -> String {
+    let counted = if truncated {
+        format!(" ({shown} of {total})")
+    } else {
+        String::new()
+    };
+    let wide = format!(
+        " {} · {}{counted} ",
+        index + 1,
+        crate::app::RESULTS_UNPUBLISHED
+    );
+    if wide.chars().count() <= width.saturating_sub(2) as usize {
+        wide
+    } else {
+        format!(
+            " {} · {}{counted} ",
+            index + 1,
+            crate::app::RESULTS_UNPUBLISHED_COMPACT
+        )
     }
 }
 

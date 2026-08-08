@@ -446,6 +446,40 @@ pub fn apply_panel_load(
     p.select(index);
 }
 
+/// What the F11 confirmation seat holds.
+///
+/// The script used to be a bare `String`, so an empty one meant «no plan» and a stale one meant
+/// nothing at all. Typed, the three states are distinct: nothing seated, a script that may be
+/// saved and executed, and a seat whose plan the database has moved out from under — which can
+/// be neither saved nor run, and says why.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ConfirmScript {
+    #[default]
+    None,
+    Ready(String),
+    Invalidated {
+        reason: String,
+    },
+}
+
+impl ConfirmScript {
+    /// The script, only while it may still be acted on.
+    pub fn ready(&self) -> Option<&str> {
+        match self {
+            ConfirmScript::Ready(script) => Some(script.as_str()),
+            ConfirmScript::None | ConfirmScript::Invalidated { .. } => None,
+        }
+    }
+
+    /// Why the seat may not be executed, if it may not.
+    pub fn invalidated(&self) -> Option<&str> {
+        match self {
+            ConfirmScript::Invalidated { reason } => Some(reason.as_str()),
+            ConfirmScript::None | ConfirmScript::Ready(_) => None,
+        }
+    }
+}
+
 /// Tab of the F11 confirmation overlay.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ConfirmTab {
@@ -575,8 +609,8 @@ impl BoardState {
     }
 }
 
-/// Cache key for the resolved group of a "watching" panel: so render does not
-/// open the DB every frame, only on a source change.
+/// Cache key for the resolved group of a "watching" panel: so a request goes out only when the
+/// source changes, never every frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchKey {
     /// GroupFiles: index of the selected group in the neighbouring GroupList panel.
@@ -588,19 +622,30 @@ pub enum WatchKey {
     DirOf(PathBuf),
 }
 
-/// What resolved for a "watching" panel — a file group, a group
-/// of twin directories, or (fallback) duplicate files inside the dir-cursor.
+/// What resolved for a "watching" panel — a file group, a group of twin directories, or the
+/// files inside the dir-cursor that the authority does (or does not) vouch for.
 #[derive(Debug, Clone)]
 pub enum WatchResult {
-    /// The old path (GroupFiles / DupOf): a group of duplicate files, with what its materialized
+    /// The old path (GroupFiles / DupOf): a group of duplicate files, with what its published
     /// row claims — the panel states the claim, and a group carries the claim of its own row.
     FileGroup(DuplicateGroup, crate::state::GroupClaim),
     /// Cursor on a directory whose twins survive the CURRENT ledger. Attributed, so the panel
     /// can mark unverified members and never call an unverified pair a twin.
     DirGroup(AttributedDirGroup),
-    /// Cursor on a directory WITHOUT a twin, but with duplicate files
-    /// inside (their hash occurs SOMEWHERE in the scan).
-    InnerDupes(Vec<PathBuf>),
+    /// Cursor on a directory WITHOUT a twin, but holding files that ARE members of published
+    /// groups. Bounded, with the real total beside the page.
+    InnerDupes {
+        paths: Vec<PathBuf>,
+        total: u64,
+        truncated: bool,
+    },
+    /// The same shape for a scan with NO published authority: raw-digest candidates, which
+    /// carry no identity and are never rendered as duplicates.
+    InnerCandidates {
+        paths: Vec<PathBuf>,
+        total: u64,
+        truncated: bool,
+    },
 }
 
 /// Which kind of source failed to read. Carried from the resolver through the cache to the
@@ -637,23 +682,6 @@ impl WatchUnavailable {
     /// The line the panel draws.
     pub fn message(&self) -> String {
         format!("{}: {}", self.subject.unavailable_label(), self.detail)
-    }
-}
-
-/// Why a "watching" panel has no result. Emptiness and failure are different answers: the three
-/// `WatchEmpty` reasons are legitimate states of the data, while `Unavailable` means the store
-/// could not be read at all. Folding the second into the first is what lets a broken database
-/// render as «no dupes at the cursor».
-#[derive(Debug, Clone)]
-pub enum WatchMiss {
-    Empty(WatchEmpty),
-    /// A hard store failure, with the subject that failed.
-    Unavailable(WatchUnavailable),
-}
-
-impl From<WatchEmpty> for WatchMiss {
-    fn from(empty: WatchEmpty) -> Self {
-        WatchMiss::Empty(empty)
     }
 }
 
@@ -732,13 +760,21 @@ pub struct CommanderState {
     pub dedup: DedupCache,
     /// scan_id of the scan the dedup overlay is read from (`None` — no data).
     pub dedup_scan_id: Option<i64>,
-    /// Scan group summaries for the GroupList/GroupFiles modes — loaded on
-    /// the first entry into a panel's groups mode (see `groups_loaded_for`).
-    pub group_summaries: Vec<GroupSummary>,
-    /// Groups of duplicate directories for DirGroupList/DirGroupFiles, revalidated against the
-    /// current ledger at load time: member trust travels with each group, and only `Trusted`
-    /// groups may present a reclaim figure.
-    pub dir_groups: Vec<AttributedDirGroup>,
+    /// Scan group summaries for the GroupList/GroupFiles modes, each with the identity of the
+    /// publication it belongs to — installed whole by the browsing actor's `Open`.
+    pub group_summaries: Vec<(crate::model::plan::GroupId, GroupSummary)>,
+    /// A scan with no published authority: browse-only candidate digests, rendered with the
+    /// unpublished wording and barred from every exact claim.
+    pub candidates: Option<crate::state::CandidateView>,
+    /// When the installed scan was created — from the same `Open` payload as everything else,
+    /// so the header costs no query at all.
+    pub scan_created_at: Option<String>,
+    /// Summaries of duplicate-directory groups for DirGroupList, attributed against the ledger
+    /// the browsing actor validated at `Open`: only `Trusted` rows may present a reclaim figure.
+    /// The full group of the selected row is opened by signature, one at a time.
+    pub dir_group_summaries: Vec<crate::state::AttributedDirGroupSummary>,
+    /// Which directory-group signature each panel has open, so the same one is asked for once.
+    pub watch_dir_keys: Vec<Option<String>>,
     /// The load error of the directory groups, when the attributed read failed. Rendered in the
     /// DirGroupList panel instead of the legitimate empty-list text — a store failure must never
     /// look like «no directory groups».
@@ -786,8 +822,9 @@ pub struct CommanderState {
     /// worker; declining, cancelling or preparing another one clears it.
     pub pending_plan: Option<ActionPlan>,
     /// Shell-script preview of the current F11 plan — shown on the "Commands" tab and saved with
-    /// `S`. Cached for display, but rendered from `pending_plan` and cleared with it.
-    pub confirm_script: String,
+    /// `S`. Typed: once the evidence behind the plan has moved, the seat carries the reason it
+    /// was invalidated instead of a script nobody may execute.
+    pub confirm_script: ConfirmScript,
     /// Composition of the current F11 plan — shown on the "Summary" tab. Derived from
     /// `pending_plan`, never counted separately.
     pub confirm_digest: PlanDigest,
@@ -842,7 +879,10 @@ impl CommanderState {
             dedup: DedupCache::default(),
             dedup_scan_id: None,
             group_summaries: Vec::new(),
-            dir_groups: Vec::new(),
+            candidates: None,
+            scan_created_at: None,
+            dir_group_summaries: Vec::new(),
+            watch_dir_keys: Vec::new(),
             dir_groups_error: None,
             groups_loaded_for: None,
             scan_coverage_cache: HashMap::new(),
@@ -859,7 +899,7 @@ impl CommanderState {
             overlay: Overlay::None,
             compare_mode: CompareMode::Off,
             pending_plan: None,
-            confirm_script: String::new(),
+            confirm_script: ConfirmScript::None,
             confirm_digest: PlanDigest::default(),
             confirm_scroll: ConfirmScroll::default(),
             triage: None,

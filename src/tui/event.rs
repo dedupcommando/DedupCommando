@@ -4,9 +4,8 @@ use std::thread;
 use crossbeam_channel::{Receiver, Sender};
 use ratatui::crossterm::event::{self, Event, KeyEvent, MouseEvent};
 
-use crate::model::scan::{ResumeInfo, ScanProgress, ScanSummary};
+use crate::model::scan::{ResumeInfo, ScanProgress};
 use crate::pipeline::ScanOutcome;
-use crate::state::GroupSummary;
 
 /// Main-loop event: from the keyboard, from the scanning worker, or a tick.
 pub enum AppEvent {
@@ -16,8 +15,9 @@ pub enum AppEvent {
     ScanFinished(std::result::Result<ScanOutcome, String>),
     /// Progress of background action application: phase/index/bytes ~6/s.
     ApplyProgress(crate::actions::ApplyProgress),
-    /// Background application finished: `BatchResult` (or an error text).
-    ApplyFinished(std::result::Result<crate::model::action::BatchResult, String>),
+    /// The guarded batch's outcome: refused whole (the plan comes back to its window),
+    /// finished with a `BatchResult`, or failed with an error text.
+    ApplyFinished(Box<crate::actions::ApplyOutcome>),
     /// File hash computed on request (F4) in the commander interface.
     CommanderHash(std::path::PathBuf, [u8; 32]),
     /// Failed to compute the file hash on request.
@@ -25,17 +25,6 @@ pub enum AppEvent {
     /// Background hash of a moved file (sorting) — quietly into the index + DB cache,
     /// so the destinations index grows without a manual rehash (triage §B).
     CommanderHashCached(std::path::PathBuf, [u8; 32]),
-    /// Dedup attributes of ONE panel directory, read in the background from the DB:
-    /// file status/hash + sizes/signatures of subdirectories. Placed in the cache by `cwd`.
-    /// Replaces the former `CommanderDedupLoaded` (the whole scan in RAM).
-    ///
-    /// `Err` carries the sanitized store failure: an unknown reason, a corrupt key/count/
-    /// generation or a SQL failure must reach the operator as an error state, never render as a
-    /// directory that merely looks unscanned.
-    CommanderDirDedup {
-        cwd: std::path::PathBuf,
-        dir: Result<crate::tui::commander::dedup::DirDedup, String>,
-    },
     /// A directory's computed size, calculated in a background thread.
     CommanderDirSize(std::path::PathBuf, u64),
     /// Panel directory contents, read in the background. `target` routes the
@@ -54,16 +43,9 @@ pub enum AppEvent {
     /// Background purge of a session from the trash finished: a heavy
     /// multi-index DELETE by `file` ran in the background so as not to hang the UI.
     SessionDeleted(std::result::Result<i64, String>),
-    /// A finished scan's ready result, loaded in the background: opening
-    /// without rescanning. `(scan_id, group summaries, scan summary, results prepared)`. Carries
-    /// lightweight `GroupSummary`, not all `DuplicateGroup` (RAM paging). The last flag is false
-    /// when the writer has not prepared this scan yet — the empty list then means «unknown», not
-    /// «no duplicates», and must not be shown as a result.
-    ResultsLoaded(i64, Vec<GroupSummary>, ScanSummary, bool),
-    /// A browsing-actor reply (R4B-2b). A dormant carrier: nothing constructs it in
-    /// production yet — R4B-2c routes the actor's sink into this channel while
-    /// `ResultsLoaded` keeps serving the current path unchanged.
-    #[allow(dead_code)] // R4B-2c constructs it from the actor's sink.
+    /// A browsing-actor reply. The one carrier for every completed-scan answer: opening a
+    /// result installs a complete `OpenedBrowse` atomically through it, so a half-loaded
+    /// result is unrepresentable and a stale reply is dropped whole by its activation.
     Browse(Box<crate::state::browse::BrowseEvent>),
     /// Background session probe for F2: unfinished + the last Complete of the same
     /// roots — F2 gives an instant response, while the heavy `list_scans` runs in the background.

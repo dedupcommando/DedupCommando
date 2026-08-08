@@ -532,26 +532,71 @@ fn run_headless_scan(cli: &cli::Cli) -> Result<()> {
             for line in completion_lines(&results.summary) {
                 println!("{line}");
             }
-            for summary in results.summaries.iter().take(50) {
-                println!(
-                    "  #{:<4} {} files x {} bytes",
-                    summary.rank, summary.file_count, summary.size_bytes
-                );
-                // Group members — from the DB on demand (we don't keep them all in RAM).
-                if let Ok(files) = store.group_files(results.scan_id, &summary.hash) {
-                    for file in &files {
-                        println!(
-                            "        {}",
-                            textsan::terminal(&file.path.display().to_string())
-                        );
-                    }
-                }
-            }
-            if results.summaries.len() > 50 {
-                println!("  ... and {} more groups", results.summaries.len() - 50);
-            }
+            list_published_groups(&store, results.scan_id)?;
         }
         ScanOutcome::Cancelled => println!("Scan cancelled."),
+    }
+    Ok(())
+}
+
+/// How many groups the headless listing prints in full.
+const HEADLESS_GROUP_LIMIT: usize = 50;
+
+/// Prints the scan's published groups and their members, through the membership authority.
+///
+/// Identity, not digest: each group is opened by its own `GroupId`, so two verified
+/// populations that happen to share a digest stay two groups and a pathname verification
+/// rejected has no member row to be printed from. A refusal is printed and returned as an
+/// error — the caller exits non-zero — because an empty listing and an unreadable checkpoint
+/// must never look the same. A scan with no published authority is not a failure: it says so
+/// in the accepted wording and prints nothing it cannot vouch for.
+fn list_published_groups(store: &ScanStore, scan_id: i64) -> Result<()> {
+    let miss = |miss: state::MembershipMiss| {
+        AppError::msg(format!(
+            "scan {scan_id}: the published results could not be read ({miss:?})"
+        ))
+    };
+    let snapshot = store.membership_snapshot(scan_id).map_err(miss)?;
+    if snapshot.mode() == state::MembershipMode::Unknown {
+        println!("  results not published — rescan required");
+        if let Some(view) = snapshot.unknown_candidates().map_err(miss)? {
+            println!(
+                "  ({} candidate digests, unverified)",
+                view.candidates.len()
+            );
+        }
+        return Ok(());
+    }
+    let summaries = snapshot.summaries().map_err(miss)?;
+    for (id, summary) in summaries.groups.iter().take(HEADLESS_GROUP_LIMIT) {
+        println!(
+            "  #{:<4} {} files x {} bytes",
+            id.rank, summary.file_count, summary.size_bytes
+        );
+        // Members on demand, by identity — never every group's rows at once.
+        let group = snapshot
+            .group_page(id, 0, summary.file_count as usize)
+            .map_err(miss)?;
+        for file in &group.members {
+            println!(
+                "        {}",
+                textsan::terminal(&file.path.display().to_string())
+            );
+        }
+    }
+    if summaries.groups.len() > HEADLESS_GROUP_LIMIT {
+        println!(
+            "  ... and {} more groups",
+            summaries.groups.len() - HEADLESS_GROUP_LIMIT
+        );
+    }
+    // Named, never repaired: a group whose summary and membership disagree is reported by
+    // identity instead of being listed as if it were answerable.
+    for id in &summaries.inconsistent {
+        println!(
+            "  #{:<4} unavailable — its summary and membership disagree",
+            id.rank
+        );
     }
     Ok(())
 }

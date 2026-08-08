@@ -501,8 +501,10 @@ impl PlanScenario {
         store
             .set_status(scan_id, ScanStatus::Complete)
             .expect("scenario status");
+        // The fixture publishes exactly as an ordinary hash-only completion does, so every
+        // reader in a test sees the same authority production would.
         store
-            .ensure_materialized(scan_id)
+            .publish_results(scan_id, crate::state::PublishMode::Derived)
             .expect("scenario publication");
         scan_id
     }

@@ -314,7 +314,7 @@ pub(crate) fn sh_quote(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::model::plan::{
-        MarkIntent, PlanGroupInput, PlanMemberEvidence, PlanObjectKey, RequestedMark,
+        GroupId, MarkIntent, PlanGroupInput, PlanMemberEvidence, PlanObjectKey, RequestedMark,
     };
     use crate::model::reclaim::LinkCount;
     use crate::testfixtures::PlanScenario;
@@ -356,6 +356,11 @@ mod tests {
         ActionPlan::try_new(
             1,
             vec![PlanGroupInput {
+                id: GroupId {
+                    scan_id: 1,
+                    rank: 0,
+                    generation: 1,
+                },
                 hash: "ab".repeat(32),
                 members: vec![
                     member(keeper, key(device, 10), Some(MarkIntent::Keeper)),
@@ -528,6 +533,11 @@ mod tests {
         let plan = ActionPlan::try_new(
             1,
             vec![PlanGroupInput {
+                id: GroupId {
+                    scan_id: 1,
+                    rank: 0,
+                    generation: 1,
+                },
                 hash: "cd".repeat(32),
                 members: vec![
                     member("/tank/keep.bin", key(7, 10), Some(MarkIntent::Keeper)),

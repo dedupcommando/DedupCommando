@@ -8,10 +8,11 @@ use rusqlite::{params, Connection, OpenFlags, Transaction};
 
 use crate::error::{AppError, Result};
 use crate::model::action::{ActionKind, MoveEvent};
+#[cfg(test)]
+use crate::model::duplicate::sort_attributed_by_benefit;
 use crate::model::duplicate::{
-    build_dir_signatures_streaming_in_context, hex_encode, signature_of,
-    sort_attributed_by_benefit, AttributedDirGroup, DirGroup, DirSigAlgo, DirTrust, DuplicateGroup,
-    FileEntry,
+    build_dir_signatures_streaming_in_context, hex_encode, signature_of, AttributedDirGroup,
+    DirGroup, DirSigAlgo, DirTrust, DuplicateGroup, FileEntry,
 };
 use crate::model::omission::{
     AuthorityUnavailable, CompletenessSnapshot, DirCompleteness, DirDisposition, DirScope,
@@ -91,25 +92,9 @@ pub struct DbCounts {
     pub file_rows: u64,
 }
 
-/// Dedup attributes of a SINGLE file in a panel directory — input for the pure
-/// `DedupStatus::classify`. For hashed files `dup_count`/
-/// `distinct_devices` matter; for unhashed ones — `size_mtime_count` (a duplicate candidate
-/// before hashing). Replaces the global RAM maps of the former `DedupIndex`.
-#[derive(Debug, Clone)]
-pub struct DedupRow {
-    /// hex hash of the file; `None` — the file is in the manifest but not yet hashed.
-    pub hashed: Option<String>,
-    /// How many files of the scan share this hash (only for hashed ones).
-    pub dup_count: u32,
-    /// How many distinct devices the files with this hash have (cross-device → dangerous).
-    pub distinct_devices: u32,
-    /// How many files of the scan share the same (size, mtime) — for LikelyDuplicate.
-    pub size_mtime_count: u32,
-}
-
 /// A lightweight duplicate-group summary — one `file_group` row, without
 /// members. Browser holds a Vec of these summaries (645k×~48 B ≈ 31 MiB), and reads a group's
-/// files on entry (`group_files`), rather than the whole scan into RAM.
+/// members on entry through the membership snapshot, rather than the whole scan into RAM.
 #[derive(Debug, Clone)]
 pub struct GroupSummary {
     /// Sequential «by benefit» rank at the moment the scan completed.
@@ -336,6 +321,7 @@ pub(crate) fn seed_marked_group(db: &Path) -> i64 {
         size: 10,
         inode,
         device: 1,
+        nlink: 1,
         ..Default::default()
     };
     store
@@ -372,6 +358,15 @@ pub(crate) fn seed_marked_group(db: &Path) -> i64 {
             ]
             .iter(),
         )
+        .unwrap();
+    // A batch is applied from a finished, published scan, so the fixture is one: the browsing
+    // actor opens it exactly as it opens a real result, and the settlement it acknowledges is
+    // the settlement of a real authority.
+    store
+        .set_status(scan_id, crate::model::scan::ScanStatus::Complete)
+        .unwrap();
+    store
+        .publish_results(scan_id, PublishMode::Derived)
         .unwrap();
     scan_id
 }
@@ -1542,83 +1537,18 @@ impl ScanStore {
     /// group's guaranteed and potential bytes is also the place that ranks them. A caller cannot
     /// hand in an order derived from anything else.
     ///
-    /// `file_dedup` (membership) IS NO LONGER WRITTEN — `file` already stores
-    /// path/size/mtime/device/inode, there is no point duplicating them (scan.db does not bloat).
-    /// The table is kept defined for compatibility; we clean up legacy rows.
-    pub fn record_file_results(&mut self, scan_id: i64, groups: &[DuplicateGroup]) -> Result<()> {
-        self.revoke_membership_cache();
-        // Every figure first, before anything is written: an allocation nobody can measure has to
-        // stop the whole result, not half of it. Groups of fewer than two allocations are not
-        // duplicates of anything and never reach a row — the same rule the SQL path applies with
-        // `HAVING COUNT(*) >= 2`.
-        let mut rows: Vec<(&DuplicateGroup, GroupReclaim)> = Vec::with_capacity(groups.len());
-        for group in groups {
-            let reclaim = group.physical_reclaim()?;
-            if reclaim.object_count >= 2 {
-                rows.push((group, reclaim));
-            }
-        }
-        rows.sort_by(|(left, left_reclaim), (right, right_reclaim)| {
-            let (left_guaranteed, left_ceiling) = left_reclaim.estimate.order_key();
-            let (right_guaranteed, right_ceiling) = right_reclaim.estimate.order_key();
-            right_guaranteed
-                .cmp(&left_guaranteed)
-                .then(right_ceiling.cmp(&left_ceiling))
-                .then(left.hash.cmp(&right.hash))
-        });
-
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM file_group WHERE scan_id = ?1",
-            params![scan_id],
-        )?;
-        tx.execute(
-            "DELETE FROM file_dedup WHERE scan_id = ?1",
-            params![scan_id],
-        )?;
-        {
-            let mut ins_group = tx.prepare(
-                "INSERT INTO file_group(scan_id, rank, hash, file_count, size, reclaim,
-                                        object_count, reclaim_state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            )?;
-            for (rank, (group, reclaim)) in rows.iter().enumerate() {
-                ins_group.execute(params![
-                    scan_id,
-                    rank as i64,
-                    group.hash,
-                    reclaim.observed_paths as i64,
-                    group.size_bytes as i64,
-                    reclaim.estimate.persisted_bytes() as i64,
-                    reclaim.object_count as i64,
-                    reclaim.estimate.state().as_i64(),
-                ])?;
-            }
-        }
-        // In the SAME transaction as the rows: a crash must never leave results without their
-        // totals or their marker, and an operator must never meet a scan whose headline was
-        // written by one result and whose groups came from another. Written even for an empty
-        // `groups` — with --verify that means every candidate group was rejected, and the empty
-        // result is final, not re-derivable from raw hashes.
-        record_scan_reclaim(&tx, scan_id)?;
-        mark_prepared(&tx, scan_id)?;
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Materializes LIGHTWEIGHT `file_group` summaries via SQL aggregation — without loading
-    /// `Vec<DuplicateGroup>` into RAM (on the 2.2M /tank it cuts the transient peak of the
-    /// grouping phase). Result-identical to `record_file_results(&duplicate_groups)`: the same
-    /// membership, pathname count, object count, state, guaranteed and potential bytes, and the
-    /// same rank.
+    /// `Vec<DuplicateGroup>` into RAM. Browse-only: it writes NO `scan_membership` row and NO
+    /// member row, so the scan's authority stays exactly what it was.
+    ///
+    /// Private since R4B-2c: publication goes through `publish_results` alone, and the one
+    /// caller left is `prepare_legacy_for_viewing`'s Unknown branch — a legacy/migrated
+    /// checkpoint gets viewable summaries without ever minting membership authority.
     ///
     /// The rank order is the checkpoint's total key — guaranteed bytes first, the trusted ceiling
-    /// as the tiebreak, the hash last — expressed once as a window function here and once as a
-    /// comparator in `record_file_results`. A hash is unique within a scan, so the key is total
-    /// and the two paths cannot disagree about a tie. `hex_encode` = lower case →
-    /// `lower(hex(hash))` (string order == BLOB order). `MIN(size)` — within a group the size is
-    /// single (identical content). NOT the write path (apply/revalidate).
-    pub fn materialize_file_groups(&mut self, scan_id: i64) -> Result<()> {
+    /// as the tiebreak, the hash last — the same window function `publish_results(Derived)`
+    /// uses, so a later republication assigns the same ranks to the same rows.
+    fn materialize_browse_summaries(&mut self, scan_id: i64) -> Result<()> {
         self.revoke_membership_cache();
         let tx = self.conn.transaction()?;
         // Before any row: nothing about this scan's allocations may be in doubt.
@@ -1748,10 +1678,10 @@ impl ScanStore {
 
     /// How many of a group's allocations' links the scan actually observed.
     ///
-    /// A point lookup for the one group on screen, not a column: the pathname count is persisted,
-    /// the link total is not, and re-deriving it for every row of a 645k-group list would put the
-    /// manifest aggregation back into every open. One validated count per allocation — summing
-    /// `nlink` once per pathname would multiply an alias set's links by its own size.
+    /// One validated count per allocation — summing `nlink` once per pathname would multiply an
+    /// alias set's links by its own size. Test-only since R4B-2c: the identity-keyed
+    /// `MembershipSnapshot::group_claim` carries the same evidence for the trusted surface.
+    #[cfg(test)]
     pub fn group_links(&self, scan_id: i64, hash_hex: &str) -> Result<GroupLinks> {
         let Some(blob) = hex_decode(hash_hex) else {
             return Ok(GroupLinks {
@@ -1792,18 +1722,6 @@ impl ScanStore {
         })
     }
 
-    /// Everything a single-group view needs to state its claim honestly: the persisted figure and
-    /// the link evidence behind it. `None` — this digest has no materialized group.
-    pub fn group_claim(&self, scan_id: i64, hash_hex: &str) -> Result<Option<GroupClaim>> {
-        let Some(summary) = self.group_summary_for_hash(scan_id, hash_hex)? else {
-            return Ok(None);
-        };
-        Ok(Some(GroupClaim {
-            reclaim: summary.reclaim,
-            links: self.group_links(scan_id, hash_hex)?,
-        }))
-    }
-
     /// Whether every manifest row of the scan carries a real link count. One unrecorded count is
     /// enough to make the scan unsafe to plan against — that row's allocation may have links
     /// nobody counted — and a manifest migrated from v2 is entirely in that state.
@@ -1839,7 +1757,6 @@ impl ScanStore {
     /// Whether this scan's results may be turned into a destructive plan. Answers only — `R2D`
     /// owns wiring it into action construction and the confirmation screens, so nothing calls it
     /// outside tests yet and today's behaviour is unchanged.
-    #[allow(dead_code)]
     pub fn destructive_plan_verdict(&self, scan_id: i64) -> Result<DestructivePlanVerdict> {
         Ok(DestructivePlanVerdict::of(
             self.scan_reclaim_state(scan_id)?,
@@ -2433,17 +2350,23 @@ impl ScanStore {
     }
 
     /// The scan's duplicate-directory groups, revalidated against the CURRENT ledger and sorted
-    /// by benefit (read in commander on entering the directory-groups mode). One deferred
-    /// transaction: the rows and the authority they are judged by cannot come from different WAL
-    /// states. Exactly 4 statements — 3 authority reads plus one ordered `dir_dedup` scan.
+    /// by benefit. One deferred transaction: the rows and the authority they are judged by
+    /// cannot come from different WAL states.
+    ///
+    /// Test-only since R4B-2c: production reads the summaries through the browsing actor's
+    /// `OpenedBrowse` and opens one group at a time by signature.
+    #[cfg(test)]
     pub fn attributed_dir_groups(&self, scan_id: i64) -> Result<Vec<AttributedDirGroup>> {
         let tx = self.conn.unchecked_transaction()?;
         attributed_dir_groups_tx(&tx, scan_id)
     }
 
-    /// Saves action marks for the specified scan files (Feature 6B).
-    /// A file in the default state (not a keeper, no action) — the row
-    /// is deleted; otherwise it is inserted/updated.
+    /// Saves action marks without reading back a settled after-image.
+    ///
+    /// Test-only since R4B-2c: every production mark travels through the browsing actor and
+    /// `save_marks_settled`, which refuses a replaced database and returns the durable image.
+    /// The fixtures keep this raw writer because seeding marks predates any actor.
+    #[cfg(test)]
     pub fn save_marks<'a>(
         &mut self,
         scan_id: i64,
@@ -2487,7 +2410,6 @@ impl ScanStore {
     ///
     /// Staged by R4B-2a with no production caller; R4B-2b's mark acknowledgement carries the
     /// returned image, and R4B-2c settles the UI from it instead of from its own before-image.
-    #[allow(dead_code)] // R4B-2b sends this image back to the UI as a typed acknowledgement.
     pub fn save_marks_settled(
         &mut self,
         scan_id: i64,
@@ -2890,205 +2812,6 @@ impl ScanStore {
         Ok(None)
     }
 
-    /// Is the file `path` in the scan manifest? A point PK lookup — for the mark-write
-    /// gate (we do not write `file_mark` for files outside the scan).
-    pub fn is_in_manifest(&self, scan_id: i64, path: &Path) -> Result<bool> {
-        let p = path.to_string_lossy();
-        let exists: i64 = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM file WHERE scan_id = ?1 AND path = ?2)",
-            params![scan_id, &*p],
-            |row| row.get(0),
-        )?;
-        Ok(exists != 0)
-    }
-
-    /// The hash of file `path` in the scan, if it is hashed. A point PK lookup — replaces
-    /// reading from the RAM index (commander build_groups / show_file_info).
-    pub fn hash_for_path(&self, scan_id: i64, path: &Path) -> Result<Option<[u8; 32]>> {
-        let p = path.to_string_lossy();
-        let row = self.conn.query_row(
-            "SELECT hash FROM file WHERE scan_id = ?1 AND path = ?2",
-            params![scan_id, &*p],
-            |row| row.get::<_, Option<Vec<u8>>>(0),
-        );
-        match row {
-            Ok(Some(bytes)) => Ok(<[u8; 32]>::try_from(bytes.as_slice()).ok()),
-            Ok(None) => Ok(None),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(err) => Err(err.into()),
-        }
-    }
-
-    /// Files of the group with hex hash `hash_hex` with FRESH marks (LEFT JOIN
-    /// `file_mark`). Reads membership from the `file` manifest (index `file_hash`), not
-    /// from `file_dedup` — an opened /tank does not hold all groups in RAM.
-    /// Dozens of rows per group — loaded on entry into the group, discarded on exit.
-    pub fn group_files(&self, scan_id: i64, hash_hex: &str) -> Result<Vec<FileEntry>> {
-        let Some(blob) = hex_decode(hash_hex) else {
-            return Ok(Vec::new());
-        };
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {GROUP_FILE_COLUMNS}
-             FROM file f
-             LEFT JOIN file_mark m ON m.scan_id = f.scan_id AND m.path = f.path
-             WHERE f.scan_id = ?1 AND f.hash = ?2
-             ORDER BY f.path"
-        ))?;
-        let rows = stmt.query_map(params![scan_id, blob], group_file_row)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    }
-
-    /// A page of a group's files — `[offset..offset+limit]`,
-    /// ordered by `path` for a stable order across pages. Previously
-    /// `group_files_capped` pulled LIMIT without `ORDER BY` and sorted in RAM — that is
-    /// fine for a single page, but adjacent pages could overlap
-    /// (index order is not guaranteed by SQLite). Here ORDER BY path is cheap,
-    /// because the covering index `file_hash_path` already yields rows in the right
-    /// order after `WHERE scan_id=? AND hash=?` — there is no sort in RAM.
-    pub fn group_files_page(
-        &self,
-        scan_id: i64,
-        hash_hex: &str,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Vec<FileEntry>> {
-        let Some(blob) = hex_decode(hash_hex) else {
-            return Ok(Vec::new());
-        };
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {GROUP_FILE_COLUMNS}
-             FROM file f
-             LEFT JOIN file_mark m ON m.scan_id = f.scan_id AND m.path = f.path
-             WHERE f.scan_id = ?1 AND f.hash = ?2
-             ORDER BY f.path
-             LIMIT ?3 OFFSET ?4"
-        ))?;
-        let rows = stmt.query_map(
-            params![scan_id, blob, limit as i64, offset as i64],
-            group_file_row,
-        )?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    }
-
-    /// An exact count of a group's files — for displaying «X/Y»
-    /// in the panel title and deciding «are there more pages». `summary.file_count` already
-    /// carries this number (materialized in `file_group`), but for resilience to
-    /// desynchronization (e.g. a manual DB edit) we keep a direct COUNT over
-    /// the `file_hash` index — it is fast at any group size.
-    pub fn group_files_count(&self, scan_id: i64, hash_hex: &str) -> Result<u64> {
-        use rusqlite::OptionalExtension;
-        let Some(blob) = hex_decode(hash_hex) else {
-            return Ok(0);
-        };
-        let count: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM file WHERE scan_id = ?1 AND hash = ?2",
-                params![scan_id, blob],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(count.unwrap_or(0) as u64)
-    }
-
-    /// Dedup status of each file from `paths` (a batch per panel directory):
-    /// point PK lookups + for each distinct hash — `COUNT(*)`/`COUNT(DISTINCT
-    /// device)` (index `file_hash`), for each (size,mtime) of unhashed ones —
-    /// `COUNT(*)` (index `file_size`). Paths outside the manifest do not enter the map
-    /// (the caller treats them as NotInScan). Replaces the RAM maps of `DedupIndex`.
-    pub fn dir_dedup_status(
-        &self,
-        scan_id: i64,
-        paths: &[PathBuf],
-    ) -> Result<HashMap<PathBuf, DedupRow>> {
-        // 1. Metadata of each path from the manifest (PK lookup).
-        let mut meta: Vec<(PathBuf, Option<Vec<u8>>, u64, i64)> = Vec::new();
-        {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT size, mtime, hash FROM file WHERE scan_id = ?1 AND path = ?2")?;
-            for path in paths {
-                let p = path.to_string_lossy();
-                let row = stmt.query_row(params![scan_id, &*p], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)? as u64,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Option<Vec<u8>>>(2)?,
-                    ))
-                });
-                match row {
-                    Ok((size, mtime, hash)) => meta.push((path.clone(), hash, size, mtime)),
-                    Err(rusqlite::Error::QueryReturnedNoRows) => {}
-                    Err(err) => return Err(err.into()),
-                }
-            }
-        }
-        // 2. dup_count + distinct_devices for each distinct hash.
-        let mut hash_counts: HashMap<Vec<u8>, (u32, u32)> = HashMap::new();
-        {
-            let mut stmt = self.conn.prepare(
-                "SELECT COUNT(*), COUNT(DISTINCT device) FROM file WHERE scan_id = ?1 AND hash = ?2",
-            )?;
-            for (_, hash, _, _) in &meta {
-                if let Some(h) = hash {
-                    if !hash_counts.contains_key(h) {
-                        let counts = stmt.query_row(params![scan_id, h], |row| {
-                            Ok((row.get::<_, i64>(0)? as u32, row.get::<_, i64>(1)? as u32))
-                        })?;
-                        hash_counts.insert(h.clone(), counts);
-                    }
-                }
-            }
-        }
-        // 3. size_mtime_count for each distinct (size,mtime) of unhashed ones.
-        let mut sm_counts: HashMap<(u64, i64), u32> = HashMap::new();
-        {
-            let mut stmt = self.conn.prepare(
-                "SELECT COUNT(*) FROM file WHERE scan_id = ?1 AND size = ?2 AND mtime = ?3",
-            )?;
-            for (_, hash, size, mtime) in &meta {
-                if hash.is_none() && !sm_counts.contains_key(&(*size, *mtime)) {
-                    let count = stmt.query_row(params![scan_id, *size as i64, *mtime], |row| {
-                        Ok(row.get::<_, i64>(0)? as u32)
-                    })?;
-                    sm_counts.insert((*size, *mtime), count);
-                }
-            }
-        }
-        // 4. Assembling the rows.
-        let mut out = HashMap::with_capacity(meta.len());
-        for (path, hash, size, mtime) in meta {
-            let row = match &hash {
-                Some(h) => {
-                    let (dup_count, distinct_devices) =
-                        hash_counts.get(h).copied().unwrap_or((0, 0));
-                    DedupRow {
-                        hashed: Some(hex_encode(h)),
-                        dup_count,
-                        distinct_devices,
-                        size_mtime_count: 0,
-                    }
-                }
-                None => DedupRow {
-                    hashed: None,
-                    dup_count: 0,
-                    distinct_devices: 0,
-                    size_mtime_count: sm_counts.get(&(size, mtime)).copied().unwrap_or(0),
-                },
-            };
-            out.insert(path, row);
-        }
-        Ok(out)
-    }
-
     /// The total size of scan files strictly under each directory in `dirs`
     /// (a prefix range over the PK, without `LIKE%`). Directories with no scan files do not
     /// enter the map. A batch over the panel's visible subdirectories.
@@ -3252,6 +2975,7 @@ impl ScanStore {
     /// below two surviving members, or when it suppresses the cursor itself — a directory whose
     /// own contents are no longer established may not be presented as one of a pair, and the
     /// surviving remainder is not «duplicates of this cursor» either.
+    #[cfg(test)]
     pub fn attributed_dir_group_at(
         &self,
         scan_id: i64,
@@ -3261,38 +2985,12 @@ impl ScanStore {
         attributed_dir_group_at_tx(&tx, scan_id, dir_path)
     }
 
-    /// Files under `dir_path` whose hash occurs in
-    /// a materialized `file_group` group (i.e. there is a duplicate SOMEWHERE in the scan,
-    /// possibly outside `dir_path`). Used by the UX when a directory has no
-    /// twin — to show duplicate files inside. Uses `file_group_hash`
-    /// (schema.rs:76) for the IN subquery and `prefix_bounds` for the range. Called
-    /// from `resolve_watch_group` on the key `WatchKey::DirOf` as a fallback.
-    pub fn dup_files_inside(&self, scan_id: i64, dir_path: &Path) -> Result<Vec<PathBuf>> {
-        let (lo, hi) = prefix_bounds(dir_path);
-        let mut stmt = self.conn.prepare(
-            "SELECT path FROM file
-             WHERE scan_id = ?1 AND path >= ?2 AND path < ?3 AND hash IS NOT NULL
-               AND lower(hex(hash)) IN (
-                   SELECT hash FROM file_group WHERE scan_id = ?1
-               )
-             ORDER BY path",
-        )?;
-        let rows = stmt.query_map(params![scan_id, lo, hi], |r| {
-            Ok(PathBuf::from(r.get::<_, String>(0)?))
-        })?;
-        let mut out: Vec<PathBuf> = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    }
-
-    /// Whether `path` is covered by the active scan — that is, whether there is at least one
-    /// row in `file` either EXACTLY at this path (it is a file from the scan manifest),
-    /// or under this prefix (a directory in which at least one file is stored).
-    /// Used by `resolve_watch_group` to distinguish «outside the scan» vs «in the scan,
-    /// but without duplicates» — without this, render shows a misleading
-    /// «no source» placeholder. Both queries are an index lookup of PK `(scan_id,path)`.
+    /// Whether `path` is covered by the active scan — an exact manifest row, or at least one
+    /// row under the prefix.
+    ///
+    /// Test-only since R4B-2c: the watch surface gets the same split from `dir_group_at`, which
+    /// decides it inside the snapshot that answered the rest of the question.
+    #[cfg(test)]
     pub fn is_path_in_scan(&self, scan_id: i64, path: &Path) -> Result<bool> {
         use rusqlite::OptionalExtension;
         let p = path.to_string_lossy();
@@ -3322,9 +3020,13 @@ impl ScanStore {
         Ok(hit.is_some())
     }
 
-    /// Lightweight summaries of all scan groups in «by benefit» order — Browser
-    /// holds them instead of all `FileEntry`. A PK-covered query over `file_group`.
-    pub fn group_summaries(&self, scan_id: i64) -> Result<Vec<GroupSummary>> {
+    /// The browse-only summary rows of a scan, in rank order.
+    ///
+    /// Test-only since R4B-2c: production reads summaries through the membership snapshot, which
+    /// carries each row's IDENTITY and names the inconsistent ones. This is the raw row list —
+    /// the question a legacy, browse-only checkpoint can still answer.
+    #[cfg(test)]
+    pub fn browse_summaries(&self, scan_id: i64) -> Result<Vec<GroupSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT rank, hash, file_count, size, reclaim, object_count, reclaim_state
              FROM file_group WHERE scan_id = ?1 ORDER BY rank",
@@ -3345,50 +3047,11 @@ impl ScanStore {
         })?;
         let mut out = Vec::new();
         for row in rows {
-            // Decoding is fallible — an unrecognised state is corruption, not an `Unknown` guess —
-            // so it happens outside the rusqlite mapper, which has no way to report it.
             let (mut summary, reclaim, state) = row?;
             summary.reclaim = ReclaimEstimate::from_persisted(reclaim, state)?;
             out.push(summary);
         }
         Ok(out)
-    }
-
-    /// A group summary by hex hash — for commander DuplicatesOfCursor:
-    /// confirms that the file under the cursor belongs to a duplicate group. A point lookup over
-    /// the index `file_group_hash`. `None` — the hash does not form a materialized group.
-    pub fn group_summary_for_hash(
-        &self,
-        scan_id: i64,
-        hash_hex: &str,
-    ) -> Result<Option<GroupSummary>> {
-        let row = self.conn.query_row(
-            "SELECT rank, hash, file_count, size, reclaim, object_count, reclaim_state
-             FROM file_group WHERE scan_id = ?1 AND hash = ?2 LIMIT 1",
-            params![scan_id, hash_hex],
-            |row| {
-                Ok((
-                    GroupSummary {
-                        rank: row.get(0)?,
-                        hash: row.get(1)?,
-                        file_count: row.get::<_, i64>(2)? as u64,
-                        size_bytes: row.get::<_, i64>(3)? as u64,
-                        object_count: row.get::<_, i64>(5)? as u64,
-                        reclaim: ReclaimEstimate::unknown(),
-                    },
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(6)?,
-                ))
-            },
-        );
-        match row {
-            Ok((mut summary, reclaim, state)) => {
-                summary.reclaim = ReclaimEstimate::from_persisted(reclaim, state)?;
-                Ok(Some(summary))
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(err) => Err(err.into()),
-        }
     }
 
     /// The number of files marked for an action (non-keeper + has an action) — for the counter
@@ -3403,8 +3066,10 @@ impl ScanStore {
         Ok(count as u64)
     }
 
-    /// Prepares a finished scan's results once, on the WRITER path — so that opening them is a
-    /// pure read and an observer never has to write.
+    /// Prepares a legacy scan's browse-only summaries once, on the WRITER path — so that
+    /// opening them is a pure read and an observer never has to write. Private since R4B-2c:
+    /// the only door in is `prepare_legacy_for_viewing`, and nothing here ever writes a
+    /// `scan_membership` or member row — viewing cannot mint authority.
     ///
     /// Keyed off the explicit `results_materialized` marker, never off `file_group` being empty:
     /// empty is a legitimate answer. For a scan that predates the marker we must still not
@@ -3413,7 +3078,7 @@ impl ScanStore {
     /// rows in `file_group`, or an authoritative `scan_stats.groups_found = 0` — the completed
     /// scan recorded that it found nothing. Only a legacy scan with no result at all and no
     /// recorded count is aggregated.
-    pub fn ensure_materialized(&mut self, scan_id: i64) -> Result<()> {
+    fn prepare_browse_summaries(&mut self, scan_id: i64) -> Result<()> {
         use rusqlite::OptionalExtension;
         if self.results_materialized(scan_id)? {
             return Ok(());
@@ -3444,9 +3109,9 @@ impl ScanStore {
         if recorded > 0 || recorded_zero_groups {
             self.mark_results_materialized(scan_id)?;
         } else {
-            // Result-identical to duplicate_groups + record_file_results, without the RAM peak
-            // (see materialize_file_groups_equals_record_file_results); it sets the marker.
-            self.materialize_file_groups(scan_id)?;
+            // The browse-only SQL aggregation, without the RAM peak; it sets the marker and
+            // deliberately leaves the scan's membership authority exactly as it was.
+            self.materialize_browse_summaries(scan_id)?;
         }
         Ok(())
     }
@@ -3478,11 +3143,13 @@ impl ScanStore {
 
     /// Prepares every completed scan that is still unprepared, so an observer finds ready
     /// results instead of having to write. Writer/operator path; returns how many were prepared.
+    /// Goes through `prepare_legacy_for_viewing`, so an authoritative scan is validated by the
+    /// same whole-authority rules every reader obeys and a legacy one stays browse-only.
     pub fn prepare_completed_scans(&mut self) -> Result<usize> {
         let pending = self.unprepared_completed_scans()?;
         let mut done = 0;
         for scan_id in pending {
-            self.ensure_materialized(scan_id)?;
+            self.prepare_legacy_for_viewing(scan_id)?;
             done += 1;
         }
         Ok(done)
@@ -3535,21 +3202,20 @@ impl ScanStore {
         scan_id: i64,
         requested: &[RequestedMark],
     ) -> PlanResult<ActionPlan> {
-        // One snapshot for the whole plan, opened before the first read and held until the plan
-        // exists and has been validated against the disk.
-        //
-        // The checkpoint DB runs in WAL and more than one connection writes to it, so between two
-        // autocommit reads a second copy of the program can commit. Reconciling the request against
-        // the marks and then loading the groups as separate reads is exactly that window: the
-        // request is checked against the old meaning and the plan is assembled from the new one.
-        // A deferred transaction on this connection covers every statement made on it, including
-        // the ones inside `destructive_plan_verdict`, so nothing here has to be threaded by hand.
-        let snapshot = self
-            .conn
-            .unchecked_transaction()
-            .map_err(Self::store_refusal)?;
+        // One validated membership snapshot for the whole plan, opened before the first read and
+        // held until the plan exists and has been validated against the disk. The snapshot IS the
+        // transaction, so the mark reconciliation, the membership resolution, the evidence, the
+        // witness and the preflight all describe one database state — and the same whole-authority
+        // validation every trusted reader obeys has already passed for it.
+        let snapshot = match self.membership_snapshot(scan_id) {
+            Ok(snapshot) => snapshot,
+            // A scan with no published membership authority has nothing a destructive plan may
+            // be keyed by. Everything else is a store-class refusal with its own sentence.
+            Err(MembershipMiss::Unknown) => return Err(PlanRefusal::RescanRequired),
+            Err(miss) => return Err(Self::store_refusal(describe_miss(&miss))),
+        };
 
-        // The coarse gate first: a scan nobody could measure is not planned against at all.
+        // The coarse gate second: a scan nobody could measure is not planned against at all.
         let verdict = self
             .destructive_plan_verdict(scan_id)
             .map_err(Self::store_refusal)?;
@@ -3607,26 +3273,52 @@ impl ScanStore {
         #[cfg(test)]
         fire_after_reconcile();
 
-        let mut digests: Vec<Vec<u8>> = marks.iter().map(|(_, _, digest)| digest.clone()).collect();
-        digests.sort();
-        digests.dedup();
-        let mut groups = Vec::with_capacity(digests.len());
-        for digest in &digests {
-            groups.push(self.plan_group(scan_id, digest)?);
+        // Membership, not digest, decides what the plan is about: every marked pathname must
+        // belong to a group of the CURRENT publication. A mark whose pathname is a member of
+        // nothing — a verify-rejected file, or a mark that outlived a republication — refuses
+        // the whole plan; folding it back in by digest is the defect this round removes.
+        let mut ids: Vec<GroupId> = Vec::new();
+        for (path, _, _) in &marks {
+            let id = match snapshot.group_of_path(path) {
+                Ok(Some(id)) => id,
+                Ok(None) => return Err(PlanRefusal::NotAMember { path: path.clone() }),
+                Err(miss) => return Err(Self::store_refusal(describe_miss(&miss))),
+            };
+            ids.push(id);
+        }
+        ids.sort_by_key(|id| id.rank);
+        ids.dedup();
+        // The witness reads each group's CURRENT digest and exact member pathnames inside this
+        // same snapshot; the strict evidence rows come from the same place. `PlanGroupInput`
+        // is keyed by identity, so two Explicit ranks sharing one digest stay two groups.
+        let witness = snapshot
+            .witness_of(&ids)
+            .map_err(|miss| Self::store_refusal(describe_miss(&miss)))?;
+        let mut groups = Vec::with_capacity(ids.len());
+        for (id, witnessed) in ids.iter().zip(&witness.groups) {
+            let members = snapshot.plan_members(id).map_err(|miss| match miss {
+                PlanEvidenceMiss::Membership(miss) => Self::store_refusal(describe_miss(&miss)),
+                // Already the exact refusal the operator has to read, and the exact variant the
+                // windows match on — passed through rather than flattened into a sentence.
+                PlanEvidenceMiss::Member(refusal) => refusal,
+            })?;
+            groups.push(PlanGroupInput {
+                id: *id,
+                hash: witnessed.digest.clone(),
+                members,
+            });
         }
 
-        // The model decides what becomes an action and what the plan may claim.
+        // The model decides what becomes an action and what the plan may claim — and derives
+        // the owned witness from these same inputs, so the lease revalidates what was planned.
         let plan = ActionPlan::try_new(scan_id, groups)?;
         // And the files have to still be the files the manifest describes. The same structural
-        // check `apply_batch` runs twice more, called here rather than left to the caller: a plan
-        // that can be returned unvalidated is a plan someone forgets to validate. Still inside the
-        // snapshot — the evidence it compares against must be the evidence the plan was folded
-        // from.
+        // check the guarded batch runs twice more, called here rather than left to the caller: a
+        // plan that can be returned unvalidated is a plan someone forgets to validate. Still
+        // inside the snapshot — the evidence it compares against must be the evidence the plan
+        // was folded from. The snapshot ends when it drops, and nothing was written.
         plan.preflight()?;
-        // Nothing was written, so this only ends the read. It is not left to `Drop`: a failure here
-        // means the snapshot did not last the whole way, and that refuses the plan like any other
-        // unreadable evidence.
-        snapshot.finish().map_err(Self::store_refusal)?;
+        drop(snapshot);
         Ok(plan)
     }
 
@@ -3705,63 +3397,6 @@ impl ScanStore {
             Value::Text(text) => format!("text {text:?}"),
             Value::Blob(bytes) => format!("blob of {} bytes", bytes.len()),
         }
-    }
-
-    /// One referenced digest with EVERY persisted member, marked or not, strictly decoded.
-    fn plan_group(&self, scan_id: i64, digest: &[u8]) -> PlanResult<PlanGroupInput> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                // `m.rowid` is the row-presence bit: a joined row always has one, and no column of
-                // it can be `NULL` by accident the way `m.is_keeper` can. Without it a damaged
-                // `NULL` in a `NOT NULL` column is indistinguishable from no mark at all.
-                "SELECT f.path, f.size, f.mtime, f.mtime_nsec, f.ctime_sec, f.ctime_nsec,
-                        f.device, f.inode, f.nlink, f.identity_version,
-                        m.is_keeper, m.action, m.rowid
-                   FROM file f
-                   LEFT JOIN file_mark m ON m.scan_id = f.scan_id AND m.path = f.path
-                  WHERE f.scan_id = ?1 AND f.hash = ?2
-                  ORDER BY f.path",
-            )
-            .map_err(Self::store_refusal)?;
-        let rows = stmt
-            .query_map(params![scan_id, digest], |row| {
-                Ok((
-                    PathBuf::from(row.get::<_, String>(0)?),
-                    PlanObjectKey {
-                        size: row.get::<_, i64>(1)? as u64,
-                        mtime: row.get::<_, i64>(2)?,
-                        mtime_nsec: row.get::<_, i64>(3)?,
-                        ctime_sec: row.get::<_, i64>(4)?,
-                        ctime_nsec: row.get::<_, i64>(5)?,
-                        device: row.get::<_, i64>(6)? as u64,
-                        inode: row.get::<_, i64>(7)? as u64,
-                        identity_version: row.get::<_, i64>(9)?,
-                    },
-                    row.get::<_, Value>(8)?,
-                    row.get::<_, Value>(10)?,
-                    row.get::<_, Value>(11)?,
-                    row.get::<_, Option<i64>>(12)?.is_some(),
-                ))
-            })
-            .map_err(Self::store_refusal)?;
-        let mut members = Vec::new();
-        for row in rows {
-            let (path, key, nlink, is_keeper, action, marked) = row.map_err(Self::store_refusal)?;
-            // Strict, unlike `group_file_row`: browsing may show a group whose counts cannot be
-            // read, a destructive plan may not be built on one.
-            let links =
-                link_count_from_sql(&nlink).map_err(|err| PlanRefusal::CorruptLinkCount {
-                    path: path.clone(),
-                    detail: err.to_string(),
-                })?;
-            let mark = Self::mark_intent_from_sql(&path, marked, &is_keeper, &action)?;
-            members.push(PlanMemberEvidence::new(path, key, links, mark)?);
-        }
-        Ok(PlanGroupInput {
-            hash: hex_encode(digest),
-            members,
-        })
     }
 
     /// A read that failed is a refusal like any other — the plan is not built on a half-read
@@ -3869,8 +3504,11 @@ fn now_string() -> String {
 }
 
 /// Decodes a hex hash string into bytes (the inverse of `hex_encode`). `None` — the string
-/// is not valid hex. Needed for binding `file_group.hash` (hex TEXT) against
-/// `file.hash` (BLOB[32]) in `group_files`.
+/// is not valid hex.
+///
+/// Test-only since R4B-2c: nothing in production binds a digest against `file.hash` any more —
+/// membership is what answers, and it is keyed by identity.
+#[cfg(test)]
 fn hex_decode(hex: &str) -> Option<Vec<u8>> {
     if hex.len() % 2 != 0 {
         return None;
@@ -4029,13 +3667,12 @@ fn take_insert_fault() -> bool {
 }
 
 // ---------------------------------------------------------------------------------------------
-// R4B-1 — staged membership authority (production-inert).
+// The membership authority (staged by R4B-1, production since R4B-2c).
 //
-// Everything from here to the next section is the future ownership of group membership: the
-// typed snapshot/resolver, the exact-schema apply opener, the fail-fast whole-batch lease and
-// the two future publication paths. NO production route calls any of it — R4B-2 is the one
-// atomic switch — which is why the entry points carry narrow `#[allow(dead_code)]` markers
-// naming that commit. Tests exercise all of it today.
+// Everything from here to the next section is the ownership of group membership: the typed
+// snapshot/resolver every trusted reader goes through, the exact-schema apply opener, the
+// fail-fast whole-batch lease and the two publication paths. Since the R4B-2c cutover this IS
+// the production route — the digest-keyed readers and the pre-authority writers are gone.
 // ---------------------------------------------------------------------------------------------
 
 /// Who last published a scan's results, as `scan_membership` records it. `Unknown` is the
@@ -4093,9 +3730,11 @@ impl From<rusqlite::Error> for MembershipMiss {
 /// One group resolved through the membership authority: the identity, the mode that vouched
 /// for it, the current summary row and the exact ordered members.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // R4B-2 makes the browser, the planner and the CSV export read these.
 pub struct ResolvedGroup {
     pub id: GroupId,
+    /// Which authority vouched for this answer. Carried so a caller can say so; the UI keys on
+    /// the identity and deliberately does not branch on the mode.
+    #[allow(dead_code)]
     pub mode: MembershipMode,
     pub summary: GroupSummary,
     pub members: Vec<FileEntry>,
@@ -4104,9 +3743,13 @@ pub struct ResolvedGroup {
 /// The current summaries under one authority. Every summary/membership disagreement is NAMED by
 /// its exact identity rather than repaired — the caller decides, this reader never normalizes.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // R4B-2 makes the browser and the commander read these.
 pub struct MembershipSummaries {
+    /// The authority and the publication these summaries came from. Every identity below
+    /// already carries the generation, so the UI reads them from there; these two are the
+    /// answer's own provenance.
+    #[allow(dead_code)]
     pub mode: MembershipMode,
+    #[allow(dead_code)]
     pub generation: i64,
     pub groups: Vec<(GroupId, GroupSummary)>,
     pub inconsistent: Vec<GroupId>,
@@ -4185,7 +3828,6 @@ pub enum LeaseRefusal {
 /// What the staged publisher writes: the Derived SQL materialization, or the Explicit verified
 /// groups a `--verify` run produced.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // R4B-2 repoints both production publication call sites onto these.
 pub enum PublishMode<'a> {
     Derived,
     Explicit(&'a [DuplicateGroup]),
@@ -4216,7 +3858,6 @@ pub const DIR_INNER_CAP: usize = 1_000;
 /// comparison accepts it: group equality is `GroupId`, so a digest cannot become an identity by
 /// being convenient.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // R4B-2c makes the commander panel read these.
 pub struct PanelFile {
     pub status: PanelFileStatus,
     pub hash_text: Option<String>,
@@ -4224,7 +3865,6 @@ pub struct PanelFile {
 
 /// What one panel row is, as membership sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // R4B-2c maps these onto the panel glyphs.
 pub enum PanelFileStatus {
     /// No manifest row in this scan.
     NotInScan,
@@ -4248,7 +3888,6 @@ pub enum PanelFileStatus {
 
 /// Why one row has no membership answer while the batch as a whole succeeded.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // R4B-2c renders these.
 pub enum PanelMiss {
     /// The scan has no membership authority: browse-only.
     Unknown,
@@ -4262,7 +3901,6 @@ pub enum PanelMiss {
 /// failure and a successful fallback at the same time, and the fallback is what the operator then
 /// acted on.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // R4B-2c moves the watch resolver onto this.
 pub enum DirGroupAnswer {
     /// The directory's surviving twins, as the current ledger attributes them.
     Group(Box<AttributedDirGroup>),
@@ -4287,7 +3925,6 @@ pub enum DirGroupAnswer {
 
 /// One inner duplicate: the pathname and the identity of the group that vouches for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // R4B-2c renders these.
 pub struct InnerDupe {
     pub path: PathBuf,
     pub id: GroupId,
@@ -4299,7 +3936,6 @@ pub struct InnerDupe {
 /// found» is representable only for a present row whose membership is `NotGrouped`; a pathname
 /// outside the scan and a membership refusal each keep their own rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // R4B-2c moves F3 onto this.
 pub enum FileInfoAnswer {
     /// No manifest row for this pathname in this scan.
     NotInScan,
@@ -4313,7 +3949,6 @@ pub enum FileInfoAnswer {
 
 /// The membership half of a file-info answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // R4B-2c renders these.
 pub enum FileMembership {
     /// In the manifest, member of no current group. The ONLY state that may render
     /// «No duplicates found».
@@ -4324,7 +3959,6 @@ pub enum FileMembership {
 /// The group behind a file-info answer: an identity, a bounded page of peers, and the honest
 /// total. Two Explicit ranks sharing a digest stay separate, because this is keyed by identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // R4B-2c renders these.
 pub struct FileGroupInfo {
     pub id: GroupId,
     /// At most `FILE_INFO_PEER_CAP`, in member order, excluding the subject itself.
@@ -4350,7 +3984,6 @@ pub enum MarkDecodeError {
 
 /// Why a settled mark write did not happen, or did not settle.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // R4B-2b sends these to the UI as a typed mark acknowledgement.
 pub enum MarkWriteError {
     /// The same pathname was requested twice with two different meanings.
     RequestContradictsItself { path: PathBuf },
@@ -4825,8 +4458,8 @@ impl ScanStore {
     /// be read from two different database states. Reads only; fails closed on malformed
     /// authority instead of downgrading it to Unknown.
     ///
-    /// Staged by R4B-1 with no production caller.
-    #[allow(dead_code)] // R4B-2 moves every membership reader onto this snapshot.
+    /// Since R4B-2c every trusted membership reader — the browsing actor, the plan builder,
+    /// the pipeline's completion listing and the headless output — goes through this snapshot.
     pub fn membership_snapshot(
         &self,
         scan_id: i64,
@@ -4910,7 +4543,6 @@ impl ScanStore {
     /// Staged by R4B-2a. `membership_snapshot` reaches it through `ensure_db_identity`, and the
     /// new `save_marks_settled` calls it directly; the existing readers keep today's behaviour
     /// until the UI that has to render the refusal switches with them.
-    #[allow(dead_code)] // R4B-2b routes the browsing actor's requests through this.
     pub fn ensure_current_path(&self) -> Result<()> {
         let Some((path, opened_as)) = self.db_identity.as_ref() else {
             return Ok(());
@@ -5001,8 +4633,7 @@ impl ScanStore {
     /// alone gets `busy_timeout=0` (the lease never queues); and the schema must be exactly
     /// current — no migration, no WAL flip, no vacuum, nothing altered merely by opening.
     ///
-    /// Staged by R4B-1 with no production caller.
-    #[allow(dead_code)] // R4B-2 moves the apply worker onto this opener.
+    /// Since R4B-2c the apply worker's guarded boundary opens through here alone.
     pub fn open_for_apply_lease(db_path: &Path) -> std::result::Result<Self, LeaseRefusal> {
         if is_observer_role() {
             return Err(LeaseRefusal::ReadOnlyRole);
@@ -5058,8 +4689,7 @@ impl ScanStore {
     /// `{rank, digest}`; member sets come back one ROW per member and are compared in Rust —
     /// neither statements nor bind variables grow with the plan.
     ///
-    /// Staged by R4B-1 with no production caller.
-    #[allow(dead_code)] // R4B-2 moves the apply worker onto this lease.
+    /// Since R4B-2c every real batch holds this lease across its whole run.
     pub fn acquire_membership_lease(
         &mut self,
         witness: &PlanWitness,
@@ -5143,9 +4773,9 @@ impl ScanStore {
     /// `file_group_member` would empty the member table on its own — that fact is stated here
     /// and pinned by a test rather than silently relied on.
     ///
-    /// Staged by R4B-1 with no production caller; `record_file_results` and
-    /// `materialize_file_groups` remain the production writers until the switch.
-    #[allow(dead_code)] // R4B-2 repoints both production publication call sites here.
+    /// Since R4B-2c this is the ONLY publication path: the pipeline publishes `Derived` for an
+    /// ordinary hash-only completion and `Explicit` from the exact populations `--verify`
+    /// returned.
     pub fn publish_results(&mut self, scan_id: i64, mode: PublishMode<'_>) -> Result<i64> {
         use rusqlite::OptionalExtension;
         self.revoke_membership_cache();
@@ -5216,9 +4846,9 @@ impl ScanStore {
                 1
             }
             PublishMode::Explicit(groups) => {
-                // The same figures-first rule and the same total order as `record_file_results`
-                // — duplicated deliberately: the production writer stays byte-untouched in this
-                // inert commit, and R4B-2 retires it in favour of this path.
+                // Figures first, before anything is written, and the same total order the
+                // Derived SQL window uses — an allocation nobody can measure stops the whole
+                // result, and a group of fewer than two allocations is not a duplicate.
                 let mut rows: Vec<(&DuplicateGroup, GroupReclaim)> =
                     Vec::with_capacity(groups.len());
                 for group in groups {
@@ -5302,8 +4932,8 @@ impl ScanStore {
     /// rules name is refused here too, including the per-rank count disagreement, because
     /// «prepared» must not mean «prepared and unusable».
     ///
-    /// Staged by R4B-1 with no production caller.
-    #[allow(dead_code)] // R4B-2 repoints the preparation call sites here.
+    /// Since R4B-2c this is the ONLY preparation path: the startup sweep, the pipeline's
+    /// walk-less branches and the browsing actor's `Open` all pass through here.
     pub fn prepare_legacy_for_viewing(&mut self, scan_id: i64) -> Result<()> {
         let legacy = {
             let snapshot = self.membership_snapshot(scan_id).map_err(|miss| {
@@ -5335,9 +4965,34 @@ impl ScanStore {
         };
         if legacy {
             // Browsing summaries only. No authority row, no member row, nothing invented.
-            return self.ensure_materialized(scan_id);
+            return self.prepare_browse_summaries(scan_id);
         }
         Ok(())
+    }
+}
+
+/// Why a group's strict plan evidence could not be read.
+///
+/// Two different things, deliberately not merged: `Membership` is the store's own answer about
+/// the authority (unknown, stale, corrupt, unreadable), while `Member` is the evidence
+/// constructor refusing one readable row — an unverified digest, an unrecorded link count. The
+/// second is already a typed `PlanRefusal` and stays one all the way to the caller: rendering it
+/// into a sentence would leave the plan builder with nothing to match on but text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanEvidenceMiss {
+    Membership(MembershipMiss),
+    Member(PlanRefusal),
+}
+
+impl From<MembershipMiss> for PlanEvidenceMiss {
+    fn from(miss: MembershipMiss) -> Self {
+        PlanEvidenceMiss::Membership(miss)
+    }
+}
+
+impl From<rusqlite::Error> for PlanEvidenceMiss {
+    fn from(err: rusqlite::Error) -> Self {
+        PlanEvidenceMiss::Membership(MembershipMiss::from(err))
     }
 }
 
@@ -5357,13 +5012,16 @@ fn describe_miss(miss: &MembershipMiss) -> String {
     }
 }
 
-#[allow(dead_code)] // R4B-2 moves the membership readers onto these; tests exercise them today.
 impl MembershipSnapshot<'_> {
     pub fn mode(&self) -> MembershipMode {
         self.mode
     }
 
     /// The current publication generation — only a scan WITH authority has one.
+    ///
+    /// Every identity this snapshot hands out already carries the generation, so production
+    /// reads it from there; this is the standalone question, kept for the tests that ask it.
+    #[cfg(test)]
     pub fn generation(&self) -> Option<i64> {
         (self.mode != MembershipMode::Unknown).then_some(self.generation)
     }
@@ -5498,6 +5156,11 @@ impl MembershipSnapshot<'_> {
     /// Every current group identity carrying this digest, in rank order. Two explicit ranks
     /// may legitimately share one digest — that is exactly R4-V1's split populations.
     ///
+    /// No production route asks a digest for identities any more: the UI holds identities and
+    /// the plan resolves pathnames. It stays as the proof that a digest CANNOT silently pick
+    /// one of two ranks, which its tests assert.
+    #[cfg(test)]
+    ///
     /// Every returned rank passes the same consistency gate the exact answers pass. An
     /// inconsistent rank refuses the whole lookup rather than being filtered out of it:
     /// filtering would turn corruption into a smaller answer that looks entirely valid.
@@ -5591,6 +5254,10 @@ impl MembershipSnapshot<'_> {
     }
 
     /// The membership test for one exact identity and pathname.
+    ///
+    /// Production asks the question the other way round — «which group holds this pathname» —
+    /// through `group_of_path` and `file_info`; this is the direct test, kept for the tests.
+    #[cfg(test)]
     pub fn is_member(
         &self,
         id: &GroupId,
@@ -5660,7 +5327,10 @@ impl MembershipSnapshot<'_> {
     ///
     /// The digest-keyed reader it replaces cannot tell two Explicit ranks sharing one digest
     /// apart, so it would answer for whichever the index happened to reach first.
-    #[allow(dead_code)] // R4B-2c moves the browser's group claim onto this.
+    /// No production route reads it yet: both windows assemble the open group's claim from
+    /// the `ResolvedGroup` summary (P0 §4 G3), so the identity-keyed claim reader stays
+    /// test-covered until a view needs the link evidence beside the reclaim figure.
+    #[allow(dead_code)]
     pub fn group_claim(&self, id: &GroupId) -> std::result::Result<GroupClaim, MembershipMiss> {
         use rusqlite::OptionalExtension;
         self.require_current(id)?;
@@ -5775,13 +5445,14 @@ impl MembershipSnapshot<'_> {
     /// Strict where browsing is not: `group_page` tolerates a link count of an impossible storage
     /// class because a group whose counts cannot be trusted is still worth showing, while a plan
     /// built on one is not. The evidence constructor is the trust boundary and it refuses here.
-    #[allow(dead_code)] // R4B-2c builds the plan from these instead of from a digest union.
     pub fn plan_members(
         &self,
         id: &GroupId,
-    ) -> std::result::Result<Vec<PlanMemberEvidence>, MembershipMiss> {
+    ) -> std::result::Result<Vec<PlanMemberEvidence>, PlanEvidenceMiss> {
         self.require_current(id)?;
-        let inconsistent = |err: String| MembershipMiss::Inconsistent { detail: err };
+        let inconsistent = |err: String| {
+            PlanEvidenceMiss::Membership(MembershipMiss::Inconsistent { detail: err })
+        };
         let mut stmt = self.tx.prepare(&format!(
             "SELECT f.path, f.size, f.mtime, f.mtime_nsec, f.ctime_sec, f.ctime_nsec,
                     f.device, f.inode, f.nlink, f.identity_version,
@@ -5818,9 +5489,12 @@ impl MembershipSnapshot<'_> {
             let links = link_count_from_sql(&nlink).map_err(|err| inconsistent(err.to_string()))?;
             let mark = decode_mark(&path, marked, &is_keeper, &action)
                 .map_err(|err| inconsistent(err.to_string()))?;
+            // The constructor's own refusal travels as itself: «this pathname carries a digest
+            // this build never verified» is a plan refusal about a readable row, not a corrupt
+            // store, and the plan builder returns it unchanged.
             members.push(
                 PlanMemberEvidence::new(path, key, links, mark)
-                    .map_err(|err| inconsistent(err.to_string()))?,
+                    .map_err(PlanEvidenceMiss::Member)?,
             );
         }
         Ok(members)
@@ -5831,7 +5505,6 @@ impl MembershipSnapshot<'_> {
     ///
     /// The digest is read here rather than remembered by the caller, so the lease compares what
     /// the plan was folded from against what the database says now.
-    #[allow(dead_code)] // R4B-2c puts the witness into the plan and the guarded apply.
     pub fn witness_of(&self, ids: &[GroupId]) -> std::result::Result<PlanWitness, MembershipMiss> {
         use rusqlite::OptionalExtension;
         // An empty list must not produce a witness for a scan with no authority.
@@ -5867,7 +5540,6 @@ impl MembershipSnapshot<'_> {
     /// pathname the current reader spends. The membership half needs authority; the size/mtime
     /// half is a candidate signal about rows that were never hashed and needs none, which is why
     /// an Unknown scan still renders something instead of nothing.
-    #[allow(dead_code)] // R4B-2c moves the commander panel onto this.
     pub fn panel_files(
         &self,
         paths: &[&Path],
@@ -6034,7 +5706,6 @@ impl MembershipSnapshot<'_> {
     /// selected manifest rows whose digest appears anywhere in `file_group` and never consulted
     /// `file_group_member`, so under Explicit authority it returned pathnames byte verification
     /// had rejected — the exact defect this work exists to remove.
-    #[allow(dead_code)] // R4B-2c moves the watch resolver onto this.
     pub fn dir_group_at(&self, dir: &Path) -> std::result::Result<DirGroupAnswer, MembershipMiss> {
         let store = |err: AppError| MembershipMiss::Store {
             detail: err.to_string(),
@@ -6213,7 +5884,6 @@ impl MembershipSnapshot<'_> {
     /// Manifest presence is established positively and is the OUTER decision, so «no duplicates
     /// found» cannot be printed for a pathname the scan never saw, nor for one whose membership
     /// could not be read.
-    #[allow(dead_code)] // R4B-2c moves the F3 overlay onto this.
     pub fn file_info(&self, path: &Path) -> std::result::Result<FileInfoAnswer, MembershipMiss> {
         use rusqlite::OptionalExtension;
         let text = path.to_string_lossy();
@@ -7320,8 +6990,12 @@ fn attributed_dir_group_summaries_tx(
     })
 }
 
-/// Attributed full groups (paths retained, the commander batch): the three authority reads plus
-/// exactly ONE ordered `dir_dedup` scan, then the shared benefit sort.
+/// Attributed full groups (paths retained): the three authority reads plus exactly ONE ordered
+/// `dir_dedup` scan, then the shared benefit sort.
+///
+/// Test-only since R4B-2c: production lists the SUMMARIES the `Open` payload carries and opens
+/// one group at a time by signature, so a panel never holds every group's paths at once.
+#[cfg(test)]
 fn attributed_dir_groups_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<Vec<AttributedDirGroup>> {
     let outcome = completeness_snapshot_tx(tx, scan_id)?;
     let legacy = LegacyContext;
@@ -8635,63 +8309,6 @@ mod tests {
     }
 
     #[test]
-    fn dup_files_inside_returns_only_files_with_duplicate_hashes() {
-        // R6 C4: inside a dir we show only files whose hash occurs in file_group.
-        let mut store = ScanStore::open_in_memory().unwrap();
-        let scan_id = store
-            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
-            .unwrap();
-        store
-            .record_files(
-                scan_id,
-                &[
-                    row("/x/a/dup1", 100, 1), // h1
-                    row("/x/a/uniq", 50, 2),  // h_unique
-                    row("/x/b/dup2", 100, 3), // h1 — forms a pair → file_group
-                ],
-            )
-            .unwrap();
-        let h1 = [1u8; 32];
-        let h_unique = [9u8; 32];
-        store
-            .record_hashes(
-                scan_id,
-                &[
-                    (PathBuf::from("/x/a/dup1"), h1),
-                    (PathBuf::from("/x/a/uniq"), h_unique),
-                    (PathBuf::from("/x/b/dup2"), h1),
-                ],
-            )
-            .unwrap();
-        store.materialize_file_groups(scan_id).unwrap();
-        // /x/a contains dup1 (has a pair in /x/b) and uniq (no duplicate) → only dup1.
-        let inside = store
-            .dup_files_inside(scan_id, &PathBuf::from("/x/a"))
-            .unwrap();
-        assert_eq!(inside, vec![PathBuf::from("/x/a/dup1")]);
-    }
-
-    #[test]
-    fn dup_files_inside_empty_for_dir_without_duplicates() {
-        let mut store = ScanStore::open_in_memory().unwrap();
-        let scan_id = store
-            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
-            .unwrap();
-        store
-            .record_files(scan_id, &[row("/x/lonely/only", 50, 1)])
-            .unwrap();
-        let h_unique = [9u8; 32];
-        store
-            .record_hashes(scan_id, &[(PathBuf::from("/x/lonely/only"), h_unique)])
-            .unwrap();
-        store.materialize_file_groups(scan_id).unwrap(); // no groups
-        let inside = store
-            .dup_files_inside(scan_id, &PathBuf::from("/x/lonely"))
-            .unwrap();
-        assert!(inside.is_empty());
-    }
-
-    #[test]
     fn is_path_in_scan_exact_file_hit_is_true() {
         // A file path that IS in the scan manifest → true (exact PK lookup).
         let mut store = ScanStore::open_in_memory().unwrap();
@@ -8805,6 +8422,56 @@ mod tests {
         assert!(store.is_path_in_scan(id, Path::new("/tank")).unwrap());
     }
 
+    /// Members of the group carrying `hash_hex`, read through the membership authority.
+    ///
+    /// The digest is only how these tests NAME the group they seeded; the answer itself comes
+    /// from membership, so a pathname verification rejected can never appear in it.
+    fn members_of_digest(store: &ScanStore, scan_id: i64, hash_hex: &str) -> Vec<FileEntry> {
+        let snapshot = store
+            .membership_snapshot(scan_id)
+            .expect("a published scan");
+        let ids = snapshot
+            .groups_of_digest(hash_hex)
+            .expect("a digest lookup");
+        match ids.first() {
+            Some(id) => snapshot.group(id).expect("the group resolves").members,
+            None => Vec::new(),
+        }
+    }
+
+    /// A page of the scan's only published group, by IDENTITY — the question the old
+    /// digest-keyed pager asked, now asked of the authority that owns membership.
+    fn snapshot_page(
+        store: &ScanStore,
+        scan_id: i64,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<FileEntry> {
+        let snapshot = store
+            .membership_snapshot(scan_id)
+            .expect("a published scan");
+        let summaries = snapshot.summaries().expect("published summaries");
+        let (id, _) = summaries.groups.first().expect("one group");
+        snapshot
+            .group_page(id, offset, limit)
+            .expect("the page resolves")
+            .members
+    }
+
+    /// The live member count of the group carrying `hash_hex`; `0` when no group carries it.
+    fn snapshot_count(store: &ScanStore, scan_id: i64, hash_hex: &str) -> u64 {
+        let snapshot = store
+            .membership_snapshot(scan_id)
+            .expect("a published scan");
+        let ids = snapshot
+            .groups_of_digest(hash_hex)
+            .expect("a digest lookup");
+        match ids.first() {
+            Some(id) => snapshot.group_member_count(id).expect("the count resolves"),
+            None => 0,
+        }
+    }
+
     #[test]
     fn group_files_page_returns_offset_limit_window() {
         // The page [offset..offset+limit], ordered by path
@@ -8814,7 +8481,6 @@ mod tests {
             .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
             .unwrap();
         let h = [1u8; 32];
-        let hex = crate::model::duplicate::hex_encode(&h);
         // 5 files with the same hash; paths are intentionally not in alphabetical insertion order.
         store
             .record_files(
@@ -8840,22 +8506,27 @@ mod tests {
                 ],
             )
             .unwrap();
+        // The pages come out of the published authority, so the fixture publishes through the one
+        // production writer. A digest that was never published is not a group.
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
         // First page (2 files) — a, b.
-        let page1 = store.group_files_page(scan_id, &hex, 0, 2).unwrap();
+        let page1 = snapshot_page(&store, scan_id, 0, 2);
         let paths1: Vec<_> = page1
             .iter()
             .map(|f| f.path.to_string_lossy().into_owned())
             .collect();
         assert_eq!(paths1, vec!["/x/a", "/x/b"]);
         // Second page (offset 2, limit 2) — c, d.
-        let page2 = store.group_files_page(scan_id, &hex, 2, 2).unwrap();
+        let page2 = snapshot_page(&store, scan_id, 2, 2);
         let paths2: Vec<_> = page2
             .iter()
             .map(|f| f.path.to_string_lossy().into_owned())
             .collect();
         assert_eq!(paths2, vec!["/x/c", "/x/d"]);
         // Third page (offset 4, limit 2) — e (tail).
-        let page3 = store.group_files_page(scan_id, &hex, 4, 2).unwrap();
+        let page3 = snapshot_page(&store, scan_id, 4, 2);
         let paths3: Vec<_> = page3
             .iter()
             .map(|f| f.path.to_string_lossy().into_owned())
@@ -8873,7 +8544,6 @@ mod tests {
             .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
             .unwrap();
         let h = [2u8; 32];
-        let hex = crate::model::duplicate::hex_encode(&h);
         let entries: Vec<_> = (0..10)
             .map(|i| (PathBuf::from(format!("/x/{i:02}")), h))
             .collect();
@@ -8884,9 +8554,12 @@ mod tests {
             .collect();
         store.record_files(scan_id, &rows).unwrap();
         store.record_hashes(scan_id, &entries).unwrap();
-        let page1 = store.group_files_page(scan_id, &hex, 0, 4).unwrap();
-        let page2 = store.group_files_page(scan_id, &hex, 4, 4).unwrap();
-        let page3 = store.group_files_page(scan_id, &hex, 8, 4).unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        let page1 = snapshot_page(&store, scan_id, 0, 4);
+        let page2 = snapshot_page(&store, scan_id, 4, 4);
+        let page3 = snapshot_page(&store, scan_id, 8, 4);
         let all_paths: Vec<_> = page1
             .iter()
             .chain(page2.iter())
@@ -8926,10 +8599,13 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(store.group_files_count(scan_id, &hex).unwrap(), 3);
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        assert_eq!(snapshot_count(&store, scan_id, &hex), 3);
         // Unknown hash → 0.
         let other_hex = crate::model::duplicate::hex_encode(&[99u8; 32]);
-        assert_eq!(store.group_files_count(scan_id, &other_hex).unwrap(), 0);
+        assert_eq!(snapshot_count(&store, scan_id, &other_hex), 0);
     }
 
     #[test]
@@ -9148,7 +8824,7 @@ mod tests {
         let scan = store.scan_reclaim(scan_id).unwrap();
         Published {
             groups: store
-                .group_summaries(scan_id)
+                .browse_summaries(scan_id)
                 .unwrap()
                 .into_iter()
                 .map(|group| {
@@ -9178,12 +8854,13 @@ mod tests {
     fn published_both_ways(seed: impl Fn(&mut ScanStore) -> i64) -> Published {
         let mut sql = ScanStore::open_in_memory().unwrap();
         let sql_id = seed(&mut sql);
-        sql.materialize_file_groups(sql_id).unwrap();
+        sql.publish_results(sql_id, PublishMode::Derived).unwrap();
 
         let mut ram = ScanStore::open_in_memory().unwrap();
         let ram_id = seed(&mut ram);
         let groups = ram.duplicate_groups(ram_id).unwrap();
-        ram.record_file_results(ram_id, &groups).unwrap();
+        ram.publish_results(ram_id, PublishMode::Explicit(&groups))
+            .unwrap();
 
         let (from_sql, from_ram) = (published(&sql, sql_id), published(&ram, ram_id));
         assert_eq!(
@@ -9233,7 +8910,9 @@ mod tests {
             ],
             &[("/x/a1", 1), ("/x/a2", 1), ("/x/a3", 1)],
         );
-        store.materialize_file_groups(scan_id).unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
         assert_eq!(store.manifest_count(scan_id).unwrap(), 3);
     }
 
@@ -9316,7 +8995,9 @@ mod tests {
             ],
             &[("/x/seen", 1), ("/x/twin", 1)],
         );
-        store.materialize_file_groups(scan_id).unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
         let links = store.group_links(scan_id, hash).unwrap();
         assert_eq!(
             (links.observed, links.total),
@@ -9342,16 +9023,20 @@ mod tests {
             );
             let err = if verify {
                 let groups = store.duplicate_groups(scan_id).unwrap();
-                store.record_file_results(scan_id, &groups).unwrap_err()
+                store
+                    .publish_results(scan_id, PublishMode::Explicit(&groups))
+                    .unwrap_err()
             } else {
-                store.materialize_file_groups(scan_id).unwrap_err()
+                store
+                    .publish_results(scan_id, PublishMode::Derived)
+                    .unwrap_err()
             };
             assert!(
                 err.to_string().contains("cannot be right"),
                 "the refusal must name the cause: {err}"
             );
             assert!(
-                store.group_summaries(scan_id).unwrap().is_empty(),
+                store.browse_summaries(scan_id).unwrap().is_empty(),
                 "a refused result leaves no rows"
             );
             assert!(
@@ -9391,9 +9076,13 @@ mod tests {
             let scan_id = seed(&mut store);
             let err = if verify {
                 let groups = store.duplicate_groups(scan_id).unwrap();
-                store.record_file_results(scan_id, &groups).unwrap_err()
+                store
+                    .publish_results(scan_id, PublishMode::Explicit(&groups))
+                    .unwrap_err()
             } else {
-                store.materialize_file_groups(scan_id).unwrap_err()
+                store
+                    .publish_results(scan_id, PublishMode::Derived)
+                    .unwrap_err()
             };
             assert!(
                 err.to_string().contains("different link counts"),
@@ -9401,7 +9090,7 @@ mod tests {
                 if verify { "RAM/--verify" } else { "SQL" }
             );
             assert!(
-                store.group_summaries(scan_id).unwrap().is_empty(),
+                store.browse_summaries(scan_id).unwrap().is_empty(),
                 "a refused result leaves no rows"
             );
             assert!(
@@ -9438,15 +9127,19 @@ mod tests {
             let scan_id = seed(&mut store);
             let err = if verify {
                 let groups = store.duplicate_groups(scan_id).unwrap();
-                store.record_file_results(scan_id, &groups).unwrap_err()
+                store
+                    .publish_results(scan_id, PublishMode::Explicit(&groups))
+                    .unwrap_err()
             } else {
-                store.materialize_file_groups(scan_id).unwrap_err()
+                store
+                    .publish_results(scan_id, PublishMode::Derived)
+                    .unwrap_err()
             };
             assert!(
                 err.to_string().contains("does not fit"),
                 "the refusal must name the cause: {err}"
             );
-            assert!(store.group_summaries(scan_id).unwrap().is_empty());
+            assert!(store.browse_summaries(scan_id).unwrap().is_empty());
             assert!(!store.results_materialized(scan_id).unwrap());
         }
     }
@@ -9497,8 +9190,10 @@ mod tests {
             &[object_row("/x/a", S, 1, 1), object_row("/x/u", S / 2, 2, 1)],
             &[("/x/a", 1), ("/x/u", 2)],
         );
-        store.materialize_file_groups(scan_id).unwrap();
-        store.ensure_materialized(scan_id).unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        store.prepare_legacy_for_viewing(scan_id).unwrap();
         assert_eq!(
             store.scan_reclaim(scan_id).unwrap().potential_bytes(),
             Some(0),
@@ -9618,8 +9313,8 @@ mod tests {
         let mut store = ScanStore::open_in_memory().unwrap();
         let scan_id = seed_migrated_v2(&mut store);
 
-        store.ensure_materialized(scan_id).unwrap();
-        let summaries = store.group_summaries(scan_id).unwrap();
+        store.prepare_legacy_for_viewing(scan_id).unwrap();
+        let summaries = store.browse_summaries(scan_id).unwrap();
         assert_eq!(summaries.len(), 1, "the row remains browseable");
         assert_eq!(summaries[0].file_count, 3, "its pathnames are still listed");
         assert_eq!(summaries[0].reclaim.state(), ReclaimState::Unknown);
@@ -9650,50 +9345,69 @@ mod tests {
         assert_eq!(stored, (2 * S) as i64, "the migrated row is not rewritten");
     }
 
-    /// The migrated row as the operator actually meets it: the summary comes out of the store and
-    /// goes through the shared group renderer that classic and the commander both draw. A summary
-    /// built by hand in the UI's own tests cannot show that the sentinel survives the database.
+    /// The migrated row as the operator meets it since R4B-2c: a scan that never published an
+    /// authority hands the browser its untrusted candidates, and no group row at all.
+    ///
+    /// This replaces the assertion that the migrated summary reaches the group renderer carrying
+    /// `? objects` — that route required the pre-cutover design, in which an unpublished scan's
+    /// browse-only summaries were drawn as if they were groups. The guarantee is strictly
+    /// stronger now: a count that was never recorded cannot be mis-drawn as `0 objects`, because
+    /// the row it lives in reaches no renderer, no identity and no destructive gate. Its old
+    /// positive figure stays in the table as history, exactly as before.
     #[test]
-    fn a_migrated_v2_summary_reaches_the_browser_as_an_unknown_count() {
+    fn a_migrated_v2_scan_reaches_the_browser_as_candidates_and_never_as_groups() {
         let mut store = ScanStore::open_in_memory().unwrap();
         let scan_id = seed_migrated_v2(&mut store);
-        store.ensure_materialized(scan_id).unwrap();
-        let summaries = store.group_summaries(scan_id).unwrap();
+        store.prepare_legacy_for_viewing(scan_id).unwrap();
+
+        let candidates = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            assert_eq!(
+                snapshot.mode(),
+                MembershipMode::Unknown,
+                "preparing a legacy result may not invent an authority"
+            );
+            assert_eq!(
+                snapshot
+                    .summaries()
+                    .expect_err("no authority, no summaries"),
+                MembershipMiss::Unknown,
+                "the renderer is never handed a group of an unpublished scan"
+            );
+            snapshot
+                .unknown_candidates()
+                .expect("an Unknown scan answers with candidates")
+                .expect("and it is Unknown, so the view exists")
+        };
+        // What the browser draws instead: raw digests over at least two allocations, with the
+        // pathname count they actually have — not the migrated row's remembered `3`.
+        assert_eq!(candidates.candidates.len(), 1);
+        assert_eq!(candidates.candidates[0].paths, 2);
+        // The candidate view carries no identity, so nothing can plan against it.
         assert_eq!(
-            (summaries[0].object_count, summaries[0].reclaim.state()),
-            (0, ReclaimState::Unknown),
-            "the sentinel the renderer has to recognise"
+            store.destructive_plan_verdict(scan_id).unwrap(),
+            DestructivePlanVerdict::RescanRequired
         );
-        for width in [52, 40] {
-            let entries = crate::tui::screens::browser::tests::drawn_entries(width, &summaries);
-            let text = &entries[0];
-            assert!(
-                text.contains("? objects"),
-                "a count that was never recorded is not a count of zero ({width} columns): {text}"
-            );
-            assert!(
-                !text.contains("0 objects"),
-                "the contradiction this row used to draw ({width} columns): {text}"
-            );
-            assert!(
-                text.contains("rescan required"),
-                "the row still says how to get the count ({width} columns): {text}"
-            );
-            assert!(
-                text.contains("3 files"),
-                "its pathnames are still listed ({width} columns): {text}"
-            );
-        }
-        // Reading the row does not rewrite it: the sentinel is still in the table afterwards.
-        let stored: i64 = store
+        assert_eq!(
+            store
+                .build_action_plan(scan_id, &[])
+                .expect_err("no authority"),
+            PlanRefusal::RescanRequired
+        );
+        // Reading it does not rewrite it: the sentinel and the old figure are still in the table.
+        let (stored_objects, stored_files): (i64, i64) = store
             .conn
             .query_row(
-                "SELECT object_count FROM file_group WHERE scan_id = ?1",
+                "SELECT object_count, file_count FROM file_group WHERE scan_id = ?1",
                 params![scan_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(stored, 0, "the migrated row keeps its sentinel");
+        assert_eq!(
+            (stored_objects, stored_files),
+            (0, 3),
+            "the migrated row keeps its sentinel and its history"
+        );
     }
 
     // === R2D-C5-1: the inert plan authority ===
@@ -10513,8 +10227,15 @@ mod tests {
 
     /// One inode cannot hold two contents. A damaged database that says otherwise would have the
     /// plan count — and act on — a single allocation as two groups.
+    ///
+    /// Since R4B-2c the plan is keyed by the published authority, so the damage is published
+    /// damage: two explicit ranks, each naming one pathname of the SAME allocation under a
+    /// different digest. That is the shape R4-V1's split populations make representable, and it
+    /// is stronger than the manifest-only corruption this replaces — the rows the plan trusts
+    /// most are the ones telling the lie.
     #[test]
     fn one_allocation_under_two_digests_refuses() {
+        use std::os::unix::fs::MetadataExt;
         let _role = role_guard();
         let scenario = PlanScenario::new("twodigests");
         let a_keeper = scenario.file("a_keeper.bin");
@@ -10548,6 +10269,50 @@ mod tests {
                 params![scan_id, alias_1.to_string_lossy(), other],
             )
             .unwrap();
+        // And the authority repeats the lie: two explicit ranks, one pathname of the shared
+        // allocation in each, published by the one production writer.
+        let entry = |path: &Path| {
+            let meta = std::fs::symlink_metadata(path).expect("scenario stat");
+            FileEntry {
+                path: path.to_path_buf(),
+                size: meta.size(),
+                mtime: meta.mtime(),
+                mtime_nsec: meta.mtime_nsec(),
+                ctime_sec: meta.ctime(),
+                ctime_nsec: meta.ctime_nsec(),
+                device: meta.dev(),
+                inode: meta.ino(),
+                nlink: meta.nlink(),
+                is_keeper: false,
+                action: None,
+            }
+        };
+        let payload_digest: Vec<u8> = store
+            .conn
+            .query_row(
+                "SELECT hash FROM file WHERE scan_id = ?1 AND path = ?2",
+                params![scan_id, alias_0.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let size = payload_size(&alias_0);
+        let split = vec![
+            DuplicateGroup {
+                id: 0,
+                size_bytes: size,
+                hash: hex_encode(&payload_digest),
+                files: vec![entry(&a_keeper), entry(&alias_0)],
+            },
+            DuplicateGroup {
+                id: 1,
+                size_bytes: size,
+                hash: hex_encode(&other),
+                files: vec![entry(&b_keeper), entry(&alias_1)],
+            },
+        ];
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&split))
+            .unwrap();
         scenario.mark(&mut store, scan_id, &a_keeper, true, None);
         scenario.mark(
             &mut store,
@@ -10579,11 +10344,13 @@ mod tests {
         // Zero groups is a legitimate final answer, not «not prepared yet».
         let mut store = ScanStore::open_in_memory().unwrap();
         let scan_id = seed_no_duplicates(&mut store);
-        store.materialize_file_groups(scan_id).unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
         assert!(store.results_materialized(scan_id).unwrap());
-        store.ensure_materialized(scan_id).unwrap();
+        store.prepare_legacy_for_viewing(scan_id).unwrap();
         assert!(
-            store.group_summaries(scan_id).unwrap().is_empty(),
+            store.browse_summaries(scan_id).unwrap().is_empty(),
             "a scan with no duplicates must stay empty"
         );
     }
@@ -10595,10 +10362,12 @@ mod tests {
         // back exactly the groups verification refused.
         let mut store = ScanStore::open_in_memory().unwrap();
         let scan_id = seed_two_groups(&mut store);
-        store.record_file_results(scan_id, &[]).unwrap();
-        store.ensure_materialized(scan_id).unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&[]))
+            .unwrap();
+        store.prepare_legacy_for_viewing(scan_id).unwrap();
         assert!(
-            store.group_summaries(scan_id).unwrap().is_empty(),
+            store.browse_summaries(scan_id).unwrap().is_empty(),
             "a read fallback must not resurrect a group rejected by verification"
         );
     }
@@ -10609,7 +10378,9 @@ mod tests {
         // — proof that opening does not re-aggregate the manifest.
         let mut store = ScanStore::open_in_memory().unwrap();
         let scan_id = seed_no_duplicates(&mut store);
-        store.materialize_file_groups(scan_id).unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
         store
             .record_files(scan_id, &[row("/x/p", 70, 7), row("/x/q", 70, 8)])
             .unwrap();
@@ -10620,9 +10391,9 @@ mod tests {
                 &[(PathBuf::from("/x/p"), h), (PathBuf::from("/x/q"), h)],
             )
             .unwrap();
-        store.ensure_materialized(scan_id).unwrap();
+        store.prepare_legacy_for_viewing(scan_id).unwrap();
         assert!(
-            store.group_summaries(scan_id).unwrap().is_empty(),
+            store.browse_summaries(scan_id).unwrap().is_empty(),
             "an already prepared result must not be recomputed"
         );
     }
@@ -10634,17 +10405,17 @@ mod tests {
         let scan_id = seed_two_groups(&mut store);
         assert!(!store.results_materialized(scan_id).unwrap());
         // The observer reads and sees the not-yet-prepared (empty) result — it writes nothing.
-        assert!(store.group_summaries(scan_id).unwrap().is_empty());
+        assert!(store.browse_summaries(scan_id).unwrap().is_empty());
         assert!(!store.results_materialized(scan_id).unwrap());
         // The writer prepares it once.
-        store.ensure_materialized(scan_id).unwrap();
+        store.prepare_legacy_for_viewing(scan_id).unwrap();
         assert!(store.results_materialized(scan_id).unwrap());
-        let prepared = store.group_summaries(scan_id).unwrap();
+        let prepared = store.browse_summaries(scan_id).unwrap();
         assert_eq!(prepared.len(), 2);
         assert_eq!(prepared[0].reclaim.guaranteed_bytes(), 200);
         // A second call changes nothing.
-        store.ensure_materialized(scan_id).unwrap();
-        assert_eq!(store.group_summaries(scan_id).unwrap().len(), 2);
+        store.prepare_legacy_for_viewing(scan_id).unwrap();
+        assert_eq!(store.browse_summaries(scan_id).unwrap().len(), 2);
     }
 
     #[test]
@@ -10677,9 +10448,9 @@ mod tests {
                 params![scan_id],
             )
             .unwrap();
-        store.ensure_materialized(scan_id).unwrap();
+        store.prepare_legacy_for_viewing(scan_id).unwrap();
         assert!(
-            store.group_summaries(scan_id).unwrap().is_empty(),
+            store.browse_summaries(scan_id).unwrap().is_empty(),
             "writer preparation must not resurrect groups rejected by verification"
         );
         assert!(
@@ -10702,7 +10473,7 @@ mod tests {
         );
         assert_eq!(store.prepare_completed_scans().unwrap(), 1);
         assert!(store.results_materialized(with_dupes).unwrap());
-        assert_eq!(store.group_summaries(with_dupes).unwrap().len(), 2);
+        assert_eq!(store.browse_summaries(with_dupes).unwrap().len(), 2);
         // Idempotent: nothing left to do on a second pass.
         assert_eq!(store.prepare_completed_scans().unwrap(), 0);
     }
@@ -10712,9 +10483,11 @@ mod tests {
         // The marker must never be observable without the rows it describes.
         let mut store = ScanStore::open_in_memory().unwrap();
         let scan_id = seed_two_groups(&mut store);
-        store.materialize_file_groups(scan_id).unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
         assert!(store.results_materialized(scan_id).unwrap());
-        assert_eq!(store.group_summaries(scan_id).unwrap().len(), 2);
+        assert_eq!(store.browse_summaries(scan_id).unwrap().len(), 2);
     }
 
     #[test]
@@ -10725,7 +10498,9 @@ mod tests {
         let scan_id = seed_two_groups(&mut store);
         let mut groups = store.duplicate_groups(scan_id).unwrap();
         groups.truncate(1); // verification dropped one of them
-        store.record_file_results(scan_id, &groups).unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&groups))
+            .unwrap();
         store
             .conn
             .execute(
@@ -10733,9 +10508,9 @@ mod tests {
                 params![scan_id],
             )
             .unwrap();
-        store.ensure_materialized(scan_id).unwrap();
+        store.prepare_legacy_for_viewing(scan_id).unwrap();
         assert_eq!(
-            store.group_summaries(scan_id).unwrap().len(),
+            store.browse_summaries(scan_id).unwrap().len(),
             1,
             "the dropped group must not come back"
         );
@@ -10862,13 +10637,15 @@ mod tests {
             .unwrap();
         let groups = store.duplicate_groups(id).unwrap();
         assert_eq!(groups.len(), 1);
-        store.record_file_results(id, &groups).unwrap();
+        store
+            .publish_results(id, PublishMode::Explicit(&groups))
+            .unwrap();
 
         // The summary is materialized; group members are read from the `file` manifest by hash.
-        let summaries = store.group_summaries(id).unwrap();
+        let summaries = store.browse_summaries(id).unwrap();
         assert_eq!(summaries.len(), 1, "one materialized group summary");
         assert_eq!(summaries[0].file_count, 2);
-        let files = store.group_files(id, &summaries[0].hash).unwrap();
+        let files = members_of_digest(&store, id, &summaries[0].hash);
         assert_eq!(files.len(), 2);
         assert!(files.iter().all(|f| !f.is_keeper), "no marks yet");
 
@@ -10876,7 +10653,7 @@ mod tests {
         let mut marked = files.clone();
         marked[0].is_keeper = true;
         store.save_marks(id, marked.iter()).unwrap();
-        let reloaded = store.group_files(id, &summaries[0].hash).unwrap();
+        let reloaded = members_of_digest(&store, id, &summaries[0].hash);
         assert!(
             reloaded.iter().any(|f| f.is_keeper),
             "keeper mark pulled in fresh from file_mark"
@@ -10902,12 +10679,12 @@ mod tests {
         store.set_status(id, ScanStatus::Complete).unwrap();
 
         assert!(
-            store.group_summaries(id).unwrap().is_empty(),
+            store.browse_summaries(id).unwrap().is_empty(),
             "no materialization yet"
         );
-        store.ensure_materialized(id).unwrap();
+        store.prepare_legacy_for_viewing(id).unwrap();
         assert_eq!(
-            store.group_summaries(id).unwrap().len(),
+            store.browse_summaries(id).unwrap().len(),
             1,
             "computed and cached in file_group"
         );
@@ -10982,7 +10759,9 @@ mod tests {
             .record_hashes(id, &[(PathBuf::from("/a"), h), (PathBuf::from("/b"), h)])
             .unwrap();
         let groups = store.duplicate_groups(id).unwrap();
-        store.record_file_results(id, &groups).unwrap();
+        store
+            .publish_results(id, PublishMode::Explicit(&groups))
+            .unwrap();
         store
             .record_dir_groups(
                 id,
@@ -11000,7 +10779,7 @@ mod tests {
         store.purge_scan(id).unwrap();
 
         assert!(
-            store.group_summaries(id).unwrap().is_empty(),
+            store.browse_summaries(id).unwrap().is_empty(),
             "file_group cleared"
         );
         // Raw count: the attributed reader needs the scan's own config row, which purge has
@@ -11151,18 +10930,6 @@ mod tests {
     }
 
     // --- db-backed UI ---
-
-    /// ManifestRow with arbitrary mtime/device/inode (for the semaphore branches).
-    fn mrow_dev(path: &str, size: u64, mtime: i64, device: u64, inode: u64) -> ManifestRow {
-        ManifestRow {
-            path: PathBuf::from(path),
-            size,
-            mtime,
-            device,
-            inode,
-            ..Default::default()
-        }
-    }
 
     /// Restores the operator role no matter how the test ends.
     struct RoleReset;
@@ -11553,9 +11320,11 @@ mod tests {
             )
             .unwrap();
         let groups = store.duplicate_groups(id).unwrap();
-        store.record_file_results(id, &groups).unwrap();
+        store
+            .publish_results(id, PublishMode::Explicit(&groups))
+            .unwrap();
 
-        let summaries = store.group_summaries(id).unwrap();
+        let summaries = store.browse_summaries(id).unwrap();
         assert_eq!(summaries.len(), 2);
         assert_eq!(summaries[0].rank, 0, "newest by benefit — rank 0");
         assert_eq!(summaries[0].file_count, 3);
@@ -11581,7 +11350,9 @@ mod tests {
             .record_hashes(id, &[(PathBuf::from("/a"), h), (PathBuf::from("/b"), h)])
             .unwrap();
         let groups = store.duplicate_groups(id).unwrap();
-        store.record_file_results(id, &groups).unwrap();
+        store
+            .publish_results(id, PublishMode::Explicit(&groups))
+            .unwrap();
 
         let dedup_rows: i64 = store
             .conn
@@ -11593,61 +11364,8 @@ mod tests {
             .unwrap();
         assert_eq!(dedup_rows, 0, "file_dedup is not written");
 
-        let files = store.group_files(id, &hex_encode(&h)).unwrap();
+        let files = members_of_digest(&store, id, &hex_encode(&h));
         assert_eq!(files.len(), 2, "group members taken from the file manifest");
-    }
-
-    /// dir_dedup_status + classify yield each of the 6 semaphore branches; a path outside the scan
-    /// does not land in the map (the caller treats it as NotInScan).
-    #[test]
-    fn dir_dedup_status_each_variant() {
-        use crate::tui::commander::dedup::DedupStatus;
-        let mut store = ScanStore::open_in_memory().unwrap();
-        let id = store
-            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
-            .unwrap();
-        store
-            .record_files(
-                id,
-                &[
-                    mrow_dev("/uniq", 10, 0, 1, 1),
-                    mrow_dev("/dupA", 20, 0, 1, 2),
-                    mrow_dev("/dupB", 20, 0, 1, 3),
-                    mrow_dev("/xdevA", 30, 0, 1, 4),
-                    mrow_dev("/xdevB", 30, 0, 2, 5),
-                    mrow_dev("/raw", 40, 0, 1, 6),
-                    mrow_dev("/likeA", 50, 7, 1, 7),
-                    mrow_dev("/likeB", 50, 7, 1, 8),
-                ],
-            )
-            .unwrap();
-        store
-            .record_hashes(
-                id,
-                &[
-                    (PathBuf::from("/uniq"), [1u8; 32]),
-                    (PathBuf::from("/dupA"), [2u8; 32]),
-                    (PathBuf::from("/dupB"), [2u8; 32]),
-                    (PathBuf::from("/xdevA"), [3u8; 32]),
-                    (PathBuf::from("/xdevB"), [3u8; 32]),
-                ],
-            )
-            .unwrap();
-        let paths: Vec<PathBuf> = ["/uniq", "/dupA", "/xdevA", "/raw", "/likeA"]
-            .iter()
-            .map(PathBuf::from)
-            .collect();
-        let rows = store.dir_dedup_status(id, &paths).unwrap();
-        let st = |p: &str| DedupStatus::classify(&rows[&PathBuf::from(p)]);
-        assert_eq!(st("/uniq"), DedupStatus::HashedUnique);
-        assert_eq!(st("/dupA"), DedupStatus::VerifiedDup);
-        assert_eq!(st("/xdevA"), DedupStatus::DangerousDup);
-        assert_eq!(st("/raw"), DedupStatus::Unhashed);
-        assert_eq!(st("/likeA"), DedupStatus::LikelyDuplicate);
-        let none = store
-            .dir_dedup_status(id, &[PathBuf::from("/nope")])
-            .unwrap();
-        assert!(!none.contains_key(&PathBuf::from("/nope")), "NotInScan");
     }
 
     /// dir_sizes_under sums strictly descendants; a neighbour with the same prefix
@@ -11912,7 +11630,7 @@ mod tests {
             store.scan_link_counts_known(id).unwrap(),
             "every walked row carries a real link count"
         );
-        let summaries = store.group_summaries(id).unwrap();
+        let summaries = store.browse_summaries(id).unwrap();
         assert_eq!(summaries.len(), 1, "one duplicate-content group");
         let size = summaries[0].size_bytes;
         assert_eq!(
@@ -13818,8 +13536,14 @@ mod tests {
                 ],
             )
             .unwrap();
-        // Group summaries + the published reclaim total + the prepared marker, in one write.
-        store.materialize_file_groups(scan_id).unwrap();
+        // Group summaries, the v5 authority, the published reclaim total and the prepared marker,
+        // in one write. The exact populations a `--verify` run publishes, through the one
+        // production writer: what a clear or a purge has to remove is what production wrote, not
+        // rows a test hand-crafted beside it.
+        let verified = store.duplicate_groups(scan_id).unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .unwrap();
         // Directory groups: two directories sharing one signature, so the >= 2 filter keeps them.
         store
             .materialize_dir_groups(scan_id, |emit| {
@@ -13845,25 +13569,21 @@ mod tests {
                 ],
             )
             .unwrap();
-        // v5 membership, written by hand: R4A is storage only, so no production writer exists yet.
-        // Explicit mode, generation 1, both members of rank 0.
-        store
-            .conn
-            .execute(
-                "INSERT INTO scan_membership(scan_id, mode, generation) VALUES (?1, 2, 1)",
-                params![scan_id],
-            )
-            .unwrap();
-        for path in ["/tank/a.bin", "/tank/b.bin"] {
+        // The publication above wrote the v5 authority itself: Explicit mode, generation 1, both
+        // members of rank 0 — asserted here so a fixture that stops publishing membership fails
+        // where it is built rather than inside the test that depends on it.
+        assert_eq!(
             store
                 .conn
-                .execute(
-                    "INSERT INTO file_group_member(scan_id, group_rank, path, generation)
-                     VALUES (?1, 0, ?2, 1)",
-                    params![scan_id, path],
+                .query_row(
+                    "SELECT mode, generation FROM scan_membership WHERE scan_id = ?1",
+                    params![scan_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                 )
-                .unwrap();
-        }
+                .unwrap(),
+            (2, 1),
+            "the fixture publishes an explicit first generation"
+        );
         store
             .record_scan_environment(
                 scan_id,
@@ -13897,8 +13617,8 @@ mod tests {
             )
             .unwrap();
         // The operator's own work: one keeper mark on a real group member.
-        let summaries = store.group_summaries(scan_id).unwrap();
-        let mut files = store.group_files(scan_id, &summaries[0].hash).unwrap();
+        let summaries = store.browse_summaries(scan_id).unwrap();
+        let mut files = members_of_digest(store, scan_id, &summaries[0].hash);
         files[0].is_keeper = true;
         store.save_marks(scan_id, files.iter()).unwrap();
         // Neither of these is this scan's result: a move journal entry and a shared cache row.
@@ -14102,23 +13822,23 @@ mod tests {
             "every counter describing the deleted manifest is revoked"
         );
         // Read back through the ordinary APIs, not only the columns.
-        for summary in store.group_summaries(scan_id).unwrap() {
-            let members = store.group_files(scan_id, &summary.hash).unwrap();
+        for summary in store.browse_summaries(scan_id).unwrap() {
+            let members = members_of_digest(&store, scan_id, &summary.hash);
             assert!(
                 !members.is_empty(),
                 "a surviving summary of {} files whose members cannot be found",
                 summary.file_count
             );
         }
-        assert!(store.group_summaries(scan_id).unwrap().is_empty());
+        assert!(store.browse_summaries(scan_id).unwrap().is_empty());
         let reclaim = store.scan_reclaim(scan_id).unwrap();
         assert_eq!(reclaim.guaranteed_bytes(), 0);
         assert_eq!(reclaim.state(), ReclaimState::Unknown);
         // The marker no longer short-circuits an open: preparing a cleared scan finds nothing to
         // hand back, rather than returning through a marker left over from the previous result.
-        store.ensure_materialized(scan_id).unwrap();
+        store.prepare_legacy_for_viewing(scan_id).unwrap();
         assert!(
-            store.group_summaries(scan_id).unwrap().is_empty(),
+            store.browse_summaries(scan_id).unwrap().is_empty(),
             "preparing a cleared scan must not return the previous run's groups"
         );
     }
@@ -14194,9 +13914,11 @@ mod tests {
                 ],
             )
             .unwrap();
-        store.materialize_file_groups(scan_id).unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
 
-        let summaries = store.group_summaries(scan_id).unwrap();
+        let summaries = store.browse_summaries(scan_id).unwrap();
         assert_eq!(summaries.len(), 1, "the next run publishes normally");
         assert_eq!(summaries[0].file_count, 2);
         assert!(store.results_materialized(scan_id).unwrap());
@@ -14368,11 +14090,15 @@ mod tests {
         assert_eq!(membership_rows(&store), (1, 2));
     }
 
-    /// R4A is storage only. Every ordinary flow — a fresh manifest, a derived materialization, a
-    /// `--verify` publication and a legacy preparation — must leave both new tables empty, because
-    /// no production writer exists yet and none may infer an authority from the rows it finds.
+    /// Since R4B-2c publication is production, and this is the positive proof of which flow
+    /// publishes what. An ordinary hash-only completion publishes a DERIVED authority — one
+    /// `scan_membership` row and no member rows, because derived membership IS the manifest's own
+    /// digest join and is answerable without them. `--verify` publishes an EXPLICIT authority
+    /// whose member rows are exactly the populations it verified. Walking and hashing publish
+    /// nothing at all, and preparing a legacy result still invents nothing: an authority nobody
+    /// published may not be inferred from the rows lying around.
     #[test]
-    fn ordinary_flows_write_no_membership() {
+    fn an_ordinary_completion_publishes_derived_authority() {
         let mut store = ScanStore::open_in_memory().unwrap();
 
         // Fresh scan: manifest and hashes only.
@@ -14380,36 +14106,69 @@ mod tests {
         assert_eq!(
             membership_rows(&store),
             (0, 0),
-            "walking/hashing writes none"
+            "walking/hashing publishes none"
         );
 
-        // The default publication path.
-        store.materialize_file_groups(fresh).unwrap();
+        // The default publication path — what every ordinary completion runs.
+        store.publish_results(fresh, PublishMode::Derived).unwrap();
         assert_eq!(
             membership_rows(&store),
-            (0, 0),
-            "derived publication writes none"
+            (1, 0),
+            "one derived authority, and no member rows to go stale beside the manifest"
         );
+        {
+            let snapshot = store.membership_snapshot(fresh).unwrap();
+            assert_eq!(snapshot.mode(), MembershipMode::Derived);
+            assert_eq!(snapshot.generation(), Some(1), "the first publication");
+            let summaries = snapshot.summaries().expect("derived authority answers");
+            assert_eq!(
+                summaries.groups.len(),
+                2,
+                "both seeded groups are published"
+            );
+            // Answerable without member rows: every summary's count comes back through the
+            // authority, so «no rows» is not «no membership».
+            for (id, summary) in &summaries.groups {
+                assert_eq!(
+                    snapshot.group_member_count(id).unwrap(),
+                    summary.file_count,
+                    "the derived group answers its own population"
+                );
+            }
+        }
 
-        // The --verify publication path.
+        // The --verify publication path: the same question, answered by explicit member rows.
         let verified = seed_two_groups(&mut store);
         let groups = store.duplicate_groups(verified).unwrap();
-        store.record_file_results(verified, &groups).unwrap();
+        let explicit_members: i64 = groups.iter().map(|group| group.files.len() as i64).sum();
+        store
+            .publish_results(verified, PublishMode::Explicit(&groups))
+            .unwrap();
         assert_eq!(
             membership_rows(&store),
-            (0, 0),
-            "explicit publication writes none"
+            (2, explicit_members),
+            "an explicit publication writes exactly the populations it verified"
         );
+        {
+            let snapshot = store.membership_snapshot(verified).unwrap();
+            assert_eq!(snapshot.mode(), MembershipMode::Explicit);
+            assert_eq!(snapshot.generation(), Some(1));
+        }
 
         // The legacy preparation path.
         let legacy = seed_two_groups(&mut store);
         store.set_status(legacy, ScanStatus::Complete).unwrap();
-        store.ensure_materialized(legacy).unwrap();
+        store.prepare_legacy_for_viewing(legacy).unwrap();
         assert!(store.results_materialized(legacy).unwrap());
         assert_eq!(
             membership_rows(&store),
-            (0, 0),
+            (2, explicit_members),
             "preparing a legacy result may not invent an authority"
+        );
+        assert_eq!(
+            store.membership_snapshot(legacy).unwrap().mode(),
+            MembershipMode::Unknown,
+            "browsing an old checkpoint leaves it Unknown"
         );
     }
 
@@ -17902,6 +17661,21 @@ mod membership_staging_tests {
     }
 
     /// Takes and drops one snapshot, returning whether it was trusted.
+    /// Members of the group carrying a digest, through the authority — this module's own copy
+    /// of the reader, so it stays independent of the other test module's fixtures.
+    fn members_by_digest(store: &ScanStore, scan_id: i64, hash_hex: &str) -> Vec<FileEntry> {
+        let snapshot = store
+            .membership_snapshot(scan_id)
+            .expect("a published scan");
+        let ids = snapshot
+            .groups_of_digest(hash_hex)
+            .expect("a digest lookup");
+        match ids.first() {
+            Some(id) => snapshot.group(id).expect("the group resolves").members,
+            None => Vec::new(),
+        }
+    }
+
     fn snap_ok(store: &ScanStore, scan_id: i64) -> bool {
         store.membership_snapshot(scan_id).is_ok()
     }
@@ -17922,16 +17696,15 @@ mod membership_staging_tests {
             "one epoch, one full validation"
         );
 
-        let mut marked = store
-            .group_files(
-                scan_id,
-                &[5u8; 32].iter().fold(String::new(), |mut acc, b| {
-                    use std::fmt::Write;
-                    let _ = write!(acc, "{b:02x}");
-                    acc
-                }),
-            )
-            .unwrap();
+        let mut marked = members_by_digest(
+            &store,
+            scan_id,
+            &[5u8; 32].iter().fold(String::new(), |mut acc, b| {
+                use std::fmt::Write;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            }),
+        );
         assert_eq!(marked.len(), 2, "the fixture's group is readable");
         marked[0].is_keeper = true;
         store.save_marks(scan_id, marked.iter()).unwrap();
@@ -18012,7 +17785,9 @@ mod membership_staging_tests {
         assert!(snap_ok(&store, scan_id));
         assert_eq!(store.full_validation_count(), 2);
 
-        store.materialize_file_groups(scan_id).unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
         assert!(
             store.membership_cache.borrow().is_none(),
             "materialization revoked"
@@ -18427,7 +18202,7 @@ mod membership_staging_tests {
         assert_eq!(store.full_validation_count(), 1);
 
         // Already prepared: `ensure_materialized` returns at the marker.
-        store.ensure_materialized(scan_id).unwrap();
+        store.prepare_legacy_for_viewing(scan_id).unwrap();
         // Nothing pending: the loop body never runs.
         store.prepare_completed_scans().unwrap();
         // Already authoritative: preparation validates and no-ops.
@@ -18947,15 +18722,9 @@ mod membership_staging_tests {
             .publish_results(scan_id, PublishMode::Explicit(&verified))
             .unwrap();
 
-        // The parent's reader still returns it — that is the red this replaces.
-        assert!(
-            store
-                .dup_files_inside(scan_id, &dir)
-                .unwrap()
-                .contains(&lonely),
-            "the raw-digest reader returns the rejected member"
-        );
-
+        // The reader that returned `lonely` here is gone: on the parent, `dup_files_inside`
+        // answered from `hash IN file_group` and handed back exactly this verification-rejected
+        // pathname (R4B-2c red transcript, D3). What follows is the answer that replaces it.
         let snapshot = store.membership_snapshot(scan_id).unwrap();
         match snapshot.dir_group_at(&dir).unwrap() {
             DirGroupAnswer::InnerDupes {
@@ -19453,9 +19222,48 @@ mod membership_staging_tests {
         assert!(
             matches!(
                 snapshot.plan_members(&id),
-                Err(MembershipMiss::Inconsistent { .. })
+                Err(PlanEvidenceMiss::Membership(
+                    MembershipMiss::Inconsistent { .. }
+                ))
             ),
             "a plan may not be built on it"
+        );
+        drop(snapshot);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other half of the same boundary: a row the store reads perfectly well, which the
+    /// evidence constructor refuses. That refusal is already typed, and it stays typed — the
+    /// builder must be able to match the variant, not parse a sentence out of a store-class
+    /// error. Its end-to-end counterpart is `a_digest_that_was_never_verified_refuses_the_plan`.
+    #[test]
+    fn plan_members_hands_back_the_constructors_own_refusal() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2c_plan_member_refusal");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let (scan_id, x1, _x2, _y1) = published_split(&dir, &mut store);
+        let id = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            snapshot.group_of_path(&x1).unwrap().unwrap()
+        };
+
+        // A well-formed row whose digest this build never verified against the file itself.
+        store.corrupt_directly(
+            "UPDATE file SET identity_version = 0 WHERE scan_id = ?1 AND path = ?2",
+            params![scan_id, x1.to_string_lossy()],
+        );
+
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        assert!(
+            snapshot.group_page(&id, 0, 10).is_ok(),
+            "browsing still shows the group"
+        );
+        assert_eq!(
+            snapshot.plan_members(&id),
+            Err(PlanEvidenceMiss::Member(PlanRefusal::UnverifiedIdentity {
+                path: x1
+            })),
+            "the constructor's typed refusal is what comes back"
         );
         drop(snapshot);
         std::fs::remove_dir_all(&dir).ok();

@@ -14,7 +14,7 @@ use crate::model::scan::{
     HashProfile, OmissionAccounting, ScanConfig, ScanPhase, ScanProgress, ScanResults, ScanStatus,
     ScanSummary, WalkStage,
 };
-use crate::state::{ManifestRow, ScanStore};
+use crate::state::{ManifestRow, MembershipMode, PublishMode, ScanStore};
 use walk::{OmissionSnapshot, SnapshotUnavailable, WalkOutcome};
 
 pub mod governor;
@@ -93,17 +93,17 @@ pub fn run_scan(
 
     // Guard: opening an already-finished scan does NOT rescan and does NOT touch
     // the time metric (`add_elapsed` below). We normally don't get here — `resume_selected`
-    // routes Complete to `spawn_open_completed`; this is a safeguard against direct calls.
+    // routes Complete to the browsing actor; this is a safeguard against direct calls.
+    //
+    // Preparation is browse-only: a legacy checkpoint gets viewable summaries and keeps its
+    // Unknown authority, an authoritative one is validated and left byte-identical. Neither
+    // mints membership, and no group list travels back — whoever shows the result reads it
+    // through the authority itself.
     if resume.is_some() && store.scan_status(scan_id)?.is_completed() {
-        store.ensure_materialized(scan_id)?;
-        let summaries = store.group_summaries(scan_id)?;
+        store.prepare_legacy_for_viewing(scan_id)?;
         let summary = store.scan_summary(scan_id)?;
         on_progress(ScanProgress::Done(summary.clone()));
-        return Ok(ScanOutcome::Completed(ScanResults {
-            scan_id,
-            summaries,
-            summary,
-        }));
+        return Ok(ScanOutcome::Completed(ScanResults { scan_id, summary }));
     }
 
     let environment = crate::zfs::pool::scan_environment(config.storage_type_override.as_deref());
@@ -325,15 +325,17 @@ fn run_phases(
             return Ok(ScanOutcome::Cancelled);
         }
 
-        // file_group summaries. On the default path — by SQL aggregation, WITHOUT
-        // loading Vec<DuplicateGroup> into RAM (cuts the transient peak on 2.2M /tank).
-        // With --verify a byte-for-byte comparison is needed, which can SPLIT groups → we load
-        // the groups and write the verified ones the old way (result-identical to the previous behavior).
+        // The publication. An ordinary hash-only completion publishes `Derived` — one SQL
+        // aggregation, no `Vec<DuplicateGroup>` in RAM (that is what keeps the transient peak
+        // down on 2.2M /tank) — and membership is the manifest by each summary's digest.
+        // `--verify` compares bytes, which can SPLIT one digest into two populations, so it
+        // publishes `Explicit` from exactly the populations verification returned: two ranks
+        // may then share a digest legitimately, each answering only for its own members.
         if verify {
-            verify_and_record(store, scan_id)?;
+            verify_and_publish(store, scan_id)?;
         } else {
-            store.materialize_file_groups(scan_id)?;
-            tracing::info!("RSS probe: after materialize_file_groups (SQL): {}", rss());
+            store.publish_results(scan_id, PublishMode::Derived)?;
+            tracing::info!("RSS probe: after publish_results (Derived SQL): {}", rss());
         }
         // The scan-wide account, from the same snapshot the builders used. A live completion is
         // structurally either freshly committed, an authoritative walk-less resume, or the typed
@@ -395,10 +397,14 @@ fn run_phases(
         }
     }
 
-    // ensure_materialized — a safeguard for the rare was_complete branch without materialization
-    // (the normal path already wrote file_group above). The summaries are light.
-    store.ensure_materialized(scan_id)?;
-    let summaries = store.group_summaries(scan_id)?;
+    // A safeguard for the rare was_complete branch, which published nothing in this run: it
+    // gets browse-only summaries and keeps whatever authority it had. The normal path just
+    // published, so preparation validates that publication and changes nothing.
+    store.prepare_legacy_for_viewing(scan_id)?;
+    // How many groups this scan now holds, read through the authority that owns them. A scan
+    // with no authority (the legacy branch) reports its candidate digests instead of a zero
+    // that would read as «no duplicates».
+    let groups_found = published_group_count(store, scan_id)?;
     tracing::info!("RSS probe: grouping phase end: {}", rss());
 
     // The summary statistics — from the light summaries: groups_found no longer requires the full
@@ -407,7 +413,7 @@ fn run_phases(
     // a different place is a second answer waiting to disagree.
     let summary = ScanSummary {
         files_scanned: store.manifest_count(scan_id)?,
-        groups_found: summaries.len(),
+        groups_found,
         reclaim: store.scan_reclaim(scan_id)?,
         already_linked_sets: store.already_linked_sets(scan_id)?,
         bytes_hashed: recon.hashed_bytes,
@@ -419,11 +425,30 @@ fn run_phases(
             None => store.scan_omission_accounting(scan_id)?,
         },
     };
-    Ok(ScanOutcome::Completed(ScanResults {
-        scan_id,
-        summaries,
-        summary,
-    }))
+    Ok(ScanOutcome::Completed(ScanResults { scan_id, summary }))
+}
+
+/// How many groups the scan's CURRENT publication holds.
+///
+/// Read through the membership snapshot, so the number and the groups the operator will browse
+/// come from one authority. A scan with no authority at all — the legacy checkpoint the
+/// was-complete branch reopens — has no published groups; it reports how many raw-digest
+/// candidates it carries, which is what its browse-only view will show, rather than a zero that
+/// would read as «this scan found no duplicates».
+fn published_group_count(store: &ScanStore, scan_id: i64) -> Result<usize> {
+    let snapshot = store
+        .membership_snapshot(scan_id)
+        .map_err(|miss| AppError::msg(format!("scan {scan_id}: {miss:?}")))?;
+    if snapshot.mode() == MembershipMode::Unknown {
+        let candidates = snapshot
+            .unknown_candidates()
+            .map_err(|miss| AppError::msg(format!("scan {scan_id}: {miss:?}")))?;
+        return Ok(candidates.map_or(0, |view| view.candidates.len()));
+    }
+    let summaries = snapshot
+        .summaries()
+        .map_err(|miss| AppError::msg(format!("scan {scan_id}: {miss:?}")))?;
+    Ok(summaries.groups.len())
 }
 
 /// Walk phase: builds the file manifest and publishes what the walk left out.
@@ -888,23 +913,26 @@ fn hash_phase(
 }
 
 /// The `--verify` publication boundary: loads the candidate groups, byte-verifies ALL of them
-/// and only then records the surviving populations — `record_file_results` is never reached
-/// when any group failed to verify, so a read failure surfaces as the scan's error instead of
-/// an empty or shrunken published result. Returns the verified group count.
-fn verify_and_record(store: &mut ScanStore, scan_id: i64) -> Result<usize> {
+/// and only then publishes the surviving populations — the publication is never reached when
+/// any group failed to verify, so a read failure surfaces as the scan's error instead of an
+/// empty or shrunken published result. Returns the verified group count.
+fn verify_and_publish(store: &mut ScanStore, scan_id: i64) -> Result<usize> {
     let rss = || crate::tui::human_bytes(crate::sysmon::current_rss_bytes());
     tracing::info!("RSS probe: before duplicate_groups (--verify): {}", rss());
     let groups = store.duplicate_groups(scan_id)?;
     // Byte-for-byte comparison — protection against a hash collision; may split groups.
     // A split changes which allocations a group holds, so its worth is recomputed from
-    // the surviving membership inside `record_file_results` — never carried over.
+    // the surviving membership inside the publication — never carried over.
     let groups = verify::verify_groups(groups)?;
     tracing::info!(
         "RSS probe: after verify ({} groups): {}",
         groups.len(),
         rss()
     );
-    store.record_file_results(scan_id, &groups)?;
+    // Explicit membership: every surviving pathname gets a member row against the rank the
+    // authoritative reclaim order assigned it, so a rejected pathname has no row at all and
+    // cannot be handed back by any reader.
+    store.publish_results(scan_id, PublishMode::Explicit(&groups))?;
     Ok(groups.len())
 }
 
@@ -1078,7 +1106,7 @@ mod hash_failures_tests {
             "no result was published"
         );
         assert!(
-            store.group_summaries(id).unwrap().is_empty(),
+            store.browse_summaries(id).unwrap().is_empty(),
             "and no group summary"
         );
         // `add_elapsed` is the last resume-side write of `run_scan`; 0 proves it never ran (and an
@@ -1606,7 +1634,7 @@ mod hash_failures_tests {
             ScanOutcome::Cancelled => panic!("the first run completes"),
         };
         assert_eq!(
-            store.group_summaries(id).unwrap().len(),
+            store.browse_summaries(id).unwrap().len(),
             1,
             "the first run published one group"
         );
@@ -1629,7 +1657,7 @@ mod hash_failures_tests {
 
         assert_eq!(store.manifest_count(id).unwrap(), 0, "the manifest is gone");
         assert!(
-            store.group_summaries(id).unwrap().is_empty(),
+            store.browse_summaries(id).unwrap().is_empty(),
             "no file group may outlive the manifest its members came from"
         );
         assert!(
@@ -1903,12 +1931,12 @@ mod verify_boundary_tests {
         assert!(open_regular_nofollow(&b).is_err());
 
         assert!(
-            verify_and_record(&mut store, scan_id).is_err(),
+            verify_and_publish(&mut store, scan_id).is_err(),
             "the failed byte verification must reach the caller"
         );
 
         assert!(
-            store.group_summaries(scan_id).unwrap().is_empty(),
+            store.browse_summaries(scan_id).unwrap().is_empty(),
             "no verified file_group result may be published"
         );
         assert!(
@@ -1927,12 +1955,12 @@ mod verify_boundary_tests {
         std::fs::remove_file(&b).unwrap();
         std::fs::write(&b, payload).unwrap();
         assert_eq!(
-            verify_and_record(&mut store, scan_id).unwrap(),
+            verify_and_publish(&mut store, scan_id).unwrap(),
             1,
             "the repaired member verifies and one group is published"
         );
         assert!(store.results_materialized(scan_id).unwrap());
-        assert_eq!(store.group_summaries(scan_id).unwrap().len(), 1);
+        assert_eq!(store.browse_summaries(scan_id).unwrap().len(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }
