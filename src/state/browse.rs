@@ -702,14 +702,6 @@ pub enum BrowseRequest {
         req: RequestId,
         id: GroupId,
     },
-    /// Reverse lookup by identity. The App asks `FileInfo` instead, which answers the same
-    /// question AND separates «not in this scan» from «in the scan, in no group».
-    #[allow(dead_code)]
-    GroupOfPath {
-        act: Activation,
-        req: RequestId,
-        path: PathBuf,
-    },
     FileInfo {
         act: Activation,
         req: RequestId,
@@ -759,14 +751,6 @@ pub enum BrowseRequest {
         req: RequestId,
         cwd: PathBuf,
     },
-    /// The App never issues it: the creation time arrives inside the one `Open` payload, so the
-    /// header costs no request at all.
-    #[allow(dead_code)]
-    ScanCreatedAt {
-        act: Activation,
-        req: RequestId,
-        scan_id: i64,
-    },
     CacheHash {
         act: Activation,
         req: RequestId,
@@ -803,13 +787,6 @@ pub enum BrowseEvent {
         act: Activation,
         req: RequestId,
         result: std::result::Result<u64, MembershipMiss>,
-    },
-    /// The reply to the request the App does not issue (see `BrowseRequest::GroupOfPath`).
-    #[allow(dead_code)]
-    GroupOfPath {
-        act: Activation,
-        req: RequestId,
-        result: std::result::Result<Option<GroupId>, MembershipMiss>,
     },
     FileInfo {
         act: Activation,
@@ -866,14 +843,6 @@ pub enum BrowseEvent {
         req: RequestId,
         cwd: PathBuf,
         result: std::result::Result<Option<i64>, StoreMiss>,
-    },
-    /// The reply to the request the App does not issue (see `BrowseRequest::ScanCreatedAt`).
-    #[allow(dead_code)]
-    ScanCreatedAt {
-        act: Activation,
-        req: RequestId,
-        scan_id: i64,
-        result: std::result::Result<Option<String>, StoreMiss>,
     },
     CacheHashAck {
         /// The identity-cache write is fire-and-forget: only its failure is acted on, so the
@@ -1804,10 +1773,8 @@ mod guarded {
     use crate::error::Result;
     use crate::model::duplicate::{AttributedDirGroup, DirSigAlgo, FileEntry};
     use crate::model::plan::{ActionPlan, MarkIntent, PlanResult, RequestedMark};
-    use crate::model::scan::{ScanConfig, ScanStatus, ScanSummary};
     use crate::state::store::{
-        AttributedDirGroupSummaries, LiveDirSignature, MarkWriteError, MembershipMiss,
-        MembershipSnapshot, ScanStore,
+        LiveDirSignature, MarkWriteError, MembershipMiss, MembershipSnapshot, ScanStore,
     };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -1870,26 +1837,11 @@ mod guarded {
         }
 
         // ---- legacy operations: the door pays their one probe ----
-
-        pub(crate) fn load_config(&self, scan_id: i64) -> Result<ScanConfig> {
-            self.inner.ensure_current_path()?;
-            self.inner.load_config(scan_id)
-        }
-
-        pub(crate) fn scan_status(&self, scan_id: i64) -> Result<ScanStatus> {
-            self.inner.ensure_current_path()?;
-            self.inner.scan_status(scan_id)
-        }
-
-        pub(crate) fn scan_summary(&self, scan_id: i64) -> Result<ScanSummary> {
-            self.inner.ensure_current_path()?;
-            self.inner.scan_summary(scan_id)
-        }
-
-        pub(crate) fn scan_created_at(&self, scan_id: i64) -> Result<Option<String>> {
-            self.inner.ensure_current_path()?;
-            self.inner.scan_created_at(scan_id)
-        }
+        //
+        // R4B-2c1 removed `load_config`, `scan_status`, `scan_summary`, `scan_created_at` and
+        // `attributed_dir_group_summaries` from this door. They existed only to assemble an
+        // `Open` payload out of separate autocommit reads; that payload now comes from one
+        // `MembershipSnapshot`, which pays its own probe and reads all of it in one transaction.
 
         pub(crate) fn marked_count(&self, scan_id: i64) -> Result<u64> {
             self.inner.ensure_current_path()?;
@@ -1904,14 +1856,6 @@ mod guarded {
         pub(crate) fn latest_scan_covering(&self, cwd: &Path) -> Result<Option<i64>> {
             self.inner.ensure_current_path()?;
             self.inner.latest_scan_covering(cwd)
-        }
-
-        pub(crate) fn attributed_dir_group_summaries(
-            &self,
-            scan_id: i64,
-        ) -> Result<AttributedDirGroupSummaries> {
-            self.inner.ensure_current_path()?;
-            self.inner.attributed_dir_group_summaries(scan_id)
         }
 
         pub(crate) fn attributed_dir_group(
@@ -2218,9 +2162,6 @@ mod arms {
                 limit,
             } => group_open(state, emitter, act, req, id, offset, limit),
             BrowseRequest::GroupCount { act, req, id } => group_count(state, emitter, act, req, id),
-            BrowseRequest::GroupOfPath { act, req, path } => {
-                group_of_path(state, emitter, act, req, path)
-            }
             BrowseRequest::FileInfo { act, req, path } => file_info(state, emitter, act, req, path),
             BrowseRequest::DirGroupAt { act, req, dir } => {
                 dir_group_at(state, emitter, act, req, dir)
@@ -2251,9 +2192,6 @@ mod arms {
             BrowseRequest::LatestScan { act, req } => latest_scan(state, emitter, act, req),
             BrowseRequest::CoveringScan { act, req, cwd } => {
                 covering_scan(state, emitter, act, req, cwd)
-            }
-            BrowseRequest::ScanCreatedAt { act, req, scan_id } => {
-                scan_created_at(state, emitter, act, req, scan_id)
             }
             BrowseRequest::CacheHash {
                 act,
@@ -2297,11 +2235,6 @@ mod arms {
             BrowseRequest::GroupCount { act, req, .. } => {
                 emitter.finish(state, Err::<u64, _>(closing_miss()), |result| {
                     BrowseEvent::GroupCount { act, req, result }
-                })
-            }
-            BrowseRequest::GroupOfPath { act, req, .. } => {
-                emitter.finish(state, Err::<Option<GroupId>, _>(closing_miss()), |result| {
-                    BrowseEvent::GroupOfPath { act, req, result }
                 })
             }
             BrowseRequest::FileInfo { act, req, .. } => emitter.finish(
@@ -2376,16 +2309,6 @@ mod arms {
                     }
                 })
             }
-            BrowseRequest::ScanCreatedAt { act, req, scan_id } => emitter.finish(
-                state,
-                Err::<Option<String>, _>(StoreMiss::Closing),
-                |result| BrowseEvent::ScanCreatedAt {
-                    act,
-                    req,
-                    scan_id,
-                    result,
-                },
-            ),
             BrowseRequest::Shutdown => {}
         }
     }
@@ -2694,60 +2617,65 @@ mod arms {
             door.prepare_legacy_for_viewing(scan_id)
                 .map_err(|err| classify_app(err, |detail| BrowseOpenFailure::Prepare { detail }))?;
         }
+        // ONE read snapshot for the WHOLE payload. Every field below — membership, status,
+        // summary, creation time, marked count, directory summaries and the config the candidate
+        // is constructed with — is read inside this transaction and therefore describes one
+        // database state. A second writer that republishes or re-marks while the payload is being
+        // built cannot split it: this open either returns the complete older state or refuses,
+        // and the next `Open` sees the newer one whole.
         step("snapshot");
-        let presentation = {
-            let snapshot = door
-                .membership_snapshot(scan_id)
-                .map_err(|miss| classify_miss(miss, BrowseOpenFailure::Snapshot))?;
-            if snapshot.mode() == MembershipMode::Unknown {
-                let candidates = snapshot
-                    .unknown_candidates()
-                    .map_err(|miss| classify_miss(miss, BrowseOpenFailure::Summaries))?;
-                match candidates {
-                    Some(view) => Presentation::Unpublished(view),
-                    // Unreachable by construction — the mode WAS Unknown — refused rather
-                    // than papered over with an empty view.
-                    None => {
-                        return Err(CandidateFail::Typed(BrowseOpenFailure::Summaries(
-                            MembershipMiss::Store {
-                                detail: "the candidate view is missing for an Unknown scan"
-                                    .to_string(),
-                            },
-                        )))
-                    }
+        let snapshot = door
+            .membership_snapshot(scan_id)
+            .map_err(|miss| classify_miss(miss, BrowseOpenFailure::Snapshot))?;
+        let presentation = if snapshot.mode() == MembershipMode::Unknown {
+            let candidates = snapshot
+                .unknown_candidates()
+                .map_err(|miss| classify_miss(miss, BrowseOpenFailure::Summaries))?;
+            match candidates {
+                Some(view) => Presentation::Unpublished(view),
+                // Unreachable by construction — the mode WAS Unknown — refused rather
+                // than papered over with an empty view.
+                None => {
+                    return Err(CandidateFail::Typed(BrowseOpenFailure::Summaries(
+                        MembershipMiss::Store {
+                            detail: "the candidate view is missing for an Unknown scan".to_string(),
+                        },
+                    )))
                 }
-            } else {
-                Presentation::Published(
-                    snapshot
-                        .summaries()
-                        .map_err(|miss| classify_miss(miss, BrowseOpenFailure::Summaries))?,
-                )
             }
+        } else {
+            Presentation::Published(
+                snapshot
+                    .summaries()
+                    .map_err(|miss| classify_miss(miss, BrowseOpenFailure::Summaries))?,
+            )
         };
         step("config");
-        let config = door
-            .load_config(scan_id)
+        let config = snapshot
+            .scan_config()
             .map_err(|err| classify_app(err, |detail| BrowseOpenFailure::Config { detail }))?;
         step("status");
-        let status = door
-            .scan_status(scan_id)
+        let status = snapshot
+            .scan_status()
             .map_err(|err| classify_app(err, |detail| BrowseOpenFailure::ScanStatus { detail }))?;
         step("summary");
-        let summary = door
-            .scan_summary(scan_id)
+        let summary = snapshot
+            .scan_summary()
             .map_err(|err| classify_app(err, |detail| BrowseOpenFailure::ScanSummary { detail }))?;
         step("created_at");
-        let created_at = door
-            .scan_created_at(scan_id)
+        let created_at = snapshot
+            .scan_created_at()
             .map_err(|err| classify_app(err, |detail| BrowseOpenFailure::CreatedAt { detail }))?;
         step("marked");
-        let marked_count = door
-            .marked_count(scan_id)
+        let marked_count = snapshot
+            .marked_count()
             .map_err(|err| classify_app(err, |detail| BrowseOpenFailure::MarkedCount { detail }))?;
         step("dir_groups");
-        let dir_groups = door
-            .attributed_dir_group_summaries(scan_id)
+        let dir_groups = snapshot
+            .attributed_dir_group_summaries()
             .map_err(|err| classify_app(err, |detail| BrowseOpenFailure::DirGroups { detail }))?;
+        // The snapshot ends here, with the complete payload already built from it.
+        drop(snapshot);
         Ok(Candidate {
             payload: OpenedBrowse {
                 scan_id,
@@ -2880,29 +2808,6 @@ mod arms {
             },
         };
         emitter.finish(state, step, |result| BrowseEvent::GroupCount {
-            act,
-            req,
-            result,
-        });
-    }
-
-    fn group_of_path(
-        state: &mut ActorState,
-        emitter: &Emitter,
-        act: Activation,
-        req: RequestId,
-        path: PathBuf,
-    ) {
-        let step = match state.scan_gate(act, false) {
-            Err(miss) => Err(miss_to_membership(miss)),
-            Ok(scan_id) => match state.slot {
-                Slot::Open(ref door) => door
-                    .membership_snapshot(scan_id)
-                    .and_then(|snapshot| snapshot.group_of_path(&path)),
-                Slot::Absent | Slot::Poisoned { .. } => Err(miss_to_membership(StoreMiss::NotOpen)),
-            },
-        };
-        emitter.finish(state, step, |result| BrowseEvent::GroupOfPath {
             act,
             req,
             result,
@@ -3347,28 +3252,6 @@ mod arms {
         });
     }
 
-    fn scan_created_at(
-        state: &mut ActorState,
-        emitter: &Emitter,
-        act: Activation,
-        req: RequestId,
-        scan_id: i64,
-    ) {
-        let step = match state.connection_gate(false) {
-            Err(miss) => Err(miss),
-            Ok(()) => match state.slot {
-                Slot::Open(ref door) => door.scan_created_at(scan_id).map_err(app_to_miss),
-                Slot::Absent | Slot::Poisoned { .. } => Err(StoreMiss::NotOpen),
-            },
-        };
-        emitter.finish(state, step, |result| BrowseEvent::ScanCreatedAt {
-            act,
-            req,
-            scan_id,
-            result,
-        });
-    }
-
     #[allow(clippy::too_many_arguments)] // the frozen protocol carries the full identity key
     fn cache_hash(
         state: &mut ActorState,
@@ -3693,7 +3576,6 @@ mod tests {
             BrowseEvent::PanelData { req, .. } => ("PanelData", Some(*req)),
             BrowseEvent::Group { req, .. } => ("Group", Some(*req)),
             BrowseEvent::GroupCount { req, .. } => ("GroupCount", Some(*req)),
-            BrowseEvent::GroupOfPath { req, .. } => ("GroupOfPath", Some(*req)),
             BrowseEvent::FileInfo { req, .. } => ("FileInfo", Some(*req)),
             BrowseEvent::DirGroupAt { req, .. } => ("DirGroupAt", Some(*req)),
             BrowseEvent::DirGroupOpened { req, .. } => ("DirGroupOpened", Some(*req)),
@@ -3705,7 +3587,6 @@ mod tests {
             BrowseEvent::ReconcileAck { req, .. } => ("ReconcileAck", Some(*req)),
             BrowseEvent::LatestScan { req, .. } => ("LatestScan", Some(*req)),
             BrowseEvent::CoveringScan { req, .. } => ("CoveringScan", Some(*req)),
-            BrowseEvent::ScanCreatedAt { req, .. } => ("ScanCreatedAt", Some(*req)),
             BrowseEvent::CacheHashAck { req, .. } => ("CacheHashAck", Some(*req)),
             BrowseEvent::Closed { .. } => ("Closed", None),
         }
@@ -3770,17 +3651,6 @@ mod tests {
                 act,
                 req,
                 id: ids[0],
-            },
-        );
-        let req = rig.req();
-        push(
-            &mut rig,
-            "GroupOfPath",
-            req,
-            BrowseRequest::GroupOfPath {
-                act,
-                req,
-                path: a1.clone(),
             },
         );
         let req = rig.req();
@@ -3892,13 +3762,6 @@ mod tests {
         let req = rig.req();
         push(
             &mut rig,
-            "ScanCreatedAt",
-            req,
-            BrowseRequest::ScanCreatedAt { act, req, scan_id },
-        );
-        let req = rig.req();
-        push(
-            &mut rig,
             "CacheHashAck",
             req,
             BrowseRequest::CacheHash {
@@ -3946,7 +3809,6 @@ mod tests {
                 BrowseRequest::PanelData { .. } => "PanelData",
                 BrowseRequest::GroupOpen { .. } => "Group",
                 BrowseRequest::GroupCount { .. } => "GroupCount",
-                BrowseRequest::GroupOfPath { .. } => "GroupOfPath",
                 BrowseRequest::FileInfo { .. } => "FileInfo",
                 BrowseRequest::DirGroupAt { .. } => "DirGroupAt",
                 BrowseRequest::OpenDirGroup { .. } => "DirGroupOpened",
@@ -3957,7 +3819,6 @@ mod tests {
                 BrowseRequest::ReconcileAfterBatch { .. } => "ReconcileAck",
                 BrowseRequest::LatestScan { .. } => "LatestScan",
                 BrowseRequest::CoveringScan { .. } => "CoveringScan",
-                BrowseRequest::ScanCreatedAt { .. } => "ScanCreatedAt",
                 BrowseRequest::CacheHash { .. } => "CacheHashAck",
                 BrowseRequest::Shutdown => "Closed",
             }
@@ -4423,14 +4284,26 @@ mod tests {
         rig.shutdown();
     }
 
+    /// A swap DURING candidate construction can no longer split the payload.
+    ///
+    /// Since R4B-2c1 every field of an `Open` is read inside ONE snapshot — a transaction over
+    /// the file this connection already holds open — so the answer is the complete OLD state,
+    /// never old membership beside new totals. The swap is caught, typed, by the very next
+    /// request's probe, which uninstalls the activation and leaves only a fresh `Open` as the
+    /// way back.
+    ///
+    /// This replaces the assertion that the open itself refuses class B here. That refusal came
+    /// from the payload's later fields each paying their own probe over their own autocommit
+    /// read — which is precisely the multi-state assembly this correction removes. The swap
+    /// BEFORE the snapshot is still class B at the open: `membership_snapshot` probes first.
     #[test]
-    fn a_swap_during_candidate_construction_uninstalls_both() {
+    fn a_swap_during_candidate_construction_keeps_the_payload_whole() {
         let mut rig = Rig::new("class_b_late", BrowseRole::Operator);
         rig.open(1);
         let db = rig.db.clone();
         let mut fired = false;
         rig.hooks.on_open_step(move |step| {
-            // After the snapshot was taken and dropped, before the dir-group summaries read.
+            // Inside the snapshot, after membership and before the dir-group summaries.
             if step == "dir_groups" && !fired {
                 fired = true;
                 let aside = db.with_extension("gone");
@@ -4446,14 +4319,19 @@ mod tests {
         }));
         match rig.recv() {
             BrowseEvent::OpenFinished {
-                result: Err(BrowseOpenFailure::PathChanged { .. }),
+                result: Ok(payload),
                 ..
-            } => {}
-            other => panic!("a swap during candidate construction is class B: {other:?}"),
+            } => {
+                assert_eq!(
+                    payload.scan_id, rig.scan_id,
+                    "the payload is the old checkpoint's, whole"
+                );
+            }
+            other => panic!("the payload must not be split by a swap under it: {other:?}"),
         }
         let req = rig.req();
         assert!(rig.handle.send_raw(BrowseRequest::MarkedCount {
-            act: Activation(1),
+            act: Activation(2),
             req,
         }));
         match rig.recv() {
@@ -4461,7 +4339,7 @@ mod tests {
                 result: Err(StoreMiss::PathChanged { .. }),
                 ..
             } => {}
-            other => panic!("class B must uninstall the old activation: {other:?}"),
+            other => panic!("the next touch must be typed class B: {other:?}"),
         }
         rig.shutdown();
     }
@@ -5080,17 +4958,6 @@ mod tests {
         let req = rig.req();
         push(
             &mut rig,
-            "GroupOfPath",
-            req,
-            BrowseRequest::GroupOfPath {
-                act,
-                req,
-                path: a1.clone(),
-            },
-        );
-        let req = rig.req();
-        push(
-            &mut rig,
             "FileInfo",
             req,
             BrowseRequest::FileInfo {
@@ -5205,13 +5072,6 @@ mod tests {
                 req,
                 cwd: dir.clone(),
             },
-        );
-        let req = rig.req();
-        push(
-            &mut rig,
-            "ScanCreatedAt",
-            req,
-            BrowseRequest::ScanCreatedAt { act, req, scan_id },
         );
         // The closing flag and the one Shutdown, in the gate's single critical section —
         // exactly what the fleet's `begin_close` performs.
@@ -6289,6 +6149,14 @@ mod tests {
             snapshot.panel_files(&refs).unwrap();
             snapshot.file_info(&files[0]).unwrap();
             snapshot.dir_group_at(&dir).unwrap();
+            // The whole `Open` payload rides the same snapshot since R4B-2c1, and costs the
+            // same nothing: the probe was spent when the snapshot was taken.
+            snapshot.scan_config().unwrap();
+            snapshot.scan_status().unwrap();
+            snapshot.scan_summary().unwrap();
+            snapshot.scan_created_at().unwrap();
+            snapshot.marked_count().unwrap();
+            snapshot.attributed_dir_group_summaries().unwrap();
             at = expect(&door, at, 0, "every snapshot reader together");
         }
         door.prepare_legacy_for_viewing(scan_id).unwrap();
@@ -6296,23 +6164,16 @@ mod tests {
         door.save_marks_settled(scan_id, &[keeper_entry(&files[0])])
             .unwrap();
         at = expect(&door, at, 1, "save_marks_settled");
-        // Legacy operations: exactly one door probe each.
-        door.load_config(scan_id).unwrap();
-        at = expect(&door, at, 1, "load_config");
-        door.scan_status(scan_id).unwrap();
-        at = expect(&door, at, 1, "scan_status");
-        door.scan_summary(scan_id).unwrap();
-        at = expect(&door, at, 1, "scan_summary");
-        door.scan_created_at(scan_id).unwrap();
-        at = expect(&door, at, 1, "scan_created_at");
+        // Legacy operations: exactly one door probe each. Since R4B-2c1 the payload readers
+        // (`load_config`, `scan_status`, `scan_summary`, `scan_created_at` and
+        // `attributed_dir_group_summaries`) are gone from this door — they are snapshot readers
+        // now, and the row above already prices every one of those at zero.
         door.marked_count(scan_id).unwrap();
         at = expect(&door, at, 1, "marked_count");
         door.latest_scan_id().unwrap();
         at = expect(&door, at, 1, "latest_scan_id");
         door.latest_scan_covering(&dir).unwrap();
         at = expect(&door, at, 1, "latest_scan_covering");
-        door.attributed_dir_group_summaries(scan_id).unwrap();
-        at = expect(&door, at, 1, "attributed_dir_group_summaries");
         door.attributed_dir_group(scan_id, "0000").unwrap();
         at = expect(&door, at, 1, "attributed_dir_group");
         door.dir_sizes_under(scan_id, std::slice::from_ref(&dir))
@@ -6355,14 +6216,20 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The Open candidate sequence spends exactly the tabled count — 8 for an operator, 7 for
+    /// The Open candidate sequence spends exactly the tabled count — 2 for an operator, 1 for
     /// an observer (`prepare` is operator-only). The open bracket's own two
     /// `probe_existing_db_file` calls live inside the store and are not `ensure_current_path`
     /// probes, so they are outside this counter by design.
+    ///
+    /// R4B-2c1 recalculated this table rather than preserving it. It used to be 8 and 7 because
+    /// six payload fields were six separate guarded door calls, each paying its own probe over
+    /// its own autocommit read. The payload is one snapshot now: one probe, one database state,
+    /// six answers. Fewer probes is a consequence here, not the goal — the goal was that the
+    /// six answers describe the same instant.
     #[test]
     fn an_open_candidate_spends_the_tabled_probe_count() {
         let (dir, db, scan_id, _files) = seeded_db("open_probes");
-        for (role, tabled) in [(BrowseRole::Operator, 8), (BrowseRole::Observer, 7)] {
+        for (role, tabled) in [(BrowseRole::Operator, 2), (BrowseRole::Observer, 1)] {
             let mut door = guarded::BrowsingStore::open(&db, role).unwrap();
             let before = door.identity_probes();
             if role == BrowseRole::Operator {
@@ -6371,13 +6238,13 @@ mod tests {
             {
                 let snapshot = door.membership_snapshot(scan_id).unwrap();
                 snapshot.summaries().unwrap();
+                snapshot.scan_config().unwrap();
+                snapshot.scan_status().unwrap();
+                snapshot.scan_summary().unwrap();
+                snapshot.scan_created_at().unwrap();
+                snapshot.marked_count().unwrap();
+                snapshot.attributed_dir_group_summaries().unwrap();
             }
-            door.load_config(scan_id).unwrap();
-            door.scan_status(scan_id).unwrap();
-            door.scan_summary(scan_id).unwrap();
-            door.scan_created_at(scan_id).unwrap();
-            door.marked_count(scan_id).unwrap();
-            door.attributed_dir_group_summaries(scan_id).unwrap();
             assert_eq!(
                 door.identity_probes() - before,
                 tabled,
@@ -6385,6 +6252,66 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R4B-2c1 blocker B: one `Open`, one database state.
+    ///
+    /// A second connection republishes the scan AND changes a mark in the middle of building the
+    /// payload — after the membership read, before the later fields. The payload may not come
+    /// back carrying the old identities beside the new count: either it is the complete older
+    /// state, or the open refuses. The next open must then see the new state, whole.
+    ///
+    /// Deterministic by construction: the writer commits from inside the `on_open_step` seam, so
+    /// the interleaving is exact — no sleep, no retry, no second thread racing the first.
+    #[test]
+    fn a_commit_during_candidate_construction_cannot_split_the_payload() {
+        let mut rig = Rig::new("one_snapshot", BrowseRole::Operator);
+        let first = rig.open(1);
+        let before = Rig::published_ids(&first)[0].generation;
+        assert_eq!(first.marked_count, 0, "the fixture starts unmarked");
+
+        let db = rig.db.clone();
+        let scan_id = rig.scan_id;
+        let target = rig.files[0].clone();
+        let mut fired = false;
+        rig.hooks.on_open_step(move |step| {
+            // Between the membership read and the counts that used to be read beside it.
+            if step != "marked" || fired {
+                return;
+            }
+            fired = true;
+            let mut store = crate::state::ScanStore::open_writable(&db).unwrap();
+            store
+                .publish_results(scan_id, crate::state::PublishMode::Derived)
+                .unwrap();
+            let mark = crate::model::duplicate::FileEntry {
+                path: target.clone(),
+                action: Some(crate::model::action::ActionKind::Delete),
+                ..Default::default()
+            };
+            store.save_marks(scan_id, std::iter::once(&mark)).unwrap();
+        });
+
+        let during = rig.open(2);
+        assert_eq!(
+            Rig::published_ids(&during)[0].generation,
+            before,
+            "the identities are the ones this snapshot read"
+        );
+        assert_eq!(
+            during.marked_count, 0,
+            "and the count beside them is from the same instant, not from the writer that \
+             committed underneath"
+        );
+
+        let after = rig.open(3);
+        assert_eq!(
+            Rig::published_ids(&after)[0].generation,
+            before + 1,
+            "a fresh open sees the republication"
+        );
+        assert_eq!(after.marked_count, 1, "and the mark that came with it");
+        rig.shutdown();
     }
 
     /// One browsing interaction, one store, one validation: twenty legacy reads after the
@@ -6400,8 +6327,8 @@ mod tests {
         }
         assert_eq!(door.full_validation_count(), 1);
         for _ in 0..20 {
-            door.scan_created_at(scan_id).unwrap();
             door.marked_count(scan_id).unwrap();
+            door.latest_scan_id().unwrap();
         }
         assert_eq!(
             door.full_validation_count(),
@@ -6506,6 +6433,33 @@ mod tests {
             browse.matches("inner: ScanStore").count(),
             1,
             "exactly one raw-store field exists, inside the guarded door"
+        );
+
+        // R4B-2c1: two request/event routes existed with full dispatch, closing and reply
+        // machinery, and their own comments said the App never issued them — `on_browse` simply
+        // ignored their events. A route nobody can reach is not «inert», it is a claim this very
+        // test used to make and could not keep. Both names are gone from every production half,
+        // and so is the shape that hid them: an event arm that silently does nothing.
+        for retired in ["GroupOfPath", "ScanCreatedAt"] {
+            for (what, source) in [("app.rs", app), ("browse.rs", browse), ("event.rs", events)] {
+                assert!(
+                    !source.contains(retired),
+                    "the retired {retired} route still appears in the production half of {what}"
+                );
+            }
+        }
+        let silent = app
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("BrowseEvent::") && line.ends_with("=> {}"));
+        assert!(
+            silent.is_none(),
+            "a browsing event consumed by a silent no-op arm: {silent:?}"
+        );
+        assert!(
+            !browse.contains("#[allow(dead_code)]\n    GroupOfPath")
+                && !browse.contains("#[allow(dead_code)]\n    ScanCreatedAt"),
+            "and neither may come back behind an allow(dead_code)"
         );
     }
 }

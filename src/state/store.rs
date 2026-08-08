@@ -1366,52 +1366,25 @@ impl ScanStore {
 
     /// Loads the scan configuration.
     pub fn load_config(&self, scan_id: i64) -> Result<ScanConfig> {
-        let json: String = self.conn.query_row(
-            "SELECT config_json FROM scan WHERE id = ?1",
-            params![scan_id],
-            |row| row.get(0),
-        )?;
-        Ok(serde_json::from_str(&json)?)
+        let tx = self.conn.unchecked_transaction()?;
+        scan_config_tx(&tx, scan_id)
     }
 
     /// The current scan status.
     pub fn scan_status(&self, scan_id: i64) -> Result<ScanStatus> {
-        let text: String = self.conn.query_row(
-            "SELECT status FROM scan WHERE id = ?1",
-            params![scan_id],
-            |row| row.get(0),
-        )?;
-        ScanStatus::parse(&text)
-            .ok_or_else(|| AppError::msg(format!("unknown scan status: {text}")))
+        let tx = self.conn.unchecked_transaction()?;
+        scan_status_tx(&tx, scan_id)
     }
 
     /// Summary of a completed scan from `scan_stats` — for opening the result
-    /// without recomputation (read in `spawn_open_completed`).
+    /// without recomputation.
+    ///
+    /// One read transaction for all four of its parts: the counters, the reclaim total, the
+    /// alias sets and the omission account described three different database states before
+    /// R4B-2c1, which is how a summary could report a total that no longer matched its groups.
     pub fn scan_summary(&self, scan_id: i64) -> Result<ScanSummary> {
-        let summary = self.conn.query_row(
-            "SELECT files_scanned, bytes_hashed, groups_found, elapsed_seconds, hash_failures
-             FROM scan_stats WHERE scan_id = ?1",
-            params![scan_id],
-            |row| {
-                Ok(ScanSummary {
-                    files_scanned: row.get::<_, i64>(0)? as u64,
-                    bytes_hashed: row.get::<_, i64>(1)? as u64,
-                    groups_found: row.get::<_, i64>(2)? as usize,
-                    elapsed_seconds: row.get::<_, f64>(3)?,
-                    hash_failures: row.get::<_, i64>(4)? as u64,
-                    // Filled below: both are decoded, and decoding can fail.
-                    ..Default::default()
-                })
-            },
-        )?;
-        Ok(ScanSummary {
-            reclaim: self.scan_reclaim(scan_id)?,
-            already_linked_sets: self.already_linked_sets(scan_id)?,
-            // The reopen side of counter parity: an authoritative ledger folds to the same totals
-            // the completion published; anything less is typed `Unavailable`, never an exact zero.
-            omissions: self.scan_omission_accounting(scan_id)?,
-            ..summary
-        })
+        let tx = self.conn.unchecked_transaction()?;
+        scan_summary_tx(&tx, scan_id)
     }
 
     /// Changes the scan status.
@@ -1622,19 +1595,8 @@ impl ScanStore {
     /// byte column per scan and the ceiling is the one that has to survive in it. Summing the
     /// exact groups is a read of the same table the browser already loads whole.
     pub fn scan_reclaim(&self, scan_id: i64) -> Result<ReclaimEstimate> {
-        let guaranteed: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(reclaim), 0) FROM file_group
-              WHERE scan_id = ?1 AND reclaim_state = ?2",
-            params![scan_id, ReclaimState::Exact.as_i64()],
-            |row| row.get(0),
-        )?;
-        let (ceiling, state): (i64, i64) = self.conn.query_row(
-            "SELECT COALESCE(MAX(reclaimable_bytes), 0), COALESCE(MAX(reclaim_state), 0)
-               FROM scan_stats WHERE scan_id = ?1",
-            params![scan_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        ReclaimEstimate::from_persisted_scan(guaranteed, ceiling, state)
+        let tx = self.conn.unchecked_transaction()?;
+        scan_reclaim_tx(&tx, scan_id)
     }
 
     /// How many scan-local allocations already have two or more pathnames inside this scan.
@@ -1645,16 +1607,8 @@ impl ScanStore {
     /// Counted from the manifest, never from synthetic rows — a link this scan never saw is not a
     /// pathname and is not counted here.
     pub fn already_linked_sets(&self, scan_id: i64) -> Result<u64> {
-        let count: i64 = self.conn.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM (
-                     SELECT 1 FROM file WHERE scan_id = ?1
-                      GROUP BY {OBJECT_KEY} HAVING COUNT(*) >= 2)"
-            ),
-            params![scan_id],
-            |row| row.get(0),
-        )?;
-        Ok(count as u64)
+        let tx = self.conn.unchecked_transaction()?;
+        already_linked_sets_tx(&tx, scan_id)
     }
 
     /// The same count for every scan at once — one pass over the manifest instead of one pass per
@@ -2757,20 +2711,9 @@ impl ScanStore {
         }
     }
 
-    /// The scan's `created_at` by id — for the commander header
-    /// (`humanize_ago` → «2 h ago»). A point PK lookup, cheap on any DB size.
-    pub fn scan_created_at(&self, scan_id: i64) -> Result<Option<String>> {
-        use rusqlite::OptionalExtension;
-        let row = self
-            .conn
-            .query_row(
-                "SELECT created_at FROM scan WHERE id = ?1",
-                params![scan_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        Ok(row)
-    }
+    // `scan_created_at` used to live here as an autocommit reader for the browsing door.
+    // R4B-2c1 moved it onto `MembershipSnapshot`, where it reads inside the transaction the rest
+    // of the open payload comes from, and nothing else asked for it.
 
     /// The most recent **completed** scan whose `roots`
     /// cover `cwd` — either one of the `roots` is an ancestor of `cwd` (cwd inside
@@ -2942,6 +2885,13 @@ impl ScanStore {
     /// plus one ordered `dir_dedup` scan, folded with O(1) state per signature run and no path
     /// retained. Members the current ledger suppresses are removed, cardinality is re-evaluated
     /// (`< 2` survivors → no group), `rank` is 1-based over the surviving groups.
+    /// Attributed summaries of all twin-directory groups, in one deferred transaction.
+    ///
+    /// Test-only since R4B-2c1: production reads them through `MembershipSnapshot`, inside the
+    /// transaction the rest of the `Open` payload comes from. The store-level tests that check
+    /// the folding rules themselves keep asking here, where the answer is not entangled with a
+    /// membership authority they are not about.
+    #[cfg(test)]
     pub fn attributed_dir_group_summaries(
         &self,
         scan_id: i64,
@@ -3057,13 +3007,8 @@ impl ScanStore {
     /// The number of files marked for an action (non-keeper + has an action) — for the counter
     /// in the Browser header, without holding all groups in RAM.
     pub fn marked_count(&self, scan_id: i64) -> Result<u64> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM file_mark
-             WHERE scan_id = ?1 AND is_keeper = 0 AND action IS NOT NULL",
-            params![scan_id],
-            |row| row.get(0),
-        )?;
-        Ok(count as u64)
+        let tx = self.conn.unchecked_transaction()?;
+        marked_count_tx(&tx, scan_id)
     }
 
     /// Prepares a legacy scan's browse-only summaries once, on the WRITER path — so that
@@ -4100,6 +4045,121 @@ fn decode_mark(
         (false, Some(kind)) => Ok(Some(MarkIntent::Act(kind))),
         (false, None) => Ok(None),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Transaction-scoped scan readers.
+//
+// One body per question, so the autocommit method on `ScanStore` and the snapshot-scoped answer
+// cannot drift apart. Everything an `Open` payload needs lives here: since R4B-2c1 the browsing
+// actor builds the whole payload from ONE snapshot, and a second copy of any of this SQL is
+// exactly how «one database state» would quietly become several.
+// ---------------------------------------------------------------------------------------------
+
+fn scan_config_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<ScanConfig> {
+    let json: String = tx.query_row(
+        "SELECT config_json FROM scan WHERE id = ?1",
+        params![scan_id],
+        |row| row.get(0),
+    )?;
+    Ok(serde_json::from_str(&json)?)
+}
+
+fn scan_status_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<ScanStatus> {
+    let text: String = tx.query_row(
+        "SELECT status FROM scan WHERE id = ?1",
+        params![scan_id],
+        |row| row.get(0),
+    )?;
+    ScanStatus::parse(&text).ok_or_else(|| AppError::msg(format!("unknown scan status: {text}")))
+}
+
+fn scan_created_at_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    let row = tx
+        .query_row(
+            "SELECT created_at FROM scan WHERE id = ?1",
+            params![scan_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(row)
+}
+
+fn marked_count_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<u64> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM file_mark
+         WHERE scan_id = ?1 AND is_keeper = 0 AND action IS NOT NULL",
+        params![scan_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as u64)
+}
+
+fn scan_reclaim_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<ReclaimEstimate> {
+    let guaranteed: i64 = tx.query_row(
+        "SELECT COALESCE(SUM(reclaim), 0) FROM file_group
+          WHERE scan_id = ?1 AND reclaim_state = ?2",
+        params![scan_id, ReclaimState::Exact.as_i64()],
+        |row| row.get(0),
+    )?;
+    let (ceiling, state): (i64, i64) = tx.query_row(
+        "SELECT COALESCE(MAX(reclaimable_bytes), 0), COALESCE(MAX(reclaim_state), 0)
+           FROM scan_stats WHERE scan_id = ?1",
+        params![scan_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    ReclaimEstimate::from_persisted_scan(guaranteed, ceiling, state)
+}
+
+fn already_linked_sets_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<u64> {
+    let count: i64 = tx.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM (
+                 SELECT 1 FROM file WHERE scan_id = ?1
+                  GROUP BY {OBJECT_KEY} HAVING COUNT(*) >= 2)"
+        ),
+        params![scan_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as u64)
+}
+
+fn scan_omission_accounting_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<OmissionAccounting> {
+    Ok(match completeness_snapshot_tx(tx, scan_id)? {
+        SnapshotOutcome::Bounded(snapshot) => match snapshot.scan_accounting()? {
+            ScanAccounting::Exact(totals) => OmissionAccounting::Ledger(totals),
+            ScanAccounting::Unavailable => OmissionAccounting::Unavailable,
+        },
+        SnapshotOutcome::Unavailable(_) => OmissionAccounting::Unavailable,
+    })
+}
+
+fn scan_summary_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<ScanSummary> {
+    let summary = tx.query_row(
+        "SELECT files_scanned, bytes_hashed, groups_found, elapsed_seconds, hash_failures
+         FROM scan_stats WHERE scan_id = ?1",
+        params![scan_id],
+        |row| {
+            Ok(ScanSummary {
+                files_scanned: row.get::<_, i64>(0)? as u64,
+                bytes_hashed: row.get::<_, i64>(1)? as u64,
+                groups_found: row.get::<_, i64>(2)? as usize,
+                elapsed_seconds: row.get::<_, f64>(3)?,
+                hash_failures: row.get::<_, i64>(4)? as u64,
+                // Filled below: both are decoded, and decoding can fail.
+                ..Default::default()
+            })
+        },
+    )?;
+    Ok(ScanSummary {
+        reclaim: scan_reclaim_tx(tx, scan_id)?,
+        already_linked_sets: already_linked_sets_tx(tx, scan_id)?,
+        // The reopen side of counter parity: an authoritative ledger folds to the same totals
+        // the completion published; anything less is typed `Unavailable`, never an exact zero.
+        omissions: scan_omission_accounting_tx(tx, scan_id)?,
+        ..summary
+    })
 }
 
 /// One consistent read of a scan's membership. See [`ScanStore::membership_snapshot`].
@@ -5283,6 +5343,47 @@ impl MembershipSnapshot<'_> {
             )?,
         };
         Ok(exists != 0)
+    }
+
+    // ----- the rest of one browsing payload, from this same transaction -----
+    //
+    // R4B-2c1: an `Open` used to read its membership under a snapshot and then take its config,
+    // status, summary, creation time, marked count and directory summaries through separate
+    // autocommit calls. A second writer — including a `--force` operator — could republish or
+    // change marks between them, and the payload then carried old `GroupId`s beside new totals:
+    // its first group request refused the very identity the UI had just installed. These read
+    // inside the snapshot's own transaction, so the whole payload describes one database state.
+
+    /// The scan's configuration, as this snapshot sees it.
+    pub fn scan_config(&self) -> Result<ScanConfig> {
+        scan_config_tx(&self.tx, self.scan_id)
+    }
+
+    /// The scan's status, as this snapshot sees it.
+    pub fn scan_status(&self) -> Result<ScanStatus> {
+        scan_status_tx(&self.tx, self.scan_id)
+    }
+
+    /// The scan's summary — counters, reclaim total, alias sets and omission account — all from
+    /// this snapshot.
+    pub fn scan_summary(&self) -> Result<ScanSummary> {
+        scan_summary_tx(&self.tx, self.scan_id)
+    }
+
+    /// The scan's creation time, as this snapshot sees it.
+    pub fn scan_created_at(&self) -> Result<Option<String>> {
+        scan_created_at_tx(&self.tx, self.scan_id)
+    }
+
+    /// How many pathnames of this scan are marked for an action, as this snapshot sees it.
+    pub fn marked_count(&self) -> Result<u64> {
+        marked_count_tx(&self.tx, self.scan_id)
+    }
+
+    /// The attributed twin-directory summaries, revalidated against the ledger THIS snapshot
+    /// holds rather than against whatever the ledger says by the time the payload is assembled.
+    pub fn attributed_dir_group_summaries(&self) -> Result<AttributedDirGroupSummaries> {
+        attributed_dir_group_summaries_tx(&self.tx, self.scan_id)
     }
 
     /// The Unknown scan's browse-only raw-digest candidates. `Ok(None)` when the scan HAS
@@ -7470,13 +7571,8 @@ impl ScanStore {
     /// pre-ledger scans, drifted or cleared authority, and roots-unavailable configurations whose
     /// observed detail was deliberately session-only.
     pub fn scan_omission_accounting(&self, scan_id: i64) -> Result<OmissionAccounting> {
-        Ok(match self.completeness_snapshot(scan_id)? {
-            SnapshotOutcome::Bounded(snapshot) => match snapshot.scan_accounting()? {
-                ScanAccounting::Exact(totals) => OmissionAccounting::Ledger(totals),
-                ScanAccounting::Unavailable => OmissionAccounting::Unavailable,
-            },
-            SnapshotOutcome::Unavailable(_) => OmissionAccounting::Unavailable,
-        })
+        let tx = self.conn.unchecked_transaction()?;
+        scan_omission_accounting_tx(&tx, scan_id)
     }
 }
 

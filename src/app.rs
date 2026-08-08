@@ -995,8 +995,40 @@ impl App {
     /// Opens a completed scan through the actor. The activation is proposed here and installed
     /// only by a successful reply, so a failed reopen leaves the previously installed scan
     /// exactly as it was.
+    ///
+    /// ONE open at a time, as an invariant rather than a screen convention. Two overlapping
+    /// opens both derive their proposal from the still-installed activation and share the single
+    /// `routes.open` slot: the second would overwrite the first, `on_open_finished` would drop
+    /// the first reply as unrouted — and the actor may already have installed that first
+    /// candidate. A class-A refusal of the second then leaves the UI on its old activation while
+    /// the actor serves the one the UI threw away, and every later request is stale until
+    /// something opens again. So a request that arrives while one is in flight is either the same
+    /// scan — which the pending request already IS — or is refused out loud, and in neither case
+    /// does the pending request, intent or activation change.
     pub(crate) fn open_via_actor(&mut self, scan_id: i64, intent: OpenIntent) {
-        let act = Activation(self.installed_act.0 + 1);
+        if let Some(pending) = &self.routes.open {
+            let message = if pending.scan_id == scan_id {
+                // Leaning on Enter, or an auto-switch that agrees with what is already being
+                // opened: idempotent, because the answer on its way is the answer to this.
+                "Opening results…".to_string()
+            } else {
+                format!(
+                    "Still opening scan #{} — that has to finish before another scan opens",
+                    pending.scan_id
+                )
+            };
+            self.status = message.clone();
+            self.commander.status = message;
+            return;
+        }
+        // Checked, because an activation that wrapped would make a stale reply look current.
+        let Some(act) = self.installed_act.0.checked_add(1).map(Activation) else {
+            let message =
+                "the browsing activation counter is exhausted — restart dedcom".to_string();
+            self.status = message.clone();
+            self.commander.status = message;
+            return;
+        };
         let Some(req) = self.send_browse(|req| BrowseRequest::Open { act, req, scan_id }) else {
             self.opening_started = None;
             return;
@@ -1014,9 +1046,11 @@ impl App {
 
     /// Everything a successful `Open` installs, in one step.
     ///
-    /// The payload was read through one actor pass, so the scan id, its summary, its marked
-    /// count, its directory groups and its presentation all describe the same database state —
-    /// there is no window in which half of a result is on screen.
+    /// The payload was read from ONE snapshot inside the actor — one SQLite read transaction —
+    /// so the scan id, its summary, its marked count, its directory groups and its presentation
+    /// all describe the same database state. A writer that republishes or re-marks while the
+    /// payload is being built cannot split it, and there is no window in which half of a result
+    /// is on screen. «One actor pass» was the weaker R4B-2c claim; R4B-2c1 made it a transaction.
     fn install_opened(&mut self, act: Activation, payload: OpenedBrowse, intent: OpenIntent) {
         let OpenedBrowse {
             scan_id,
@@ -1293,10 +1327,6 @@ impl App {
             BrowseEvent::PanelData { act, req, result } => self.on_panel_data(act, req, result),
             BrowseEvent::Group { act, req, result } => self.on_group(act, req, result),
             BrowseEvent::GroupCount { act, req, result } => self.on_group_count(act, req, result),
-            // The App's reverse lookup is `FileInfo`: it answers the same question and
-            // additionally separates «not in this scan» from «in the scan, in no group», which
-            // a bare identity lookup cannot.
-            BrowseEvent::GroupOfPath { .. } => {}
             BrowseEvent::FileInfo { act, req, result } => {
                 self.on_file_info(act, req, result.map(|answer| *answer))
             }
@@ -1323,9 +1353,6 @@ impl App {
                 cwd,
                 result,
             } => self.on_covering_scan(act, req, cwd, result),
-            // The App never issues `ScanCreatedAt`: the creation time arrives inside the one
-            // `OpenedBrowse` payload, so the header costs no request at all.
-            BrowseEvent::ScanCreatedAt { .. } => {}
             BrowseEvent::CacheHashAck { result, .. } => {
                 if let Err(miss) = result {
                     if !self.fatal_store_miss(&miss) {
@@ -2603,6 +2630,18 @@ impl App {
         tracing::info!(?actor, ?cause, "the browsing actor retired");
         let drained = handle.drain_tickets();
         self.settle_retired(drained, &cause);
+        // An `Open` the retired actor owed is never going to be answered. Releasing its route
+        // here is what keeps «one open at a time» from becoming «no open ever again» — and the
+        // operator is told, rather than left watching an «Opening results…» that has stopped.
+        if let Some(route) = self.routes.open.take() {
+            self.opening_started = None;
+            let message = format!(
+                "the results of scan #{} could not be opened: browsing stopped first",
+                route.scan_id
+            );
+            self.status = message.clone();
+            self.commander.status = message;
+        }
         // Exactly once: `take_terminal` hands the pair over on the first terminal only.
         let _ = join.join();
         match cause {
@@ -6047,6 +6086,101 @@ mod actor_route_tests {
         assert!(
             quiet(&app),
             "every request the interaction sent was answered"
+        );
+    }
+
+    /// R4B-2c1 blocker A: two opens cannot overlap.
+    ///
+    /// Both would propose an activation derived from the same installed one and share the single
+    /// `routes.open` slot. The second would overwrite the first, its reply would be dropped as
+    /// unrouted — and the actor may already have installed that first candidate. A class-A
+    /// refusal of the second then leaves the UI on its old activation while the actor serves the
+    /// one the UI threw away, and every later request is stale.
+    #[test]
+    fn a_second_open_cannot_overtake_the_one_in_flight() {
+        let _role = crate::state::store::role_guard();
+        let (_scenario, mut app, rx, scan_id) = opened("overlapping_opens");
+        let installed = app.installed_act;
+
+        let before = app.browse.requests_issued();
+        app.open_via_actor(scan_id, OpenIntent::Wizard);
+        let pending = app
+            .routes
+            .open
+            .as_ref()
+            .map(|route| (route.req, route.act, route.scan_id))
+            .expect("one open in flight");
+        assert_eq!(pending.1, Activation(installed.0 + 1));
+
+        // Leaning on Enter: the same scan, already being opened. Idempotent.
+        app.open_via_actor(scan_id, OpenIntent::Wizard);
+        app.open_via_actor(scan_id, OpenIntent::Commander);
+        // And a different scan — refused out loud, and one the actor would refuse class A.
+        app.open_via_actor(999_999, OpenIntent::Wizard);
+        assert!(
+            app.status.contains("Still opening"),
+            "the operator is told why nothing happened: {}",
+            app.status
+        );
+
+        assert_eq!(
+            app.browse.requests_issued(),
+            before + 1,
+            "exactly one Open was enqueued"
+        );
+        assert_eq!(
+            app.routes
+                .open
+                .as_ref()
+                .map(|route| (route.req, route.act, route.scan_id)),
+            Some(pending),
+            "the pending request, its activation and its scan are the only ones"
+        );
+
+        pump_until(&mut app, &rx, "the open reply", |app| {
+            app.routes.open.is_none()
+        });
+        drain(&mut app, &rx);
+        assert_eq!(
+            (app.installed_act, app.current_scan_id),
+            (pending.1, Some(scan_id)),
+            "the UI installed the activation it asked for, over the scan it asked for"
+        );
+
+        // And the actor agrees: a later request is answered, not refused as stale.
+        app.browser.marked_count = None;
+        app.refresh_marked_count();
+        pump_until(&mut app, &rx, "the marked count", |app| {
+            app.routes.marked.is_none()
+        });
+        assert!(
+            app.browser.marked_count.is_some(),
+            "a request after the open must not be stale: {}",
+            app.status
+        );
+    }
+
+    /// The other half of the same invariant: an open whose actor dies before answering must
+    /// release its route, or «one open at a time» becomes «no open ever again».
+    #[test]
+    fn an_open_whose_actor_retires_releases_its_route() {
+        let _role = crate::state::store::role_guard();
+        let (_scenario, mut app, rx, scan_id) = opened("open_route_released");
+
+        app.open_via_actor(scan_id, OpenIntent::Wizard);
+        assert!(app.routes.open.is_some(), "one open in flight");
+        app.request_shutdown(false);
+        pump_until(&mut app, &rx, "the shutdown to finish", |app| {
+            app.should_quit
+        });
+
+        assert!(
+            app.routes.open.is_none(),
+            "the retired actor's open must not hold the slot forever"
+        );
+        assert!(
+            app.opening_started.is_none(),
+            "and the «Opening results…» animation stops with it"
         );
     }
 
