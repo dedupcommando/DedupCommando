@@ -241,6 +241,11 @@ pub struct ScanStore {
     /// future actor commit and needs its own scoped seam.
     #[cfg(test)]
     full_validations: std::cell::Cell<u64>,
+    /// Test-only: identity probes spent on this store. The claim it exists for is «one probe per
+    /// store operation» — a membership request must not pay one for the snapshot and another for
+    /// the answer, and a reader must not quietly pay none.
+    #[cfg(test)]
+    identity_probes: std::cell::Cell<u64>,
 }
 
 /// One cached whole-authority validation, valid only while the connection still sees the same
@@ -377,6 +382,10 @@ pub(crate) fn seed_marked_group(db: &Path) -> i64 {
 /// otherwise look unchanged. Used as a `GROUP BY` list and as a join key; nothing here is ever
 /// concatenated into a text key.
 const OBJECT_KEY: &str = "device, inode, size, mtime, mtime_nsec, ctime_sec, ctime_nsec";
+
+/// The same key, qualified for a statement that joins `file` as `f` beside another relation.
+const OBJECT_KEY_F: &str =
+    "f.device, f.inode, f.size, f.mtime, f.mtime_nsec, f.ctime_sec, f.ctime_nsec";
 
 /// Sizes worth hashing: a size qualifies only when at least TWO DISTINCT physical objects share
 /// it. Counting path rows instead is the P-1 defect — four aliases of one allocation are one copy,
@@ -752,10 +761,16 @@ fn settled_identity(
 ) -> Result<Option<(PathBuf, crate::paths::PathIdentity)>> {
     let after = crate::paths::probe_existing_db_file(db_path)?;
     if before != after {
-        return Err(AppError::msg(format!(
-            "dedcom.db was replaced while it was being opened: {}. Try again.",
-            crate::textsan::terminal(&db_path.display().to_string())
-        )));
+        // Typed, not a message: the same fact reaches a later reader as
+        // `MembershipMiss::ReopenRequired`, and both are recognised by matching rather than by
+        // reading the sentence. The sentence itself is unchanged.
+        let shown = crate::textsan::terminal(&db_path.display().to_string());
+        return Err(AppError::PathChanged {
+            detail: format!(
+                "dedcom.db was replaced while it was being opened: {shown}. Try again."
+            ),
+            path: shown,
+        });
     }
     Ok(Some((db_path.to_path_buf(), after)))
 }
@@ -865,7 +880,15 @@ impl ScanStore {
             membership_statements: std::cell::Cell::new(0),
             #[cfg(test)]
             full_validations: std::cell::Cell::new(0),
+            #[cfg(test)]
+            identity_probes: std::cell::Cell::new(0),
         }
+    }
+
+    /// Test-only: identity probes this store has spent (see the field).
+    #[cfg(test)]
+    pub(crate) fn identity_probes(&self) -> u64 {
+        self.identity_probes.get()
     }
 
     /// Test-only: set-based propagation statements issued so far (see the field).
@@ -2451,6 +2474,127 @@ impl ScanStore {
         Ok(())
     }
 
+    /// Writes marks and hands back what the database now holds for exactly those pathnames.
+    ///
+    /// The after-image is read INSIDE the same transaction as the write. Reading it after the
+    /// commit would describe a second database state, and the caller would settle its screen from
+    /// a state it never wrote — the defect class this work has already rejected three times.
+    ///
+    /// Three refusals happen before anything is written: a replaced database file, one pathname
+    /// requested twice with two different meanings, and a pathname with no manifest row. The
+    /// fourth is the strict decoder on the way back out, which is why a row that ends up both
+    /// keeper and action fails here rather than in a plan the operator has already confirmed.
+    ///
+    /// Staged by R4B-2a with no production caller; R4B-2b's mark acknowledgement carries the
+    /// returned image, and R4B-2c settles the UI from it instead of from its own before-image.
+    #[allow(dead_code)] // R4B-2b sends this image back to the UI as a typed acknowledgement.
+    pub fn save_marks_settled(
+        &mut self,
+        scan_id: i64,
+        files: &[FileEntry],
+    ) -> std::result::Result<Vec<(PathBuf, Option<MarkIntent>)>, MarkWriteError> {
+        use rusqlite::OptionalExtension;
+        let store = |err: rusqlite::Error| MarkWriteError::Store {
+            detail: err.to_string(),
+        };
+        // Before the transaction, and before any write: this connection must still be looking at
+        // the database the operator is looking at.
+        self.ensure_current_path()
+            .map_err(|err| MarkWriteError::PathChanged {
+                detail: err.to_string(),
+            })?;
+        // The request has to agree with itself before it is worth writing. One pathname named
+        // twice with two different fates is a window that does not know its own state, and which
+        // of the two won would be an accident of iteration order.
+        let mut wanted: Vec<(&Path, bool, Option<ActionKind>)> = Vec::with_capacity(files.len());
+        for file in files {
+            let path = file.path.as_path();
+            match wanted.iter().find(|(seen, _, _)| *seen == path) {
+                Some((_, keeper, action))
+                    if *keeper != file.is_keeper || *action != file.action =>
+                {
+                    return Err(MarkWriteError::RequestContradictsItself {
+                        path: file.path.clone(),
+                    })
+                }
+                Some(_) => {}
+                None => wanted.push((path, file.is_keeper, file.action)),
+            }
+        }
+
+        let tx = self.conn.transaction().map_err(store)?;
+        {
+            let mut manifest = tx
+                .prepare("SELECT 1 FROM file WHERE scan_id = ?1 AND path = ?2")
+                .map_err(store)?;
+            let mut upsert = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO file_mark(scan_id, path, is_keeper, action)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(store)?;
+            let mut clear = tx
+                .prepare("DELETE FROM file_mark WHERE scan_id = ?1 AND path = ?2")
+                .map_err(store)?;
+            for (path, keeper, action) in &wanted {
+                let text = path.to_string_lossy();
+                // A mark for a pathname this scan never saw has nothing to vouch for it. The
+                // commander checks this separately today; here it is part of the write.
+                let known: Option<i64> = manifest
+                    .query_row(params![scan_id, &*text], |row| row.get(0))
+                    .optional()
+                    .map_err(store)?;
+                if known.is_none() {
+                    return Err(MarkWriteError::NotInManifest {
+                        path: path.to_path_buf(),
+                    });
+                }
+                if !*keeper && action.is_none() {
+                    clear.execute(params![scan_id, &*text]).map_err(store)?;
+                } else {
+                    upsert
+                        .execute(params![
+                            scan_id,
+                            &*text,
+                            *keeper as i64,
+                            action.map(|kind| kind.as_str()),
+                        ])
+                        .map_err(store)?;
+                }
+            }
+        }
+
+        // The read-back, still inside the transaction. `m.rowid` is the row-presence bit the
+        // strict decoder needs: a joined row always has one, and no column of it can be NULL by
+        // accident the way `is_keeper` can.
+        let mut after: Vec<(PathBuf, Option<MarkIntent>)> = Vec::with_capacity(wanted.len());
+        {
+            let mut read = tx
+                .prepare(
+                    "SELECT m.is_keeper, m.action, m.rowid FROM file_mark m
+                      WHERE m.scan_id = ?1 AND m.path = ?2",
+                )
+                .map_err(store)?;
+            for (path, _, _) in &wanted {
+                let text = path.to_string_lossy();
+                let row: Option<(Value, Value)> = read
+                    .query_row(params![scan_id, &*text], |row| {
+                        Ok((row.get::<_, Value>(0)?, row.get::<_, Value>(1)?))
+                    })
+                    .optional()
+                    .map_err(store)?;
+                let (present, is_keeper, action) = match row {
+                    Some((keeper, action)) => (true, keeper, action),
+                    None => (false, Value::Null, Value::Null),
+                };
+                let intent = decode_mark(path, present, &is_keeper, &action)?;
+                after.push((path.to_path_buf(), intent));
+            }
+        }
+        tx.commit().map_err(store)?;
+        Ok(after)
+    }
+
     /// Settles the persisted marks with what a batch of actions actually did — the durable half
     /// of what each UI does with its own copy. `attempted` are the targets the batch reached.
     /// A cancelled batch clears only those, so everything it never got to stays marked and a
@@ -3540,66 +3684,16 @@ impl ScanStore {
         Ok(out)
     }
 
-    /// Decodes one mark, or refuses. `None` — this pathname carries no mark at all.
-    ///
-    /// `present` is the row-presence bit, and it is the difference between two things that look
-    /// identical in a `LEFT JOIN` result: no `file_mark` row at all, whose columns are `NULL`
-    /// because there is nothing to read, and a row that exists with a `NULL` in a column declared
-    /// `INTEGER NOT NULL`. The first is an ordinary unmarked member. The second is damaged
-    /// evidence, and reading it as «not the keeper» would turn it into whatever its `action` says.
-    ///
-    /// Strict where the rest of the program can afford not to be. `and_then(ActionKind::parse)`
-    /// turns an identifier this build does not know into «no action», and the marked row then
-    /// disappears from the plan while the rest of it is accepted — the operator confirms a screen
-    /// that is missing something they marked. `is_keeper` is a flag, so on a present row only
-    /// SQLite's integer `0` and `1` are that flag. A row that is both a keeper and an action states
-    /// two incompatible fates for one pathname and is not something to normalise.
+    /// The planner's view of [`decode_mark`]. One decoder, two callers: the plan builder refuses
+    /// with `PlanRefusal`, the settled writer with `MarkWriteError`, and neither has its own idea
+    /// of what a valid mark is.
     fn mark_intent_from_sql(
         path: &Path,
         present: bool,
         is_keeper: &Value,
         action: &Value,
     ) -> PlanResult<Option<MarkIntent>> {
-        let corrupt = |field: &'static str, value: &Value| PlanRefusal::CorruptMark {
-            path: path.to_path_buf(),
-            field,
-            detail: Self::describe_value(value),
-        };
-        if !present {
-            // Nothing was joined. Any value here would mean the query handed us columns of a row it
-            // says does not exist.
-            return match (is_keeper, action) {
-                (Value::Null, Value::Null) => Ok(None),
-                (Value::Null, other) => Err(corrupt("action", other)),
-                (other, _) => Err(corrupt("is_keeper", other)),
-            };
-        }
-        let keeper = match is_keeper {
-            Value::Integer(0) => false,
-            Value::Integer(1) => true,
-            other => return Err(corrupt("is_keeper", other)),
-        };
-        let action = match action {
-            Value::Null => None,
-            Value::Text(text) => {
-                Some(
-                    ActionKind::parse(text).ok_or_else(|| PlanRefusal::CorruptMark {
-                        path: path.to_path_buf(),
-                        field: "action",
-                        detail: format!("text {text:?}"),
-                    })?,
-                )
-            }
-            other => return Err(corrupt("action", other)),
-        };
-        match (keeper, action) {
-            (true, Some(_)) => Err(PlanRefusal::ContradictoryMark {
-                path: path.to_path_buf(),
-            }),
-            (true, None) => Ok(Some(MarkIntent::Keeper)),
-            (false, Some(kind)) => Ok(Some(MarkIntent::Act(kind))),
-            (false, None) => Ok(None),
-        }
+        decode_mark(path, present, is_keeper, action).map_err(PlanRefusal::from)
     }
 
     /// What a cell actually holds, for a refusal an operator can act on.
@@ -4097,6 +4191,284 @@ pub enum PublishMode<'a> {
     Explicit(&'a [DuplicateGroup]),
 }
 
+// ---------------------------------------------------------------------------------------------
+// R4B-2a — the typed store surface the future browsing actor reads through.
+//
+// Everything from here to the end of this block is data and errors only: no actor, no messages,
+// no production caller. The readers themselves live on `MembershipSnapshot`, so each answer comes
+// from the one validated transaction that snapshot already owns.
+// ---------------------------------------------------------------------------------------------
+
+/// Peers the file-info overlay lists at once.
+///
+/// The overlay is a read-only text list with no paging keys of its own, so it is smaller than the
+/// browser's own group page. Without a cap a single answer would carry every pathname of a
+/// multi-million-member group through a serialized reader and hold every other request behind it.
+pub const FILE_INFO_PEER_CAP: usize = 200;
+
+/// Inner-duplicate rows one directory answer returns. Same reason, a longer list: this one fills a
+/// panel body rather than an overlay.
+pub const DIR_INNER_CAP: usize = 1_000;
+
+/// One panel row's dedup evidence: what to draw, and the digest to SHOW.
+///
+/// `hash_text` is display data and nothing else. It is safe to carry precisely because no
+/// comparison accepts it: group equality is `GroupId`, so a digest cannot become an identity by
+/// being convenient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // R4B-2c makes the commander panel read these.
+pub struct PanelFile {
+    pub status: PanelFileStatus,
+    pub hash_text: Option<String>,
+}
+
+/// What one panel row is, as membership sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // R4B-2c maps these onto the panel glyphs.
+pub enum PanelFileStatus {
+    /// No manifest row in this scan.
+    NotInScan,
+    /// In the manifest, not hashed yet, and nothing shares its size and mtime.
+    NotHashed,
+    /// Not hashed, but another manifest row carries the same size and mtime.
+    LikelyBySizeMtime { peers: u64 },
+    /// A member of this exact current group.
+    InGroup {
+        id: GroupId,
+        members: u64,
+        distinct_devices: u64,
+    },
+    /// Hashed and in the manifest, but a member of no current group — an alias-only set among
+    /// them, which is one allocation and therefore not a duplicate of anything.
+    NotGrouped,
+    /// No trusted answer for this row. It renders as unavailable and takes no part in exact
+    /// cross-panel matching.
+    Unavailable(PanelMiss),
+}
+
+/// Why one row has no membership answer while the batch as a whole succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // R4B-2c renders these.
+pub enum PanelMiss {
+    /// The scan has no membership authority: browse-only.
+    Unknown,
+    /// The central validation named this row's rank inconsistent, so it has no exact identity.
+    Inconsistent { detail: String },
+}
+
+/// What the directory watch surface can answer, as ONE value.
+///
+/// A sum rather than a pair of results on purpose: the shape it replaces could represent a read
+/// failure and a successful fallback at the same time, and the fallback is what the operator then
+/// acted on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // R4B-2c moves the watch resolver onto this.
+pub enum DirGroupAnswer {
+    /// The directory's surviving twins, as the current ledger attributes them.
+    Group(Box<AttributedDirGroup>),
+    /// Trusted fallback: files under the directory that are members of a current group.
+    InnerDupes {
+        members: Vec<InnerDupe>,
+        total: u64,
+        truncated: bool,
+    },
+    /// No authority: raw-digest candidates. They carry NO `GroupId` and are never duplicates —
+    /// nothing here may be shown as a confirmed twin.
+    InnerCandidates {
+        paths: Vec<PathBuf>,
+        total: u64,
+        truncated: bool,
+    },
+    /// The directory is covered by the scan and holds nothing duplicated.
+    NoDuplicates,
+    /// The scan does not cover this directory at all.
+    NotInScan,
+}
+
+/// One inner duplicate: the pathname and the identity of the group that vouches for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // R4B-2c renders these.
+pub struct InnerDupe {
+    pub path: PathBuf,
+    pub id: GroupId,
+}
+
+/// What the file-info surface knows about one pathname.
+///
+/// Manifest presence is the OUTER decision, and it is established positively. «No duplicates
+/// found» is representable only for a present row whose membership is `NotGrouped`; a pathname
+/// outside the scan and a membership refusal each keep their own rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // R4B-2c moves F3 onto this.
+pub enum FileInfoAnswer {
+    /// No manifest row for this pathname in this scan.
+    NotInScan,
+    InScan {
+        /// `None` means only that this manifest row carries no digest yet.
+        hash_text: Option<String>,
+        /// Independent of presence, so a refusal can never be read as «no duplicates».
+        membership: std::result::Result<FileMembership, MembershipMiss>,
+    },
+}
+
+/// The membership half of a file-info answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // R4B-2c renders these.
+pub enum FileMembership {
+    /// In the manifest, member of no current group. The ONLY state that may render
+    /// «No duplicates found».
+    NotGrouped,
+    InGroup(Box<FileGroupInfo>),
+}
+
+/// The group behind a file-info answer: an identity, a bounded page of peers, and the honest
+/// total. Two Explicit ranks sharing a digest stay separate, because this is keyed by identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // R4B-2c renders these.
+pub struct FileGroupInfo {
+    pub id: GroupId,
+    /// At most `FILE_INFO_PEER_CAP`, in member order, excluding the subject itself.
+    pub peers: Vec<PathBuf>,
+    /// The group's real member count, whatever `peers` holds.
+    pub total: u64,
+    pub truncated: bool,
+}
+
+/// Why one durable mark did not decode. The single strict decoder's error; `PlanRefusal` and
+/// `MarkWriteError` both convert FROM it, so there is exactly one place that judges a mark.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkDecodeError {
+    Corrupt {
+        path: PathBuf,
+        field: &'static str,
+        detail: String,
+    },
+    Contradictory {
+        path: PathBuf,
+    },
+}
+
+/// Why a settled mark write did not happen, or did not settle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // R4B-2b sends these to the UI as a typed mark acknowledgement.
+pub enum MarkWriteError {
+    /// The same pathname was requested twice with two different meanings.
+    RequestContradictsItself { path: PathBuf },
+    /// A requested pathname has no manifest row in this scan.
+    NotInManifest { path: PathBuf },
+    /// The after-image did not decode.
+    Decode(MarkDecodeError),
+    /// The database file at the configured path was replaced. Nothing was written.
+    PathChanged { detail: String },
+    /// The write or the read-back failed.
+    Store { detail: String },
+}
+
+impl std::fmt::Display for MarkDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MarkDecodeError::Corrupt {
+                path,
+                field,
+                detail,
+            } => write!(
+                f,
+                "dedcom.db holds an unreadable mark for {} ({field}: {detail})",
+                path.display()
+            ),
+            MarkDecodeError::Contradictory { path } => write!(
+                f,
+                "{} is marked both as the keeper and for an action",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl From<MarkDecodeError> for PlanRefusal {
+    fn from(err: MarkDecodeError) -> Self {
+        match err {
+            MarkDecodeError::Corrupt {
+                path,
+                field,
+                detail,
+            } => PlanRefusal::CorruptMark {
+                path,
+                field,
+                detail,
+            },
+            MarkDecodeError::Contradictory { path } => PlanRefusal::ContradictoryMark { path },
+        }
+    }
+}
+
+impl From<MarkDecodeError> for MarkWriteError {
+    fn from(err: MarkDecodeError) -> Self {
+        MarkWriteError::Decode(err)
+    }
+}
+
+/// One durable mark, decoded strictly, or a refusal.
+///
+/// `present` is the row-presence bit, and it is the difference between two things a `LEFT JOIN`
+/// renders identically: no `file_mark` row at all, whose columns are `NULL` because there is
+/// nothing to read, and a row that exists carrying a `NULL` in a column declared `INTEGER NOT
+/// NULL`. The first is an ordinary unmarked member; the second is damaged evidence, and reading
+/// it as «not the keeper» would turn it into whatever its `action` says.
+///
+/// Strict where the rest of the program can afford not to be. `and_then(ActionKind::parse)` would
+/// turn an identifier this build does not know into «no action», and the marked row would then
+/// vanish from a plan the operator confirms. `is_keeper` is a flag, so on a present row only
+/// SQLite's integer `0` and `1` are that flag. A row that is both a keeper and an action states
+/// two incompatible fates for one pathname and is not something to normalise.
+fn decode_mark(
+    path: &Path,
+    present: bool,
+    is_keeper: &Value,
+    action: &Value,
+) -> std::result::Result<Option<MarkIntent>, MarkDecodeError> {
+    let corrupt = |field: &'static str, value: &Value| MarkDecodeError::Corrupt {
+        path: path.to_path_buf(),
+        field,
+        detail: ScanStore::describe_value(value),
+    };
+    if !present {
+        // Nothing was joined. Any value here would mean the query handed us columns of a row it
+        // says does not exist.
+        return match (is_keeper, action) {
+            (Value::Null, Value::Null) => Ok(None),
+            (Value::Null, other) => Err(corrupt("action", other)),
+            (other, _) => Err(corrupt("is_keeper", other)),
+        };
+    }
+    let keeper = match is_keeper {
+        Value::Integer(0) => false,
+        Value::Integer(1) => true,
+        other => return Err(corrupt("is_keeper", other)),
+    };
+    let action = match action {
+        Value::Null => None,
+        Value::Text(text) => {
+            Some(
+                ActionKind::parse(text).ok_or_else(|| MarkDecodeError::Corrupt {
+                    path: path.to_path_buf(),
+                    field: "action",
+                    detail: format!("text {text:?}"),
+                })?,
+            )
+        }
+        other => return Err(corrupt("action", other)),
+    };
+    match (keeper, action) {
+        (true, Some(_)) => Err(MarkDecodeError::Contradictory {
+            path: path.to_path_buf(),
+        }),
+        (true, None) => Ok(Some(MarkIntent::Keeper)),
+        (false, Some(kind)) => Ok(Some(MarkIntent::Act(kind))),
+        (false, None) => Ok(None),
+    }
+}
+
 /// One consistent read of a scan's membership. See [`ScanStore::membership_snapshot`].
 pub struct MembershipSnapshot<'a> {
     tx: Transaction<'a>,
@@ -4525,31 +4897,56 @@ impl ScanStore {
         })
     }
 
-    /// Refuses when the configured path no longer names the file this store opened. In-memory
-    /// stores have no path and are exempt. The cache is dropped on the way out, so a later
-    /// verified reopen cannot inherit a verdict computed against the previous file.
-    fn ensure_db_identity(&self) -> std::result::Result<(), MembershipMiss> {
+    /// The configured path still names the file this store opened.
+    ///
+    /// One `stat`-class probe and no SQL. An in-memory store has no path to be replaced and is
+    /// exempt. On a mismatch the cached authority verdict is dropped too, but the refusal — not
+    /// the drop — is the safety property: this connection must not answer about a database nobody
+    /// is looking at any more.
+    ///
+    /// What it does NOT prove is the same limit `settled_identity` states: this is the identity of
+    /// the PATH at the moment of one probe, never of the file SQLite itself holds open.
+    ///
+    /// Staged by R4B-2a. `membership_snapshot` reaches it through `ensure_db_identity`, and the
+    /// new `save_marks_settled` calls it directly; the existing readers keep today's behaviour
+    /// until the UI that has to render the refusal switches with them.
+    #[allow(dead_code)] // R4B-2b routes the browsing actor's requests through this.
+    pub fn ensure_current_path(&self) -> Result<()> {
         let Some((path, opened_as)) = self.db_identity.as_ref() else {
             return Ok(());
         };
-        let refusal = |detail: String| MembershipMiss::ReopenRequired { detail };
+        #[cfg(test)]
+        self.identity_probes.set(self.identity_probes.get() + 1);
+        let shown = crate::textsan::terminal(&path.display().to_string());
+        let refusal = |detail: String| AppError::PathChanged {
+            path: shown.clone(),
+            detail,
+        };
         match crate::paths::probe_existing_db_file(path) {
             Ok(now) if now == *opened_as => Ok(()),
             Ok(_) => {
                 self.revoke_membership_cache();
                 Err(refusal(format!(
-                    "dedcom.db at {} no longer names the file it named when it was opened; reopen required",
-                    crate::textsan::terminal(&path.display().to_string())
+                    "dedcom.db at {shown} no longer names the file it named when it was opened; reopen required"
                 )))
             }
             Err(err) => {
                 self.revoke_membership_cache();
                 Err(refusal(format!(
-                    "dedcom.db at {} can no longer be identified: {err}",
-                    crate::textsan::terminal(&path.display().to_string())
+                    "dedcom.db at {shown} can no longer be identified: {err}"
                 )))
             }
         }
+    }
+
+    /// The membership half of the same check: one probe, and the typed refusal every trusted
+    /// reader already understands. The sentence is `ensure_current_path`'s, unchanged — nothing
+    /// here re-words it, and nothing anywhere decides control flow by reading it.
+    fn ensure_db_identity(&self) -> std::result::Result<(), MembershipMiss> {
+        self.ensure_current_path()
+            .map_err(|err| MembershipMiss::ReopenRequired {
+                detail: err.to_string(),
+            })
     }
 
     /// The cached verdict, if it was computed for exactly this key on this connection.
@@ -5248,6 +5645,597 @@ impl MembershipSnapshot<'_> {
             candidates.push(row?);
         }
         Ok(Some(CandidateView { candidates }))
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // R4B-2a — the readers the future browsing actor uses.
+    //
+    // Every one of them answers from the transaction this snapshot already owns. None opens a
+    // second transaction, and none takes a second identity probe: the one probe was spent when
+    // the snapshot was created, which is what makes «one probe per operation» true rather than
+    // aspirational.
+    // -----------------------------------------------------------------------------------------
+
+    /// What a group is worth and what evidence stands behind it — keyed by IDENTITY.
+    ///
+    /// The digest-keyed reader it replaces cannot tell two Explicit ranks sharing one digest
+    /// apart, so it would answer for whichever the index happened to reach first.
+    #[allow(dead_code)] // R4B-2c moves the browser's group claim onto this.
+    pub fn group_claim(&self, id: &GroupId) -> std::result::Result<GroupClaim, MembershipMiss> {
+        use rusqlite::OptionalExtension;
+        self.require_current(id)?;
+        let persisted: Option<(i64, i64)> = self
+            .tx
+            .query_row(
+                "SELECT reclaim, reclaim_state FROM file_group WHERE scan_id = ?1 AND rank = ?2",
+                params![id.scan_id, id.rank],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (reclaim, state) = persisted.ok_or(MembershipMiss::NoSuchGroup)?;
+        let reclaim = ReclaimEstimate::from_persisted(reclaim, state).map_err(|err| {
+            MembershipMiss::Inconsistent {
+                detail: err.to_string(),
+            }
+        })?;
+        Ok(GroupClaim {
+            reclaim,
+            links: self.group_links_of(id)?,
+        })
+    }
+
+    /// One validated link count per distinct allocation of THIS group's members, summed.
+    fn group_links_of(&self, id: &GroupId) -> std::result::Result<GroupLinks, MembershipMiss> {
+        let mut stmt = self.tx.prepare(&format!(
+            "SELECT COUNT(*), MIN(f.nlink), COUNT(DISTINCT f.nlink),
+                    MIN(typeof(f.nlink)), MAX(typeof(f.nlink)), MIN(f.path)
+               FROM {source}
+              WHERE {filter}
+              GROUP BY {OBJECT_KEY_F}",
+            source = self.member_source(),
+            filter = self.member_filter(),
+        ))?;
+        let rows = stmt.query_map(params![id.scan_id, id.rank], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                GroupedLinkCount {
+                    value: row.get::<_, Value>(1)?,
+                    distinct: row.get::<_, i64>(2)?,
+                    min_class: row.get::<_, String>(3)?,
+                    max_class: row.get::<_, String>(4)?,
+                },
+                PathBuf::from(row.get::<_, String>(5)?),
+            ))
+        })?;
+        let (mut observed, mut total) = (0u64, Some(0u64));
+        for row in rows {
+            let (paths, evidence, representative) = row?;
+            observed += paths as u64;
+            let decoded =
+                evidence
+                    .decode(&representative)
+                    .map_err(|err| MembershipMiss::Inconsistent {
+                        detail: err.to_string(),
+                    })?;
+            total = match (total, decoded) {
+                (Some(sum), LinkCount::Known(links)) => sum.checked_add(links),
+                _ => None,
+            };
+        }
+        Ok(GroupLinks {
+            observed,
+            total: total.map_or(LinkCount::Unknown, LinkCount::from_u64),
+        })
+    }
+
+    /// The member relation for this authority: Explicit reads its own rows, Derived reads the
+    /// manifest by the CURRENT summary's digest. There is no third form, and no raw-digest
+    /// fallback under Explicit.
+    fn member_source(&self) -> &'static str {
+        match self.mode {
+            MembershipMode::Explicit => {
+                "file_group_member mm JOIN file f ON f.scan_id = mm.scan_id AND f.path = mm.path"
+            }
+            _ => "file_group g JOIN file f ON f.scan_id = g.scan_id AND f.hash = unhex(g.hash)",
+        }
+    }
+
+    fn member_filter(&self) -> &'static str {
+        match self.mode {
+            MembershipMode::Explicit => "mm.scan_id = ?1 AND mm.group_rank = ?2",
+            _ => "g.scan_id = ?1 AND g.rank = ?2",
+        }
+    }
+
+    /// The member pathnames of one group, in member order, optionally capped.
+    fn member_paths(
+        &self,
+        id: &GroupId,
+        limit: Option<usize>,
+    ) -> std::result::Result<Vec<PathBuf>, MembershipMiss> {
+        let mut stmt = self.tx.prepare(&format!(
+            "SELECT f.path FROM {source} WHERE {filter} ORDER BY f.path LIMIT ?3",
+            source = self.member_source(),
+            filter = self.member_filter(),
+        ))?;
+        // SQLite reads a negative limit as «no limit».
+        let cap = limit.map_or(-1i64, |n| n as i64);
+        let rows = stmt.query_map(params![id.scan_id, id.rank, cap], |row| {
+            Ok(PathBuf::from(row.get::<_, String>(0)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every persisted member of one group, as the destructive plan is allowed to read it.
+    ///
+    /// Strict where browsing is not: `group_page` tolerates a link count of an impossible storage
+    /// class because a group whose counts cannot be trusted is still worth showing, while a plan
+    /// built on one is not. The evidence constructor is the trust boundary and it refuses here.
+    #[allow(dead_code)] // R4B-2c builds the plan from these instead of from a digest union.
+    pub fn plan_members(
+        &self,
+        id: &GroupId,
+    ) -> std::result::Result<Vec<PlanMemberEvidence>, MembershipMiss> {
+        self.require_current(id)?;
+        let inconsistent = |err: String| MembershipMiss::Inconsistent { detail: err };
+        let mut stmt = self.tx.prepare(&format!(
+            "SELECT f.path, f.size, f.mtime, f.mtime_nsec, f.ctime_sec, f.ctime_nsec,
+                    f.device, f.inode, f.nlink, f.identity_version,
+                    m.is_keeper, m.action, m.rowid
+               FROM {source}
+               LEFT JOIN file_mark m ON m.scan_id = f.scan_id AND m.path = f.path
+              WHERE {filter}
+              ORDER BY f.path",
+            source = self.member_source(),
+            filter = self.member_filter(),
+        ))?;
+        let rows = stmt.query_map(params![id.scan_id, id.rank], |row| {
+            Ok((
+                PathBuf::from(row.get::<_, String>(0)?),
+                PlanObjectKey {
+                    size: row.get::<_, i64>(1)? as u64,
+                    mtime: row.get::<_, i64>(2)?,
+                    mtime_nsec: row.get::<_, i64>(3)?,
+                    ctime_sec: row.get::<_, i64>(4)?,
+                    ctime_nsec: row.get::<_, i64>(5)?,
+                    device: row.get::<_, i64>(6)? as u64,
+                    inode: row.get::<_, i64>(7)? as u64,
+                    identity_version: row.get::<_, i64>(9)?,
+                },
+                row.get::<_, Value>(8)?,
+                row.get::<_, Value>(10)?,
+                row.get::<_, Value>(11)?,
+                row.get::<_, Option<i64>>(12)?.is_some(),
+            ))
+        })?;
+        let mut members = Vec::new();
+        for row in rows {
+            let (path, key, nlink, is_keeper, action, marked) = row?;
+            let links = link_count_from_sql(&nlink).map_err(|err| inconsistent(err.to_string()))?;
+            let mark = decode_mark(&path, marked, &is_keeper, &action)
+                .map_err(|err| inconsistent(err.to_string()))?;
+            members.push(
+                PlanMemberEvidence::new(path, key, links, mark)
+                    .map_err(|err| inconsistent(err.to_string()))?,
+            );
+        }
+        Ok(members)
+    }
+
+    /// The witness a future plan hands to the apply lease: for each identity, the digest its
+    /// CURRENT summary carries and the exact member pathnames.
+    ///
+    /// The digest is read here rather than remembered by the caller, so the lease compares what
+    /// the plan was folded from against what the database says now.
+    #[allow(dead_code)] // R4B-2c puts the witness into the plan and the guarded apply.
+    pub fn witness_of(&self, ids: &[GroupId]) -> std::result::Result<PlanWitness, MembershipMiss> {
+        use rusqlite::OptionalExtension;
+        // An empty list must not produce a witness for a scan with no authority.
+        self.require_authority()?;
+        let mut groups = Vec::with_capacity(ids.len());
+        for id in ids {
+            self.require_current(id)?;
+            let digest: Option<String> = self
+                .tx
+                .query_row(
+                    "SELECT hash FROM file_group WHERE scan_id = ?1 AND rank = ?2",
+                    params![id.scan_id, id.rank],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            groups.push(GroupWitness {
+                id: *id,
+                digest: digest.ok_or(MembershipMiss::NoSuchGroup)?,
+                members: self.member_paths(id, None)?,
+            });
+        }
+        Ok(PlanWitness {
+            scan_id: self.scan_id,
+            generation: self.generation,
+            groups,
+        })
+    }
+
+    /// Dedup evidence for a whole panel of pathnames, in a bounded number of statements.
+    ///
+    /// Three statements regardless of how many pathnames are asked for — the batch travels as one
+    /// JSON array, the same way the lease binds its witness — against the point lookup per
+    /// pathname the current reader spends. The membership half needs authority; the size/mtime
+    /// half is a candidate signal about rows that were never hashed and needs none, which is why
+    /// an Unknown scan still renders something instead of nothing.
+    #[allow(dead_code)] // R4B-2c moves the commander panel onto this.
+    pub fn panel_files(
+        &self,
+        paths: &[&Path],
+    ) -> std::result::Result<HashMap<PathBuf, PanelFile>, MembershipMiss> {
+        let want = serde_json::Value::Array(
+            paths
+                .iter()
+                .map(|path| serde_json::Value::String(path.to_string_lossy().into_owned()))
+                .collect(),
+        )
+        .to_string();
+        let mut out: HashMap<PathBuf, PanelFile> = HashMap::with_capacity(paths.len());
+
+        // 1. The manifest half: is the pathname in the scan at all, and does its row carry a
+        //    digest yet. `f.rowid` is the row-presence bit — a LEFT JOIN renders «no row» and
+        //    «row with NULL columns» identically without it.
+        {
+            // `hex(NULL)` is the empty string in SQLite, not NULL — so «no digest» has to be
+            // asked for explicitly, or an unhashed row would carry a digest of «».
+            let mut stmt = self.tx.prepare(
+                "WITH want(path) AS (SELECT value FROM json_each(?2))
+                 SELECT want.path, f.rowid IS NOT NULL,
+                        CASE WHEN f.hash IS NULL THEN NULL ELSE lower(hex(f.hash)) END
+                   FROM want
+                   LEFT JOIN file f ON f.scan_id = ?1 AND f.path = want.path",
+            )?;
+            let rows = stmt.query_map(params![self.scan_id, &want], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (path, present, hash_text) = row?;
+                let status = match (present, hash_text.is_some(), self.mode) {
+                    (false, _, _) => PanelFileStatus::NotInScan,
+                    (true, false, _) => PanelFileStatus::NotHashed,
+                    // Hashed, but nothing may vouch for a group: browse-only.
+                    (true, true, MembershipMode::Unknown) => {
+                        PanelFileStatus::Unavailable(PanelMiss::Unknown)
+                    }
+                    // Hashed and under authority: a member until statement 2 says otherwise.
+                    (true, true, _) => PanelFileStatus::NotGrouped,
+                };
+                out.insert(PathBuf::from(path), PanelFile { status, hash_text });
+            }
+        }
+
+        // 2. The membership half. `COUNT(DISTINCT …)` cannot be a window function in SQLite, so
+        //    the per-rank aggregate is a grouped subquery joined back — one statement either way,
+        //    and the bind count does not grow with the batch.
+        if self.mode != MembershipMode::Unknown {
+            let sql = match self.mode {
+                MembershipMode::Explicit => {
+                    "WITH want(path) AS (SELECT value FROM json_each(?2)),
+                          hit(path, rank) AS (
+                              SELECT want.path, mm.group_rank
+                                FROM want
+                                JOIN file_group_member mm
+                                  ON mm.scan_id = ?1 AND mm.path = want.path),
+                          agg(rank, members, devices) AS (
+                              SELECT mm.group_rank, COUNT(*), COUNT(DISTINCT f.device)
+                                FROM file_group_member mm
+                                JOIN file f ON f.scan_id = mm.scan_id AND f.path = mm.path
+                               WHERE mm.scan_id = ?1
+                                 AND mm.group_rank IN (SELECT rank FROM hit)
+                               GROUP BY mm.group_rank)
+                     SELECT hit.path, hit.rank, agg.members, agg.devices
+                       FROM hit JOIN agg ON agg.rank = hit.rank"
+                }
+                _ => {
+                    "WITH want(path) AS (SELECT value FROM json_each(?2)),
+                          hit(path, rank) AS (
+                              SELECT want.path, g.rank
+                                FROM want
+                                JOIN file f
+                                  ON f.scan_id = ?1 AND f.path = want.path
+                                 AND f.hash IS NOT NULL
+                                JOIN file_group g
+                                  ON g.scan_id = ?1 AND g.hash = lower(hex(f.hash))),
+                          agg(rank, members, devices) AS (
+                              SELECT g.rank, COUNT(*), COUNT(DISTINCT f.device)
+                                FROM file_group g
+                                JOIN file f ON f.scan_id = g.scan_id AND f.hash = unhex(g.hash)
+                               WHERE g.scan_id = ?1 AND g.rank IN (SELECT rank FROM hit)
+                               GROUP BY g.rank)
+                     SELECT hit.path, hit.rank, agg.members, agg.devices
+                       FROM hit JOIN agg ON agg.rank = hit.rank"
+                }
+            };
+            let mut stmt = self.tx.prepare(sql)?;
+            let rows = stmt.query_map(params![self.scan_id, &want], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, i64>(3)? as u64,
+                ))
+            })?;
+            for row in rows {
+                let (path, rank, members, distinct_devices) = row?;
+                // A rank the central validation named inconsistent has no exact identity to
+                // hand out. The row says so and takes no part in cross-panel matching.
+                let status = if self.integrity.inconsistent_ranks.contains(&rank) {
+                    PanelFileStatus::Unavailable(PanelMiss::Inconsistent {
+                        detail: format!(
+                            "group rank {rank} of scan {} declares a member count its membership \
+                             does not hold",
+                            self.scan_id
+                        ),
+                    })
+                } else {
+                    PanelFileStatus::InGroup {
+                        id: GroupId {
+                            scan_id: self.scan_id,
+                            rank,
+                            generation: self.generation,
+                        },
+                        members,
+                        distinct_devices,
+                    }
+                };
+                if let Some(entry) = out.get_mut(Path::new(&path)) {
+                    entry.status = status;
+                }
+            }
+        }
+
+        // 3. The candidate half: an unhashed row whose size and mtime another row shares is a
+        //    likely duplicate the scan has not proved yet. Nothing here claims membership.
+        {
+            let mut stmt = self.tx.prepare(
+                "WITH want(path) AS (SELECT value FROM json_each(?2)),
+                      un(path, size, mtime) AS (
+                          SELECT want.path, f.size, f.mtime
+                            FROM want
+                            JOIN file f ON f.scan_id = ?1 AND f.path = want.path
+                           WHERE f.hash IS NULL)
+                 SELECT un.path,
+                        (SELECT COUNT(*) FROM file p
+                          WHERE p.scan_id = ?1 AND p.size = un.size AND p.mtime = un.mtime)
+                   FROM un",
+            )?;
+            let rows = stmt.query_map(params![self.scan_id, &want], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?;
+            for row in rows {
+                let (path, peers) = row?;
+                if peers < 2 {
+                    continue;
+                }
+                if let Some(entry) = out.get_mut(Path::new(&path)) {
+                    entry.status = PanelFileStatus::LikelyBySizeMtime { peers };
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// What the directory watch surface can say about `dir`, as one value.
+    ///
+    /// The inner-duplicates fallback is derived through THIS authority. The reader it replaces
+    /// selected manifest rows whose digest appears anywhere in `file_group` and never consulted
+    /// `file_group_member`, so under Explicit authority it returned pathnames byte verification
+    /// had rejected — the exact defect this work exists to remove.
+    #[allow(dead_code)] // R4B-2c moves the watch resolver onto this.
+    pub fn dir_group_at(&self, dir: &Path) -> std::result::Result<DirGroupAnswer, MembershipMiss> {
+        let store = |err: AppError| MembershipMiss::Store {
+            detail: err.to_string(),
+        };
+        // The attributed ledger answer first, on this same transaction — so the directory
+        // decision and the membership decision cannot come from two database states.
+        if let Some(group) =
+            attributed_dir_group_at_tx(&self.tx, self.scan_id, dir).map_err(store)?
+        {
+            return Ok(DirGroupAnswer::Group(Box::new(group)));
+        }
+        let (lo, hi) = prefix_bounds(dir);
+        let cap = (DIR_INNER_CAP + 1) as i64;
+
+        if self.mode == MembershipMode::Unknown {
+            // No authority: raw-digest candidates, and they are never called duplicates. The
+            // object rule is the same one every candidate reader applies — a digest counts only
+            // when at least two DISTINCT allocations carry it.
+            let listing = format!(
+                "SELECT path FROM file
+                  WHERE scan_id = ?1 AND path >= ?2 AND path < ?3 AND hash IS NOT NULL
+                    AND hash IN (SELECT digest FROM ({objects})
+                                  GROUP BY digest HAVING COUNT(*) >= 2)
+                  ORDER BY path LIMIT ?4",
+                objects = group_objects_sql()
+            );
+            let mut stmt = self.tx.prepare(&listing)?;
+            let rows = stmt.query_map(params![self.scan_id, &lo, &hi, cap], |row| {
+                Ok(PathBuf::from(row.get::<_, String>(0)?))
+            })?;
+            let mut paths = Vec::new();
+            for row in rows {
+                paths.push(row?);
+            }
+            if paths.is_empty() {
+                return self.dir_absence(dir, &lo, &hi);
+            }
+            let total: i64 = self.tx.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM file
+                      WHERE scan_id = ?1 AND path >= ?2 AND path < ?3 AND hash IS NOT NULL
+                        AND hash IN (SELECT digest FROM ({objects})
+                                      GROUP BY digest HAVING COUNT(*) >= 2)",
+                    objects = group_objects_sql()
+                ),
+                params![self.scan_id, &lo, &hi],
+                |row| row.get(0),
+            )?;
+            paths.truncate(DIR_INNER_CAP);
+            let total = total as u64;
+            return Ok(DirGroupAnswer::InnerCandidates {
+                truncated: total > paths.len() as u64,
+                total,
+                paths,
+            });
+        }
+
+        let (listing, counting) = match self.mode {
+            MembershipMode::Explicit => (
+                "SELECT mm.path, mm.group_rank FROM file_group_member mm
+                  WHERE mm.scan_id = ?1 AND mm.path >= ?2 AND mm.path < ?3
+                  ORDER BY mm.path LIMIT ?4",
+                "SELECT COUNT(*) FROM file_group_member mm
+                  WHERE mm.scan_id = ?1 AND mm.path >= ?2 AND mm.path < ?3",
+            ),
+            _ => (
+                "SELECT f.path, g.rank FROM file f
+                   JOIN file_group g ON g.scan_id = f.scan_id AND g.hash = lower(hex(f.hash))
+                  WHERE f.scan_id = ?1 AND f.hash IS NOT NULL
+                    AND f.path >= ?2 AND f.path < ?3
+                  ORDER BY f.path LIMIT ?4",
+                "SELECT COUNT(*) FROM file f
+                   JOIN file_group g ON g.scan_id = f.scan_id AND g.hash = lower(hex(f.hash))
+                  WHERE f.scan_id = ?1 AND f.hash IS NOT NULL
+                    AND f.path >= ?2 AND f.path < ?3",
+            ),
+        };
+        let mut stmt = self.tx.prepare(listing)?;
+        let rows = stmt.query_map(params![self.scan_id, &lo, &hi, cap], |row| {
+            Ok((
+                PathBuf::from(row.get::<_, String>(0)?),
+                row.get::<_, i64>(1)?,
+            ))
+        })?;
+        let mut members = Vec::new();
+        let mut seen: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+        for row in rows {
+            let (path, rank) = row?;
+            // Every DISTINCT rank this exact answer touches passes the same gate every other
+            // exact answer passes. One inconsistent rank refuses the WHOLE lookup: filtering it
+            // out would turn corruption into a shorter list that looks entirely valid.
+            if seen.insert(rank) {
+                self.require_consistent(rank)?;
+            }
+            members.push(InnerDupe {
+                path,
+                id: GroupId {
+                    scan_id: self.scan_id,
+                    rank,
+                    generation: self.generation,
+                },
+            });
+        }
+        if members.is_empty() {
+            return self.dir_absence(dir, &lo, &hi);
+        }
+        let total: i64 = self
+            .tx
+            .query_row(counting, params![self.scan_id, &lo, &hi], |row| row.get(0))?;
+        members.truncate(DIR_INNER_CAP);
+        let total = total as u64;
+        Ok(DirGroupAnswer::InnerDupes {
+            truncated: total > members.len() as u64,
+            total,
+            members,
+        })
+    }
+
+    /// Nothing duplicated under `dir` — but is the directory covered by the scan at all? The two
+    /// answers are different advice to the operator and must not share one rendering.
+    fn dir_absence(
+        &self,
+        dir: &Path,
+        lo: &str,
+        hi: &str,
+    ) -> std::result::Result<DirGroupAnswer, MembershipMiss> {
+        use rusqlite::OptionalExtension;
+        let text = dir.to_string_lossy();
+        let exact: Option<i64> = self
+            .tx
+            .query_row(
+                "SELECT 1 FROM file WHERE scan_id = ?1 AND path = ?2 LIMIT 1",
+                params![self.scan_id, &*text],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exact.is_some() {
+            return Ok(DirGroupAnswer::NoDuplicates);
+        }
+        let under: Option<i64> = self
+            .tx
+            .query_row(
+                "SELECT 1 FROM file WHERE scan_id = ?1 AND path >= ?2 AND path < ?3 LIMIT 1",
+                params![self.scan_id, lo, hi],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(if under.is_some() {
+            DirGroupAnswer::NoDuplicates
+        } else {
+            DirGroupAnswer::NotInScan
+        })
+    }
+
+    /// Everything the file-info surface needs about one pathname, from this one snapshot.
+    ///
+    /// Manifest presence is established positively and is the OUTER decision, so «no duplicates
+    /// found» cannot be printed for a pathname the scan never saw, nor for one whose membership
+    /// could not be read.
+    #[allow(dead_code)] // R4B-2c moves the F3 overlay onto this.
+    pub fn file_info(&self, path: &Path) -> std::result::Result<FileInfoAnswer, MembershipMiss> {
+        use rusqlite::OptionalExtension;
+        let text = path.to_string_lossy();
+        // `hex(NULL)` is «» in SQLite, so the absence of a digest is asked for by name.
+        let row: Option<Option<String>> = self
+            .tx
+            .query_row(
+                "SELECT CASE WHEN hash IS NULL THEN NULL ELSE lower(hex(hash)) END
+                   FROM file WHERE scan_id = ?1 AND path = ?2",
+                params![self.scan_id, &*text],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(hash_text) = row else {
+            return Ok(FileInfoAnswer::NotInScan);
+        };
+        Ok(FileInfoAnswer::InScan {
+            hash_text,
+            membership: self.file_membership(path),
+        })
+    }
+
+    /// The membership half of a file-info answer, computed separately so a refusal keeps its own
+    /// rendering instead of being flattened into «no duplicates».
+    fn file_membership(&self, path: &Path) -> std::result::Result<FileMembership, MembershipMiss> {
+        self.require_authority()?;
+        // `group_of_path` already passes the rank through the consistency gate.
+        let Some(id) = self.group_of_path(path)? else {
+            return Ok(FileMembership::NotGrouped);
+        };
+        let total = self.group_member_count(&id)?;
+        let mut peers = self.member_paths(&id, Some(FILE_INFO_PEER_CAP + 1))?;
+        peers.retain(|member| member != path);
+        peers.truncate(FILE_INFO_PEER_CAP);
+        Ok(FileMembership::InGroup(Box::new(FileGroupInfo {
+            id,
+            // The subject is not its own peer, so the honest comparison is against total - 1.
+            truncated: total.saturating_sub(1) > peers.len() as u64,
+            total,
+            peers,
+        })))
     }
 
     /// Shared body of `group`/`group_page`.
@@ -17528,5 +18516,946 @@ mod membership_staging_tests {
         }
         assert!(store.prepare_legacy_for_viewing(scan_id).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // =========================================================================================
+    // R4B-2a — the typed store surface.
+    // =========================================================================================
+
+    /// A file-backed store, which is the only kind that HAS a path identity to check.
+    fn file_store(dir: &Path) -> (PathBuf, ScanStore) {
+        let db = dir.join("dedcom.db");
+        let store = ScanStore::open_writable(&db).unwrap();
+        (db, store)
+    }
+
+    /// Replaces the database file with a different regular file at the same pathname — an
+    /// ordinary operator replacement, not an adversarial one.
+    fn replace_db(db: &Path) {
+        let spare = db.with_extension("spare");
+        std::fs::write(&spare, b"not the checkpoint").unwrap();
+        std::fs::remove_file(db).unwrap();
+        std::fs::rename(&spare, db).unwrap();
+    }
+
+    /// Like `seed`, but with digests this build verified against the files themselves. The plan
+    /// evidence constructor refuses an `identity_version = 0` row on purpose, so a fixture for
+    /// anything plan-shaped has to be the verified kind.
+    fn seed_verified(store: &mut ScanStore, root: &Path, files: &[(PathBuf, [u8; 32])]) -> i64 {
+        let scan_id = store
+            .begin_scan(&ScanConfig::new(vec![root.to_path_buf()]))
+            .unwrap();
+        let rows: Vec<ManifestRow> = files.iter().map(|(path, _)| manifest_row(path)).collect();
+        store.record_files(scan_id, &rows).unwrap();
+        let verified: Vec<(ManifestRow, [u8; 32])> = files
+            .iter()
+            .map(|(path, digest)| (manifest_row(path), *digest))
+            .collect();
+        store.record_hashes_verified(scan_id, &verified).unwrap();
+        scan_id
+    }
+
+    fn published_split(dir: &Path, store: &mut ScanStore) -> (i64, PathBuf, PathBuf, PathBuf) {
+        let digest = [0x5au8; 32];
+        let x1 = write(dir, "x1.bin", b"XXXX");
+        let x2 = write(dir, "x2.bin", b"XXXX");
+        let y1 = write(dir, "y1.bin", b"YYYYYY");
+        let y2 = write(dir, "y2.bin", b"YYYYYY");
+        let scan_id = seed_verified(
+            store,
+            dir,
+            &[
+                (x1.clone(), digest),
+                (x2.clone(), digest),
+                (y1.clone(), digest),
+                (y2, digest),
+            ],
+        );
+        let verified =
+            crate::pipeline::verify::verify_groups(store.duplicate_groups(scan_id).unwrap())
+                .unwrap();
+        assert_eq!(verified.len(), 2, "the fixture must really split");
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .unwrap();
+        (scan_id, x1, x2, y1)
+    }
+
+    /// The cross-open replacement refusal is a TYPE, not a sentence.
+    ///
+    /// Red on the parent: the same swap produced `AppError::Msg`, so no caller could recognise it
+    /// without reading the text — and reading it is what this whole contract forbids.
+    #[test]
+    fn the_cross_open_replacement_refusal_is_typed() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2a_typed_open");
+        let db = dir.join("dedcom.db");
+        drop(ScanStore::open_writable(&db).unwrap());
+        let swapped = db.clone();
+        let race = OpenRace::armed(move || replace_db(&swapped));
+        let err = match ScanStore::open_writable(&db) {
+            Err(err) => err,
+            Ok(_) => panic!("a swapped path must refuse the open"),
+        };
+        assert!(race.fired(), "the seam must have fired");
+        match err {
+            AppError::PathChanged {
+                ref path,
+                ref detail,
+            } => {
+                assert!(
+                    detail.contains("replaced while it was being opened"),
+                    "{detail}"
+                );
+                assert!(path.contains("dedcom.db"), "{path}");
+            }
+            other => panic!("expected a typed PathChanged, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `ensure_current_path` answers by identity, and an in-memory store has no path to lose.
+    #[test]
+    fn ensure_current_path_answers_by_identity() {
+        let _role = role_guard();
+        let memory = ScanStore::open_in_memory().unwrap();
+        assert!(memory.ensure_current_path().is_ok());
+        assert_eq!(memory.identity_probes(), 0, "no path, nothing to probe");
+
+        let dir = temp_dir("r4b2a_identity");
+        let (db, store) = file_store(&dir);
+        assert!(store.ensure_current_path().is_ok());
+        assert_eq!(store.identity_probes(), 1);
+
+        replace_db(&db);
+        match store.ensure_current_path() {
+            Err(AppError::PathChanged { .. }) => {}
+            other => panic!("a replaced database must refuse: {other:?}"),
+        }
+
+        std::fs::remove_file(&db).unwrap();
+        match store.ensure_current_path() {
+            Err(AppError::PathChanged { .. }) => {}
+            other => panic!("a removed database must refuse: {other:?}"),
+        }
+        assert_eq!(store.identity_probes(), 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One membership request spends exactly ONE probe, and every new reader spends none: the
+    /// snapshot already paid for the whole operation.
+    #[test]
+    fn a_membership_request_spends_exactly_one_probe() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2a_probes");
+        let (_db, mut store) = file_store(&dir);
+        let (scan_id, x1, _x2, _y1) = published_split(&dir, &mut store);
+
+        let before = store.identity_probes();
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        assert_eq!(
+            store.identity_probes(),
+            before + 1,
+            "the snapshot itself is the one probe"
+        );
+        let ids: Vec<GroupId> = snapshot
+            .summaries()
+            .unwrap()
+            .groups
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        let paths: Vec<&Path> = vec![x1.as_path()];
+        snapshot.panel_files(&paths).unwrap();
+        snapshot.plan_members(&ids[0]).unwrap();
+        snapshot.witness_of(&ids).unwrap();
+        snapshot.group_claim(&ids[0]).unwrap();
+        snapshot.dir_group_at(&dir).unwrap();
+        snapshot.file_info(&x1).unwrap();
+        assert_eq!(
+            store.identity_probes(),
+            before + 1,
+            "no new reader may pay a second probe"
+        );
+        drop(snapshot);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A replaced database is refused BEFORE the write, and `file_mark` is left byte-identical.
+    #[test]
+    fn save_marks_settled_refuses_a_replaced_database_before_writing() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2a_marks_swap");
+        let (db, mut store) = file_store(&dir);
+        let (scan_id, x1, _x2, _y1) = published_split(&dir, &mut store);
+        let marks_before = mark_rows(&store, scan_id);
+
+        replace_db(&db);
+        let entry = FileEntry {
+            path: x1,
+            is_keeper: true,
+            ..Default::default()
+        };
+        match store.save_marks_settled(scan_id, &[entry]) {
+            Err(MarkWriteError::PathChanged { .. }) => {}
+            other => panic!("a replaced database must refuse before writing: {other:?}"),
+        }
+        assert_eq!(
+            mark_rows(&store, scan_id),
+            marks_before,
+            "nothing may have been written"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every `file_mark` row of a scan, for a byte-identical before/after comparison.
+    fn mark_rows(store: &ScanStore, scan_id: i64) -> Vec<(String, Value, Value)> {
+        let mut stmt = store
+            .conn
+            .prepare(
+                "SELECT path, is_keeper, action FROM file_mark WHERE scan_id = ?1 ORDER BY path",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(params![scan_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Value>(1)?,
+                    row.get::<_, Value>(2)?,
+                ))
+            })
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    }
+
+    /// The after-image is what the DATABASE holds, read inside the same transaction as the write.
+    #[test]
+    fn save_marks_settled_returns_the_same_transaction_after_image() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2a_marks_after");
+        let (_db, mut store) = file_store(&dir);
+        let (scan_id, x1, x2, _y1) = published_split(&dir, &mut store);
+
+        let keeper = FileEntry {
+            path: x1.clone(),
+            is_keeper: true,
+            ..Default::default()
+        };
+        let target = FileEntry {
+            path: x2.clone(),
+            action: Some(ActionKind::Delete),
+            ..Default::default()
+        };
+        let after = store
+            .save_marks_settled(scan_id, &[keeper, target])
+            .unwrap();
+        assert_eq!(
+            after,
+            vec![
+                (x1.clone(), Some(MarkIntent::Keeper)),
+                (x2.clone(), Some(MarkIntent::Act(ActionKind::Delete))),
+            ]
+        );
+        // And it really is the database's own state, not the request echoed back.
+        assert_eq!(mark_rows(&store, scan_id).len(), 2, "both rows are durable");
+
+        // Clearing a mark removes the row, and the image says so.
+        let cleared = FileEntry {
+            path: x2.clone(),
+            ..Default::default()
+        };
+        let after = store.save_marks_settled(scan_id, &[cleared]).unwrap();
+        assert_eq!(after, vec![(x2, None)]);
+        assert_eq!(mark_rows(&store, scan_id).len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The three refusals that happen before or instead of a durable write.
+    #[test]
+    fn save_marks_settled_refuses_contradictions_and_strangers() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2a_marks_refuse");
+        let (_db, mut store) = file_store(&dir);
+        let (scan_id, x1, _x2, _y1) = published_split(&dir, &mut store);
+        let before = mark_rows(&store, scan_id);
+
+        // One pathname, two fates, in one request.
+        let one = FileEntry {
+            path: x1.clone(),
+            is_keeper: true,
+            ..Default::default()
+        };
+        let other = FileEntry {
+            path: x1.clone(),
+            action: Some(ActionKind::Delete),
+            ..Default::default()
+        };
+        match store.save_marks_settled(scan_id, &[one, other]) {
+            Err(MarkWriteError::RequestContradictsItself { path }) => assert_eq!(path, x1),
+            other => panic!("expected RequestContradictsItself, got {other:?}"),
+        }
+        assert_eq!(mark_rows(&store, scan_id), before);
+
+        // A pathname this scan never saw has nothing to vouch for it.
+        let stranger = FileEntry {
+            path: dir.join("never-scanned.bin"),
+            is_keeper: true,
+            ..Default::default()
+        };
+        match store.save_marks_settled(scan_id, &[stranger]) {
+            Err(MarkWriteError::NotInManifest { path }) => {
+                assert_eq!(path, dir.join("never-scanned.bin"))
+            }
+            other => panic!("expected NotInManifest, got {other:?}"),
+        }
+        assert_eq!(mark_rows(&store, scan_id), before);
+
+        // Keeper AND action for one pathname is two incompatible fates; the strict decoder
+        // catches it on the way back out, so the transaction rolls back.
+        let both = FileEntry {
+            path: x1.clone(),
+            is_keeper: true,
+            action: Some(ActionKind::Delete),
+            ..Default::default()
+        };
+        match store.save_marks_settled(scan_id, &[both]) {
+            Err(MarkWriteError::Decode(MarkDecodeError::Contradictory { path })) => {
+                assert_eq!(path, x1)
+            }
+            other => panic!("expected a contradictory decode, got {other:?}"),
+        }
+        assert_eq!(
+            mark_rows(&store, scan_id),
+            before,
+            "a refused read-back rolls the write back"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The strict decoder itself, case by case.
+    ///
+    /// `save_marks_settled` can only reach `Contradictory` through its own writes — it never
+    /// writes an unknown action or a non-integer flag — so those cases are proved here, on the
+    /// one decoder both the planner and the writer use.
+    #[test]
+    fn the_strict_mark_decoder_keeps_its_cases_distinct() {
+        let path = Path::new("/x/a");
+        let text = |s: &str| Value::Text(s.to_string());
+        // No row at all.
+        assert_eq!(
+            decode_mark(path, false, &Value::Null, &Value::Null).unwrap(),
+            None
+        );
+        // A row that does not exist cannot have values.
+        assert!(matches!(
+            decode_mark(path, false, &Value::Integer(1), &Value::Null),
+            Err(MarkDecodeError::Corrupt {
+                field: "is_keeper",
+                ..
+            })
+        ));
+        // A flag is 0 or 1, and nothing else.
+        assert!(matches!(
+            decode_mark(path, true, &Value::Integer(2), &Value::Null),
+            Err(MarkDecodeError::Corrupt {
+                field: "is_keeper",
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode_mark(path, true, &text("yes"), &Value::Null),
+            Err(MarkDecodeError::Corrupt {
+                field: "is_keeper",
+                ..
+            })
+        ));
+        // An identifier this build does not know is not «no action».
+        assert!(matches!(
+            decode_mark(path, true, &Value::Integer(0), &text("teleport")),
+            Err(MarkDecodeError::Corrupt {
+                field: "action",
+                ..
+            })
+        ));
+        // Two fates for one pathname.
+        assert!(matches!(
+            decode_mark(path, true, &Value::Integer(1), &text("delete")),
+            Err(MarkDecodeError::Contradictory { .. })
+        ));
+        // The healthy shapes.
+        assert_eq!(
+            decode_mark(path, true, &Value::Integer(1), &Value::Null).unwrap(),
+            Some(MarkIntent::Keeper)
+        );
+        assert_eq!(
+            decode_mark(path, true, &Value::Integer(0), &text("delete")).unwrap(),
+            Some(MarkIntent::Act(ActionKind::Delete))
+        );
+        assert_eq!(
+            decode_mark(path, true, &Value::Integer(0), &Value::Null).unwrap(),
+            None
+        );
+    }
+
+    /// D3 — the inner-duplicates fallback never returns a pathname byte verification rejected.
+    ///
+    /// Red on the parent: `dup_files_inside` selects manifest rows whose digest appears anywhere
+    /// in `file_group`, so the lone file — which `verify_groups` dropped as a population of one —
+    /// comes back as a «duplicate» under Explicit authority.
+    #[test]
+    fn the_directory_fallback_never_returns_a_verified_rejected_member() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2a_rejected");
+        let digest = [0x77u8; 32];
+        let a = write(&dir, "a.bin", b"AAAA");
+        let b = write(&dir, "b.bin", b"AAAA");
+        let lonely = write(&dir, "lonely.bin", b"ZZZZZZZZ");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(
+            &mut store,
+            &dir,
+            &[
+                (a.clone(), digest),
+                (b.clone(), digest),
+                (lonely.clone(), digest),
+            ],
+        );
+        let verified =
+            crate::pipeline::verify::verify_groups(store.duplicate_groups(scan_id).unwrap())
+                .unwrap();
+        assert_eq!(verified.len(), 1, "the lone population is dropped");
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .unwrap();
+
+        // The parent's reader still returns it — that is the red this replaces.
+        assert!(
+            store
+                .dup_files_inside(scan_id, &dir)
+                .unwrap()
+                .contains(&lonely),
+            "the raw-digest reader returns the rejected member"
+        );
+
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        match snapshot.dir_group_at(&dir).unwrap() {
+            DirGroupAnswer::InnerDupes {
+                members,
+                total,
+                truncated,
+            } => {
+                let paths: Vec<&PathBuf> = members.iter().map(|m| &m.path).collect();
+                assert!(paths.contains(&&a) && paths.contains(&&b));
+                assert!(
+                    !paths.contains(&&lonely),
+                    "a rejected member is not a member"
+                );
+                assert_eq!(total, 2);
+                assert!(!truncated);
+            }
+            other => panic!("expected InnerDupes, got {other:?}"),
+        }
+        drop(snapshot);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D1/D2 — one inconsistent rank refuses the WHOLE directory answer, in both modes. It is
+    /// never filtered out into a shorter list that looks entirely valid.
+    #[test]
+    fn an_inconsistent_rank_refuses_the_whole_directory_answer() {
+        let _role = role_guard();
+        for explicit in [true, false] {
+            let dir = temp_dir(if explicit {
+                "r4b2a_dir_x"
+            } else {
+                "r4b2a_dir_d"
+            });
+            let digest = [0x31u8; 32];
+            let a = write(&dir, "a.bin", b"SAME");
+            let b = write(&dir, "b.bin", b"SAME");
+            let mut store = ScanStore::open_in_memory().unwrap();
+            let scan_id = seed(&mut store, &dir, &[(a, digest), (b, digest)]);
+            if explicit {
+                let verified = crate::pipeline::verify::verify_groups(
+                    store.duplicate_groups(scan_id).unwrap(),
+                )
+                .unwrap();
+                store
+                    .publish_results(scan_id, PublishMode::Explicit(&verified))
+                    .unwrap();
+            } else {
+                store
+                    .publish_results(scan_id, PublishMode::Derived)
+                    .unwrap();
+            }
+            // A healthy control first, so the refusal below is the corruption and not the shape.
+            {
+                let snapshot = store.membership_snapshot(scan_id).unwrap();
+                assert!(matches!(
+                    snapshot.dir_group_at(&dir).unwrap(),
+                    DirGroupAnswer::InnerDupes { total: 2, .. }
+                ));
+            }
+            // The one reportable disagreement: the summary claims a count its membership does
+            // not hold.
+            store.corrupt_directly(
+                "UPDATE file_group SET file_count = file_count + 1 WHERE scan_id = ?1",
+                params![scan_id],
+            );
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            match snapshot.dir_group_at(&dir) {
+                Err(MembershipMiss::Inconsistent { .. }) => {}
+                other => panic!("explicit={explicit}: expected a whole refusal, got {other:?}"),
+            }
+            drop(snapshot);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// D4 — an Unknown scan yields typed candidates. They carry no identity and are never
+    /// presented as duplicates.
+    #[test]
+    fn an_unknown_scan_yields_typed_candidates() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2a_dir_unknown");
+        let digest = [0x41u8; 32];
+        let a = write(&dir, "a.bin", b"SAME");
+        let b = write(&dir, "b.bin", b"SAME");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(
+            &mut store,
+            &dir,
+            &[(a.clone(), digest), (b.clone(), digest)],
+        );
+
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        assert_eq!(snapshot.mode(), MembershipMode::Unknown);
+        match snapshot.dir_group_at(&dir).unwrap() {
+            DirGroupAnswer::InnerCandidates {
+                paths,
+                total,
+                truncated,
+            } => {
+                assert_eq!(paths, vec![a, b]);
+                assert_eq!(total, 2);
+                assert!(!truncated);
+            }
+            other => panic!("expected InnerCandidates, got {other:?}"),
+        }
+        drop(snapshot);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D5 — the directory answer is capped, and says so with an exact total.
+    #[test]
+    fn the_directory_answer_is_capped_with_an_exact_total() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2a_dir_cap");
+        let digest = [0x51u8; 32];
+        let members = DIR_INNER_CAP + 5;
+        let mut files = Vec::with_capacity(members);
+        for index in 0..members {
+            files.push((write(&dir, &format!("m{index:05}.bin"), b"SAME"), digest));
+        }
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &files);
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        match snapshot.dir_group_at(&dir).unwrap() {
+            DirGroupAnswer::InnerDupes {
+                members: rows,
+                total,
+                truncated,
+            } => {
+                assert_eq!(rows.len(), DIR_INNER_CAP, "the cap is exact");
+                assert_eq!(total, members as u64, "the total is the real one");
+                assert!(truncated);
+            }
+            other => panic!("expected InnerDupes, got {other:?}"),
+        }
+        drop(snapshot);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A directory the scan covers but that holds nothing duplicated, and one it does not cover
+    /// at all, are two different pieces of advice and keep two different answers.
+    #[test]
+    fn the_directory_answer_separates_absence_from_emptiness() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2a_dir_absence");
+        let inside = dir.join("inside");
+        std::fs::create_dir_all(&inside).unwrap();
+        let lone = write(&inside, "only.bin", b"UNIQUE");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &[(lone, [0x61u8; 32])]);
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        assert!(matches!(
+            snapshot.dir_group_at(&inside).unwrap(),
+            DirGroupAnswer::NoDuplicates
+        ));
+        assert!(matches!(
+            snapshot.dir_group_at(Path::new("/nowhere-at-all")).unwrap(),
+            DirGroupAnswer::NotInScan
+        ));
+        drop(snapshot);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F3 — the four states one pathname can be in, each with its own answer.
+    #[test]
+    fn file_info_separates_absence_unhashed_ungrouped_and_membership() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2a_file_info");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let (scan_id, x1, x2, y1) = published_split(&dir, &mut store);
+        // A manifest row with no digest yet, added after publication so it groups with nothing.
+        let pending = write(&dir, "pending.bin", b"NOT HASHED YET");
+        store
+            .record_files(scan_id, &[manifest_row(&pending)])
+            .unwrap();
+
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        // Outside the scan entirely.
+        assert!(matches!(
+            snapshot.file_info(Path::new("/nowhere/at/all")).unwrap(),
+            FileInfoAnswer::NotInScan
+        ));
+        // In the scan, no digest yet: absence of a hash is not absence of the file.
+        match snapshot.file_info(&pending).unwrap() {
+            FileInfoAnswer::InScan {
+                hash_text,
+                membership,
+            } => {
+                assert!(hash_text.is_none());
+                assert!(matches!(membership, Ok(FileMembership::NotGrouped)));
+            }
+            other => panic!("expected InScan, got {other:?}"),
+        }
+        // A member of an exact group: the peers are its own population, never the digest union.
+        match snapshot.file_info(&x1).unwrap() {
+            FileInfoAnswer::InScan {
+                hash_text,
+                membership,
+            } => {
+                assert!(hash_text.is_some());
+                let FileMembership::InGroup(info) = membership.unwrap() else {
+                    panic!("x1 is a member")
+                };
+                assert_eq!(info.total, 2);
+                assert_eq!(info.peers, vec![x2.clone()]);
+                assert!(!info.truncated);
+                // The other same-digest population is a different identity and is not a peer.
+                let other = snapshot.group_of_path(&y1).unwrap().unwrap();
+                assert_ne!(other, info.id, "two Explicit ranks stay separate");
+                assert!(!info.peers.contains(&y1));
+            }
+            other => panic!("expected InScan, got {other:?}"),
+        }
+        drop(snapshot);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F3 on a group larger than the cap: bounded peers, exact total, honest truncation.
+    #[test]
+    fn file_info_bounds_a_large_group() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2a_file_info_cap");
+        let digest = [0x71u8; 32];
+        let members = FILE_INFO_PEER_CAP + 40;
+        let mut files = Vec::with_capacity(members);
+        for index in 0..members {
+            files.push((write(&dir, &format!("p{index:05}.bin"), b"SAME"), digest));
+        }
+        let subject = files[0].0.clone();
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &files);
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        match snapshot.file_info(&subject).unwrap() {
+            FileInfoAnswer::InScan { membership, .. } => {
+                let FileMembership::InGroup(info) = membership.unwrap() else {
+                    panic!("the subject is a member")
+                };
+                assert_eq!(info.peers.len(), FILE_INFO_PEER_CAP, "the cap is exact");
+                assert_eq!(info.total, members as u64);
+                assert!(info.truncated);
+                assert!(!info.peers.contains(&subject), "not its own peer");
+            }
+            other => panic!("expected InScan, got {other:?}"),
+        }
+        drop(snapshot);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An Unknown scan answers F3 with a typed membership refusal, never «no duplicates».
+    #[test]
+    fn file_info_refuses_membership_without_authority() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2a_file_info_unknown");
+        let digest = [0x81u8; 32];
+        let a = write(&dir, "a.bin", b"SAME");
+        let b = write(&dir, "b.bin", b"SAME");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &[(a.clone(), digest), (b, digest)]);
+
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        match snapshot.file_info(&a).unwrap() {
+            FileInfoAnswer::InScan {
+                hash_text,
+                membership,
+            } => {
+                assert!(hash_text.is_some(), "the digest may still be shown");
+                assert!(matches!(membership, Err(MembershipMiss::Unknown)));
+            }
+            other => panic!("expected InScan, got {other:?}"),
+        }
+        drop(snapshot);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The panel batch: membership under authority, candidacy without it, and a fixed statement
+    /// shape either way.
+    #[test]
+    fn panel_files_answers_membership_candidacy_and_absence() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2a_panel");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let (scan_id, x1, x2, y1) = published_split(&dir, &mut store);
+        let twin_a = write(&dir, "twin_a.bin", b"1234567");
+        let twin_b = write(&dir, "twin_b.bin", b"1234567");
+        store
+            .record_files(scan_id, &[manifest_row(&twin_a), manifest_row(&twin_b)])
+            .unwrap();
+        let outside = dir.join("never.bin");
+
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        let paths: Vec<&Path> = vec![
+            x1.as_path(),
+            y1.as_path(),
+            twin_a.as_path(),
+            outside.as_path(),
+        ];
+        let rows = snapshot.panel_files(&paths).unwrap();
+        assert_eq!(rows.len(), 4);
+
+        let x_row = &rows[&x1];
+        let PanelFileStatus::InGroup {
+            id: x_id,
+            members,
+            distinct_devices,
+        } = x_row.status.clone()
+        else {
+            panic!("x1 is a member: {:?}", x_row.status)
+        };
+        assert_eq!(members, 2);
+        assert!(distinct_devices >= 1);
+        assert!(x_row.hash_text.is_some(), "the digest is display data");
+
+        let PanelFileStatus::InGroup { id: y_id, .. } = rows[&y1].status.clone() else {
+            panic!("y1 is a member")
+        };
+        assert_ne!(x_id, y_id, "same digest, two identities");
+        assert_eq!(
+            rows[&x1].hash_text, rows[&y1].hash_text,
+            "the digest really is shared — identity is what separates them"
+        );
+
+        // Unhashed, and something shares its size and mtime.
+        assert!(matches!(
+            rows[&twin_a].status,
+            PanelFileStatus::LikelyBySizeMtime { peers } if peers >= 2
+        ));
+        assert!(rows[&twin_a].hash_text.is_none());
+        assert_eq!(rows[&outside].status, PanelFileStatus::NotInScan);
+        drop(snapshot);
+
+        // An inconsistent rank hands out no identity, and the row is barred from matching. The
+        // rank comes from the identity the reader just returned — ranks are assigned by payoff,
+        // so naming a literal here would test whichever group happened to sort first.
+        store.corrupt_directly(
+            "UPDATE file_group SET file_count = file_count + 1 WHERE scan_id = ?1 AND rank = ?2",
+            params![scan_id, x_id.rank],
+        );
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        let rows = snapshot.panel_files(&[x1.as_path(), x2.as_path()]).unwrap();
+        assert!(matches!(
+            rows[&x1].status,
+            PanelFileStatus::Unavailable(PanelMiss::Inconsistent { .. })
+        ));
+        drop(snapshot);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Without authority a hashed row is unavailable, not «not grouped»: nothing may vouch for it.
+    #[test]
+    fn panel_files_marks_an_unknown_scan_unavailable() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2a_panel_unknown");
+        let digest = [0x91u8; 32];
+        let a = write(&dir, "a.bin", b"SAME");
+        let b = write(&dir, "b.bin", b"SAME");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &[(a.clone(), digest), (b, digest)]);
+
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        let rows = snapshot.panel_files(&[a.as_path()]).unwrap();
+        assert_eq!(
+            rows[&a].status,
+            PanelFileStatus::Unavailable(PanelMiss::Unknown)
+        );
+        assert!(rows[&a].hash_text.is_some());
+        drop(snapshot);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `plan_members` is strict where `group_page` is deliberately lenient: a corrupt link count
+    /// may still be browsed, and may not be planned against.
+    #[test]
+    fn plan_members_refuses_what_browsing_tolerates() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2a_plan_members");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let (scan_id, x1, _x2, _y1) = published_split(&dir, &mut store);
+        let id = {
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            let id = snapshot.group_of_path(&x1).unwrap().unwrap();
+            let members = snapshot.plan_members(&id).unwrap();
+            assert_eq!(members.len(), 2, "every persisted member, marked or not");
+            id
+        };
+
+        store.corrupt_directly(
+            "UPDATE file SET nlink = 'plenty' WHERE scan_id = ?1 AND path = ?2",
+            params![scan_id, x1.to_string_lossy()],
+        );
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        assert!(
+            snapshot.group_page(&id, 0, 10).is_ok(),
+            "browsing still shows the group"
+        );
+        assert!(
+            matches!(
+                snapshot.plan_members(&id),
+                Err(MembershipMiss::Inconsistent { .. })
+            ),
+            "a plan may not be built on it"
+        );
+        drop(snapshot);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The witness carries the CURRENT summary's digest and the exact members, and refuses a
+    /// stale identity outright.
+    #[test]
+    fn witness_of_reads_the_current_digest_and_members() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2a_witness");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let (scan_id, x1, x2, y1) = published_split(&dir, &mut store);
+
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        let x_id = snapshot.group_of_path(&x1).unwrap().unwrap();
+        let y_id = snapshot.group_of_path(&y1).unwrap().unwrap();
+        let witness = snapshot.witness_of(&[x_id, y_id]).unwrap();
+        assert_eq!(witness.scan_id, scan_id);
+        assert_eq!(witness.groups.len(), 2);
+        assert_eq!(witness.groups[0].members, vec![x1.clone(), x2]);
+        assert_eq!(
+            witness.groups[0].digest, witness.groups[1].digest,
+            "the split populations really do share a digest"
+        );
+        assert_ne!(witness.groups[0].id, witness.groups[1].id);
+        drop(snapshot);
+
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        let stale = GroupId {
+            generation: x_id.generation - 1,
+            ..x_id
+        };
+        assert!(matches!(
+            snapshot.witness_of(&[stale]),
+            Err(MembershipMiss::Stale { .. })
+        ));
+        drop(snapshot);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A claim belongs to an identity, not to a digest: the two same-digest populations each
+    /// state their own.
+    #[test]
+    fn group_claim_is_keyed_by_identity() {
+        let _role = role_guard();
+        let dir = temp_dir("r4b2a_claim");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let (scan_id, x1, _x2, y1) = published_split(&dir, &mut store);
+
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        let x_id = snapshot.group_of_path(&x1).unwrap().unwrap();
+        let y_id = snapshot.group_of_path(&y1).unwrap().unwrap();
+        let x_claim = snapshot.group_claim(&x_id).unwrap();
+        let y_claim = snapshot.group_claim(&y_id).unwrap();
+        assert_eq!(x_claim.links.observed, 2);
+        assert_eq!(y_claim.links.observed, 2);
+        // Different bytes behind each population, so the two claims are not the same figure.
+        assert_ne!(
+            x_claim.reclaim, y_claim.reclaim,
+            "each identity states its own claim"
+        );
+        drop(snapshot);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Structural: this commit adds the guard to the NEW surface only.
+    ///
+    /// The whole point of the commit boundary is that a refusal must not appear underneath a UI
+    /// that still swallows it. This walks the source and names every method that calls the guard,
+    /// so adding one to an existing reader fails here rather than in review.
+    #[test]
+    fn only_the_new_surface_calls_the_identity_guard() {
+        // Production code only: everything from the first `#[cfg(test)] mod` onward is tests,
+        // and this test's own assertion text names the call it is looking for.
+        let whole = include_str!("store.rs");
+        let source = whole
+            .split_once("\n#[cfg(test)]\nmod ")
+            .map(|(production, _)| production)
+            .unwrap_or(whole);
+        let mut current = String::new();
+        let mut callers: Vec<String> = Vec::new();
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            if line.starts_with("    fn ") || line.starts_with("    pub fn ") {
+                let rest = trimmed.trim_start_matches("pub ").trim_start_matches("fn ");
+                current = rest
+                    .split(['(', '<'])
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+            }
+            if trimmed.contains("self.ensure_current_path()") {
+                callers.push(current.clone());
+            }
+        }
+        callers.sort();
+        callers.dedup();
+        assert_eq!(
+            callers,
+            vec![
+                "ensure_db_identity".to_string(),
+                "save_marks_settled".to_string()
+            ],
+            "R4B-2a guards the new surface only; the existing readers switch with the UI that has \
+             to render the refusal"
+        );
     }
 }

@@ -17,3 +17,11 @@ pub use store::{
     CandidateView, DigestCandidate, LeaseRefusal, MembershipLease, MembershipMiss, MembershipMode,
     MembershipSnapshot, MembershipSummaries, PublishMode, ResolvedGroup,
 };
+// R4B-2a staging: the typed surface the future browsing actor reads through. Same reason again —
+// consumers reach store types through `crate::state` — and again with no production consumer, so
+// the actor commit changes call sites rather than paths.
+#[allow(unused_imports)] // R4B-2b/2c give every one of these a production consumer.
+pub use store::{
+    DirGroupAnswer, FileGroupInfo, FileInfoAnswer, FileMembership, InnerDupe, MarkDecodeError,
+    MarkWriteError, PanelFile, PanelFileStatus, PanelMiss, DIR_INNER_CAP, FILE_INFO_PEER_CAP,
+};
