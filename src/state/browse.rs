@@ -97,55 +97,261 @@ pub trait BrowseSink: Send {
     fn emit(&self, event: BrowseEvent);
 }
 
-/// One in-flight mark mutation the consumer still owes a settlement for. Retained inside the
-/// handle so a draining actor's tickets survive until its `Closed` arrives — dropping the
-/// handle early is exactly how a mark could end neither settled nor reported.
+/// Why a consumer-side registration or enqueue did not happen. One vocabulary for the ticket
+/// constructor, the inflight ledger and the send gate, so a caller settles from a `match` and
+/// never from a sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendRefusal {
+    /// The request names one pathname twice.
+    DuplicatePath { path: PathBuf },
+    /// The path set and the before-image do not describe the same exact set.
+    BeforeImageMismatch { path: PathBuf },
+    /// A live ticket or long operation already carries this request id.
+    RequestAlreadyLive,
+    /// Another live ticket already owns this pathname.
+    PathAlreadyLive { path: PathBuf },
+    /// One long operation at a time; the live one must settle first.
+    LongOperationLive,
+    /// Linearized after `begin_close`: never accepted, never queued.
+    Closing,
+    /// The actor's receiver is gone; its `Closed` is already observable.
+    Disconnected,
+    /// `SetMarks`/`AutoSelect` carry settlement state and may only travel through their typed
+    /// entry points — an untracked optimistic mutation is unrepresentable.
+    RequiresTicket,
+    /// `Shutdown` belongs to `begin_close` alone.
+    ShutdownReserved,
+}
+
+/// One in-flight mark mutation the consumer still owes a settlement for: the activation, the
+/// request id, the exact path set and the per-path durable before-image. Retained inside the
+/// handle so a draining actor's tickets survive until its `Closed` arrives — this is what a
+/// consumer needs to roll optimistic UI state back honestly, whatever happens to the actor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkTicket {
     pub act: Activation,
     pub req: RequestId,
+    /// The exact pathnames the request touches, in request order, unique.
+    pub paths: Vec<PathBuf>,
+    /// The durable mark each path carried BEFORE this request, same set as `paths`.
+    pub before: Vec<(PathBuf, Option<MarkIntent>)>,
 }
 
-/// The consumer-side ticket ledger, shared by every clone of one actor's handle.
+/// A refused mark send: the typed reason plus the complete before-image handed back, so the
+/// caller can settle its optimistic state locally without asking anyone.
+#[derive(Debug)]
+pub struct RefusedMarkSend {
+    pub reason: SendRefusal,
+    pub before: Vec<(PathBuf, Option<MarkIntent>)>,
+}
+
+/// A refused long-operation send: the typed reason plus the caller's token back.
+#[derive(Debug)]
+pub struct RefusedAutoSelect {
+    pub reason: SendRefusal,
+    pub cancel: CancelToken,
+}
+
+impl MarkTicket {
+    /// The only constructor. Validates that `paths` is duplicate-free and that `before`
+    /// describes exactly the same set — a ticket whose halves disagree could «settle» a path
+    /// it never covered, or forget one it did.
+    pub fn new(
+        act: Activation,
+        req: RequestId,
+        paths: Vec<PathBuf>,
+        before: Vec<(PathBuf, Option<MarkIntent>)>,
+    ) -> std::result::Result<MarkTicket, RefusedMarkSend> {
+        let mut seen: std::collections::BTreeSet<&PathBuf> = std::collections::BTreeSet::new();
+        for path in &paths {
+            if !seen.insert(path) {
+                return Err(RefusedMarkSend {
+                    reason: SendRefusal::DuplicatePath { path: path.clone() },
+                    before,
+                });
+            }
+        }
+        let mut image: std::collections::BTreeSet<&PathBuf> = std::collections::BTreeSet::new();
+        for (path, _) in &before {
+            if !image.insert(path) {
+                return Err(RefusedMarkSend {
+                    reason: SendRefusal::DuplicatePath { path: path.clone() },
+                    before,
+                });
+            }
+        }
+        let disagree = paths
+            .iter()
+            .find(|path| !image.contains(path))
+            .or_else(|| {
+                before
+                    .iter()
+                    .map(|(path, _)| path)
+                    .find(|path| !seen.contains(path))
+            })
+            .cloned();
+        if let Some(path) = disagree {
+            return Err(RefusedMarkSend {
+                reason: SendRefusal::BeforeImageMismatch { path },
+                before,
+            });
+        }
+        Ok(MarkTicket {
+            act,
+            req,
+            paths,
+            before,
+        })
+    }
+}
+
+/// The retained record of one live long operation: enough for the fleet to cancel it, for the
+/// consumer to settle it on its terminal event, and for a retirement to reveal that a sweep
+/// was mid-flight when the actor died. The token is the request-scoped one — stored, never
+/// reset, never shared with a later operation.
+#[derive(Debug, Clone)]
+pub struct LongOperation {
+    pub act: Activation,
+    pub req: RequestId,
+    pub cancel: CancelToken,
+}
+
+/// What settling one request id released.
+#[derive(Debug)]
+pub enum Settled {
+    Marks(MarkTicket),
+    Long(LongOperation),
+}
+
+/// Everything a terminal retirement drains: complete tickets, before-images included, and the
+/// live long operation if one was mid-flight. Every path lock is released with it.
+#[derive(Debug, Default)]
+pub struct DrainedInflight {
+    pub tickets: Vec<MarkTicket>,
+    pub long_op: Option<LongOperation>,
+}
+
+/// The consumer-side settlement ledger, shared by every clone of one actor's handle. Owns the
+/// per-path locks: two live mutations over one pathname would race each other's after-images,
+/// so the second registration is refused, typed, before it can enqueue.
 #[derive(Debug, Default)]
 pub struct Inflight {
-    tickets: Mutex<BTreeMap<u64, MarkTicket>>,
+    state: Mutex<InflightState>,
+}
+
+#[derive(Debug, Default)]
+struct InflightState {
+    tickets: BTreeMap<u64, MarkTicket>,
+    /// path → the request id whose live ticket owns it.
+    locks: BTreeMap<PathBuf, u64>,
+    long_op: Option<LongOperation>,
 }
 
 impl Inflight {
-    fn register(&self, ticket: MarkTicket) {
-        self.tickets
+    fn locked(&self) -> std::sync::MutexGuard<'_, InflightState> {
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(ticket.req.0, ticket);
     }
 
-    fn settle(&self, req: RequestId) -> Option<MarkTicket> {
-        self.tickets
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&req.0)
+    /// Registers a mark ticket, refusing a duplicate request id or any path intersection with
+    /// a live ticket. Never overwrites: the older entry always survives a refused newcomer.
+    fn register_marks(&self, ticket: MarkTicket) -> std::result::Result<(), RefusedMarkSend> {
+        let mut state = self.locked();
+        if state.tickets.contains_key(&ticket.req.0)
+            || state
+                .long_op
+                .as_ref()
+                .is_some_and(|long| long.req == ticket.req)
+        {
+            return Err(RefusedMarkSend {
+                reason: SendRefusal::RequestAlreadyLive,
+                before: ticket.before,
+            });
+        }
+        if let Some(path) = ticket
+            .paths
+            .iter()
+            .find(|path| state.locks.contains_key(*path))
+        {
+            return Err(RefusedMarkSend {
+                reason: SendRefusal::PathAlreadyLive { path: path.clone() },
+                before: ticket.before,
+            });
+        }
+        for path in &ticket.paths {
+            state.locks.insert(path.clone(), ticket.req.0);
+        }
+        state.tickets.insert(ticket.req.0, ticket);
+        Ok(())
     }
 
-    fn drain(&self) -> Vec<MarkTicket> {
-        let mut held = self
-            .tickets
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let drained: Vec<MarkTicket> = held.values().cloned().collect();
-        held.clear();
-        drained
+    /// Registers the one long operation, refusing a second while one is live.
+    fn register_long(&self, long: LongOperation) -> std::result::Result<(), SendRefusal> {
+        let mut state = self.locked();
+        if state.long_op.is_some() {
+            return Err(SendRefusal::LongOperationLive);
+        }
+        if state.tickets.contains_key(&long.req.0) {
+            return Err(SendRefusal::RequestAlreadyLive);
+        }
+        state.long_op = Some(long);
+        Ok(())
+    }
+
+    /// Settles one request id: removes its ticket and releases every path lock it held, or
+    /// takes the long operation if that is what the id names. A retry over the same paths
+    /// succeeds after this.
+    fn settle(&self, req: RequestId) -> Option<Settled> {
+        let mut state = self.locked();
+        if let Some(ticket) = state.tickets.remove(&req.0) {
+            state.locks.retain(|_, owner| *owner != req.0);
+            return Some(Settled::Marks(ticket));
+        }
+        if state.long_op.as_ref().is_some_and(|long| long.req == req) {
+            return state.long_op.take().map(Settled::Long);
+        }
+        None
+    }
+
+    /// Takes everything at once — the retirement step after this actor's terminal.
+    fn drain(&self) -> DrainedInflight {
+        let mut state = self.locked();
+        let tickets: Vec<MarkTicket> = std::mem::take(&mut state.tickets).into_values().collect();
+        state.locks.clear();
+        DrainedInflight {
+            tickets,
+            long_op: state.long_op.take(),
+        }
+    }
+
+    /// Cancels the live long operation through its own stored token, if one is live.
+    fn cancel_long(&self) -> bool {
+        match &self.locked().long_op {
+            Some(long) => {
+                long.cancel.cancel();
+                true
+            }
+            None => false,
+        }
     }
 }
 
-/// The consumer's end of one actor: the request queue, the shared closing flag and the ticket
-/// ledger. Cheap to clone; every clone talks to the same actor.
+/// The consumer's end of one actor: the request queue, the shared closing flag, the send gate
+/// and the settlement ledger. Cheap to clone; every clone talks to the same actor and shares
+/// the same gate, which is what makes closing linearizable against all of them.
 #[derive(Clone)]
 pub struct BrowseHandle {
     actor: ActorId,
     tx: Sender<BrowseRequest>,
     closing: Arc<AtomicBool>,
     inflight: Arc<Inflight>,
+    /// The one send gate. Every enqueue and `begin_close` take it, so each request is
+    /// linearized strictly before or strictly after the close: before → it sits in the queue
+    /// ahead of the one `Shutdown` and receives its typed settlement; after → it is rejected
+    /// to the caller and was never accepted. The `Empty`-then-drop loss window cannot exist,
+    /// because nothing can enter the queue behind `Shutdown`.
+    gate: Arc<Mutex<()>>,
 }
 
 impl BrowseHandle {
@@ -153,23 +359,135 @@ impl BrowseHandle {
         self.actor
     }
 
-    /// Enqueues a request. `false` means the actor's receiver is gone — which, by the run
-    /// loop's construction, can only be observed after that actor's `Closed` was emitted.
-    pub fn send(&self, request: BrowseRequest) -> bool {
-        self.tx.send(request).is_ok()
+    /// The one gated enqueue every send path uses. On refusal the request comes back whole,
+    /// so a typed entry point can recover its settlement payload.
+    fn enqueue(
+        &self,
+        request: BrowseRequest,
+    ) -> std::result::Result<(), (SendRefusal, BrowseRequest)> {
+        let _linearized = self
+            .gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.closing.load(Ordering::SeqCst) {
+            return Err((SendRefusal::Closing, request));
+        }
+        self.tx
+            .send(request)
+            .map_err(|refused| (SendRefusal::Disconnected, refused.0))
     }
 
-    pub fn register_ticket(&self, ticket: MarkTicket) {
-        self.inflight.register(ticket);
+    /// Enqueues a request that carries no consumer-side settlement state. `SetMarks` and
+    /// `AutoSelect` are refused here by construction — they may only travel through the typed
+    /// entry points that register their settlement state first — and `Shutdown` belongs to
+    /// `begin_close` alone.
+    pub fn send(&self, request: BrowseRequest) -> std::result::Result<(), SendRefusal> {
+        match &request {
+            BrowseRequest::SetMarks { .. } | BrowseRequest::AutoSelect { .. } => {
+                return Err(SendRefusal::RequiresTicket)
+            }
+            BrowseRequest::Shutdown => return Err(SendRefusal::ShutdownReserved),
+            _ => {}
+        }
+        self.enqueue(request).map_err(|(reason, _)| reason)
     }
 
-    pub fn settle_ticket(&self, req: RequestId) -> Option<MarkTicket> {
+    /// Test-only raw enqueue for exhaustive protocol routing: still gated, still refused
+    /// after close, but without the tracking discipline. Production code has no such door.
+    #[cfg(test)]
+    pub(crate) fn send_raw(&self, request: BrowseRequest) -> bool {
+        self.enqueue(request).is_ok()
+    }
+
+    /// Registers the ticket and enqueues the matching `SetMarks` as ONE operation: the ticket
+    /// is in the ledger before the request can run, the request is built from the same
+    /// entries the ticket's path set came from, and a failed enqueue rolls the registration
+    /// back and returns the complete before-image for local settlement. An accepted request
+    /// is owned from here on by the actor's reply or by terminal retirement — never neither.
+    pub fn send_set_marks(
+        &self,
+        act: Activation,
+        req: RequestId,
+        entries: Vec<FileEntry>,
+        before: Vec<(PathBuf, Option<MarkIntent>)>,
+    ) -> std::result::Result<(), RefusedMarkSend> {
+        let paths: Vec<PathBuf> = entries.iter().map(|entry| entry.path.clone()).collect();
+        let ticket = MarkTicket::new(act, req, paths, before)?;
+        self.inflight.register_marks(ticket)?;
+        if let Err((reason, _request)) = self.enqueue(BrowseRequest::SetMarks { act, req, entries })
+        {
+            let before = match self.inflight.settle(req) {
+                Some(Settled::Marks(ticket)) => ticket.before,
+                // The ledger cannot lose a just-registered ticket; empty keeps this total.
+                Some(Settled::Long(_)) | None => Vec::new(),
+            };
+            return Err(RefusedMarkSend { reason, before });
+        }
+        Ok(())
+    }
+
+    /// Registers the long operation and enqueues the matching `AutoSelect` as ONE operation,
+    /// under the same rollback contract as `send_set_marks`. The stored token is a clone of
+    /// the request's own — cancelling through the ledger cancels the sweep, and nothing ever
+    /// resets it.
+    pub fn send_auto_select(
+        &self,
+        act: Activation,
+        req: RequestId,
+        cancel: CancelToken,
+    ) -> std::result::Result<(), RefusedAutoSelect> {
+        if let Err(reason) = self.inflight.register_long(LongOperation {
+            act,
+            req,
+            cancel: cancel.clone(),
+        }) {
+            return Err(RefusedAutoSelect { reason, cancel });
+        }
+        if let Err((reason, request)) = self.enqueue(BrowseRequest::AutoSelect { act, req, cancel })
+        {
+            let cancel = match (self.inflight.settle(req), request) {
+                (_, BrowseRequest::AutoSelect { cancel, .. }) => cancel,
+                (Some(Settled::Long(long)), _) => long.cancel,
+                _ => CancelToken::new(),
+            };
+            return Err(RefusedAutoSelect { reason, cancel });
+        }
+        Ok(())
+    }
+
+    /// Registers a ticket without enqueueing — the seam a consumer needs when it must adopt
+    /// settlement state it created elsewhere. Refusals are the same typed conflicts.
+    pub fn register_ticket(&self, ticket: MarkTicket) -> std::result::Result<(), RefusedMarkSend> {
+        self.inflight.register_marks(ticket)
+    }
+
+    /// Settles one request id, releasing its ticket (and path locks) or the long operation.
+    pub fn settle(&self, req: RequestId) -> Option<Settled> {
         self.inflight.settle(req)
     }
 
-    /// Takes every unsettled ticket at once — the retirement step after this actor's terminal.
-    pub fn drain_tickets(&self) -> Vec<MarkTicket> {
+    /// Cancels the live long operation through its stored request-scoped token.
+    pub fn cancel_long_operation(&self) -> bool {
+        self.inflight.cancel_long()
+    }
+
+    /// Takes every unsettled ticket and the live long operation at once — the retirement step
+    /// after this actor's terminal. Complete evidence, locks released.
+    pub fn drain_tickets(&self) -> DrainedInflight {
         self.inflight.drain()
+    }
+
+    /// The closing half of the gate: marks closing and queues the one `Shutdown` in the same
+    /// critical section, so every sender clone is linearized strictly before or after it.
+    /// `false` means the receiver is already gone — the terminal path is then synthesised by
+    /// the fleet, which owns exactly that case.
+    fn begin_close_send(&self) -> bool {
+        let _linearized = self
+            .gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.closing.store(true, Ordering::SeqCst);
+        self.tx.send(BrowseRequest::Shutdown).is_ok()
     }
 }
 
@@ -845,20 +1163,22 @@ impl BrowseFleet {
         Some(actor)
     }
 
-    /// Starts closing the live actor. The closing flag is set BEFORE `Shutdown` is queued, so
-    /// requests already behind it are refused instead of executed.
+    /// Starts closing the live actor. Under the handle's send gate the closing flag and the
+    /// one `Shutdown` are one critical section, so every sender clone is linearized strictly
+    /// before or strictly after the close.
     ///
     /// Normally returns `None` and the terminal arrives later as a `Closed` event. When the
-    /// send itself fails the actor is already gone, so the terminal path is synthesised
-    /// inline: the retired pair comes back to the caller to settle and join, and the pending
-    /// successor is dropped — the cause of death is unknown at this point, and spawning blind
-    /// after a possible panic is what the panic policy forbids.
-    pub fn begin_close(&mut self) -> Option<(BrowseHandle, JoinHandle<()>)> {
+    /// send itself fails the actor is already gone, so the ownership transition happens here:
+    /// the complete retirement — handle with every unsettled ticket and the live long
+    /// operation, plus the join handle — comes back to the caller, and the pending successor
+    /// is dropped, because the cause of death is unknown at this point and spawning blind
+    /// after a possible panic is what the panic policy forbids. Dropping the EVIDENCE is not
+    /// part of that conservatism: it is returned whole.
+    pub fn begin_close(&mut self) -> Option<RetiredActor> {
         match &self.state {
             FleetState::Idle | FleetState::Draining { .. } => None,
             FleetState::Live { handle, .. } => {
-                handle.closing.store(true, Ordering::SeqCst);
-                let sent = handle.send(BrowseRequest::Shutdown);
+                let sent = handle.begin_close_send();
                 let FleetState::Live {
                     actor,
                     handle,
@@ -876,24 +1196,27 @@ impl BrowseFleet {
                     None
                 } else {
                     self.pending = None;
-                    Some((handle, join))
+                    Some(RetiredActor {
+                        actor,
+                        handle,
+                        join,
+                    })
                 }
             }
         }
     }
 
     /// Asks for a serialized replacement: close the live actor now, remember what to spawn
-    /// once its terminal settles. On an idle fleet it only records the wish.
-    pub fn replace(&mut self, role: BrowseRole, reopen: Option<i64>) {
+    /// once its terminal settles. On an idle fleet it only records the wish. A send failure
+    /// surfaces the synthesised retirement to the caller UNJOINED and UNDRAINED — settling
+    /// the tickets, discovering a live long operation and joining exactly once belong to the
+    /// caller, and nothing here may discard that evidence.
+    pub fn replace(&mut self, role: BrowseRole, reopen: Option<i64>) -> Option<RetiredActor> {
         self.pending = Some(PendingSpawn { role, reopen });
         if matches!(self.state, FleetState::Live { .. }) {
-            // A send failure here synthesises the terminal inline and clears `pending`
-            // (unknown cause of death — no blind successor); the caller settles the pair the
-            // same way `take_terminal`'s caller would.
-            if let Some((handle, join)) = self.begin_close() {
-                drop(handle.drain_tickets());
-                let _ = join.join();
-            }
+            self.begin_close()
+        } else {
+            None
         }
     }
 
@@ -905,15 +1228,12 @@ impl BrowseFleet {
         self.pending.as_ref()
     }
 
-    /// Consumes the one terminal an actor owes. Returns the retired pair the FIRST time a
-    /// terminal for `actor` is seen; `None` for a duplicate or an unknown id — idempotence is
-    /// structural, because the state has already moved on. A `Panicked` cause additionally
-    /// clears the pending successor: an actor that died of a panic never gets one.
-    pub fn take_terminal(
-        &mut self,
-        actor: ActorId,
-        cause: &CloseCause,
-    ) -> Option<(BrowseHandle, JoinHandle<()>)> {
+    /// Consumes the one terminal an actor owes. Returns the complete retirement the FIRST
+    /// time a terminal for `actor` is seen; `None` for a duplicate or an unknown id —
+    /// idempotence is structural, because the state has already moved on. A `Panicked` cause
+    /// additionally clears the pending successor: an actor that died of a panic never gets
+    /// one.
+    pub fn take_terminal(&mut self, actor: ActorId, cause: &CloseCause) -> Option<RetiredActor> {
         let matches_actor = match &self.state {
             FleetState::Live { actor: live, .. } => *live == actor,
             FleetState::Draining {
@@ -929,11 +1249,26 @@ impl BrowseFleet {
         }
         match std::mem::replace(&mut self.state, FleetState::Idle) {
             FleetState::Live { handle, join, .. } | FleetState::Draining { handle, join, .. } => {
-                Some((handle, join))
+                Some(RetiredActor {
+                    actor,
+                    handle,
+                    join,
+                })
             }
             FleetState::Idle => None,
         }
     }
+}
+
+/// The one-owner retirement of an actor: the handle still holding every unsettled ticket and
+/// the live long operation, plus the join handle to be joined exactly once. Whichever route
+/// produced it — a consumed `Closed`, a shutdown-send failure — the first observer owns it
+/// whole, and every later observation of the same terminal is a `None`. R4B-2c settles
+/// optimistic UI state from exactly this; the actor-only checkpoint proves it survives.
+pub struct RetiredActor {
+    pub actor: ActorId,
+    pub handle: BrowseHandle,
+    pub join: JoinHandle<()>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1211,6 +1546,7 @@ impl BrowseActor {
             tx,
             closing: closing.clone(),
             inflight: Arc::new(Inflight::default()),
+            gate: Arc::new(Mutex::new(())),
         };
         let join = std::thread::Builder::new()
             .name("dedcom-browse".to_string())
@@ -1244,6 +1580,11 @@ impl BrowseActor {
 /// The dispatch loop. Owns the receiver: normal shutdown drops it BEFORE emitting `Closed`,
 /// and a panic unwinds it before the guard reports — either way, an observable `Closed`
 /// means no new request can be queued any more.
+///
+/// There is deliberately no post-`Shutdown` drain: every enqueue and `begin_close` share one
+/// send gate, so a request is either in the queue AHEAD of the one `Shutdown` — and settles
+/// through the closing check above — or was rejected to its caller and never entered. Nothing
+/// can sit behind `Shutdown`, and an accepted request can never be left unanswered.
 fn run(state: &mut ActorState, rx: Receiver<BrowseRequest>, emitter: &emit::Emitter) {
     while let Ok(request) = rx.recv() {
         if matches!(request, BrowseRequest::Shutdown) {
@@ -1255,14 +1596,6 @@ fn run(state: &mut ActorState, rx: Receiver<BrowseRequest>, emitter: &emit::Emit
         }
         state.hooks.fire_dispatch();
         arms::handle(state, emitter, request);
-    }
-    // Whatever still sits behind the shutdown gets its typed terminal refusal — a queued
-    // mutator must never be left without a settlement, and must never touch the database.
-    while let Ok(request) = rx.try_recv() {
-        if matches!(request, BrowseRequest::Shutdown) {
-            continue;
-        }
-        arms::refuse_closing(state, emitter, request);
     }
     let actor = state.actor;
     drop(rx);
@@ -3082,7 +3415,7 @@ mod tests {
 
         fn open(&mut self, act: u64) -> Box<OpenedBrowse> {
             let req = self.req();
-            assert!(self.handle.send(BrowseRequest::Open {
+            assert!(self.handle.send_raw(BrowseRequest::Open {
                 act: Activation(act),
                 req,
                 scan_id: self.scan_id,
@@ -3112,7 +3445,7 @@ mod tests {
         /// Marked count through the actor itself, so the assertion needs no second connection.
         fn marked(&mut self, act: u64) -> u64 {
             let req = self.req();
-            assert!(self.handle.send(BrowseRequest::MarkedCount {
+            assert!(self.handle.send_raw(BrowseRequest::MarkedCount {
                 act: Activation(act),
                 req,
             }));
@@ -3130,7 +3463,7 @@ mod tests {
         }
 
         fn shutdown(mut self) {
-            assert!(self.handle.send(BrowseRequest::Shutdown));
+            assert!(self.handle.send_raw(BrowseRequest::Shutdown));
             match self.recv() {
                 BrowseEvent::Closed {
                     actor,
@@ -3205,7 +3538,7 @@ mod tests {
         let mut sent: Vec<(&'static str, RequestId)> = Vec::new();
         let mut push =
             |rig: &mut Rig, expected: &'static str, req: RequestId, request: BrowseRequest| {
-                assert!(rig.handle.send(request));
+                assert!(rig.handle.send_raw(request));
                 sent.push((expected, req));
             };
         // One of each, in one queue. Each constructor names the event variant it must settle
@@ -3446,7 +3779,7 @@ mod tests {
     fn connection_scoped_requests_bootstrap_before_any_open() {
         let mut rig = Rig::new("bootstrap", BrowseRole::Observer);
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::LatestScan {
+        assert!(rig.handle.send_raw(BrowseRequest::LatestScan {
             act: Activation(0),
             req,
         }));
@@ -3459,7 +3792,7 @@ mod tests {
         }
         let cwd = rig.dir.clone();
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::CoveringScan {
+        assert!(rig.handle.send_raw(BrowseRequest::CoveringScan {
             act: Activation(0),
             req,
             cwd,
@@ -3478,7 +3811,7 @@ mod tests {
     fn scan_scoped_requests_refuse_typed_without_an_active_scan() {
         let mut rig = Rig::new("no_active", BrowseRole::Operator);
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::MarkedCount {
+        assert!(rig.handle.send_raw(BrowseRequest::MarkedCount {
             act: Activation(1),
             req,
         }));
@@ -3490,7 +3823,7 @@ mod tests {
             other => panic!("a scan-scoped read needs an installed scan: {other:?}"),
         }
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::SetMarks {
+        assert!(rig.handle.send_raw(BrowseRequest::SetMarks {
             act: Activation(1),
             req,
             entries: Vec::new(),
@@ -3512,7 +3845,7 @@ mod tests {
     fn a_write_is_refused_for_the_observer_role() {
         let mut rig = Rig::new("observer_write", BrowseRole::Observer);
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::CacheHash {
+        assert!(rig.handle.send_raw(BrowseRequest::CacheHash {
             act: Activation(0),
             req,
             device: 1,
@@ -3548,7 +3881,7 @@ mod tests {
             sink_box,
             TestHooks::default(),
         );
-        assert!(handle.send(BrowseRequest::MarkedCount {
+        assert!(handle.send_raw(BrowseRequest::MarkedCount {
             act: Activation(1),
             req: RequestId(1),
         }));
@@ -3559,7 +3892,7 @@ mod tests {
             } => {}
             other => panic!("a pre-open read is refused from actor state alone: {other:?}"),
         }
-        assert!(handle.send(BrowseRequest::SetMarks {
+        assert!(handle.send_raw(BrowseRequest::SetMarks {
             act: Activation(1),
             req: RequestId(2),
             entries: Vec::new(),
@@ -3584,7 +3917,7 @@ mod tests {
                 && !parent.join("dedcom.db-shm").exists(),
             "a refused request must not create the database or its sidecars"
         );
-        assert!(handle.send(BrowseRequest::Shutdown));
+        assert!(handle.send_raw(BrowseRequest::Shutdown));
         match events.recv_timeout(Duration::from_secs(10)).unwrap() {
             BrowseEvent::Closed {
                 actor: got,
@@ -3606,7 +3939,7 @@ mod tests {
         let (sink_box, events) = sink();
         let (actor, handle, join) =
             BrowseActor::spawn_with_hooks(db, BrowseRole::Observer, sink_box, TestHooks::default());
-        assert!(handle.send(BrowseRequest::CacheHash {
+        assert!(handle.send_raw(BrowseRequest::CacheHash {
             act: Activation(0),
             req: RequestId(1),
             device: 1,
@@ -3628,7 +3961,7 @@ mod tests {
             !parent.exists(),
             "the refused observer write must not touch the path at all"
         );
-        assert!(handle.send(BrowseRequest::Shutdown));
+        assert!(handle.send_raw(BrowseRequest::Shutdown));
         match events.recv_timeout(Duration::from_secs(10)).unwrap() {
             BrowseEvent::Closed {
                 actor: got,
@@ -3707,7 +4040,7 @@ mod tests {
         rig.open(1);
         let aside = swap_away(&rig.db);
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::Open {
+        assert!(rig.handle.send_raw(BrowseRequest::Open {
             act: Activation(2),
             req,
             scan_id: rig.scan_id,
@@ -3723,7 +4056,7 @@ mod tests {
         }
         // Activation A is dead and the actor is poisoned, not merely empty.
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::MarkedCount {
+        assert!(rig.handle.send_raw(BrowseRequest::MarkedCount {
             act: Activation(1),
             req,
         }));
@@ -3764,7 +4097,7 @@ mod tests {
         std::fs::rename(&rig.db, &gone).unwrap();
         std::fs::rename(&second, &rig.db).unwrap();
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::Open {
+        assert!(rig.handle.send_raw(BrowseRequest::Open {
             act: Activation(2),
             req,
             scan_id: 9_999,
@@ -3805,7 +4138,7 @@ mod tests {
         let mut rig = Rig::new("class_a", BrowseRole::Observer);
         rig.open(1);
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::Open {
+        assert!(rig.handle.send_raw(BrowseRequest::Open {
             act: Activation(2),
             req,
             scan_id: 9_999,
@@ -3852,7 +4185,7 @@ mod tests {
             }
         });
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::Open {
+        assert!(rig.handle.send_raw(BrowseRequest::Open {
             act: Activation(2),
             req,
             scan_id: rig.scan_id,
@@ -3867,7 +4200,7 @@ mod tests {
         // Both store and active are gone: even the old activation refuses, and so does a
         // connection-scoped read — nothing is served from a database nobody is looking at.
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::MarkedCount {
+        assert!(rig.handle.send_raw(BrowseRequest::MarkedCount {
             act: Activation(1),
             req,
         }));
@@ -3879,7 +4212,7 @@ mod tests {
             other => panic!("a poisoned actor must refuse: {other:?}"),
         }
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::LatestScan {
+        assert!(rig.handle.send_raw(BrowseRequest::LatestScan {
             act: Activation(0),
             req,
         }));
@@ -3913,7 +4246,7 @@ mod tests {
             }
         });
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::Open {
+        assert!(rig.handle.send_raw(BrowseRequest::Open {
             act: Activation(2),
             req,
             scan_id: rig.scan_id,
@@ -3926,7 +4259,7 @@ mod tests {
             other => panic!("a swap during candidate construction is class B: {other:?}"),
         }
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::MarkedCount {
+        assert!(rig.handle.send_raw(BrowseRequest::MarkedCount {
             act: Activation(1),
             req,
         }));
@@ -3959,7 +4292,7 @@ mod tests {
             }
         });
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::Open {
+        assert!(rig.handle.send_raw(BrowseRequest::Open {
             act: Activation(2),
             req,
             scan_id: rig.scan_id,
@@ -3974,7 +4307,7 @@ mod tests {
         // The stale pair survived the class-A refusal — and the next touch refuses typed and
         // poisons, so the window closes one request later.
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::MarkedCount {
+        assert!(rig.handle.send_raw(BrowseRequest::MarkedCount {
             act: Activation(1),
             req,
         }));
@@ -3996,7 +4329,7 @@ mod tests {
         rig.open(1);
         let aside = swap_away(&rig.db);
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::MarkedCount {
+        assert!(rig.handle.send_raw(BrowseRequest::MarkedCount {
             act: Activation(1),
             req,
         }));
@@ -4008,7 +4341,7 @@ mod tests {
             other => panic!("the door probe must refuse a replaced path: {other:?}"),
         }
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::LatestScan {
+        assert!(rig.handle.send_raw(BrowseRequest::LatestScan {
             act: Activation(0),
             req,
         }));
@@ -4034,7 +4367,7 @@ mod tests {
         let ids = Rig::published_ids(&payload);
         let _aside = swap_away(&rig.db);
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::GroupCount {
+        assert!(rig.handle.send_raw(BrowseRequest::GroupCount {
             act: Activation(1),
             req,
             id: ids[0],
@@ -4047,7 +4380,7 @@ mod tests {
             other => panic!("the snapshot surface must refuse typed: {other:?}"),
         }
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::LatestScan {
+        assert!(rig.handle.send_raw(BrowseRequest::LatestScan {
             act: Activation(0),
             req,
         }));
@@ -4068,7 +4401,7 @@ mod tests {
         let [a1, a2, ..] = rig.files.clone();
         let aside = swap_away(&rig.db);
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::SetMarks {
+        assert!(rig.handle.send_raw(BrowseRequest::SetMarks {
             act: Activation(1),
             req,
             entries: vec![keeper_entry(&a1), delete_entry(&a2)],
@@ -4084,7 +4417,7 @@ mod tests {
             other => panic!("the write surface must refuse typed: {other:?}"),
         }
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::MarkedCount {
+        assert!(rig.handle.send_raw(BrowseRequest::MarkedCount {
             act: Activation(1),
             req,
         }));
@@ -4113,7 +4446,7 @@ mod tests {
         let [a1, a2, b1, b2] = rig.files.clone();
         // A durable baseline so the "no row changed" half is observable.
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::SetMarks {
+        assert!(rig.handle.send_raw(BrowseRequest::SetMarks {
             act: Activation(1),
             req,
             entries: vec![keeper_entry(&a1), delete_entry(&a2)],
@@ -4128,7 +4461,7 @@ mod tests {
         assert_eq!(rig.marked(1), 1);
         // A stale read settles typed.
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::MarkedCount {
+        assert!(rig.handle.send_raw(BrowseRequest::MarkedCount {
             act: Activation(0),
             req,
         }));
@@ -4145,7 +4478,7 @@ mod tests {
         }
         // A stale mutator settles typed and reaches no row.
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::SetMarks {
+        assert!(rig.handle.send_raw(BrowseRequest::SetMarks {
             act: Activation(0),
             req,
             entries: vec![keeper_entry(&b1), delete_entry(&b2)],
@@ -4176,7 +4509,7 @@ mod tests {
         // not move, because it opened by its own immutable role.
         crate::state::set_observer_role(true);
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::SetMarks {
+        assert!(rig.handle.send_raw(BrowseRequest::SetMarks {
             act: Activation(1),
             req,
             entries: vec![keeper_entry(&a1), delete_entry(&a2)],
@@ -4197,7 +4530,7 @@ mod tests {
         rig.open(1);
         let [a1, a2, ..] = rig.files.clone();
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::SetMarks {
+        assert!(rig.handle.send_raw(BrowseRequest::SetMarks {
             act: Activation(1),
             req,
             entries: vec![keeper_entry(&a1), delete_entry(&a2)],
@@ -4237,7 +4570,7 @@ mod tests {
         });
         let cancel = CancelToken::new();
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::AutoSelect {
+        assert!(rig.handle.send_raw(BrowseRequest::AutoSelect {
             act: Activation(1),
             req,
             cancel: cancel.clone(),
@@ -4278,7 +4611,7 @@ mod tests {
         rig.open(1);
         let [a1, a2, ..] = rig.files.clone();
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::SetMarks {
+        assert!(rig.handle.send_raw(BrowseRequest::SetMarks {
             act: Activation(1),
             req,
             entries: vec![keeper_entry(&a1), delete_entry(&a2)],
@@ -4301,7 +4634,7 @@ mod tests {
         }
         // A request that contradicts itself is refused whole, and the durable rows survive.
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::SetMarks {
+        assert!(rig.handle.send_raw(BrowseRequest::SetMarks {
             act: Activation(1),
             req,
             entries: vec![keeper_entry(&a1), delete_entry(&a1)],
@@ -4325,7 +4658,7 @@ mod tests {
         let mut rig = Rig::new("auto_ok", BrowseRole::Operator);
         rig.open(1);
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::AutoSelect {
+        assert!(rig.handle.send_raw(BrowseRequest::AutoSelect {
             act: Activation(1),
             req,
             cancel: CancelToken::new(),
@@ -4364,7 +4697,7 @@ mod tests {
             }
         });
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::AutoSelect {
+        assert!(rig.handle.send_raw(BrowseRequest::AutoSelect {
             act: Activation(1),
             req,
             cancel,
@@ -4402,7 +4735,7 @@ mod tests {
             }
         });
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::AutoSelect {
+        assert!(rig.handle.send_raw(BrowseRequest::AutoSelect {
             act: Activation(1),
             req,
             cancel: CancelToken::new(),
@@ -4415,7 +4748,7 @@ mod tests {
             other => panic!("a zero-commit path change is a typed refusal: {other:?}"),
         }
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::LatestScan {
+        assert!(rig.handle.send_raw(BrowseRequest::LatestScan {
             act: Activation(0),
             req,
         }));
@@ -4435,7 +4768,7 @@ mod tests {
         rig.open(1);
         let [a1, a2, ..] = rig.files.clone();
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::SetMarks {
+        assert!(rig.handle.send_raw(BrowseRequest::SetMarks {
             act: Activation(1),
             req,
             entries: vec![keeper_entry(&a1), delete_entry(&a2)],
@@ -4444,7 +4777,7 @@ mod tests {
         assert_eq!(rig.marked(1), 1);
         // A finished batch spends the whole plan.
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::ReconcileAfterBatch {
+        assert!(rig.handle.send_raw(BrowseRequest::ReconcileAfterBatch {
             act: Activation(1),
             req,
             attempted: vec![a2.clone()],
@@ -4456,7 +4789,7 @@ mod tests {
         }
         assert_eq!(rig.marked(1), 0, "the batch spent the marks");
         let req = rig.req();
-        assert!(rig.handle.send(BrowseRequest::CacheHash {
+        assert!(rig.handle.send_raw(BrowseRequest::CacheHash {
             act: Activation(1),
             req,
             device: 11,
@@ -4494,14 +4827,14 @@ mod tests {
         let probe = rig.req();
         assert!(rig
             .handle
-            .send(BrowseRequest::MarkedCount { act, req: probe }));
+            .send_raw(BrowseRequest::MarkedCount { act, req: probe }));
         at_gate
             .recv_timeout(Duration::from_secs(10))
             .expect("the actor must reach the dispatch gate");
         let mut queued: Vec<(&'static str, RequestId)> = Vec::new();
         let mut push =
             |rig: &mut Rig, name: &'static str, req: RequestId, request: BrowseRequest| {
-                assert!(rig.handle.send(request));
+                assert!(rig.handle.send_raw(request));
                 queued.push((name, req));
             };
         let req = rig.req();
@@ -4687,9 +5020,9 @@ mod tests {
             req,
             BrowseRequest::ScanCreatedAt { act, req, scan_id },
         );
-        // The closing flag first, the shutdown behind the queue — `begin_close`'s order.
-        rig.handle.closing.store(true, Ordering::SeqCst);
-        assert!(rig.handle.send(BrowseRequest::Shutdown));
+        // The closing flag and the one Shutdown, in the gate's single critical section —
+        // exactly what the fleet's `begin_close` performs.
+        assert!(rig.handle.begin_close_send());
         go_tx.send(()).unwrap();
         // The in-flight probe was already past the closing check and completes normally.
         match rig.recv() {
@@ -4746,11 +5079,12 @@ mod tests {
             other => panic!("the close must emit its terminal: {other:?}"),
         };
         assert_eq!(cause, CloseCause::Requested);
-        let (handle, join) = fleet
+        let retired = fleet
             .take_terminal(actor, &cause)
-            .expect("the first terminal returns the retired pair");
-        assert!(handle.drain_tickets().is_empty());
-        join.join().unwrap();
+            .expect("the first terminal returns the retirement");
+        let drained = retired.handle.drain_tickets();
+        assert!(drained.tickets.is_empty() && drained.long_op.is_none());
+        retired.join.join().unwrap();
         assert_eq!(fleet.phase(), FleetPhase::Idle);
         assert!(!fleet.terminal_owed());
         assert!(
@@ -4781,18 +5115,20 @@ mod tests {
             .expect("an idle fleet spawns");
         let handle = fleet.live().expect("live").clone();
         let req = RequestId(1);
-        handle.register_ticket(MarkTicket {
-            act: Activation(1),
-            req,
-        });
-        assert!(handle.send(BrowseRequest::LatestScan {
+        handle
+            .register_ticket(mark_ticket(1, 1, Path::new("/x/panic-ticket.bin")))
+            .expect("the ticket registers");
+        assert!(handle.send_raw(BrowseRequest::LatestScan {
             act: Activation(0),
             req,
         }));
         at_gate
             .recv_timeout(Duration::from_secs(10))
             .expect("the actor must reach the dispatch gate");
-        fleet.replace(BrowseRole::Operator, Some(scan_id));
+        assert!(
+            fleet.replace(BrowseRole::Operator, Some(scan_id)).is_none(),
+            "the parked actor is alive, so the terminal arrives as an event"
+        );
         assert!(fleet.pending_spawn().is_some(), "the successor is pending");
         assert_eq!(fleet.phase(), FleetPhase::Draining);
         go_tx.send(()).unwrap();
@@ -4810,16 +5146,15 @@ mod tests {
             ),
             other => panic!("the cause must be the panic: {other:?}"),
         }
-        let (handle, join) = fleet.take_terminal(actor, &cause).expect("first terminal");
+        let retired = fleet.take_terminal(actor, &cause).expect("first terminal");
+        let drained = retired.handle.drain_tickets();
         assert_eq!(
-            handle.drain_tickets(),
-            vec![MarkTicket {
-                act: Activation(1),
-                req,
-            }],
-            "the retired tickets are still there to settle"
+            drained.tickets.len(),
+            1,
+            "the retired ticket is still there to settle"
         );
-        join.join().unwrap();
+        assert_eq!(drained.tickets[0].req, req);
+        retired.join.join().unwrap();
         assert_eq!(fleet.phase(), FleetPhase::Idle);
         assert!(
             fleet.pending_spawn().is_none(),
@@ -4828,26 +5163,35 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The actor already panicked with its `Closed` queued but unconsumed, one mark ticket
+    /// and one long-operation record live. `replace()` hits the send failure — and the
+    /// synthesised retirement preserves BOTH records whole, joins exactly once, clears the
+    /// pending successor, and the late real `Closed` is a no-op.
     #[test]
-    fn a_send_failure_synthesises_the_terminal_and_a_late_closed_is_a_no_op() {
+    fn a_send_failure_returns_the_retirement_with_all_evidence() {
         let _lock = crate::panics::test_lock();
-        let (dir, db, _scan_id, _files) = seeded_db("fleet_send_fail");
+        let (dir, db, _scan_id, files) = seeded_db("fleet_send_fail");
         let mut fleet = BrowseFleet::new();
         let (sink_box, events) = sink();
         let hooks = TestHooks::default();
         hooks.on_dispatch(|| panic!("boom before the queue drains"));
         let actor = fleet
-            .spawn_hooked(db, BrowseRole::Observer, sink_box, hooks)
+            .spawn_hooked(db, BrowseRole::Operator, sink_box, hooks)
             .expect("an idle fleet spawns");
         let handle = fleet.live().expect("live").clone();
-        assert!(handle.send(BrowseRequest::LatestScan {
-            act: Activation(0),
-            req: RequestId(1),
-        }));
-        // The actor dies; its Closed(Panicked) is in the sink, the receiver is gone. The
-        // fleet has processed nothing yet.
+        handle
+            .register_ticket(mark_ticket(1, 7, &files[0]))
+            .expect("the ticket registers");
+        let token = CancelToken::new();
+        handle
+            .send_auto_select(Activation(1), RequestId(8), token)
+            .expect("the long operation registers and enqueues");
+        // Dispatching that sweep panics the actor: its Closed(Panicked) is in the sink, the
+        // receiver is gone, and both records are still unsettled. The fleet knows nothing.
         let late = events.recv_timeout(Duration::from_secs(10)).unwrap();
-        fleet.replace(BrowseRole::Operator, None);
+        let retired = fleet
+            .replace(BrowseRole::Observer, None)
+            .expect("the send failure surfaces the synthesised retirement");
         assert!(
             fleet.pending_spawn().is_none(),
             "a synthesised terminal never spawns blind"
@@ -4855,13 +5199,33 @@ mod tests {
         assert_eq!(
             fleet.phase(),
             FleetPhase::Idle,
-            "the send failure synthesised the whole terminal path inline"
+            "the ownership transition happened inline"
         );
+        let drained = retired.handle.drain_tickets();
+        assert_eq!(
+            drained.tickets.len(),
+            1,
+            "the mark ticket survives retirement"
+        );
+        assert_eq!(drained.tickets[0].req, RequestId(7));
+        assert_eq!(
+            drained.tickets[0].before,
+            vec![(files[0].clone(), None)],
+            "the before-image survives whole"
+        );
+        let long = drained
+            .long_op
+            .expect("the in-flight sweep is discoverable at retirement");
+        assert_eq!(long.req, RequestId(8));
+        retired.join.join().unwrap();
         // The real terminal arrives late and finds the state already moved on.
         match late {
             BrowseEvent::Closed { actor: got, cause } => {
                 assert_eq!(got, actor);
-                assert!(fleet.take_terminal(got, &cause).is_none());
+                assert!(
+                    fleet.take_terminal(got, &cause).is_none(),
+                    "the late real Closed finds the ownership already transferred"
+                );
             }
             other => panic!("the sink holds the one Closed: {other:?}"),
         }
@@ -4870,21 +5234,44 @@ mod tests {
 
     // ---- 11. serialized replacement -----------------------------------------------------------
 
+    /// Normal replacement retains every ticket, before-image and long-operation record until
+    /// the first `Closed`, then releases the whole retirement exactly once — before any
+    /// successor can exist.
     #[test]
     fn replacement_is_serialized_and_settles_old_tickets_first() {
-        let (dir, db, scan_id, _files) = seeded_db("fleet_replace");
+        let (dir, db, scan_id, files) = seeded_db("fleet_replace");
         let mut fleet = BrowseFleet::new();
         let (sink_box, events) = sink();
+        let hooks = TestHooks::default();
+        // Park the sweep before its handler so a live long operation spans the replacement.
+        let (at_gate_tx, at_gate) = crossbeam_channel::bounded::<()>(1);
+        let (go_tx, go) = crossbeam_channel::bounded::<()>(1);
+        let mut fired = false;
+        hooks.on_dispatch(move || {
+            if fired {
+                return;
+            }
+            fired = true;
+            let _ = at_gate_tx.send(());
+            let _ = go.recv();
+        });
         let first = fleet
-            .spawn(db.clone(), BrowseRole::Operator, sink_box)
+            .spawn_hooked(db.clone(), BrowseRole::Operator, sink_box, hooks)
             .expect("an idle fleet spawns");
         let handle = fleet.live().expect("live").clone();
-        let ticket = MarkTicket {
-            act: Activation(1),
-            req: RequestId(41),
-        };
-        handle.register_ticket(ticket.clone());
-        fleet.replace(BrowseRole::Observer, Some(scan_id));
+        handle
+            .register_ticket(mark_ticket(1, 41, &files[0]))
+            .expect("the ticket registers");
+        handle
+            .send_auto_select(Activation(1), RequestId(42), CancelToken::new())
+            .expect("the sweep registers and enqueues");
+        at_gate
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the actor must reach the dispatch gate");
+        assert!(
+            fleet.replace(BrowseRole::Observer, Some(scan_id)).is_none(),
+            "the actor is alive, so the terminal arrives as an event"
+        );
         assert_eq!(fleet.phase(), FleetPhase::Draining);
         // No second actor can exist while the first drains.
         let (denied_sink, _denied_events) = sink();
@@ -4894,6 +5281,13 @@ mod tests {
                 .is_none(),
             "spawning over a draining fleet is refused"
         );
+        go_tx.send(()).unwrap();
+        // The parked sweep observes closing and settles typed; the ledger is deliberately
+        // NOT settled here — retention until the terminal is the claim under test.
+        match events.recv_timeout(Duration::from_secs(10)).unwrap() {
+            BrowseEvent::AutoSelectDone { req, .. } => assert_eq!(req, RequestId(42)),
+            other => panic!("the sweep settles typed: {other:?}"),
+        }
         let cause = match events.recv_timeout(Duration::from_secs(10)).unwrap() {
             BrowseEvent::Closed { actor, cause } => {
                 assert_eq!(actor, first);
@@ -4901,14 +5295,20 @@ mod tests {
             }
             other => panic!("the retiring actor owes its terminal: {other:?}"),
         };
-        let (retired, join) = fleet.take_terminal(first, &cause).expect("first terminal");
-        let settled = retired.drain_tickets();
+        let retired = fleet.take_terminal(first, &cause).expect("first terminal");
+        let drained = retired.handle.drain_tickets();
         assert_eq!(
-            settled,
-            vec![ticket],
-            "old tickets settle before any successor"
+            drained.tickets.len(),
+            1,
+            "the ticket is retained until the terminal"
         );
-        join.join().unwrap();
+        assert_eq!(drained.tickets[0].req, RequestId(41));
+        assert_eq!(drained.tickets[0].before, vec![(files[0].clone(), None)]);
+        assert_eq!(
+            drained.long_op.expect("the long-op record is retained").req,
+            RequestId(42)
+        );
+        retired.join.join().unwrap();
         assert_eq!(fleet.phase(), FleetPhase::Idle);
         let plan = fleet.pending_spawn().cloned().expect("the wish survived");
         assert_eq!(plan.role, BrowseRole::Observer);
@@ -4923,12 +5323,430 @@ mod tests {
         match second_events.recv_timeout(Duration::from_secs(10)).unwrap() {
             BrowseEvent::Closed { actor, cause } => {
                 assert_eq!(actor, second);
-                let (_handle, join) = fleet.take_terminal(actor, &cause).expect("terminal");
-                join.join().unwrap();
+                let retired = fleet.take_terminal(actor, &cause).expect("terminal");
+                retired.join.join().unwrap();
             }
             other => panic!("the successor closes cleanly: {other:?}"),
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- R4B-2b2: lossless inflight, one send gate, evidence-preserving retirement -----------
+
+    /// A one-path ticket with a `None` before-image — the smallest valid settlement record.
+    fn mark_ticket(act: u64, req: u64, path: &Path) -> MarkTicket {
+        MarkTicket::new(
+            Activation(act),
+            RequestId(req),
+            vec![path.to_path_buf()],
+            vec![(path.to_path_buf(), None)],
+        )
+        .expect("a one-path ticket is valid")
+    }
+
+    /// Mandate 3: the constructor refuses halves that disagree — a ticket that could settle a
+    /// path it never covered, or forget one it did, must be unbuildable.
+    #[test]
+    fn the_ticket_constructor_rejects_disagreeing_halves() {
+        let a = PathBuf::from("/x/a.bin");
+        let b = PathBuf::from("/x/b.bin");
+        let dup = MarkTicket::new(
+            Activation(1),
+            RequestId(1),
+            vec![a.clone(), a.clone()],
+            vec![(a.clone(), None)],
+        )
+        .expect_err("a duplicated pathname is refused");
+        assert_eq!(dup.reason, SendRefusal::DuplicatePath { path: a.clone() });
+        let missing = MarkTicket::new(
+            Activation(1),
+            RequestId(1),
+            vec![a.clone(), b.clone()],
+            vec![(a.clone(), None)],
+        )
+        .expect_err("a before-image that skips a path is refused");
+        assert_eq!(
+            missing.reason,
+            SendRefusal::BeforeImageMismatch { path: b.clone() }
+        );
+        assert_eq!(
+            missing.before,
+            vec![(a.clone(), None)],
+            "the before-image comes back with the refusal"
+        );
+        let extra = MarkTicket::new(
+            Activation(1),
+            RequestId(1),
+            vec![a.clone()],
+            vec![(a.clone(), None), (b.clone(), Some(MarkIntent::Keeper))],
+        )
+        .expect_err("a before-image that invents a path is refused");
+        assert_eq!(
+            extra.reason,
+            SendRefusal::BeforeImageMismatch { path: b.clone() }
+        );
+        let doubled = MarkTicket::new(
+            Activation(1),
+            RequestId(1),
+            vec![a.clone()],
+            vec![(a.clone(), None), (a.clone(), None)],
+        )
+        .expect_err("a doubled before-image row is refused");
+        assert_eq!(doubled.reason, SendRefusal::DuplicatePath { path: a });
+    }
+
+    /// Mandates 1 and 2: an intersecting path set and a duplicate request id are refused
+    /// typed, the older entry survives untouched, and settling releases the locks so a retry
+    /// succeeds.
+    #[test]
+    fn conflicting_registrations_are_refused_without_overwriting() {
+        let mut rig = Rig::new("inflight_conflicts", BrowseRole::Operator);
+        rig.open(1);
+        let [a1, a2, ..] = rig.files.clone();
+        // Park the actor so the first mutation stays in flight while the conflicts land.
+        let (at_gate_tx, at_gate) = crossbeam_channel::bounded::<()>(1);
+        let (go_tx, go) = crossbeam_channel::bounded::<()>(1);
+        let mut fired = false;
+        rig.hooks.on_dispatch(move || {
+            if fired {
+                return;
+            }
+            fired = true;
+            let _ = at_gate_tx.send(());
+            let _ = go.recv();
+        });
+        let first = rig.req();
+        rig.handle
+            .send_set_marks(
+                Activation(1),
+                first,
+                vec![keeper_entry(&a1), delete_entry(&a2)],
+                vec![(a1.clone(), None), (a2.clone(), None)],
+            )
+            .expect("the first mutation registers and enqueues");
+        at_gate
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the actor must reach the dispatch gate");
+        let second = rig.req();
+        let refused = rig
+            .handle
+            .send_set_marks(
+                Activation(1),
+                second,
+                vec![delete_entry(&a2)],
+                vec![(a2.clone(), Some(MarkIntent::Keeper))],
+            )
+            .expect_err("a live path must refuse the second registration");
+        assert_eq!(
+            refused.reason,
+            SendRefusal::PathAlreadyLive { path: a2.clone() }
+        );
+        assert_eq!(
+            refused.before,
+            vec![(a2.clone(), Some(MarkIntent::Keeper))],
+            "the before-image comes back for local settlement"
+        );
+        let dup = rig
+            .handle
+            .register_ticket(mark_ticket(1, first.0, &rig.dir.join("elsewhere.bin")))
+            .expect_err("a live request id must refuse a second ticket");
+        assert_eq!(dup.reason, SendRefusal::RequestAlreadyLive);
+        go_tx.send(()).unwrap();
+        match rig.recv() {
+            BrowseEvent::MarkAck {
+                req,
+                outcome: MarkOutcome::Settled { .. },
+                ..
+            } => assert_eq!(req, first),
+            other => panic!("the first mutation settles: {other:?}"),
+        }
+        // The original ticket outlived the refused newcomers, before-image intact.
+        match rig.handle.settle(first) {
+            Some(Settled::Marks(ticket)) => {
+                assert_eq!(ticket.req, first);
+                assert_eq!(ticket.before, vec![(a1.clone(), None), (a2.clone(), None)]);
+            }
+            other => panic!("the original ticket must survive untouched: {other:?}"),
+        }
+        // Its locks went with it: the refused retry now succeeds end to end.
+        let retry = rig.req();
+        rig.handle
+            .send_set_marks(
+                Activation(1),
+                retry,
+                vec![delete_entry(&a2)],
+                vec![(a2.clone(), Some(MarkIntent::Keeper))],
+            )
+            .expect("settlement releases the path locks");
+        match rig.recv() {
+            BrowseEvent::MarkAck { req, .. } => assert_eq!(req, retry),
+            other => panic!("the retry settles: {other:?}"),
+        }
+        assert!(rig.handle.settle(retry).is_some());
+        rig.shutdown();
+    }
+
+    /// Mandate 4: however fast the reply races back, the ticket was registered before the
+    /// enqueue, so the observer of the event always finds it settleable.
+    #[test]
+    fn the_ticket_exists_before_its_event_can_be_observed() {
+        let mut rig = Rig::new("ticket_before_event", BrowseRole::Operator);
+        rig.open(1);
+        let [a1, a2, ..] = rig.files.clone();
+        let req = rig.req();
+        rig.handle
+            .send_set_marks(
+                Activation(1),
+                req,
+                vec![keeper_entry(&a1), delete_entry(&a2)],
+                vec![(a1.clone(), None), (a2.clone(), None)],
+            )
+            .expect("the mutation registers and enqueues");
+        match rig.recv() {
+            BrowseEvent::MarkAck {
+                req: got,
+                outcome: MarkOutcome::Settled { .. },
+                ..
+            } => assert_eq!(got, req),
+            other => panic!("the mutation settles: {other:?}"),
+        }
+        match rig.handle.settle(req) {
+            Some(Settled::Marks(ticket)) => assert_eq!(ticket.paths, vec![a1, a2]),
+            other => panic!("the registration preceded the enqueue: {other:?}"),
+        }
+        rig.shutdown();
+    }
+
+    /// Mandate 5: a failed enqueue rolls the registration back whole — the before-image comes
+    /// back, and no path lock or long-operation slot leaks.
+    #[test]
+    fn a_failed_enqueue_rolls_the_registration_back_whole() {
+        let mut rig = Rig::new("rollback", BrowseRole::Operator);
+        rig.open(1);
+        let [a1, ..] = rig.files.clone();
+        assert!(rig.handle.begin_close_send());
+        let req = rig.req();
+        let refused = rig
+            .handle
+            .send_set_marks(
+                Activation(1),
+                req,
+                vec![keeper_entry(&a1)],
+                vec![(a1.clone(), Some(MarkIntent::Keeper))],
+            )
+            .expect_err("a post-close mutation is never accepted");
+        assert_eq!(refused.reason, SendRefusal::Closing);
+        assert_eq!(refused.before, vec![(a1.clone(), Some(MarkIntent::Keeper))]);
+        // No lock leaked: the same path registers cleanly again.
+        rig.handle
+            .register_ticket(mark_ticket(1, req.0 + 10, &a1))
+            .expect("the rollback released the path lock");
+        // The long-operation slot rolls back the same way: the second refusal is Closing,
+        // not LongOperationLive.
+        let denied = rig
+            .handle
+            .send_auto_select(Activation(1), RequestId(req.0 + 20), CancelToken::new())
+            .expect_err("a post-close sweep is never accepted");
+        assert_eq!(denied.reason, SendRefusal::Closing);
+        let again = rig
+            .handle
+            .send_auto_select(Activation(1), RequestId(req.0 + 21), CancelToken::new())
+            .expect_err("still closing");
+        assert_eq!(
+            again.reason,
+            SendRefusal::Closing,
+            "the refused long operation did not stick in the slot"
+        );
+        match rig.recv() {
+            BrowseEvent::Closed {
+                cause: CloseCause::Requested,
+                ..
+            } => {}
+            other => panic!("the close settles: {other:?}"),
+        }
+        rig.join.take().unwrap().join().unwrap();
+        std::fs::remove_dir_all(&rig.dir).ok();
+    }
+
+    /// Mandate 6: the long operation is retained with its own token, cancellable through the
+    /// ledger, refused while live, settled by its event, and free again afterwards.
+    #[test]
+    fn the_long_operation_is_cancellable_settled_and_refused_while_live() {
+        let mut rig = Rig::new("long_op", BrowseRole::Operator);
+        rig.open(1);
+        let (at_gate_tx, at_gate) = crossbeam_channel::bounded::<()>(1);
+        let (go_tx, go) = crossbeam_channel::bounded::<()>(1);
+        let mut fired = false;
+        rig.hooks.on_dispatch(move || {
+            if fired {
+                return;
+            }
+            fired = true;
+            let _ = at_gate_tx.send(());
+            let _ = go.recv();
+        });
+        let sweep = rig.req();
+        let token = CancelToken::new();
+        rig.handle
+            .send_auto_select(Activation(1), sweep, token.clone())
+            .expect("the sweep registers and enqueues");
+        at_gate
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the actor must reach the dispatch gate");
+        let denied = rig
+            .handle
+            .send_auto_select(Activation(1), rig.ids.allocate(), CancelToken::new())
+            .expect_err("one long operation at a time");
+        assert_eq!(denied.reason, SendRefusal::LongOperationLive);
+        assert!(rig.handle.cancel_long_operation());
+        assert!(
+            token.cancelled(),
+            "the ledger cancels through the request's own token"
+        );
+        go_tx.send(()).unwrap();
+        match rig.recv() {
+            BrowseEvent::AutoSelectDone {
+                req,
+                outcome: AutoSelectOutcome::Refused(AutoSelectRefusal::CancelledBeforeFirstCommit),
+                ..
+            } => assert_eq!(req, sweep),
+            other => panic!("the cancelled sweep settles typed: {other:?}"),
+        }
+        match rig.handle.settle(sweep) {
+            Some(Settled::Long(long)) => assert_eq!(long.req, sweep),
+            other => panic!("the long operation settles by its id: {other:?}"),
+        }
+        let next = rig.ids.allocate();
+        rig.handle
+            .send_auto_select(Activation(1), next, CancelToken::new())
+            .expect("the slot is free after settlement");
+        match rig.recv() {
+            BrowseEvent::AutoSelectDone { req, .. } => assert_eq!(req, next),
+            other => panic!("the second sweep settles: {other:?}"),
+        }
+        assert!(rig.handle.settle(next).is_some());
+        rig.shutdown();
+    }
+
+    /// Mandate 7, deterministic half: a request linearized after `begin_close` is rejected to
+    /// its caller and never enters the queue — acceptance without ownership is exactly what
+    /// the old drain window allowed.
+    #[test]
+    fn a_send_after_close_is_rejected_locally() {
+        let mut rig = Rig::new("post_close_send", BrowseRole::Operator);
+        rig.open(1);
+        let (at_gate_tx, at_gate) = crossbeam_channel::bounded::<()>(1);
+        let (go_tx, go) = crossbeam_channel::bounded::<()>(1);
+        let mut fired = false;
+        rig.hooks.on_dispatch(move || {
+            if fired {
+                return;
+            }
+            fired = true;
+            let _ = at_gate_tx.send(());
+            let _ = go.recv();
+        });
+        let parked = rig.req();
+        assert!(rig.handle.send_raw(BrowseRequest::MarkedCount {
+            act: Activation(1),
+            req: parked,
+        }));
+        at_gate
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the actor must reach the dispatch gate");
+        assert!(rig.handle.begin_close_send());
+        assert_eq!(
+            rig.handle.send(BrowseRequest::LatestScan {
+                act: Activation(0),
+                req: rig.ids.allocate(),
+            }),
+            Err(SendRefusal::Closing),
+            "a post-close request is refused to the caller, never accepted"
+        );
+        go_tx.send(()).unwrap();
+        match rig.recv() {
+            BrowseEvent::MarkedCount { req, .. } => assert_eq!(req, parked),
+            other => panic!("the in-flight request completes: {other:?}"),
+        }
+        match rig.recv() {
+            BrowseEvent::Closed {
+                cause: CloseCause::Requested,
+                ..
+            } => {}
+            other => panic!("exactly one Closed follows: {other:?}"),
+        }
+        assert!(
+            rig.events.try_recv().is_err(),
+            "the rejected request has no orphan event"
+        );
+        rig.join.take().unwrap().join().unwrap();
+        std::fs::remove_dir_all(&rig.dir).ok();
+    }
+
+    /// Mandate 7, concurrent half: two sender clones race one closer through the shared gate.
+    /// Under every interleaving, an accepted send receives its declared event before the one
+    /// `Closed`, and a rejected send has none — no request is ever accepted and then lost.
+    #[test]
+    fn no_accepted_send_is_ever_lost_across_close() {
+        let mut rig = Rig::new("send_close_race", BrowseRole::Operator);
+        rig.open(1);
+        const PER_SENDER: u64 = 25;
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut senders = Vec::new();
+        for lane in 0..2u64 {
+            let handle = rig.handle.clone();
+            let barrier = barrier.clone();
+            senders.push(std::thread::spawn(move || {
+                let mut accepted: Vec<RequestId> = Vec::new();
+                barrier.wait();
+                for slot in 0..PER_SENDER {
+                    let req = RequestId(1_000 + lane * PER_SENDER + slot);
+                    if handle
+                        .send(BrowseRequest::LatestScan {
+                            act: Activation(0),
+                            req,
+                        })
+                        .is_ok()
+                    {
+                        accepted.push(req);
+                    }
+                }
+                accepted
+            }));
+        }
+        let closer = {
+            let handle = rig.handle.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                assert!(handle.begin_close_send());
+            })
+        };
+        let mut accepted: Vec<RequestId> = Vec::new();
+        for sender in senders {
+            accepted.extend(sender.join().unwrap());
+        }
+        closer.join().unwrap();
+        let mut answered: Vec<RequestId> = Vec::new();
+        loop {
+            match rig.recv() {
+                BrowseEvent::Closed {
+                    cause: CloseCause::Requested,
+                    ..
+                } => break,
+                BrowseEvent::LatestScan { req, .. } => answered.push(req),
+                other => panic!("only LatestScan replies and one Closed exist: {other:?}"),
+            }
+        }
+        accepted.sort();
+        answered.sort();
+        assert_eq!(
+            accepted, answered,
+            "accepted ⇔ answered: nothing lost, nothing invented"
+        );
+        assert!(rig.events.try_recv().is_err());
+        rig.join.take().unwrap().join().unwrap();
+        std::fs::remove_dir_all(&rig.dir).ok();
     }
 
     // ---- 12. the probe matrix, pinned by counters ---------------------------------------------
