@@ -1021,33 +1021,56 @@ impl ActorState {
         }
     }
 
-    /// The gate for connection-scoped requests: a connection (bootstrapped if need be), plus
-    /// the role check when the request writes. Deliberately NO activation comparison and NO
-    /// filesystem identity probe — identity is the store's invariant, paid inside each door
-    /// method, and connection-scoped requests are exactly the frozen exemption list.
+    /// The gate for connection-scoped requests. Refusals decidable from actor state alone —
+    /// a poisoned slot, a write asked of an observer — fire BEFORE any open: a refused
+    /// request must never establish a directory, create a database or run a migration as a
+    /// side effect. Only after them may a request bootstrap the lazy connection. Deliberately
+    /// NO activation comparison and NO filesystem identity probe — identity is the store's
+    /// invariant, paid inside each door method.
     fn connection_gate(&mut self, write: bool) -> Result<(), StoreMiss> {
-        self.door()?;
+        if let Slot::Poisoned { detail } = &self.slot {
+            return Err(StoreMiss::PathChanged {
+                detail: detail.clone(),
+            });
+        }
         if write && self.role == BrowseRole::Observer {
             return Err(StoreMiss::ReadOnlyRole);
         }
+        self.door()?;
         Ok(())
     }
 
-    /// The gate for scan-scoped requests, evaluated BEFORE any database access: connection,
-    /// role for writes, an installed scan, and the exact activation. Returns the installed
-    /// scan id so the arm cannot accidentally use the request's own idea of it.
+    /// The gate for scan-scoped requests, decided entirely from in-memory state: poisoned
+    /// slot, immutable role, installed scan, exact activation — in that order, all of it
+    /// before any store method can run. A request this gate refuses opens nothing, creates
+    /// nothing, migrates nothing and probes nothing. Returns the installed scan id so the
+    /// arm cannot accidentally use the request's own idea of it.
     fn scan_gate(&mut self, act: Activation, write: bool) -> Result<i64, StoreMiss> {
-        self.connection_gate(write)?;
-        let Some(active) = &self.active else {
-            return Err(StoreMiss::NoActiveScan);
+        if let Slot::Poisoned { detail } = &self.slot {
+            return Err(StoreMiss::PathChanged {
+                detail: detail.clone(),
+            });
+        }
+        if write && self.role == BrowseRole::Observer {
+            return Err(StoreMiss::ReadOnlyRole);
+        }
+        let (scan_id, installed) = match &self.active {
+            None => return Err(StoreMiss::NoActiveScan),
+            Some(active) => (active.scan_id, active.act),
         };
-        if active.act != act {
+        if installed != act {
             return Err(StoreMiss::StaleActivation {
-                expected: active.act.0,
+                expected: installed.0,
                 found: act.0,
             });
         }
-        Ok(active.scan_id)
+        // An installed scan implies a held connection — `Open` installs both together and
+        // poisoning drops both together — so this match is totality, never a bootstrap: a
+        // scan-scoped request does not open the database.
+        match &self.slot {
+            Slot::Open(_) => Ok(scan_id),
+            Slot::Absent | Slot::Poisoned { .. } => Err(StoreMiss::NotOpen),
+        }
     }
 
     /// The installed dir-signature algorithm; the scan gate has already proven `active`.
@@ -2017,7 +2040,9 @@ mod arms {
 
     /// `Open`: reuse-or-open by the actor's own role, then build the COMPLETE candidate
     /// without touching `active`, then install atomically. Failure never leaves the two
-    /// sides describing different scans: class A changes nothing, class B uninstalls both.
+    /// sides describing different scans: class A changes nothing, class B uninstalls both —
+    /// and once a typed mismatch has discarded the previous pair, EVERY later failure of
+    /// this `Open` is class B, because no previous state is left for class A to keep.
     fn open(
         state: &mut ActorState,
         emitter: &Emitter,
@@ -2025,24 +2050,50 @@ mod arms {
         req: RequestId,
         scan_id: i64,
     ) {
-        // 1. The reuse-or-open bracket. A connection whose identity no longer holds is
-        //    dropped together with the active scan — `Open` is the one request allowed to
-        //    rebuild from that state, which is exactly why it is exempt from the gate.
-        let reuse = match &state.slot {
-            Slot::Open(door) => door.identity_check().is_ok(),
-            Slot::Absent | Slot::Poisoned { .. } => false,
+        // 1. The reuse-or-open bracket. The typed mismatch that discards a live pair is
+        //    RETAINED, never reduced to a boolean: it decides the class of every failure
+        //    below. `Open` is the one request allowed to rebuild from a poisoned slot, which
+        //    is exactly why it is exempt from the gate.
+        let retained: Option<String> = match &state.slot {
+            Slot::Open(door) => match door.identity_check() {
+                Ok(()) => None,
+                Err(err) => Some(match err.path_mismatch() {
+                    Some(detail) => detail.to_string(),
+                    // `ensure_current_path` refuses only through `PathChanged` today; should
+                    // a different shape ever reach here, the identity is still unproven, and
+                    // an unproven identity discards exactly like a proven mismatch.
+                    None => err.to_string(),
+                }),
+            },
+            Slot::Poisoned { detail } => Some(detail.clone()),
+            Slot::Absent => None,
         };
-        if !reuse {
+        let healthy_reuse = matches!(&state.slot, Slot::Open(_)) && retained.is_none();
+        if !healthy_reuse {
             state.active = None;
             state.slot = Slot::Absent;
             match super::guarded::BrowsingStore::open(&state.db, state.role) {
                 Ok(door) => state.slot = Slot::Open(Box::new(door)),
                 Err(err) => {
-                    let failure = match err.path_mismatch() {
-                        Some(detail) => BrowseOpenFailure::PathChanged {
-                            detail: detail.to_string(),
-                        },
-                        None => BrowseOpenFailure::Open {
+                    // No connection could be established. With a retained mismatch this is
+                    // class B whatever the open error says: the pair is already gone, and
+                    // the pathname holds something that is not the checkpoint. The fresh
+                    // context rides along for diagnostics only — the class comes from the
+                    // retained type, never from error text.
+                    let failure = match (err.path_mismatch(), &retained) {
+                        (Some(detail), _) => {
+                            let detail = detail.to_string();
+                            state.poison(&detail);
+                            BrowseOpenFailure::PathChanged { detail }
+                        }
+                        (None, Some(mismatch)) => {
+                            let detail = format!("{mismatch}; reopening also failed: {err}");
+                            state.poison(&detail);
+                            BrowseOpenFailure::PathChanged { detail }
+                        }
+                        // Nothing was installed and nothing was discarded: an ordinary
+                        // class-A open failure over an empty slot.
+                        (None, None) => BrowseOpenFailure::Open {
                             detail: err.to_string(),
                         },
                     };
@@ -2055,9 +2106,12 @@ mod arms {
         }
         // 2. The complete candidate, before any installation.
         let built = build_candidate(state, scan_id);
-        // 3. Exactly one of: install, class-A refusal, class-B uninstall.
-        match built {
-            Ok(candidate) => {
+        // 3. Exactly one of: install, class-A refusal, class-B uninstall. A retained
+        //    mismatch turns even a typed candidate refusal into class B: the reopened
+        //    checkpoint may be healthy, but the pair this `Open` discarded is not coming
+        //    back, and class A would tell the consumer to keep serving it.
+        match (built, retained) {
+            (Ok(candidate), _) => {
                 state.active = Some(ActiveScan {
                     scan_id,
                     act,
@@ -2069,12 +2123,22 @@ mod arms {
                     |result| BrowseEvent::OpenFinished { act, req, result },
                 );
             }
-            Err(CandidateFail::Typed(failure)) => {
+            (Err(CandidateFail::Typed(failure)), None) => {
                 emitter.finish(state, Err::<Box<OpenedBrowse>, _>(failure), |result| {
                     BrowseEvent::OpenFinished { act, req, result }
                 });
             }
-            Err(CandidateFail::Mismatch { detail }) => {
+            (Err(CandidateFail::Typed(failure)), Some(mismatch)) => {
+                let detail =
+                    format!("{mismatch}; the reopened checkpoint then refused: {failure:?}");
+                state.poison(&detail);
+                emitter.finish(
+                    state,
+                    Err::<Box<OpenedBrowse>, _>(BrowseOpenFailure::PathChanged { detail }),
+                    |result| BrowseEvent::OpenFinished { act, req, result },
+                );
+            }
+            (Err(CandidateFail::Mismatch { detail }), _) => {
                 state.poison(&detail);
                 emitter.finish(
                     state,
@@ -3464,6 +3528,260 @@ mod tests {
             } => {}
             other => panic!("an observer must not write the hash cache: {other:?}"),
         }
+        rig.shutdown();
+    }
+
+    // ---- R4B-2b1 correction A: refusal before any database access ----------------------------
+
+    /// Red on `df0319d`: the lazy bootstrap ran ahead of the scan gate, so an Operator's
+    /// refused pre-open request had already established the state directory, created
+    /// dedcom.db, enabled WAL and migrated it.
+    #[test]
+    fn a_refused_scan_request_creates_no_database() {
+        let scratch = temp_dir("gate_no_side_effect");
+        let parent = scratch.join("state");
+        let db = parent.join("dedcom.db");
+        let (sink_box, events) = sink();
+        let (actor, handle, join) = BrowseActor::spawn_with_hooks(
+            db.clone(),
+            BrowseRole::Operator,
+            sink_box,
+            TestHooks::default(),
+        );
+        assert!(handle.send(BrowseRequest::MarkedCount {
+            act: Activation(1),
+            req: RequestId(1),
+        }));
+        match events.recv_timeout(Duration::from_secs(10)).unwrap() {
+            BrowseEvent::MarkedCount {
+                result: Err(StoreMiss::NoActiveScan),
+                ..
+            } => {}
+            other => panic!("a pre-open read is refused from actor state alone: {other:?}"),
+        }
+        assert!(handle.send(BrowseRequest::SetMarks {
+            act: Activation(1),
+            req: RequestId(2),
+            entries: Vec::new(),
+        }));
+        match events.recv_timeout(Duration::from_secs(10)).unwrap() {
+            BrowseEvent::MarkAck {
+                outcome:
+                    MarkOutcome::Unreadable {
+                        error: MarkWriteError::Store { .. },
+                    },
+                ..
+            } => {}
+            other => panic!("a pre-open mutation is refused from actor state alone: {other:?}"),
+        }
+        assert!(
+            !parent.exists(),
+            "a refused request must not establish the state directory"
+        );
+        assert!(
+            !db.exists()
+                && !parent.join("dedcom.db-wal").exists()
+                && !parent.join("dedcom.db-shm").exists(),
+            "a refused request must not create the database or its sidecars"
+        );
+        assert!(handle.send(BrowseRequest::Shutdown));
+        match events.recv_timeout(Duration::from_secs(10)).unwrap() {
+            BrowseEvent::Closed {
+                actor: got,
+                cause: CloseCause::Requested,
+            } => assert_eq!(got, actor),
+            other => panic!("shutdown must close: {other:?}"),
+        }
+        join.join().unwrap();
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// Red on `df0319d`: the observer's write refusal came AFTER the lazy open, so over an
+    /// unavailable path it surfaced as an open/read error instead of the role refusal.
+    #[test]
+    fn an_observer_write_refuses_before_opening_anything() {
+        let scratch = temp_dir("observer_no_open");
+        let parent = scratch.join("state");
+        let db = parent.join("dedcom.db");
+        let (sink_box, events) = sink();
+        let (actor, handle, join) =
+            BrowseActor::spawn_with_hooks(db, BrowseRole::Observer, sink_box, TestHooks::default());
+        assert!(handle.send(BrowseRequest::CacheHash {
+            act: Activation(0),
+            req: RequestId(1),
+            device: 1,
+            inode: 2,
+            size: 3,
+            mtime: 4,
+            digest: [1u8; 32],
+        }));
+        match events.recv_timeout(Duration::from_secs(10)).unwrap() {
+            BrowseEvent::CacheHashAck {
+                result: Err(StoreMiss::ReadOnlyRole),
+                ..
+            } => {}
+            other => {
+                panic!("the role refusal must not depend on the path being openable: {other:?}")
+            }
+        }
+        assert!(
+            !parent.exists(),
+            "the refused observer write must not touch the path at all"
+        );
+        assert!(handle.send(BrowseRequest::Shutdown));
+        match events.recv_timeout(Duration::from_secs(10)).unwrap() {
+            BrowseEvent::Closed {
+                actor: got,
+                cause: CloseCause::Requested,
+            } => assert_eq!(got, actor),
+            other => panic!("shutdown must close: {other:?}"),
+        }
+        join.join().unwrap();
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// The gate itself, driven directly over an installed pair: a stale or scan-less request
+    /// is decided from memory, spending zero identity probes and zero validations. The
+    /// actor-level behavioural control stays in `stale_activation_settles_typed_and_touches_
+    /// no_row`.
+    #[test]
+    fn a_gate_refusal_spends_no_probe_and_no_validation() {
+        let (dir, db, scan_id, _files) = seeded_db("gate_counters");
+        let door = guarded::BrowsingStore::open(&db, BrowseRole::Operator).unwrap();
+        let mut state = ActorState {
+            actor: ActorId(999_000),
+            db: db.clone(),
+            role: BrowseRole::Operator,
+            closing: Arc::new(AtomicBool::new(false)),
+            slot: Slot::Open(Box::new(door)),
+            active: Some(ActiveScan {
+                scan_id,
+                act: Activation(1),
+                dir_sig_algo: DirSigAlgo::Old,
+            }),
+            hooks: TestHooks::default(),
+        };
+        let counters = |state: &ActorState| match &state.slot {
+            Slot::Open(door) => (door.identity_probes(), door.full_validation_count()),
+            _ => panic!("the fixture holds an open slot"),
+        };
+        let before = counters(&state);
+        assert!(matches!(
+            state.scan_gate(Activation(0), false),
+            Err(StoreMiss::StaleActivation {
+                expected: 1,
+                found: 0
+            })
+        ));
+        assert!(matches!(
+            state.scan_gate(Activation(0), true),
+            Err(StoreMiss::StaleActivation { .. })
+        ));
+        state.active = None;
+        assert!(matches!(
+            state.scan_gate(Activation(1), false),
+            Err(StoreMiss::NoActiveScan)
+        ));
+        assert!(matches!(
+            state.scan_gate(Activation(1), true),
+            Err(StoreMiss::NoActiveScan)
+        ));
+        assert_eq!(
+            counters(&state),
+            before,
+            "a gate refusal pays no probe and no validation"
+        );
+        drop(state);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- R4B-2b1 correction B: class B survives a failed reopen -------------------------------
+
+    /// Red on `df0319d`: the reuse identity check was reduced to `.is_ok()`, so when the
+    /// replacement at the pathname was a regular but invalid SQLite file, the actor dropped
+    /// the installed pair and then reported class-A `Open { .. }` — telling the consumer to
+    /// keep state the actor no longer has.
+    #[test]
+    fn a_replacement_by_an_invalid_file_is_still_class_b() {
+        let mut rig = Rig::new("class_b_invalid", BrowseRole::Operator);
+        rig.open(1);
+        let aside = swap_away(&rig.db);
+        let req = rig.req();
+        assert!(rig.handle.send(BrowseRequest::Open {
+            act: Activation(2),
+            req,
+            scan_id: rig.scan_id,
+        }));
+        match rig.recv() {
+            BrowseEvent::OpenFinished {
+                result: Err(BrowseOpenFailure::PathChanged { .. }),
+                ..
+            } => {}
+            other => panic!(
+                "the discarded pair makes this class B even though the reopen failed: {other:?}"
+            ),
+        }
+        // Activation A is dead and the actor is poisoned, not merely empty.
+        let req = rig.req();
+        assert!(rig.handle.send(BrowseRequest::MarkedCount {
+            act: Activation(1),
+            req,
+        }));
+        match rig.recv() {
+            BrowseEvent::MarkedCount {
+                result: Err(StoreMiss::PathChanged { .. }),
+                ..
+            } => {}
+            other => panic!("activation A must be unusable after the class-B reply: {other:?}"),
+        }
+        // A later Open over a restored checkpoint recovers normally.
+        swap_back(&rig.db, &aside);
+        let payload = rig.open(3);
+        assert_eq!(payload.scan_id, rig.scan_id);
+        assert_eq!(rig.marked(3), 0);
+        rig.shutdown();
+    }
+
+    /// Red on `df0319d`: with a VALID second checkpoint at the pathname the fresh open
+    /// succeeds, and a typed candidate refusal (`NoSuchScan`) was then emitted as class A —
+    /// although the pair this `Open` had discarded was not coming back.
+    #[test]
+    fn a_candidate_refusal_after_a_replacement_is_still_class_b() {
+        let mut rig = Rig::new("class_b_candidate", BrowseRole::Observer);
+        rig.open(1);
+        let second = rig.dir.join("second.db");
+        let c1 = write(&rig.dir, "c1.bin", b"CCCC");
+        let c2 = write(&rig.dir, "c2.bin", b"CCCC");
+        let mut store = ScanStore::open_writable(&second).unwrap();
+        let second_scan = seed_verified(
+            &mut store,
+            &rig.dir,
+            &[(c1, [0xCCu8; 32]), (c2, [0xCCu8; 32])],
+        );
+        publish_explicit(&mut store, second_scan);
+        drop(store);
+        let gone = rig.db.with_extension("gone");
+        std::fs::rename(&rig.db, &gone).unwrap();
+        std::fs::rename(&second, &rig.db).unwrap();
+        let req = rig.req();
+        assert!(rig.handle.send(BrowseRequest::Open {
+            act: Activation(2),
+            req,
+            scan_id: 9_999,
+        }));
+        match rig.recv() {
+            BrowseEvent::OpenFinished {
+                result: Err(BrowseOpenFailure::PathChanged { .. }),
+                ..
+            } => {}
+            other => panic!(
+                "a typed candidate refusal after a discarding mismatch is class B: {other:?}"
+            ),
+        }
+        // Recovery: the checkpoint now at the pathname opens by its own scan id.
+        rig.scan_id = second_scan;
+        let payload = rig.open(3);
+        assert_eq!(payload.scan_id, second_scan);
         rig.shutdown();
     }
 
