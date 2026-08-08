@@ -1,4 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
+// R4B-2b staging: the serialized browsing actor. Public so the dormant `App` field and the
+// dormant `AppEvent` carrier can name its types; nothing in production spawns it until R4B-2c,
+// so the whole surface is dead to the binary today — the tests at the bottom of `browse.rs`
+// are its only driver.
+#[allow(dead_code)] // R4B-2c gives every piece of the actor a production caller.
+pub mod browse;
 pub mod host_profile;
 pub mod move_track;
 pub mod schema;

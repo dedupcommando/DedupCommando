@@ -328,6 +328,11 @@ pub struct App {
     /// move (create_dir_all + WAL PRAGMA + migrate + cold page-cache) loaded
     /// the DB from disk → freeze of "groups by reclaim" on /tank (the same class as upstream Bug 4).
     pub(crate) browse_store: Option<ScanStore>,
+    /// The serialized browsing-actor fleet (R4B-2b). Dormant: initialized `Idle`, no code
+    /// spawns an actor or routes a request through it yet — R4B-2c performs the atomic
+    /// cutover from `browse_store` and the per-frame opens onto this.
+    #[allow(dead_code)] // R4B-2c reads it; until then only its type keeps the field honest.
+    pub(crate) browse: crate::state::browse::BrowseFleet,
     pub events: Sender<AppEvent>,
     pub config: ScanConfigState,
     pub folder_picker: FolderPickerState,
@@ -500,6 +505,7 @@ impl App {
             applying: ApplyingState::default(),
             scan_diff: ScanDiffState::default(),
             browse_store: None,
+            browse: crate::state::browse::BrowseFleet::new(),
             browser: BrowserState::default(),
             review: ReviewState::default(),
             summary_result: None,
@@ -541,6 +547,9 @@ impl App {
         match event {
             AppEvent::Key(key) => self.on_key(key),
             AppEvent::Resize => {}
+            // R4B-2b: dormant — nothing sends this event until R4B-2c routes the actor's
+            // replies into the UI. The arm exists so the carrier compiles without a wildcard.
+            AppEvent::Browse(_) => {}
             AppEvent::ScanProgress(progress) => self.on_progress(progress),
             AppEvent::ScanFinished(result) => self.on_finished(result),
             AppEvent::ApplyProgress(progress) => self.on_apply_progress(progress),

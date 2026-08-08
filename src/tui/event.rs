@@ -60,6 +60,11 @@ pub enum AppEvent {
     /// when the writer has not prepared this scan yet — the empty list then means «unknown», not
     /// «no duplicates», and must not be shown as a result.
     ResultsLoaded(i64, Vec<GroupSummary>, ScanSummary, bool),
+    /// A browsing-actor reply (R4B-2b). A dormant carrier: nothing constructs it in
+    /// production yet — R4B-2c routes the actor's sink into this channel while
+    /// `ResultsLoaded` keeps serving the current path unchanged.
+    #[allow(dead_code)] // R4B-2c constructs it from the actor's sink.
+    Browse(Box<crate::state::browse::BrowseEvent>),
     /// Background session probe for F2: unfinished + the last Complete of the same
     /// roots — F2 gives an instant response, while the heavy `list_scans` runs in the background.
     CommanderResumeProbe {
