@@ -6092,8 +6092,10 @@ impl MembershipSnapshot<'_> {
             });
         }
 
-        let (listing, counting) = match self.mode {
+        let (ranks_sql, listing, counting) = match self.mode {
             MembershipMode::Explicit => (
+                "SELECT DISTINCT mm.group_rank FROM file_group_member mm
+                  WHERE mm.scan_id = ?1 AND mm.path >= ?2 AND mm.path < ?3",
                 "SELECT mm.path, mm.group_rank FROM file_group_member mm
                   WHERE mm.scan_id = ?1 AND mm.path >= ?2 AND mm.path < ?3
                   ORDER BY mm.path LIMIT ?4",
@@ -6101,6 +6103,10 @@ impl MembershipSnapshot<'_> {
                   WHERE mm.scan_id = ?1 AND mm.path >= ?2 AND mm.path < ?3",
             ),
             _ => (
+                "SELECT DISTINCT g.rank FROM file f
+                   JOIN file_group g ON g.scan_id = f.scan_id AND g.hash = lower(hex(f.hash))
+                  WHERE f.scan_id = ?1 AND f.hash IS NOT NULL
+                    AND f.path >= ?2 AND f.path < ?3",
                 "SELECT f.path, g.rank FROM file f
                    JOIN file_group g ON g.scan_id = f.scan_id AND g.hash = lower(hex(f.hash))
                   WHERE f.scan_id = ?1 AND f.hash IS NOT NULL
@@ -6112,6 +6118,29 @@ impl MembershipSnapshot<'_> {
                     AND f.path >= ?2 AND f.path < ?3",
             ),
         };
+
+        // The integrity gate runs over every DISTINCT rank represented anywhere under the
+        // prefix, BEFORE a single member is built — never over the capped page. Judging only the
+        // rows the display happens to show would let a corrupt group that sorts past the cap be
+        // counted in the exact total and never checked, and the answer would come back trusted
+        // and merely shorter. It is a separate statement rather than a wider listing because the
+        // fix must not materialise every pathname of the directory to find its groups.
+        {
+            let mut stmt = self.tx.prepare(ranks_sql)?;
+            let rows =
+                stmt.query_map(params![self.scan_id, &lo, &hi], |row| row.get::<_, i64>(0))?;
+            let mut any = false;
+            for row in rows {
+                any = true;
+                // One inconsistent rank refuses the WHOLE lookup. Filtering it out, or
+                // decrementing the total, would turn corruption into a list that looks valid.
+                self.require_consistent(row?)?;
+            }
+            if !any {
+                return self.dir_absence(dir, &lo, &hi);
+            }
+        }
+
         let mut stmt = self.tx.prepare(listing)?;
         let rows = stmt.query_map(params![self.scan_id, &lo, &hi, cap], |row| {
             Ok((
@@ -6120,15 +6149,8 @@ impl MembershipSnapshot<'_> {
             ))
         })?;
         let mut members = Vec::new();
-        let mut seen: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
         for row in rows {
             let (path, rank) = row?;
-            // Every DISTINCT rank this exact answer touches passes the same gate every other
-            // exact answer passes. One inconsistent rank refuses the WHOLE lookup: filtering it
-            // out would turn corruption into a shorter list that looks entirely valid.
-            if seen.insert(rank) {
-                self.require_consistent(rank)?;
-            }
             members.push(InnerDupe {
                 path,
                 id: GroupId {
@@ -6137,9 +6159,6 @@ impl MembershipSnapshot<'_> {
                     generation: self.generation,
                 },
             });
-        }
-        if members.is_empty() {
-            return self.dir_absence(dir, &lo, &hi);
         }
         let total: i64 = self
             .tx
@@ -19078,6 +19097,94 @@ mod membership_staging_tests {
         }
         drop(snapshot);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Corruption that sorts PAST the display cap still refuses the whole answer.
+    ///
+    /// The defect this pins: the integrity gate used to run over the capped page, so a group
+    /// whose pathnames sort after the limit was counted in the exact total and never checked.
+    /// The caller then received a trusted answer that was merely shorter — which is precisely
+    /// the «filtering turns corruption into a plausible list» failure the rule exists to stop.
+    #[test]
+    fn an_inconsistent_rank_beyond_the_cap_still_refuses() {
+        let _role = role_guard();
+        for explicit in [true, false] {
+            let dir = temp_dir(if explicit { "r4b2a1_x" } else { "r4b2a1_d" });
+            // Healthy, early-sorting, and exactly enough to fill the display limit.
+            let mut files = Vec::with_capacity(DIR_INNER_CAP + 3);
+            for index in 0..=DIR_INNER_CAP {
+                files.push((
+                    write(&dir, &format!("a{index:05}.bin"), b"EARLY"),
+                    [0xa1u8; 32],
+                ));
+            }
+            // A real second group — two members and its own digest, so it is a group under both
+            // authorities — whose pathnames sort past the cap.
+            let z0 = write(&dir, "z0.bin", b"LATE");
+            let z1 = write(&dir, "z1.bin", b"LATE");
+            files.push((z0.clone(), [0xb2u8; 32]));
+            files.push((z1, [0xb2u8; 32]));
+
+            let mut store = ScanStore::open_in_memory().unwrap();
+            let scan_id = seed(&mut store, &dir, &files);
+            if explicit {
+                let verified = crate::pipeline::verify::verify_groups(
+                    store.duplicate_groups(scan_id).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(verified.len(), 2, "two real groups under the directory");
+                store
+                    .publish_results(scan_id, PublishMode::Explicit(&verified))
+                    .unwrap();
+            } else {
+                store
+                    .publish_results(scan_id, PublishMode::Derived)
+                    .unwrap();
+            }
+
+            // The healthy control, which also proves the late group really is past the cap —
+            // without that, the corrupt case below would not reach the defect.
+            let late = {
+                let snapshot = store.membership_snapshot(scan_id).unwrap();
+                let late = snapshot.group_of_path(&z0).unwrap().unwrap();
+                match snapshot.dir_group_at(&dir).unwrap() {
+                    DirGroupAnswer::InnerDupes {
+                        members,
+                        total,
+                        truncated,
+                    } => {
+                        assert_eq!(members.len(), DIR_INNER_CAP, "the cap is exact");
+                        assert_eq!(total, files.len() as u64, "the total counts the late rows");
+                        assert!(truncated);
+                        assert!(
+                            !members.iter().any(|member| member.id == late),
+                            "explicit={explicit}: the late group must be past the display cap"
+                        );
+                    }
+                    other => panic!("explicit={explicit}: expected InnerDupes, got {other:?}"),
+                }
+                late
+            };
+
+            // Corrupt ONLY the late rank: its summary now claims a member it does not hold.
+            store.corrupt_directly(
+                "UPDATE file_group SET file_count = file_count + 1
+                  WHERE scan_id = ?1 AND rank = ?2",
+                params![scan_id, late.rank],
+            );
+            let snapshot = store.membership_snapshot(scan_id).unwrap();
+            // On the parent this returned `InnerDupes` with the same 1000 healthy rows and a
+            // total that included the corrupt group's members.
+            match snapshot.dir_group_at(&dir) {
+                Err(MembershipMiss::Inconsistent { .. }) => {}
+                other => panic!(
+                    "explicit={explicit}: corruption past the display cap must refuse the whole \
+                     lookup, got {other:?}"
+                ),
+            }
+            drop(snapshot);
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// A directory the scan covers but that holds nothing duplicated, and one it does not cover
