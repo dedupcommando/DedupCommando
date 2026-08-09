@@ -351,18 +351,224 @@ pub const PROTECTED_STATE_ENTRIES: [&str; 5] = [
 /// `None` when the basename is not one of the protected entries, when the path has no filename, or
 /// when either directory cannot be canonicalized — a destination whose directory does not exist is
 /// refused by the writer anyway.
-pub fn names_protected_state_entry(state_dir: &Path, dest: &Path) -> Option<&'static str> {
-    let name = dest.file_name()?.to_str()?;
-    let protected = PROTECTED_STATE_ENTRIES
+pub fn protected_state_entry_name(name: &str) -> Option<&'static str> {
+    PROTECTED_STATE_ENTRIES
         .iter()
-        .find(|entry| **entry == name)?;
-    let parent = match dest.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    let parent = parent.canonicalize().ok()?;
-    let state = state_dir.canonicalize().ok()?;
-    (parent == state).then_some(*protected)
+        .find(|entry| entry.eq_ignore_ascii_case(name))
+        .copied()
+}
+
+/// A directory opened once and kept open, so everything done in it afterwards is done to THAT
+/// directory — not to whatever its pathname resolves to the next time somebody asks.
+///
+/// The export needs both halves of that at once. The protected-state check has to compare
+/// directory OBJECTS: a bind mount gives one directory two canonical paths, `realpath` cannot see
+/// through it, and comparing spellings therefore let an alias of the state directory pass. And the
+/// temporary artifact has to be created, removed and renamed relative to this same handle, so the
+/// parent cannot be re-pointed between the check and the publication.
+pub struct DirHandle {
+    fd: OwnedFd,
+    shown: String,
+}
+
+impl DirHandle {
+    /// Opens `dir` as a directory, resolving the operator's own path exactly once.
+    ///
+    /// Symlinks in that path are followed here deliberately — a destination reached through a
+    /// linked directory is an ordinary thing to ask for. What matters is that it is resolved
+    /// ONCE: from here on the handle IS the directory, whatever the name comes to mean.
+    pub fn open(dir: &Path) -> io::Result<Self> {
+        let c = cstring(dir)?;
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_RDONLY,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd >= 0 and just obtained from open — we own it.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        Ok(Self {
+            fd,
+            shown: crate::textsan::terminal(&dir.display().to_string()),
+        })
+    }
+
+    /// The physical identity of the OPENED directory: `(st_dev, st_ino)` from `fstat` on the
+    /// handle, never from a path. Every spelling of one directory — `..`, a symlink, a bind
+    /// mount — answers with the same pair.
+    pub fn identity(&self) -> io::Result<(u64, u64)> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(self.fd.as_raw_fd(), &mut st) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((st.st_dev as u64, st.st_ino as u64))
+    }
+
+    /// Whether this handle and `other` are the same directory object.
+    pub fn is_same_object(&self, other: &DirHandle) -> io::Result<bool> {
+        Ok(self.identity()? == other.identity()?)
+    }
+
+    /// Creates a new file in this directory: `O_EXCL` (the cross-process claim on the name),
+    /// `O_NOFOLLOW` (never write through a planted symlink) and mode 0600.
+    pub fn create_new_file(&self, name: &OsStr) -> io::Result<std::fs::File> {
+        let c = name_cstring(name)?;
+        let fd = unsafe {
+            libc::openat(
+                self.fd.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd >= 0 and just obtained from openat — we own it.
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+
+    /// Removes a name from this directory.
+    pub fn remove_file(&self, name: &OsStr) -> io::Result<()> {
+        let c = name_cstring(name)?;
+        if unsafe { libc::unlinkat(self.fd.as_raw_fd(), c.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Renames one name to another WITHIN this directory — the atomic publication, aimed at the
+    /// handle rather than at a pathname that may mean something else by now.
+    pub fn rename(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        let from_c = name_cstring(from)?;
+        let to_c = name_cstring(to)?;
+        let rc = unsafe {
+            libc::renameat(
+                self.fd.as_raw_fd(),
+                from_c.as_ptr(),
+                self.fd.as_raw_fd(),
+                to_c.as_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The directory as the operator should see it (already terminal-sanitized).
+    pub fn shown(&self) -> &str {
+        &self.shown
+    }
+}
+
+fn name_cstring(name: &OsStr) -> io::Result<CString> {
+    CString::new(name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a file name contains an interior NUL",
+        )
+    })
+}
+
+#[cfg(test)]
+mod dir_handle_tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("dedcom_dirh_{tag}_{}_{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The whole point of the handle: one directory OBJECT reached through several spellings is
+    /// one directory. A bind mount is the case this exists for and cannot be made unprivileged
+    /// here, but `..` and a symlink exercise the same comparison — identity, not spelling.
+    #[test]
+    fn one_directory_object_is_the_same_through_every_spelling() {
+        let dir = temp_dir("identity");
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("alias")).unwrap();
+
+        let direct = DirHandle::open(&dir).unwrap();
+        for spelling in [dir.join("sub").join(".."), dir.join("alias"), dir.join(".")] {
+            let other = DirHandle::open(&spelling).unwrap();
+            assert!(
+                direct.is_same_object(&other).unwrap(),
+                "{spelling:?} is the same directory"
+            );
+            assert_eq!(direct.identity().unwrap(), other.identity().unwrap());
+        }
+
+        let elsewhere = DirHandle::open(&dir.join("sub")).unwrap();
+        assert!(!direct.is_same_object(&elsewhere).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Create, rename and remove all act on the handle, so a name pointing somewhere else by now
+    /// cannot redirect them.
+    #[test]
+    fn the_handle_creates_renames_and_removes_in_its_own_directory() {
+        let dir = temp_dir("ops");
+        let handle = DirHandle::open(&dir).unwrap();
+
+        let temp = OsStr::new(".tmp-artifact");
+        let file = handle.create_new_file(temp).unwrap();
+        drop(file);
+        assert!(dir.join(".tmp-artifact").exists());
+        assert!(
+            handle.create_new_file(temp).is_err(),
+            "O_EXCL is the claim on the name"
+        );
+
+        handle.rename(temp, OsStr::new("published")).unwrap();
+        assert!(!dir.join(".tmp-artifact").exists());
+        assert!(dir.join("published").exists());
+
+        handle.remove_file(OsStr::new("published")).unwrap();
+        assert!(!dir.join("published").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A planted symlink at the temporary name is not written through.
+    #[test]
+    fn creation_refuses_to_follow_a_symlink_at_the_name() {
+        let dir = temp_dir("nofollow");
+        let target = dir.join("target");
+        std::fs::write(&target, b"do not overwrite\n").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("planted")).unwrap();
+
+        let handle = DirHandle::open(&dir).unwrap();
+        assert!(handle.create_new_file(OsStr::new("planted")).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not overwrite\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The protected names are matched without case, because a case-insensitive dataset resolves
+    /// `DEDCOM.DB` to the checkpoint.
+    #[test]
+    fn protected_names_are_matched_without_case() {
+        for name in ["dedcom.db", "DEDCOM.DB", "Dedcom.Db", "DEDCOM.DB-WAL"] {
+            assert!(
+                protected_state_entry_name(name).is_some(),
+                "{name} names live state"
+            );
+        }
+        for name in ["groups.csv", "dedcom.db.bak", "dedcom", "mydedcom.db"] {
+            assert!(
+                protected_state_entry_name(name).is_none(),
+                "{name} is an ordinary destination"
+            );
+        }
+    }
 }
 
 /// Path to the log file.

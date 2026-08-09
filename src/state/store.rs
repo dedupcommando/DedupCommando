@@ -940,6 +940,16 @@ impl ScanStore {
         self.export_rows_max.get()
     }
 
+    /// Test-only: how many member rows the export is holding RIGHT NOW.
+    ///
+    /// The high-water mark alone cannot prove the buffer is released: a later, larger group
+    /// reaches the same peak whether or not a failed export left its own rows counted. This is
+    /// the value that must be zero the moment an export returns, however it returned.
+    #[cfg(test)]
+    pub fn export_buffered_rows_now(&self) -> u64 {
+        self.export_rows_now.get()
+    }
+
     /// Test-only: identity probes this store has spent (see the field).
     #[cfg(test)]
     pub(crate) fn identity_probes(&self) -> u64 {
@@ -20009,15 +20019,34 @@ mod export_reader_tests {
             "the peak is the largest group, at any scale"
         );
         assert!(store.export_buffered_rows_max() < totals.rows);
+        assert_eq!(
+            store.export_buffered_rows_now(),
+            0,
+            "and nothing is still held when it returns"
+        );
     }
 
-    /// A failed export must not leave the meter holding a group that was already dropped —
-    /// otherwise the next export's high-water mark is measured on top of a fiction.
+    /// A failed export must not leave the meter holding a group that was already dropped.
+    ///
+    /// Asserted on the LIVE count rather than only on the high-water mark. With `[2, 5, 3]` the
+    /// first group is the two-row one, so a stale `2` is invisible the moment the five-row group
+    /// sets the same expected peak — which is exactly how this test used to pass with the release
+    /// guard deleted. The live count is zero or it is not.
     #[test]
     fn a_failing_sink_releases_the_live_buffer() {
         let mut store = ScanStore::open_in_memory().unwrap();
         let id = seed(&mut store, &[2, 5, 3]);
         store.publish_results(id, PublishMode::Derived).unwrap();
+
+        {
+            let snapshot = store.membership_snapshot(id).unwrap();
+            assert_eq!(snapshot.for_each_export_group(|_| Ok(())).unwrap().rows, 10);
+        }
+        assert_eq!(
+            store.export_buffered_rows_now(),
+            0,
+            "a finished export holds nothing"
+        );
 
         {
             let snapshot = store.membership_snapshot(id).unwrap();
@@ -20027,6 +20056,12 @@ mod export_reader_tests {
                 .to_string();
             assert!(err.contains("the sink refuses"), "{err}");
         }
+        assert_eq!(
+            store.export_buffered_rows_now(),
+            0,
+            "and a refused one holds nothing either"
+        );
+
         {
             let snapshot = store.membership_snapshot(id).unwrap();
             assert_eq!(snapshot.for_each_export_group(|_| Ok(())).unwrap().rows, 10);
@@ -20034,8 +20069,9 @@ mod export_reader_tests {
         assert_eq!(
             store.export_buffered_rows_max(),
             5,
-            "the failed export must not inflate what the next one measures"
+            "the peak is the largest group, never a sum across exports"
         );
+        assert!(store.export_buffered_rows_max() < 10);
     }
 
     /// The same, when the sink unwinds instead of returning an error.
@@ -20053,12 +20089,18 @@ mod export_reader_tests {
         }));
         std::panic::set_hook(previous);
         assert!(outcome.is_err(), "the sink must have unwound");
+        assert_eq!(
+            store.export_buffered_rows_now(),
+            0,
+            "the unwind released the buffer on its way out"
+        );
 
         {
             let snapshot = store.membership_snapshot(id).unwrap();
             assert_eq!(snapshot.for_each_export_group(|_| Ok(())).unwrap().rows, 10);
         }
         assert_eq!(store.export_buffered_rows_max(), 5);
+        assert_eq!(store.export_buffered_rows_now(), 0);
     }
 
     /// Members arrive in `(rank, path)` order, so one group's rows are contiguous and the file is

@@ -1255,30 +1255,39 @@ const EXPORT_WRITER_CAPACITY: usize = 256 * 1024;
 /// Read-only, and still without the instance lock: it opens the checkpoint read-only, writes only
 /// its own artifact, and takes one consistent snapshot rather than a lock.
 fn run_export_csv(cli: &cli::Cli, out_path: &Path) -> Result<()> {
-    // Before the checkpoint is even opened, let alone a snapshot taken: dedcom's own live state is
-    // not a destination. Replacing the checkpoint loses every scan the operator ever ran, and
-    // replacing the lock file pulls it out from under a running instance — neither is what
-    // «overwrite the file I named» means.
-    if let Some(entry) = paths::names_protected_state_entry(&paths::state_dir(cli), out_path) {
-        return Err(AppError::msg(format!(
-            "{} is dedcom's own {entry}; exporting over it would destroy the checkpoint or the \
-             lock a running instance holds. Choose another destination — nothing was written.",
-            textsan::terminal(&out_path.display().to_string())
-        )));
-    }
+    // The destination directory is opened ONCE, here, and every step below acts on that handle.
+    // Both halves matter. The protected-state check has to compare directory OBJECTS, because a
+    // bind mount gives one directory two canonical paths and comparing spellings let an alias of
+    // the state directory through — the checkpoint was replaced that way. And the publication has
+    // to rename inside the same opened directory, so the parent cannot be re-pointed between the
+    // check and the rename.
+    let (dir_path, artifact_name) = destination_parts(out_path)?;
+    let parent = paths::DirHandle::open(&dir_path).map_err(|err| {
+        AppError::msg(format!(
+            "the directory for the export does not exist or cannot be opened: {} ({err})",
+            textsan::terminal(&dir_path.display().to_string())
+        ))
+    })?;
+    refuse_dedcoms_own_state(cli, &parent, &artifact_name, out_path)?;
+    // Test seam: anything that could re-point the destination pathname lands exactly here, after
+    // the check and before the publication. The handle above is what publishes, so a swap must
+    // not move the artifact.
+    #[cfg(test)]
+    take_export_parent_swap();
+
     // Export reads the checkpoint and writes only the CSV — same read-only contract as --stats.
     let store = ScanStore::open_read_only(&paths::checkpoint_db(cli))?;
     // Every eligibility refusal happens here, BEFORE any file exists: a destination that already
     // holds yesterday's export must survive today's refusal byte for byte.
     let session = store.open_trusted_export()?;
 
-    let mut artifact = TempArtifact::create(out_path)?;
+    let mut artifact = TempArtifact::create(parent, &artifact_name)?;
     let totals = {
         let mut writer =
             std::io::BufWriter::with_capacity(EXPORT_WRITER_CAPACITY, artifact.file_mut());
         write_export(&mut writer, &session.snapshot)?
     };
-    artifact.publish(out_path)?;
+    artifact.publish()?;
 
     println!(
         "Exported {} groups ({} files) from scan {}, status: {} -> {}",
@@ -1412,9 +1421,62 @@ fn write_export_group(
 /// name, it is mode 0600, nothing in this product reads it, and the next export claims a fresh
 /// name.
 struct TempArtifact {
-    path: PathBuf,
+    dir: paths::DirHandle,
+    temp: std::ffi::OsString,
+    dest: std::ffi::OsString,
     file: std::fs::File,
     armed: bool,
+}
+
+/// Splits a destination into the directory that will hold it and the name it will carry.
+fn destination_parts(dest: &Path) -> Result<(PathBuf, std::ffi::OsString)> {
+    let Some(name) = dest.file_name() else {
+        return Err(AppError::msg(format!(
+            "{} does not name a file to write",
+            textsan::terminal(&dest.display().to_string())
+        )));
+    };
+    let dir = match dest.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => PathBuf::from("."),
+        Some(parent) => parent.to_path_buf(),
+        None => PathBuf::from("."),
+    };
+    Ok((dir, name.to_os_string()))
+}
+
+/// Refuses a destination that IS one of dedcom's own live state entries.
+///
+/// Two questions, and both have to be about objects rather than spellings. Is the name one of the
+/// five (compared without ASCII case, because a case-insensitive dataset resolves `DEDCOM.DB` to
+/// the checkpoint)? And is the already-opened parent the same directory OBJECT as the state
+/// directory — which a bind mount, a second mount of the same filesystem, a symlink or a `..`
+/// spelling all are, while their canonical paths differ.
+///
+/// If the name is protected and the comparison cannot be made at all, it refuses: this is the one
+/// question where «could not tell» must not mean «go ahead».
+fn refuse_dedcoms_own_state(
+    cli: &cli::Cli,
+    parent: &paths::DirHandle,
+    name: &std::ffi::OsStr,
+    dest: &Path,
+) -> Result<()> {
+    let Some(entry) = name.to_str().and_then(paths::protected_state_entry_name) else {
+        return Ok(());
+    };
+    let state_dir = paths::state_dir(cli);
+    let Ok(state) = paths::DirHandle::open(&state_dir) else {
+        // No state directory to protect; the checkpoint open below will say so properly.
+        return Ok(());
+    };
+    if parent.is_same_object(&state).unwrap_or(true) {
+        return Err(AppError::msg(format!(
+            "{} is dedcom's own {entry} — that directory IS the state directory, whatever the \
+             path says. Exporting over it would destroy the checkpoint or the lock a running \
+             instance holds. Choose another destination; nothing was written.",
+            textsan::terminal(&dest.display().to_string())
+        )));
+    }
+    Ok(())
 }
 
 /// Upper bound on create-and-retry repetitions for the temporary name; a backstop against an
@@ -1422,56 +1484,37 @@ struct TempArtifact {
 const MAX_TEMP_CLAIM_RETRIES: u32 = 1_000;
 
 impl TempArtifact {
-    /// Claims a temporary name beside the destination and opens it exclusively.
+    /// Claims a temporary name IN the already-opened directory and opens it exclusively.
     ///
-    /// Same directory, because the publication is a `rename` and a rename is only atomic within
-    /// one filesystem. `O_EXCL` is the cross-process guarantee (the pid/nanos base only keeps the
-    /// retry count down), `O_NOFOLLOW` refuses a symlink at the temporary name itself, and 0600
-    /// is what the content deserves: a complete pathname inventory of the pool.
-    fn create(dest: &Path) -> Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let Some(name) = dest
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-        else {
-            return Err(AppError::msg(format!(
-                "{} does not name a file to write",
-                textsan::terminal(&dest.display().to_string())
-            )));
-        };
-        let dir = match dest.parent() {
-            Some(parent) if parent.as_os_str().is_empty() => PathBuf::from("."),
-            Some(parent) => parent.to_path_buf(),
-            None => PathBuf::from("."),
-        };
-        if !dir.is_dir() {
-            return Err(AppError::msg(format!(
-                "the directory for the export does not exist: {}",
-                textsan::terminal(&dir.display().to_string())
-            )));
-        }
+    /// The same directory, because the publication is a `rename` and a rename is only atomic
+    /// within one filesystem — and the same DIRECTORY HANDLE, because re-resolving the parent
+    /// pathname between the check and the rename is what a bind-mounted alias exploited.
+    /// `O_EXCL` is the cross-process guarantee (the pid/nanos base only keeps the retry count
+    /// down), `O_NOFOLLOW` refuses a symlink planted at the temporary name, and 0600 is what the
+    /// content deserves: a complete pathname inventory of the pool.
+    fn create(dir: paths::DirHandle, dest: &std::ffi::OsStr) -> Result<Self> {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos())
             .unwrap_or(0);
-        let base = format!(".{name}.dedcom-export-{}-{nanos}", std::process::id());
+        let base = format!(
+            ".{}.dedcom-export-{}-{nanos}",
+            dest.to_string_lossy(),
+            std::process::id()
+        );
         let mut attempt = 0u32;
         loop {
-            let candidate = if attempt == 0 {
-                dir.join(format!("{base}.tmp"))
+            let candidate = std::ffi::OsString::from(if attempt == 0 {
+                format!("{base}.tmp")
             } else {
-                dir.join(format!("{base}-r{attempt}.tmp"))
-            };
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .mode(0o600)
-                .open(&candidate)
-            {
+                format!("{base}-r{attempt}.tmp")
+            });
+            match dir.create_new_file(&candidate) {
                 Ok(file) => {
                     return Ok(Self {
-                        path: candidate,
+                        dir,
+                        temp: candidate,
+                        dest: dest.to_os_string(),
                         file,
                         armed: true,
                     })
@@ -1481,7 +1524,7 @@ impl TempArtifact {
                         return Err(AppError::msg(format!(
                             "could not claim a temporary name for the export in {} after \
                              {MAX_TEMP_CLAIM_RETRIES} attempts",
-                            textsan::terminal(&dir.display().to_string())
+                            dir.shown()
                         )));
                     }
                     attempt += 1;
@@ -1489,7 +1532,7 @@ impl TempArtifact {
                 Err(err) => {
                     return Err(AppError::msg(format!(
                         "cannot create the temporary export file in {}: {err}",
-                        textsan::terminal(&dir.display().to_string())
+                        dir.shown()
                     )))
                 }
             }
@@ -1500,18 +1543,19 @@ impl TempArtifact {
         &mut self.file
     }
 
-    /// Durability first, then the atomic replacement of the final name.
+    /// Durability first, then the atomic replacement of the final name — inside the directory
+    /// this artifact has held open all along.
     ///
     /// The rename replaces the NAME the operator gave, deliberately: if the destination is a
     /// symlink, its target is never written through. Re-exporting over an existing file is the
     /// ordinary case, so this is a plain replace rather than `RENAME_NOREPLACE` — that rule
     /// belongs to the destructive action path, where the target is a file nobody asked to lose.
-    fn publish(mut self, dest: &Path) -> Result<()> {
+    fn publish(mut self) -> Result<()> {
         self.file.sync_data()?;
-        std::fs::rename(&self.path, dest).map_err(|err| {
+        self.dir.rename(&self.temp, &self.dest).map_err(|err| {
             AppError::msg(format!(
-                "cannot publish the export to {}: {err}",
-                textsan::terminal(&dest.display().to_string())
+                "cannot publish the export in {}: {err}",
+                self.dir.shown()
             ))
         })?;
         self.armed = false;
@@ -1522,8 +1566,50 @@ impl TempArtifact {
 impl Drop for TempArtifact {
     fn drop(&mut self) {
         if self.armed {
-            let _ = std::fs::remove_file(&self.path);
+            let _ = self.dir.remove_file(&self.temp);
         }
+    }
+}
+
+// Test-only one-shot seam at the instant between validating the destination directory and
+// publishing into it. It exists so a test can re-point a symlinked parent right there and prove
+// that publication still lands in the directory that was opened and checked — the property a
+// re-resolved pathname would silently lose.
+#[cfg(test)]
+thread_local! {
+    static EXPORT_PARENT_SWAP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms the one-shot parent-swap hook for this thread and disarms it on drop.
+#[cfg(test)]
+struct ExportParentSwap;
+
+#[cfg(test)]
+impl ExportParentSwap {
+    fn armed(action: impl FnOnce() + 'static) -> Self {
+        EXPORT_PARENT_SWAP.with(|slot| *slot.borrow_mut() = Some(Box::new(action)));
+        ExportParentSwap
+    }
+
+    /// Whether the armed shot was consumed. A test whose seam was never reached proved nothing.
+    fn fired(&self) -> bool {
+        EXPORT_PARENT_SWAP.with(|slot| slot.borrow().is_none())
+    }
+}
+
+#[cfg(test)]
+impl Drop for ExportParentSwap {
+    fn drop(&mut self) {
+        EXPORT_PARENT_SWAP.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn take_export_parent_swap() {
+    let action = EXPORT_PARENT_SWAP.with(|slot| slot.borrow_mut().take());
+    if let Some(action) = action {
+        action();
     }
 }
 
@@ -1649,7 +1735,9 @@ mod csv_tests {
 mod export_csv_tests {
     use std::path::{Path, PathBuf};
 
-    use super::{cli, paths, run_export_csv, ExportFault, ExportWriteFault, EXPORT_HEADER};
+    use super::{
+        cli, paths, run_export_csv, ExportFault, ExportParentSwap, ExportWriteFault, EXPORT_HEADER,
+    };
     use crate::model::action::ActionKind;
     use crate::model::scan::{ScanConfig, ScanStatus};
     use crate::state::store::ExportRace;
@@ -2621,8 +2709,63 @@ mod export_csv_tests {
         }
     }
 
-    /// The comparison is on canonicalized PARENTS, so a `..` spelling and a symlinked alias of
-    /// the state directory are caught too.
+    /// The protected names are matched without ASCII case, because a case-insensitive dataset
+    /// resolves `DEDCOM.DB` to the checkpoint itself.
+    #[test]
+    fn a_cased_spelling_of_a_protected_entry_is_refused() {
+        for spelling in ["DEDCOM.DB", "Dedcom.Db", "DEDCOM.LOCK"] {
+            let rig = Rig::new("cased");
+            let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+            complete_derived(&mut rig.store(), &rows, 0xCD);
+
+            let dest = rig.dir.join(spelling);
+            std::fs::write(&dest, b"not the artifact\n").unwrap();
+            let stamp = modified(&dest);
+
+            let err = run_export_csv(&rig.cli(), &dest).unwrap_err().to_string();
+            assert!(err.contains("state directory"), "{spelling}: {err}");
+            assert_eq!(std::fs::read(&dest).unwrap(), b"not the artifact\n");
+            assert_eq!(modified(&dest), stamp);
+            assert!(rig.residue().is_empty());
+        }
+    }
+
+    /// The destination directory is opened once and pinned: re-pointing the path afterwards must
+    /// not move the artifact — least of all into the state directory.
+    #[test]
+    fn a_parent_swapped_after_the_check_cannot_redirect_the_publication() {
+        let rig = Rig::new("parentswap");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        complete_derived(&mut rig.store(), &rows, 0xCE);
+
+        let real = rig.dir.join("out");
+        std::fs::create_dir(&real).unwrap();
+        let link = rig.dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let dest = link.join("export.csv");
+
+        let swapped_link = link.clone();
+        let state_dir = rig.dir.clone();
+        let swap = ExportParentSwap::armed(move || {
+            std::fs::remove_file(&swapped_link).unwrap();
+            std::os::unix::fs::symlink(&state_dir, &swapped_link).unwrap();
+        });
+
+        run_export_csv(&rig.cli(), &dest).unwrap();
+        assert!(swap.fired(), "the seam must have been reached");
+        assert!(
+            real.join("export.csv").exists(),
+            "published into the directory that was opened and checked"
+        );
+        assert!(
+            !rig.dir.join("export.csv").exists(),
+            "and never into the directory the path came to mean"
+        );
+        assert!(rig.residue().is_empty());
+    }
+
+    /// The comparison is on directory OBJECTS, so a `..` spelling and a symlinked alias of the
+    /// state directory are caught too.
     #[test]
     fn a_dotdot_or_aliased_parent_cannot_smuggle_the_checkpoint_in() {
         let rig = Rig::new("aliasparent");

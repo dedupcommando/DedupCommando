@@ -253,10 +253,15 @@ it was** when:
 
 Any path you like, **except dedcom's own live state**: `dedcom.db`, its
 `-wal`/`-shm`/`-journal` companions and `dedcom.lock` in the state directory are
-refused, however the path is spelled (`..`, a symlinked directory). Exporting
-over the checkpoint would destroy every scan you have run, and over the lock
-would pull it out from under a running instance. An ordinary CSV name inside the
-state directory is fine.
+refused. Exporting over the checkpoint would destroy every scan you have run,
+and over the lock would pull it out from under a running instance.
+
+The refusal is about the **directory itself**, not about how you spell its path:
+`..`, a symlinked directory and a bind mount of the state directory are all the
+same directory and all refused. The five names are matched ignoring ASCII case
+(`DEDCOM.DB` too), because a `casesensitivity=insensitive` dataset resolves
+those spellings to the same file. An ordinary CSV name inside the state
+directory is fine.
 
 ### How `keep` is decided
 
