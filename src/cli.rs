@@ -23,7 +23,9 @@ pub struct Cli {
     /// Roots for headless scanning (the `--scan` flag, repeatable).
     /// If non-empty, the no-TUI mode is started.
     pub scan_roots: Vec<PathBuf>,
-    /// Export the duplicate groups of the last scan to CSV and exit.
+    /// Export the published duplicate groups of the newest active scan to CSV and exit.
+    /// The scan has to be finished: an unfinished newest scan is a refusal, never a silent
+    /// fallback to an older session.
     pub export_csv: Option<PathBuf>,
     /// Include-filter by extensions for a headless scan (the `--include-ext` flag,
     /// comma-separated list, flag repeatable). Empty — no filter.
@@ -127,7 +129,15 @@ impl Cli {
 }
 
 fn print_help() {
-    println!(
+    println!("{}", help_text());
+}
+
+/// The help text as a value, so the wording of a contract can be pinned by a test rather than
+/// only by review. `--export-csv` is here for exactly that reason: «the last scan» read as if an
+/// unfinished newest scan would be skipped in favour of an older finished one, which is not what
+/// the export does.
+fn help_text() -> String {
+    format!(
         "dedcom {} — TUI search for identical files in a ZFS pool
 
 USAGE:
@@ -145,7 +155,8 @@ OPTIONS:
     --purge-quarantine    Purge the quarantine and exit (by default only
                           shows the size; deletes only with the --yes flag)
     --yes                 Confirm deletion for --purge-quarantine
-    --export-csv <PATH>   Export the duplicates of the last scan to CSV and exit
+    --export-csv <PATH>   Export the newest active scan's published duplicate groups to
+                          CSV and exit; refuses if that scan has not finished
     --include-ext <LIST>  Scan only files with these extensions
                           (comma-separated: jpg,png,gif; flag repeatable)
     --storage-type <TYPE> Storage type for statistics: hdd | ssd | nvme
@@ -164,5 +175,32 @@ OPTIONS:
     -h, --help            Show this help
     -V, --version         Show the version",
         crate::version()
-    );
+    )
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::help_text;
+
+    /// The export line states the selection rule the code actually implements.
+    #[test]
+    fn the_export_line_says_newest_and_says_it_refuses_an_unfinished_scan() {
+        let help = help_text();
+        let line = help
+            .lines()
+            .find(|line| line.contains("--export-csv"))
+            .expect("the help lists --export-csv");
+        assert!(
+            line.contains("newest active scan"),
+            "the selection rule must be in the help: {line}"
+        );
+        assert!(
+            help.contains("refuses if that scan has not finished"),
+            "an unfinished newest scan is a refusal, not a fallback to an older one:\n{help}"
+        );
+        assert!(
+            !help.contains("duplicates of the last scan"),
+            "«the last scan» reads as «the last FINISHED scan», which is not the contract"
+        );
+    }
 }

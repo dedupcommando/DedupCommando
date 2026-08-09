@@ -78,7 +78,7 @@ Headless mode scans only (applying actions is interactive by design — see [Lim
 ```sh
 dedcom --scan /tank                 # scan and write checkpoints
 dedcom --stats                      # print scan + database stats
-dedcom --export-csv groups.csv      # export the last scan's groups to CSV
+dedcom --export-csv groups.csv      # export the newest active scan; refuses if it is unfinished
 dedcom --purge-quarantine [--yes]   # report quarantine size; deletes only with --yes
 ```
 

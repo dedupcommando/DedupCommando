@@ -7,7 +7,7 @@ Five flags run `dedcom` without the TUI:
 | `--scan <PATH>`               | Scans a root and prints the result                      |
 | `--stats`                     | Prints statistics for all scans and DB state            |
 | `--compact-db`                | Empties the session trash and compacts the DB (VACUUM)  |
-| `--export-csv <PATH>`         | Exports the groups of the last scan to CSV              |
+| `--export-csv <PATH>`         | Exports the newest active session's published groups to CSV (refuses if it has not finished) |
 | `--purge-quarantine`          | Deletes the `.dedcom-quarantine` directories in all datasets |
 
 All of them **exit immediately** once done (there is no interactive UI). If
@@ -190,37 +190,90 @@ from cron once a week/month.
 
 ```text
 $ dedcom --export-csv /tmp/duplicates.csv
-Exported 12437 groups (87234 files), scan status: complete -> /tmp/duplicates.csv
+Exported 12437 groups (87234 files) from scan 42, status: complete -> /tmp/duplicates.csv
 ```
 
 File format:
 
 ```csv
-group,keep,size_bytes,hash,path
-1,1,104857600,a3f5...e1,/tank/media/photo/canonical/IMG_3120.HEIC
-1,0,104857600,a3f5...e1,/tank/backup/IMG_3120.HEIC
-1,0,104857600,a3f5...e1,/tank/old-copy/IMG_3120.HEIC
-2,1,52428800,b8d2...c4,/tank/video/v1.mp4
-2,0,52428800,b8d2...c4,/tank/video/v1-copy.mp4
+group,keep,size_bytes,hash,path,scan_id,generation,device,inode,links,mark,keep_source
+0,1,104857600,a3f5...e1,/tank/media/photo/IMG_3120.HEIC,42,3,64768,1180,1,keeper,mark
+0,0,104857600,a3f5...e1,/tank/backup/IMG_3120.HEIC,42,3,64768,9912,1,,mark
+1,1,52428800,b8d2...c4,/tank/video/v1.mp4,42,3,64768,3311,2,,default
+1,0,52428800,b8d2...c4,/tank/video/v1-copy.mp4,42,3,64768,3311,2,,default
 ...
 ```
 
-| Column        | Meaning                                                        |
-|---------------|----------------------------------------------------------------|
-| `group`       | Group number (1, 2, 3…) — all rows of one group share a `hash` |
-| `keep`        | 1 = keeper (one per group), 0 = dedup candidate                |
-| `size_bytes`  | File size in bytes                                             |
-| `hash`        | BLAKE3 hex (64 characters)                                     |
-| `path`        | Full path to the file (CSV-escaped, see below)                |
+| Column        | Meaning                                                             |
+|---------------|---------------------------------------------------------------------|
+| `group`       | The group's published rank (0, 1, 2…) — all its rows share a `hash` |
+| `keep`        | 1 = the file stays, 0 = dedup candidate                             |
+| `size_bytes`  | File size in bytes                                                  |
+| `hash`        | BLAKE3 hex (64 characters)                                          |
+| `path`        | Full path to the file (CSV-escaped, see below)                      |
+| `scan_id`     | Which session was exported                                          |
+| `generation`  | Which publication of that session the ranks belong to               |
+| `device`, `inode` | Physical identity: equal pairs are **aliases of one allocation** |
+| `links`       | Link count the scan observed (`0` = never recorded, a pre-v3 row)   |
+| `mark`        | Durable mark: `keeper`, `delete`, `hardlink`, `reflink`, or empty   |
+| `keep_source` | `mark` — `keep` follows the operator's durable state; `default` — it was computed |
 
-The keeper is chosen **by the most recent mtime** (other criteria — only via the
-TUI).
+`scan_id` + `generation` + `group` is the stable identity of a group. Rank is
+reassigned by payoff on every publication, so two exports are only comparable
+group-by-group when they carry the same `generation`.
 
-Read-only. It takes the **last** saved scan (including an unfinished one — it
-exports what has already been hashed).
+Two rows with the same `device`+`inode` are the same physical file under two
+names: deleting one of them frees nothing.
+
+### Which session is exported
+
+The **newest active** (non-trashed) session. If that session has not finished,
+the export refuses — it does **not** fall back to an older finished one, because
+quietly exporting a different session is how a CSV ends up describing something
+you never looked at. A session in the trash is never exported.
+
+The export refuses, exits non-zero and leaves the destination file **exactly as
+it was** when:
+
+- the newest active session has not finished (still walking/hashing, or aborted);
+- it has no verified membership — an older checkpoint, or a scan that never
+  published. Re-run the scan: opening the checkpoint does not republish it;
+- a group has no keeper mark and no unmarked file, so the CSV would say "delete
+  every copy" for it;
+- a durable mark is damaged, or says both "keeper" and an action for one path;
+- a group summary disagrees with the membership it declares.
+
+### How `keep` is decided
+
+1. Files you durably marked as keeper (`F7`) keep. **There may be several**, and
+   all of them get `keep=1`.
+2. Files you marked for an action get `keep=0` and their action in `mark`.
+3. Only when a group has no keeper mark at all is a keeper computed — the newest
+   `mtime` among the **unmarked** files (ties broken by nanoseconds, then by
+   path, so the answer is always the same). Those rows say `keep_source=default`.
+
+An action mark is never turned into a keeper.
+
+### The file itself
+
+Read-only with respect to the checkpoint, and it does not take the instance
+lock — it can run beside a working operator, and everything in one CSV comes
+from a single consistent read of the database.
+
+The artifact is written to a temporary file in the destination's own directory
+and then renamed into place, so a failure never leaves a half-written CSV and
+never damages a previous one. If the destination is a symlink, the **name** is
+replaced — the link's target is never written through. The file is created mode
+`0600`: it is a complete list of pathnames in your pool.
 
 CSV escaping: paths with commas/quotes/newlines are wrapped in double quotes,
-and quotes inside are doubled (RFC 4180).
+and quotes inside are doubled (RFC 4180). A path that begins with `=`, `+`, `-`,
+`@`, tab or CR is prefixed with an apostrophe so a spreadsheet treats it as text
+rather than a formula.
+
+A pathname the scan could not read as UTF-8 is exported in the same replacement
+spelling the rest of dedcom shows (`?`-like `U+FFFD`) — it is not byte-faithful,
+so do not feed such a row back to `rm` expecting it to name the same file.
 
 ### What to do with this CSV
 

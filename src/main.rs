@@ -1234,50 +1234,348 @@ mod reporting_tests {
     }
 }
 
-/// The `--export-csv` mode: exports the duplicate groups of the last scan to CSV.
-/// Works for an unfinished scan too — the already-hashed files are taken.
+/// The header of the trusted export. The first five columns are the original ones, in their
+/// original order and meaning, so a consumer reading them positionally keeps working; everything
+/// the physical model needs is appended after them.
+const EXPORT_HEADER: &str =
+    "group,keep,size_bytes,hash,path,scan_id,generation,device,inode,links,mark,keep_source\n";
+
+/// The export's write buffer. One named constant rather than a default nobody can point at: the
+/// only unbounded thing in the export would be the writer, and this is its bound.
+const EXPORT_WRITER_CAPACITY: usize = 256 * 1024;
+
+/// The `--export-csv` mode: exports one finished scan's published groups to CSV.
+///
+/// Trusted, or nothing. The rows come from the membership authority — the same one the browser
+/// and the destructive plan obey — so a pathname byte verification rejected can no longer appear,
+/// two Explicit ranks of one digest stay two groups, and the operator's durable marks are what
+/// the `keep` column says. A scan without that authority, or one that has not finished, is a
+/// refusal that leaves the operator's destination exactly as it was.
+///
+/// Read-only, and still without the instance lock: it opens the checkpoint read-only, writes only
+/// its own artifact, and takes one consistent snapshot rather than a lock.
 fn run_export_csv(cli: &cli::Cli, out_path: &Path) -> Result<()> {
     // Export reads the checkpoint and writes only the CSV — same read-only contract as --stats.
     let store = ScanStore::open_read_only(&paths::checkpoint_db(cli))?;
-    let info = store
-        .find_resumable()?
-        .ok_or_else(|| AppError::msg("no saved scan"))?;
-    let groups = store.duplicate_groups(info.scan_id)?;
+    // Every eligibility refusal happens here, BEFORE any file exists: a destination that already
+    // holds yesterday's export must survive today's refusal byte for byte.
+    let session = store.open_trusted_export()?;
 
-    let mut csv = String::from("group,keep,size_bytes,hash,path\n");
-    let mut file_rows = 0u64;
-    for group in &groups {
-        // The default keeper is the file with the freshest mtime.
-        let keeper = group
-            .files
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, file)| file.mtime)
-            .map(|(index, _)| index)
-            .unwrap_or(0);
-        for (index, file) in group.files.iter().enumerate() {
-            let keep = if index == keeper { 1 } else { 0 };
-            csv.push_str(&format!(
-                "{},{},{},{},{}\n",
-                group.id,
-                keep,
-                file.size,
-                group.hash,
-                csv_field(&file.path.to_string_lossy()),
-            ));
-            file_rows += 1;
-        }
-    }
+    let mut artifact = TempArtifact::create(out_path)?;
+    let totals = {
+        let mut writer =
+            std::io::BufWriter::with_capacity(EXPORT_WRITER_CAPACITY, artifact.file_mut());
+        write_export(&mut writer, &session.snapshot)?
+    };
+    artifact.publish(out_path)?;
 
-    std::fs::write(out_path, csv)?;
     println!(
-        "Exported {} groups ({} files), scan status: {} -> {}",
-        groups.len(),
-        file_rows,
-        info.status.as_str(),
+        "Exported {} groups ({} files) from scan {}, status: {} -> {}",
+        totals.groups,
+        totals.rows,
+        session.scan_id,
+        session.status.as_str(),
         textsan::terminal(&out_path.display().to_string())
     );
     Ok(())
+}
+
+/// Writes the header and every group, one group at a time, and flushes what it wrote.
+fn write_export(
+    writer: &mut std::io::BufWriter<&mut std::fs::File>,
+    snapshot: &state::store::MembershipSnapshot<'_>,
+) -> Result<state::store::ExportTotals> {
+    use std::io::Write as _;
+    writer.write_all(EXPORT_HEADER.as_bytes())?;
+    let totals = snapshot.for_each_export_group(|group| {
+        write_export_group(writer, group)?;
+        // Test seam: fires only after a whole group has reached the temporary file, which is what
+        // makes «the failure happened mid-write» a fact rather than a hope.
+        #[cfg(test)]
+        {
+            let fault = take_export_write_fault();
+            if fault != ExportFault::None {
+                writer.flush()?;
+                let len = writer
+                    .get_ref()
+                    .metadata()
+                    .map(|meta| meta.len())
+                    .unwrap_or(0);
+                record_export_fault_len(len);
+                if fault == ExportFault::Panic {
+                    panic!("injected export panic");
+                }
+                return Err(AppError::msg("injected export write fault"));
+            }
+        }
+        Ok(())
+    })?;
+    writer.flush()?;
+    Ok(totals)
+}
+
+/// One group's rows, with the keeper rule applied to the group as a whole.
+///
+/// The rule, in the order it is applied: durable keeper marks win and there may be several of
+/// them; action marks are never turned into keepers; only when no keeper mark exists at all is a
+/// keeper computed, and then only among the members the operator left unmarked. A group with no
+/// keeper mark and no unmarked member has no survivor to name — and a CSV whose every row of a
+/// group says `keep=0` reads, to any consumer of the original five columns, as permission to
+/// delete every copy. That file is not written.
+fn write_export_group(
+    writer: &mut impl std::io::Write,
+    group: &state::store::ExportGroup,
+) -> Result<()> {
+    let marked_keeper = |member: &state::store::ExportMember| {
+        matches!(member.mark, Some(crate::model::plan::MarkIntent::Keeper))
+    };
+    let has_keeper_mark = group.members.iter().any(marked_keeper);
+    // Deterministic and total: mtime, then its nanoseconds, then the pathname. `max_by_key`
+    // alone returns the LAST maximum, which would make the answer depend on row arrival.
+    let fallback = if has_keeper_mark {
+        None
+    } else {
+        group
+            .members
+            .iter()
+            .enumerate()
+            .filter(|(_, member)| member.mark.is_none())
+            .max_by(|(_, left), (_, right)| {
+                left.mtime
+                    .cmp(&right.mtime)
+                    .then(left.mtime_nsec.cmp(&right.mtime_nsec))
+                    .then(left.path.cmp(&right.path))
+            })
+            .map(|(index, _)| index)
+    };
+    if !has_keeper_mark && fallback.is_none() {
+        return Err(AppError::msg(format!(
+            "group {} of scan {} has every pathname marked for an action and no keeper — a CSV \
+             of that group would read as «delete every copy». Mark a keeper (F7) or clear one \
+             action, then export again. Nothing was written.",
+            group.id.rank, group.id.scan_id
+        )));
+    }
+    for (index, member) in group.members.iter().enumerate() {
+        let keep = marked_keeper(member) || fallback == Some(index);
+        let mark = match member.mark {
+            Some(crate::model::plan::MarkIntent::Keeper) => "keeper",
+            Some(crate::model::plan::MarkIntent::Act(kind)) => kind.as_str(),
+            None => "",
+        };
+        // Where THIS row's `keep` came from: its own durable mark, or the operator's keeper
+        // elsewhere in the group — both `mark`; the computed fallback — `default`.
+        let keep_source = if has_keeper_mark || member.mark.is_some() {
+            "mark"
+        } else {
+            "default"
+        };
+        writeln!(
+            writer,
+            "{},{},{},{},{},{},{},{},{},{},{},{}",
+            group.id.rank,
+            u8::from(keep),
+            member.size,
+            csv_field(&group.hash),
+            csv_field(&member.path.to_string_lossy()),
+            group.id.scan_id,
+            group.id.generation,
+            member.device,
+            member.inode,
+            member.links,
+            mark,
+            keep_source,
+        )?;
+    }
+    Ok(())
+}
+
+/// The uncommitted export artifact: a temporary file in the destination's own directory, owned by
+/// a guard that removes it unless the publication succeeded.
+///
+/// Cleanup is a mechanism here, not an intention. Every early return — a refusal from the reader,
+/// a write error, a corrupt mark discovered halfway through — and every unwind runs `Drop`, so
+/// there is no path on which a half-written file survives under a name that looks finished. What
+/// `Drop` cannot cover is stated rather than implied: `process::abort`, a panic while panicking
+/// and `SIGKILL` leave the temporary behind. It is inert — it never carries the destination's
+/// name, it is mode 0600, nothing in this product reads it, and the next export claims a fresh
+/// name.
+struct TempArtifact {
+    path: PathBuf,
+    file: std::fs::File,
+    armed: bool,
+}
+
+/// Upper bound on create-and-retry repetitions for the temporary name; a backstop against an
+/// infinite loop, never reached in practice (the base carries the pid and nanoseconds).
+const MAX_TEMP_CLAIM_RETRIES: u32 = 1_000;
+
+impl TempArtifact {
+    /// Claims a temporary name beside the destination and opens it exclusively.
+    ///
+    /// Same directory, because the publication is a `rename` and a rename is only atomic within
+    /// one filesystem. `O_EXCL` is the cross-process guarantee (the pid/nanos base only keeps the
+    /// retry count down), `O_NOFOLLOW` refuses a symlink at the temporary name itself, and 0600
+    /// is what the content deserves: a complete pathname inventory of the pool.
+    fn create(dest: &Path) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let Some(name) = dest
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+        else {
+            return Err(AppError::msg(format!(
+                "{} does not name a file to write",
+                textsan::terminal(&dest.display().to_string())
+            )));
+        };
+        let dir = match dest.parent() {
+            Some(parent) if parent.as_os_str().is_empty() => PathBuf::from("."),
+            Some(parent) => parent.to_path_buf(),
+            None => PathBuf::from("."),
+        };
+        if !dir.is_dir() {
+            return Err(AppError::msg(format!(
+                "the directory for the export does not exist: {}",
+                textsan::terminal(&dir.display().to_string())
+            )));
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let base = format!(".{name}.dedcom-export-{}-{nanos}", std::process::id());
+        let mut attempt = 0u32;
+        loop {
+            let candidate = if attempt == 0 {
+                dir.join(format!("{base}.tmp"))
+            } else {
+                dir.join(format!("{base}-r{attempt}.tmp"))
+            };
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .mode(0o600)
+                .open(&candidate)
+            {
+                Ok(file) => {
+                    return Ok(Self {
+                        path: candidate,
+                        file,
+                        armed: true,
+                    })
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if attempt >= MAX_TEMP_CLAIM_RETRIES {
+                        return Err(AppError::msg(format!(
+                            "could not claim a temporary name for the export in {} after \
+                             {MAX_TEMP_CLAIM_RETRIES} attempts",
+                            textsan::terminal(&dir.display().to_string())
+                        )));
+                    }
+                    attempt += 1;
+                }
+                Err(err) => {
+                    return Err(AppError::msg(format!(
+                        "cannot create the temporary export file in {}: {err}",
+                        textsan::terminal(&dir.display().to_string())
+                    )))
+                }
+            }
+        }
+    }
+
+    fn file_mut(&mut self) -> &mut std::fs::File {
+        &mut self.file
+    }
+
+    /// Durability first, then the atomic replacement of the final name.
+    ///
+    /// The rename replaces the NAME the operator gave, deliberately: if the destination is a
+    /// symlink, its target is never written through. Re-exporting over an existing file is the
+    /// ordinary case, so this is a plain replace rather than `RENAME_NOREPLACE` — that rule
+    /// belongs to the destructive action path, where the target is a file nobody asked to lose.
+    fn publish(mut self, dest: &Path) -> Result<()> {
+        self.file.sync_data()?;
+        std::fs::rename(&self.path, dest).map_err(|err| {
+            AppError::msg(format!(
+                "cannot publish the export to {}: {err}",
+                textsan::terminal(&dest.display().to_string())
+            ))
+        })?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for TempArtifact {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+// Test-only one-shot fault in the export's write path, so «the export failed after bytes reached
+// the temporary file» can be produced deterministically — the real thing is a full disk or an I/O
+// error, which no test can schedule. The length observed when it fired is recorded, so a test can
+// prove the failure really was mid-write rather than before the first byte.
+/// What the armed one-shot does when the export reaches the seam.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportFault {
+    None,
+    /// An ordinary `Err` return, as a full disk would produce.
+    Error,
+    /// An unwind, so the guard's `Drop` is what has to clean up.
+    Panic,
+}
+
+#[cfg(test)]
+thread_local! {
+    static EXPORT_WRITE_FAULT: std::cell::Cell<ExportFault> =
+        const { std::cell::Cell::new(ExportFault::None) };
+    static EXPORT_FAULT_LEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Arms the one-shot export write fault for this thread and disarms it on drop.
+#[cfg(test)]
+struct ExportWriteFault;
+
+#[cfg(test)]
+impl ExportWriteFault {
+    fn armed(kind: ExportFault) -> Self {
+        EXPORT_WRITE_FAULT.with(|slot| slot.set(kind));
+        EXPORT_FAULT_LEN.with(|slot| slot.set(0));
+        ExportWriteFault
+    }
+
+    /// Whether the armed shot was consumed. A test whose seam was never reached proved nothing.
+    fn fired(&self) -> bool {
+        EXPORT_WRITE_FAULT.with(|slot| slot.get() == ExportFault::None)
+    }
+
+    /// How many bytes were already in the temporary file when it fired.
+    fn bytes_written(&self) -> u64 {
+        EXPORT_FAULT_LEN.with(|slot| slot.get())
+    }
+}
+
+#[cfg(test)]
+impl Drop for ExportWriteFault {
+    fn drop(&mut self) {
+        EXPORT_WRITE_FAULT.with(|slot| slot.set(ExportFault::None));
+    }
+}
+
+#[cfg(test)]
+fn take_export_write_fault() -> ExportFault {
+    EXPORT_WRITE_FAULT.with(|slot| slot.replace(ExportFault::None))
+}
+
+#[cfg(test)]
+fn record_export_fault_len(len: u64) {
+    EXPORT_FAULT_LEN.with(|slot| slot.set(len));
 }
 
 /// CSV field escaping per RFC 4180 (quotes, commas, line breaks) with formula-injection
@@ -1332,5 +1630,884 @@ mod csv_tests {
     fn formula_and_comma_compose() {
         // The apostrophe is placed BEFORE RFC quoting; both protections work together.
         assert_eq!(csv_field("=a,b"), "\"'=a,b\"");
+    }
+}
+
+/// The trusted `--export-csv` contract: what the artifact says, and what it refuses to say.
+#[cfg(test)]
+mod export_csv_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{cli, paths, run_export_csv, ExportFault, ExportWriteFault, EXPORT_HEADER};
+    use crate::model::action::ActionKind;
+    use crate::model::scan::{ScanConfig, ScanStatus};
+    use crate::state::store::ExportRace;
+    use crate::state::{ManifestRow, PublishMode, ScanStore};
+
+    /// A state directory that cleans itself up even when a test panics.
+    struct Rig {
+        dir: PathBuf,
+    }
+
+    impl Rig {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or(0);
+            let mut dir = std::env::temp_dir();
+            dir.push(format!(
+                "dedcom_export_{tag}_{}_{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Rig { dir }
+        }
+
+        fn cli(&self) -> cli::Cli {
+            cli::Cli {
+                state_dir: Some(self.dir.clone()),
+                ..Default::default()
+            }
+        }
+
+        fn db(&self) -> PathBuf {
+            paths::checkpoint_db(&self.cli())
+        }
+
+        fn store(&self) -> ScanStore {
+            ScanStore::open_writable(&self.db()).unwrap()
+        }
+
+        fn dest(&self) -> PathBuf {
+            self.dir.join("export.csv")
+        }
+
+        fn run(&self) -> super::Result<()> {
+            run_export_csv(&self.cli(), &self.dest())
+        }
+
+        fn export(&self) -> String {
+            self.run().expect("the export must succeed");
+            std::fs::read_to_string(self.dest()).unwrap()
+        }
+
+        /// Temporary artifacts still lying around the destination directory.
+        fn residue(&self) -> Vec<String> {
+            std::fs::read_dir(&self.dir)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains(".dedcom-export-"))
+                .collect()
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn row(path: &str, inode: u64, mtime: i64) -> ManifestRow {
+        ManifestRow {
+            path: PathBuf::from(path),
+            size: 8192,
+            mtime,
+            mtime_nsec: 0,
+            ctime_sec: mtime,
+            ctime_nsec: 0,
+            device: 7,
+            inode,
+            nlink: 1,
+        }
+    }
+
+    /// Manifest rows plus one digest for all of them.
+    fn seed(store: &mut ScanStore, rows: &[ManifestRow], digest: u8) -> i64 {
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank")]))
+            .unwrap();
+        store.record_files(id, rows).unwrap();
+        let hashes: Vec<(PathBuf, [u8; 32])> = rows
+            .iter()
+            .map(|row| (row.path.clone(), [digest; 32]))
+            .collect();
+        store.record_hashes(id, &hashes).unwrap();
+        id
+    }
+
+    /// The ordinary case: one digest, published Derived, scan finished.
+    fn complete_derived(store: &mut ScanStore, rows: &[ManifestRow], digest: u8) -> i64 {
+        let id = seed(store, rows, digest);
+        store.publish_results(id, PublishMode::Derived).unwrap();
+        store.set_status(id, ScanStatus::Complete).unwrap();
+        id
+    }
+
+    /// One exported row, split so a quoted pathname cannot confuse the fields around it: the
+    /// first four and the last seven columns never contain a comma.
+    struct Row {
+        group: String,
+        keep: String,
+        size: String,
+        hash: String,
+        path: String,
+        scan_id: String,
+        generation: String,
+        device: String,
+        inode: String,
+        links: String,
+        mark: String,
+        keep_source: String,
+    }
+
+    fn unquote(field: &str) -> String {
+        if field.len() >= 2 && field.starts_with('"') && field.ends_with('"') {
+            field[1..field.len() - 1].replace("\"\"", "\"")
+        } else {
+            field.to_string()
+        }
+    }
+
+    fn parse(line: &str) -> Row {
+        let mut head = line.splitn(5, ',');
+        let group = head.next().unwrap().to_string();
+        let keep = head.next().unwrap().to_string();
+        let size = head.next().unwrap().to_string();
+        let hash = head.next().unwrap().to_string();
+        let rest = head.next().unwrap();
+        let mut tail: Vec<&str> = rest.rsplitn(8, ',').collect();
+        tail.reverse();
+        Row {
+            group,
+            keep,
+            size,
+            hash,
+            path: unquote(tail[0]),
+            scan_id: tail[1].to_string(),
+            generation: tail[2].to_string(),
+            device: tail[3].to_string(),
+            inode: tail[4].to_string(),
+            links: tail[5].to_string(),
+            mark: tail[6].to_string(),
+            keep_source: tail[7].to_string(),
+        }
+    }
+
+    fn rows_of(csv: &str) -> Vec<Row> {
+        csv.lines()
+            .skip(1)
+            .filter(|line| !line.is_empty())
+            .map(parse)
+            .collect()
+    }
+
+    fn find<'a>(rows: &'a [Row], path: &str) -> &'a Row {
+        rows.iter()
+            .find(|row| row.path == path)
+            .unwrap_or_else(|| panic!("no row for {path}"))
+    }
+
+    /// G1 — an ordinary Derived export: published identity, physical columns, one computed keeper.
+    #[test]
+    fn an_ordinary_derived_export_carries_the_published_identity() {
+        let rig = Rig::new("derived");
+        let rows = [
+            row("/tank/a", 1, 1000),
+            row("/tank/b", 2, 2000),
+            row("/tank/c", 3, 3000),
+        ];
+        let id = complete_derived(&mut rig.store(), &rows, 0xA1);
+
+        let csv = rig.export();
+        assert_eq!(
+            csv.lines().next().unwrap(),
+            EXPORT_HEADER.trim_end(),
+            "the header is the accepted append-only schema"
+        );
+        let parsed = rows_of(&csv);
+        assert_eq!(parsed.len(), 3);
+        for row in &parsed {
+            assert_eq!(row.group, "0");
+            assert_eq!(row.scan_id, id.to_string());
+            assert_eq!(row.generation, "1");
+            assert_eq!(row.device, "7");
+            assert_eq!(row.links, "1");
+            assert_eq!(row.size, "8192");
+            assert_eq!(row.hash.len(), 64);
+            assert_eq!(row.mark, "");
+            assert_eq!(row.keep_source, "default");
+        }
+        assert_eq!(parsed.iter().filter(|row| row.keep == "1").count(), 1);
+        assert_eq!(find(&parsed, "/tank/c").keep, "1", "freshest mtime keeps");
+        assert!(rig.residue().is_empty());
+    }
+
+    /// G2 — the pathname byte verification rejected is absent from the artifact.
+    #[test]
+    fn a_verification_rejected_pathname_is_not_exported() {
+        let rig = Rig::new("rejected");
+        let rows = [
+            row("/tank/a", 1, 1000),
+            row("/tank/b", 2, 1000),
+            row("/tank/c", 3, 1000),
+        ];
+        {
+            let mut store = rig.store();
+            let id = seed(&mut store, &rows, 0xA2);
+            let mut groups = store.duplicate_groups(id).unwrap();
+            groups[0]
+                .files
+                .retain(|file| file.path.as_path() != Path::new("/tank/c"));
+            store
+                .publish_results(id, PublishMode::Explicit(&groups))
+                .unwrap();
+            store.set_status(id, ScanStatus::Complete).unwrap();
+        }
+
+        let csv = rig.export();
+        assert!(
+            !csv.contains("/tank/c"),
+            "the rejected pathname must not come back:\n{csv}"
+        );
+        assert_eq!(rows_of(&csv).len(), 2);
+    }
+
+    /// G3 — two Explicit ranks that share one digest stay two groups.
+    #[test]
+    fn two_explicit_ranks_of_one_digest_stay_two_groups() {
+        let rig = Rig::new("split");
+        let rows = [
+            row("/tank/a", 1, 1000),
+            row("/tank/b", 2, 1000),
+            row("/tank/c", 3, 1000),
+            row("/tank/d", 4, 1000),
+        ];
+        {
+            let mut store = rig.store();
+            let id = seed(&mut store, &rows, 0xA3);
+            let raw = store.duplicate_groups(id).unwrap();
+            let mut left = raw[0].clone();
+            let mut right = raw[0].clone();
+            left.files.retain(|file| file.inode <= 2);
+            right.files.retain(|file| file.inode >= 3);
+            store
+                .publish_results(id, PublishMode::Explicit(&[left, right]))
+                .unwrap();
+            store.set_status(id, ScanStatus::Complete).unwrap();
+        }
+
+        let csv = rig.export();
+        let parsed = rows_of(&csv);
+        assert_eq!(parsed.len(), 4);
+        let groups: std::collections::BTreeSet<&str> =
+            parsed.iter().map(|row| row.group.as_str()).collect();
+        assert_eq!(
+            groups.len(),
+            2,
+            "two published ranks, two CSV groups:\n{csv}"
+        );
+        assert_eq!(parsed.iter().filter(|row| row.keep == "1").count(), 2);
+        let hashes: std::collections::BTreeSet<&str> =
+            parsed.iter().map(|row| row.hash.as_str()).collect();
+        assert_eq!(hashes.len(), 1, "and they legitimately share one digest");
+    }
+
+    /// G4 — with no marks the keeper is a total order, not «whichever the rows arrived in».
+    #[test]
+    fn without_marks_the_keeper_is_the_deterministic_maximum() {
+        let rig = Rig::new("fallback");
+        // Same mtime AND same nanoseconds: only the pathname can break the tie.
+        let rows = [row("/tank/a", 1, 5000), row("/tank/b", 2, 5000)];
+        complete_derived(&mut rig.store(), &rows, 0xA4);
+
+        let csv = rig.export();
+        let parsed = rows_of(&csv);
+        assert_eq!(find(&parsed, "/tank/b").keep, "1", "the greater path wins");
+        assert_eq!(find(&parsed, "/tank/a").keep, "0");
+        assert_eq!(find(&parsed, "/tank/b").keep_source, "default");
+    }
+
+    /// G5 — a durable keeper mark on the OLDER file wins over the freshest mtime.
+    #[test]
+    fn a_durable_keeper_mark_wins_over_a_fresher_mtime() {
+        let rig = Rig::new("keeper");
+        let rows = [row("/tank/old", 1, 1000), row("/tank/new", 2, 9000)];
+        {
+            let mut store = rig.store();
+            let id = complete_derived(&mut store, &rows, 0xA5);
+            let mut groups = store.duplicate_groups(id).unwrap();
+            for file in &mut groups[0].files {
+                file.is_keeper = file.path.as_path() == Path::new("/tank/old");
+            }
+            let marked = groups[0].files.clone();
+            store.save_marks(id, marked.iter()).unwrap();
+        }
+
+        let csv = rig.export();
+        let parsed = rows_of(&csv);
+        let old = find(&parsed, "/tank/old");
+        assert_eq!(old.keep, "1");
+        assert_eq!(old.mark, "keeper");
+        assert_eq!(old.keep_source, "mark");
+        let new = find(&parsed, "/tank/new");
+        assert_eq!(new.keep, "0");
+        assert_eq!(
+            new.keep_source, "mark",
+            "its 0 follows from the operator's keeper, not from a default"
+        );
+    }
+
+    /// G6 — keeper and action marks in one group are both honoured, and an unmarked sibling
+    /// stays a candidate.
+    #[test]
+    fn keeper_and_action_marks_are_both_honoured() {
+        let rig = Rig::new("combo");
+        let rows = [
+            row("/tank/keep", 1, 1000),
+            row("/tank/link", 2, 2000),
+            row("/tank/plain", 3, 3000),
+        ];
+        {
+            let mut store = rig.store();
+            let id = complete_derived(&mut store, &rows, 0xA6);
+            let mut groups = store.duplicate_groups(id).unwrap();
+            for file in &mut groups[0].files {
+                if file.path.as_path() == Path::new("/tank/keep") {
+                    file.is_keeper = true;
+                } else if file.path.as_path() == Path::new("/tank/link") {
+                    file.action = Some(ActionKind::Hardlink);
+                }
+            }
+            let marked = groups[0].files.clone();
+            store.save_marks(id, marked.iter()).unwrap();
+        }
+
+        let csv = rig.export();
+        let parsed = rows_of(&csv);
+        assert_eq!(find(&parsed, "/tank/keep").keep, "1");
+        assert_eq!(find(&parsed, "/tank/keep").mark, "keeper");
+        assert_eq!(find(&parsed, "/tank/link").keep, "0");
+        assert_eq!(find(&parsed, "/tank/link").mark, "hardlink");
+        let plain = find(&parsed, "/tank/plain");
+        assert_eq!(
+            plain.keep, "0",
+            "the freshest mtime does not override a keeper mark"
+        );
+        assert_eq!(plain.mark, "");
+    }
+
+    /// G7 — two keeper marks stay two keepers; the export invents no single survivor.
+    #[test]
+    fn two_keeper_marks_stay_two_keepers() {
+        let rig = Rig::new("twokeepers");
+        let rows = [
+            row("/tank/a", 1, 1000),
+            row("/tank/b", 2, 2000),
+            row("/tank/c", 3, 3000),
+        ];
+        {
+            let mut store = rig.store();
+            let id = complete_derived(&mut store, &rows, 0xA7);
+            let mut groups = store.duplicate_groups(id).unwrap();
+            for file in &mut groups[0].files {
+                file.is_keeper = file.path.as_path() != Path::new("/tank/c");
+            }
+            let marked = groups[0].files.clone();
+            store.save_marks(id, marked.iter()).unwrap();
+        }
+
+        let csv = rig.export();
+        let parsed = rows_of(&csv);
+        assert_eq!(parsed.iter().filter(|row| row.keep == "1").count(), 2);
+        assert_eq!(find(&parsed, "/tank/c").keep, "0");
+    }
+
+    /// G8' — a group whose every pathname is action-marked has no survivor, and a CSV that says
+    /// so would read as «delete every copy». The whole export refuses.
+    #[test]
+    fn a_group_with_no_survivor_refuses_the_whole_export() {
+        let rig = Rig::new("nosurvivor");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        {
+            let mut store = rig.store();
+            let id = complete_derived(&mut store, &rows, 0xA8);
+            let mut groups = store.duplicate_groups(id).unwrap();
+            for file in &mut groups[0].files {
+                file.action = Some(ActionKind::Delete);
+            }
+            let marked = groups[0].files.clone();
+            store.save_marks(id, marked.iter()).unwrap();
+        }
+        std::fs::write(rig.dest(), b"previous export\n").unwrap();
+
+        let err = rig.run().unwrap_err().to_string();
+        assert!(
+            err.contains("no keeper"),
+            "the refusal explains itself: {err}"
+        );
+        assert!(err.contains("group 0"), "and names the group: {err}");
+        assert_eq!(
+            std::fs::read(rig.dest()).unwrap(),
+            b"previous export\n",
+            "the operator's existing file is untouched"
+        );
+        assert!(rig.residue().is_empty(), "and no temporary is left behind");
+    }
+
+    /// G9 — a mark that states two fates, and an action identifier this build does not know,
+    /// both refuse instead of being normalised into guidance.
+    #[test]
+    fn a_damaged_mark_refuses_the_export() {
+        for (tag, sql) in [
+            (
+                "contradictory",
+                "INSERT INTO file_mark(scan_id, path, is_keeper, action)
+                 VALUES (?1, '/tank/a', 1, 'delete')",
+            ),
+            (
+                "unknown",
+                "INSERT INTO file_mark(scan_id, path, is_keeper, action)
+                 VALUES (?1, '/tank/a', 0, 'obliterate')",
+            ),
+        ] {
+            let rig = Rig::new(tag);
+            let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+            {
+                let mut store = rig.store();
+                let id = complete_derived(&mut store, &rows, 0xA9);
+                assert_eq!(store.corrupt_directly(sql, rusqlite::params![id]), 1);
+            }
+            let err = rig.run().unwrap_err().to_string();
+            assert!(
+                err.contains("/tank/a"),
+                "the refusal names the pathname ({tag}): {err}"
+            );
+            assert!(!rig.dest().exists(), "no artifact was published ({tag})");
+            assert!(rig.residue().is_empty(), "no temporary is left ({tag})");
+        }
+    }
+
+    /// G10 — aliases of one allocation are visible as such, and an unrecorded link count is
+    /// reported as unknown rather than refused.
+    #[test]
+    fn aliases_of_one_allocation_are_visible() {
+        let rig = Rig::new("aliases");
+        let mut rows = [
+            row("/tank/one", 1, 1000),
+            row("/tank/one-alias", 1, 1000),
+            row("/tank/other", 2, 2000),
+        ];
+        rows[0].nlink = 2;
+        rows[1].nlink = 2;
+        rows[2].nlink = 0; // a pre-v3 row: the link count was never recorded
+        complete_derived(&mut rig.store(), &rows, 0xAA);
+
+        let csv = rig.export();
+        let parsed = rows_of(&csv);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(find(&parsed, "/tank/one").inode, "1");
+        assert_eq!(find(&parsed, "/tank/one-alias").inode, "1");
+        assert_eq!(
+            find(&parsed, "/tank/one").links,
+            "2",
+            "the link count the walk observed"
+        );
+        assert_eq!(
+            find(&parsed, "/tank/other").links,
+            "0",
+            "0 is «never recorded», not «no links»"
+        );
+    }
+
+    /// G11 — a trusted publication with no duplicate groups is a finished answer.
+    #[test]
+    fn an_empty_publication_is_a_header_only_file() {
+        let rig = Rig::new("empty");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        {
+            let mut store = rig.store();
+            let id = store
+                .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank")]))
+                .unwrap();
+            store.record_files(id, &rows).unwrap();
+            // Two different digests: nothing is a duplicate of anything.
+            store
+                .record_hashes(
+                    id,
+                    &[
+                        (rows[0].path.clone(), [0xB1; 32]),
+                        (rows[1].path.clone(), [0xB2; 32]),
+                    ],
+                )
+                .unwrap();
+            store.publish_results(id, PublishMode::Derived).unwrap();
+            store.set_status(id, ScanStatus::Complete).unwrap();
+        }
+
+        let csv = rig.export();
+        assert_eq!(csv, EXPORT_HEADER, "header only, and it succeeded");
+    }
+
+    /// G12 — a summary whose member count its membership does not hold refuses the whole export.
+    #[test]
+    fn an_inconsistent_rank_refuses_the_export() {
+        let rig = Rig::new("inconsistent");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        {
+            let mut store = rig.store();
+            let id = complete_derived(&mut store, &rows, 0xAB);
+            assert_eq!(
+                store.corrupt_directly(
+                    "UPDATE file_group SET file_count = file_count + 5 WHERE scan_id = ?1",
+                    rusqlite::params![id],
+                ),
+                1
+            );
+        }
+        std::fs::write(rig.dest(), b"previous export\n").unwrap();
+
+        let err = rig.run().unwrap_err().to_string();
+        assert!(err.contains("member count"), "{err}");
+        assert_eq!(std::fs::read(rig.dest()).unwrap(), b"previous export\n");
+        assert!(rig.residue().is_empty());
+    }
+
+    /// G13 — no authority is a refusal that tells the operator the only real remedy.
+    #[test]
+    fn an_unknown_authority_refuses_and_says_rescan() {
+        let rig = Rig::new("unknown");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        {
+            let mut store = rig.store();
+            let id = seed(&mut store, &rows, 0xAC);
+            store.set_status(id, ScanStatus::Complete).unwrap();
+        }
+
+        let err = rig.run().unwrap_err().to_string();
+        assert!(err.contains("no verified membership"), "{err}");
+        assert!(err.contains("Re-run the scan"), "{err}");
+        assert!(
+            err.contains("opening the checkpoint does not republish it"),
+            "the message must not send the operator down a path that cannot work: {err}"
+        );
+        assert!(!rig.dest().exists(), "and nothing was written");
+    }
+
+    /// G26/G27 — the authority is published before the final status, so the status is checked on
+    /// its own.
+    #[test]
+    fn a_published_but_unfinished_scan_refuses() {
+        for status in [
+            ScanStatus::Hashing,
+            ScanStatus::Walking,
+            ScanStatus::Aborted,
+        ] {
+            let rig = Rig::new("unfinished");
+            let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+            {
+                let mut store = rig.store();
+                let id = seed(&mut store, &rows, 0xAD);
+                store.publish_results(id, PublishMode::Derived).unwrap();
+                store.set_status(id, status).unwrap();
+            }
+            let err = rig.run().unwrap_err().to_string();
+            assert!(
+                err.contains("has not finished"),
+                "{status:?} must refuse: {err}"
+            );
+            assert!(err.contains(status.as_str()), "and name the status: {err}");
+            assert!(!rig.dest().exists());
+        }
+    }
+
+    /// A status this build cannot parse is skipped by the selector, exactly as it is everywhere
+    /// else — and with no other active scan the export says so instead of guessing.
+    #[test]
+    fn an_unparseable_status_is_not_selected() {
+        let rig = Rig::new("badstatus");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        {
+            let mut store = rig.store();
+            let id = complete_derived(&mut store, &rows, 0xAE);
+            assert_eq!(
+                store.corrupt_directly(
+                    "UPDATE scan SET status = 'quantum' WHERE id = ?1",
+                    rusqlite::params![id],
+                ),
+                1
+            );
+        }
+        let err = rig.run().unwrap_err().to_string();
+        assert!(err.contains("no saved scan"), "{err}");
+        assert!(!rig.dest().exists());
+    }
+
+    /// A trashed session is not eligible, and with nothing else active the export refuses.
+    #[test]
+    fn a_trashed_session_is_not_exported() {
+        let rig = Rig::new("trashed");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        {
+            let mut store = rig.store();
+            let id = complete_derived(&mut store, &rows, 0xAF);
+            store.trash_scan(id).unwrap();
+        }
+        let err = rig.run().unwrap_err().to_string();
+        assert!(err.contains("no saved scan"), "{err}");
+        assert!(!rig.dest().exists());
+    }
+
+    /// G15 — a pathname the walk could not read as UTF-8 is exported in the manifest's own
+    /// spelling; the export adds no second lossy conversion of its own.
+    #[test]
+    fn a_non_utf8_pathname_keeps_the_manifest_spelling() {
+        use std::os::unix::ffi::OsStrExt;
+        let rig = Rig::new("nonutf8");
+        let raw = PathBuf::from(std::ffi::OsStr::from_bytes(b"/tank/bad\xffname.bin"));
+        let mut rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        rows[1].path = raw;
+        complete_derived(&mut rig.store(), &rows, 0xB0);
+
+        let csv = rig.export();
+        assert!(
+            csv.contains("/tank/bad\u{FFFD}name.bin"),
+            "the manifest's lossy spelling is what every surface uses:\n{csv}"
+        );
+    }
+
+    /// G16 — RFC-4180 quoting and formula neutralisation survive the new columns.
+    #[test]
+    fn commas_quotes_and_formula_prefixes_stay_escaped() {
+        let rig = Rig::new("escaping");
+        let rows = [
+            row("=cmd|calc,evil\"quote", 1, 1000),
+            row("/tank/plain", 2, 2000),
+        ];
+        complete_derived(&mut rig.store(), &rows, 0xB3);
+
+        let csv = rig.export();
+        assert!(
+            csv.contains("\"'=cmd|calc,evil\"\"quote\""),
+            "apostrophe first, then RFC quoting, then doubled quotes:\n{csv}"
+        );
+        // The row still has its twelve fields: the quoted pathname did not shift them.
+        let parsed = rows_of(&csv);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(find(&parsed, "/tank/plain").keep_source, "default");
+    }
+
+    /// G17 — a refusal after the temporary exists still leaves the destination alone, byte for
+    /// byte and mtime for mtime.
+    #[test]
+    fn a_mid_write_failure_leaves_the_destination_untouched() {
+        let rig = Rig::new("midwrite");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        complete_derived(&mut rig.store(), &rows, 0xB4);
+        std::fs::write(rig.dest(), b"previous export\n").unwrap();
+        let before = std::fs::metadata(rig.dest()).unwrap().modified().unwrap();
+
+        let fault = ExportWriteFault::armed(ExportFault::Error);
+        let err = rig.run().unwrap_err().to_string();
+        assert!(fault.fired(), "the seam must have been reached");
+        assert!(
+            fault.bytes_written() > 0,
+            "and it must have fired AFTER bytes reached the temporary"
+        );
+        assert!(err.contains("injected export write fault"), "{err}");
+        assert_eq!(std::fs::read(rig.dest()).unwrap(), b"previous export\n");
+        assert_eq!(
+            std::fs::metadata(rig.dest()).unwrap().modified().unwrap(),
+            before
+        );
+        assert!(rig.residue().is_empty(), "the guard removed the temporary");
+    }
+
+    /// G24 — the same guarantee under an unwind, where only `Drop` can deliver it.
+    #[test]
+    fn a_panic_mid_write_leaves_no_artifact() {
+        let rig = Rig::new("panic");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        complete_derived(&mut rig.store(), &rows, 0xB5);
+        std::fs::write(rig.dest(), b"previous export\n").unwrap();
+
+        let fault = ExportWriteFault::armed(ExportFault::Panic);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.run()));
+        std::panic::set_hook(previous);
+
+        assert!(outcome.is_err(), "the export must have unwound");
+        assert!(fault.fired());
+        assert!(fault.bytes_written() > 0);
+        assert_eq!(std::fs::read(rig.dest()).unwrap(), b"previous export\n");
+        assert!(rig.residue().is_empty(), "Drop ran during the unwind");
+    }
+
+    /// G18 — the destination NAME is replaced; a symlink's target is never written through.
+    #[test]
+    fn a_symlinked_destination_is_replaced_not_followed() {
+        let rig = Rig::new("symlink");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        complete_derived(&mut rig.store(), &rows, 0xB6);
+        let target = rig.dir.join("elsewhere.csv");
+        std::fs::write(&target, b"not to be overwritten\n").unwrap();
+        std::os::unix::fs::symlink(&target, rig.dest()).unwrap();
+
+        let csv = rig.export();
+        assert!(csv.starts_with("group,keep"), "the export succeeded");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"not to be overwritten\n",
+            "the link's target is untouched"
+        );
+        assert!(
+            !std::fs::symlink_metadata(rig.dest())
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the name now holds the artifact itself"
+        );
+    }
+
+    /// The published artifact is not world-readable: it is the pool's complete pathname
+    /// inventory, exactly what the checkpoint's own 0600 protects.
+    #[test]
+    fn the_published_artifact_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let rig = Rig::new("mode");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        complete_derived(&mut rig.store(), &rows, 0xB7);
+
+        rig.export();
+        let mode = std::fs::metadata(rig.dest()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+    }
+
+    /// G21 — the session is trashed in the gap between selection and snapshot.
+    #[test]
+    fn a_trash_at_the_selection_seam_refuses() {
+        let rig = Rig::new("raceTrash");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        let id = complete_derived(&mut rig.store(), &rows, 0xB8);
+        let db = rig.db();
+
+        let race = ExportRace::armed(move || {
+            ScanStore::open_writable(&db)
+                .unwrap()
+                .trash_scan(id)
+                .unwrap();
+        });
+        let err = rig.run().unwrap_err().to_string();
+        assert!(race.fired(), "the seam must have been reached");
+        assert!(err.contains("moved to the trash"), "{err}");
+        assert!(!rig.dest().exists());
+        assert!(rig.residue().is_empty());
+    }
+
+    /// G21 — a newer session finishes in that same gap: the export refuses rather than quietly
+    /// exporting a session nobody asked for.
+    #[test]
+    fn a_newer_scan_at_the_selection_seam_refuses() {
+        let rig = Rig::new("raceNewer");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        complete_derived(&mut rig.store(), &rows, 0xB9);
+        let db = rig.db();
+
+        let race = ExportRace::armed(move || {
+            let mut store = ScanStore::open_writable(&db).unwrap();
+            let rows = [row("/tank/x", 11, 1000), row("/tank/y", 12, 2000)];
+            complete_derived(&mut store, &rows, 0xBA);
+        });
+        let err = rig.run().unwrap_err().to_string();
+        assert!(race.fired());
+        assert!(err.contains("newest active session changed"), "{err}");
+        assert!(!rig.dest().exists());
+    }
+
+    /// G20 — a republication and a mark land in that same gap: the artifact describes ONE state.
+    #[test]
+    fn a_republication_at_the_seam_yields_one_whole_state() {
+        let rig = Rig::new("raceRepublish");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        let id = complete_derived(&mut rig.store(), &rows, 0xBB);
+        let db = rig.db();
+
+        let race = ExportRace::armed(move || {
+            let mut store = ScanStore::open_writable(&db).unwrap();
+            store.publish_results(id, PublishMode::Derived).unwrap();
+            let mut groups = store.duplicate_groups(id).unwrap();
+            for file in &mut groups[0].files {
+                file.is_keeper = file.path.as_path() == Path::new("/tank/a");
+            }
+            let marked = groups[0].files.clone();
+            store.save_marks(id, marked.iter()).unwrap();
+        });
+        let csv = rig.export();
+        assert!(race.fired());
+        let parsed = rows_of(&csv);
+        let generations: std::collections::BTreeSet<&str> =
+            parsed.iter().map(|row| row.generation.as_str()).collect();
+        assert_eq!(
+            generations.len(),
+            1,
+            "one publication per artifact, never two:\n{csv}"
+        );
+        assert_eq!(
+            generations.into_iter().next().unwrap(),
+            "2",
+            "and it is the state the snapshot opened on"
+        );
+        let keeper = parsed.iter().find(|row| row.keep == "1").unwrap();
+        assert_eq!(
+            keeper.path, "/tank/a",
+            "the marks come from that same state:\n{csv}"
+        );
+    }
+
+    /// The reporting contract the mode has always had: no lock, no writes to the checkpoint.
+    #[test]
+    fn the_export_does_not_modify_the_checkpoint() {
+        let rig = Rig::new("readonly");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        complete_derived(&mut rig.store(), &rows, 0xBC);
+        let before = std::fs::read(rig.db()).unwrap();
+
+        rig.export();
+        assert_eq!(
+            std::fs::read(rig.db()).unwrap(),
+            before,
+            "the checkpoint is a report source, not a workspace"
+        );
+    }
+
+    /// Re-exporting over yesterday's artifact is the ordinary case and must keep working.
+    #[test]
+    fn an_existing_destination_is_replaced_on_success() {
+        let rig = Rig::new("replace");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        complete_derived(&mut rig.store(), &rows, 0xBD);
+        std::fs::write(rig.dest(), b"previous export\n").unwrap();
+
+        let csv = rig.export();
+        assert!(csv.starts_with("group,keep"));
+        assert_eq!(rows_of(&csv).len(), 2);
+        assert!(rig.residue().is_empty());
+    }
+
+    /// A destination whose directory does not exist is refused before anything is created.
+    #[test]
+    fn a_missing_destination_directory_is_refused() {
+        let rig = Rig::new("nodir");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        complete_derived(&mut rig.store(), &rows, 0xBE);
+
+        let missing = rig.dir.join("no-such-dir").join("export.csv");
+        let err = run_export_csv(&rig.cli(), &missing)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(rig.residue().is_empty());
     }
 }

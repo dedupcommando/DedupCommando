@@ -231,6 +231,14 @@ pub struct ScanStore {
     /// the answer, and a reader must not quietly pay none.
     #[cfg(test)]
     identity_probes: std::cell::Cell<u64>,
+    /// Test-only: member rows the export currently holds in RAM, and the high-water mark of that
+    /// number. The claim they exist for is «the export buffers ONE group, never the scan»: a
+    /// process-memory measurement answers to the allocator and the page cache, while a counter of
+    /// the rows the reader itself is holding answers to nothing else.
+    #[cfg(test)]
+    export_rows_now: std::cell::Cell<u64>,
+    #[cfg(test)]
+    export_rows_max: std::cell::Cell<u64>,
 }
 
 /// One cached whole-authority validation, valid only while the connection still sees the same
@@ -849,6 +857,48 @@ fn take_open_race_hook() {
     }
 }
 
+// Test-only one-shot seam at the exact instant between the export's selection read and the
+// snapshot it then opens. That gap is the only place an export can observe two database states,
+// so a trash, a newer scan, a republication or a mark written there is what the seam schedules —
+// deterministically, which no sleep or second thread could do.
+#[cfg(test)]
+thread_local! {
+    static EXPORT_RACE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms the one-shot export-race hook for this thread and disarms it on drop.
+#[cfg(test)]
+pub(crate) struct ExportRace;
+
+#[cfg(test)]
+impl ExportRace {
+    pub(crate) fn armed(action: impl FnOnce() + 'static) -> Self {
+        EXPORT_RACE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(action)));
+        ExportRace
+    }
+
+    /// Whether the armed shot was consumed. A test whose seam was never reached proved nothing.
+    pub(crate) fn fired(&self) -> bool {
+        EXPORT_RACE_HOOK.with(|slot| slot.borrow().is_none())
+    }
+}
+
+#[cfg(test)]
+impl Drop for ExportRace {
+    fn drop(&mut self) {
+        EXPORT_RACE_HOOK.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn take_export_race_hook() {
+    let action = EXPORT_RACE_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+    }
+}
+
 /// Runs the one set-based propagation statement on an open transaction and returns the rows it
 /// filled in. One statement per call — never a loop over aliases.
 fn propagate_trusted_digests(tx: &Connection, scan_id: i64) -> Result<u64> {
@@ -877,7 +927,17 @@ impl ScanStore {
             full_validations: std::cell::Cell::new(0),
             #[cfg(test)]
             identity_probes: std::cell::Cell::new(0),
+            #[cfg(test)]
+            export_rows_now: std::cell::Cell::new(0),
+            #[cfg(test)]
+            export_rows_max: std::cell::Cell::new(0),
         }
+    }
+
+    /// Test-only: the most member rows the export ever held at once (see the fields).
+    #[cfg(test)]
+    pub fn export_buffered_rows_max(&self) -> u64 {
+        self.export_rows_max.get()
     }
 
     /// Test-only: identity probes this store has spent (see the field).
@@ -1032,6 +1092,13 @@ impl ScanStore {
     }
 
     /// Looks for the most recent scan (to resume or view).
+    ///
+    /// Test-only since CSV-C1: its last production caller was `--export-csv`, and the export now
+    /// selects through `newest_active_scan_tx`, which the trash predicate this one lacks is the
+    /// whole point of. Headless resume left it earlier for the same reason
+    /// (`run_headless_scan` uses `resume_probe_for_roots`). Kept because the resume-ordering
+    /// fixtures still ask this exact question.
+    #[cfg(test)]
     pub fn find_resumable(&self) -> Result<Option<ResumeInfo>> {
         // Newest first; stream the rows and stop at the first whose status this build can parse,
         // skipping unknown-status rows (written by a future version) with a warning — without
@@ -4056,6 +4123,30 @@ fn decode_mark(
 // exactly how «one database state» would quietly become several.
 // ---------------------------------------------------------------------------------------------
 
+/// The newest session the operator has NOT moved to the trash, with the status it carries.
+///
+/// Streamed newest-first and stopping at the first row this build can read — the same
+/// unknown-status discipline `find_resumable` uses — but with the trash predicate the session
+/// list uses (`scans_filtered`). A trashed session is hidden from every list the operator sees,
+/// and an export that hands its contents back would be answering about a session the product says
+/// is gone. Deliberately reads nothing else: an export needs an id and a status, not a session
+/// card, so none of the progress or reclaim aggregation is paid here.
+fn newest_active_scan_tx(tx: &Transaction<'_>) -> Result<Option<(i64, ScanStatus)>> {
+    let mut stmt =
+        tx.prepare("SELECT id, status FROM scan WHERE COALESCE(trashed, 0) = 0 ORDER BY id DESC")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let scan_id: i64 = row.get(0)?;
+        let status_text: String = row.get(1)?;
+        let Some(status) = ScanStatus::parse(&status_text) else {
+            tracing::warn!(scan_id, status = %status_text, "skipping scan with unknown status");
+            continue;
+        };
+        return Ok(Some((scan_id, status)));
+    }
+    Ok(None)
+}
+
 fn scan_config_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<ScanConfig> {
     let json: String = tx.query_row(
         "SELECT config_json FROM scan WHERE id = ?1",
@@ -4171,6 +4262,122 @@ pub struct MembershipSnapshot<'a> {
     /// The whole-authority integrity result, computed once when the snapshot was taken and
     /// shared by every trusted method.
     integrity: AuthorityIntegrity,
+    /// Test-only meter of the rows the export buffers; nothing in production.
+    export_meter: ExportMeter<'a>,
+}
+
+/// Test-only meter of the member rows an export holds at once; compiles to nothing in production.
+///
+/// Same shape as [`LeaseMeter`], for the same reason: the claim being metered is about one
+/// operation, and a counter living on the store keeps it readable after that operation ended.
+struct ExportMeter<'a> {
+    #[cfg(test)]
+    now: &'a std::cell::Cell<u64>,
+    #[cfg(test)]
+    max: &'a std::cell::Cell<u64>,
+    #[cfg(not(test))]
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+
+impl ExportMeter<'_> {
+    /// One more member row is now buffered.
+    fn push(&self) {
+        #[cfg(test)]
+        {
+            let now = self.now.get() + 1;
+            self.now.set(now);
+            if now > self.max.get() {
+                self.max.set(now);
+            }
+        }
+    }
+
+    /// The buffered group was handed over and dropped.
+    fn release(&self) {
+        #[cfg(test)]
+        self.now.set(0);
+    }
+}
+
+/// One member row of an export, read strictly.
+///
+/// `links` is `0` for a row whose link count was never recorded (a pre-v3 manifest), exactly as
+/// `FileEntry::nlink` reports it — an export is a report and says «unknown», where a destructive
+/// plan refuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportMember {
+    pub path: PathBuf,
+    pub size: u64,
+    pub mtime: i64,
+    pub mtime_nsec: i64,
+    pub device: u64,
+    pub inode: u64,
+    pub links: u64,
+    /// The durable mark, decoded by the strict decoder — never the browsing one, which would read
+    /// a damaged flag as «not the keeper» and an unknown action as «no action».
+    pub mark: Option<MarkIntent>,
+}
+
+/// One published group of an export: its authoritative identity, its digest and its members in
+/// member order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportGroup {
+    pub id: GroupId,
+    pub hash: String,
+    pub members: Vec<ExportMember>,
+}
+
+/// The one statement an export streams, per authority mode.
+///
+/// Composed from the same member relation the trusted readers use (`member_source`), with the
+/// scan-wide filter this reader adds — a second spelling of «what a member is» is exactly how the
+/// export and the browser would come to disagree.
+///
+/// The order is `(rank, path)` and it is meant to come from the indexes rather than from a
+/// sorter: Explicit drives `file_group_member` by its primary key `(scan_id, group_rank, path)`,
+/// Derived drives `file_group` by `(scan_id, rank)` and probes `file_hash_path
+/// (scan_id, hash, path)`. That is a claim about a query plan, so it is not left as a comment —
+/// `export_plan_tests` runs `EXPLAIN QUERY PLAN` over these exact statements and fails on
+/// `USE TEMP B-TREE FOR ORDER BY`.
+fn export_rows_sql(mode: MembershipMode) -> &'static str {
+    match mode {
+        MembershipMode::Explicit => {
+            "SELECT mm.group_rank, g.hash, f.path, f.size, f.mtime, f.mtime_nsec,
+                    f.device, f.inode, f.nlink, m.is_keeper, m.action, m.rowid
+               FROM file_group_member mm
+               JOIN file_group g     ON g.scan_id = mm.scan_id AND g.rank = mm.group_rank
+               JOIN file f           ON f.scan_id = mm.scan_id AND f.path = mm.path
+               LEFT JOIN file_mark m ON m.scan_id = mm.scan_id AND m.path = mm.path
+              WHERE mm.scan_id = ?1
+              ORDER BY mm.group_rank, mm.path"
+        }
+        _ => {
+            "SELECT g.rank, g.hash, f.path, f.size, f.mtime, f.mtime_nsec,
+                    f.device, f.inode, f.nlink, m.is_keeper, m.action, m.rowid
+               FROM file_group g
+               JOIN file f           ON f.scan_id = g.scan_id AND f.hash = unhex(g.hash)
+               LEFT JOIN file_mark m ON m.scan_id = f.scan_id AND m.path = f.path
+              WHERE g.scan_id = ?1
+              ORDER BY g.rank, f.path"
+        }
+    }
+}
+
+/// What one export covered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExportTotals {
+    pub groups: u64,
+    pub rows: u64,
+}
+
+/// The one snapshot an export runs from, with the two facts its own header line needs.
+///
+/// Constructed only by [`ScanStore::open_trusted_export`], which is where both eligibility rules
+/// live: a trusted authority AND a finished scan.
+pub struct TrustedExport<'a> {
+    pub snapshot: MembershipSnapshot<'a>,
+    pub scan_id: i64,
+    pub status: ScanStatus,
 }
 
 /// What the one central validation found. Structural corruption never reaches this value — it
@@ -4587,6 +4794,78 @@ impl ScanStore {
             mode,
             generation,
             integrity,
+            export_meter: ExportMeter {
+                #[cfg(test)]
+                now: &self.export_rows_now,
+                #[cfg(test)]
+                max: &self.export_rows_max,
+                #[cfg(not(test))]
+                _phantom: std::marker::PhantomData,
+            },
+        })
+    }
+
+    /// The one snapshot `--export-csv` runs from, or a refusal that leaves the operator's
+    /// destination alone.
+    ///
+    /// Two facts are checked, and they are genuinely different things. The authority answers «is
+    /// this membership trusted»; the status answers «has the scan finished». Production publishes
+    /// the authority first and sets the final status afterwards (`pipeline::run_phases`), so a
+    /// reader that took only the authority would export a scan still hashing — and this mode takes
+    /// no instance lock, which is exactly why it can be in that window.
+    ///
+    /// The selection is made in autocommit and RE-MADE inside the snapshot: between the two, the
+    /// session can be trashed or a newer one can finish, and answering from the first read would
+    /// describe a session nobody asked for.
+    pub fn open_trusted_export(&self) -> Result<TrustedExport<'_>> {
+        let selected = {
+            let tx = self.conn.unchecked_transaction()?;
+            newest_active_scan_tx(&tx)?
+        };
+        let Some((scan_id, _)) = selected else {
+            return Err(AppError::msg("no saved scan"));
+        };
+        // The seam: everything a second writer could do lands exactly here.
+        #[cfg(test)]
+        take_export_race_hook();
+        let snapshot = self.membership_snapshot(scan_id).map_err(|miss| {
+            AppError::msg(format!(
+                "scan {scan_id} cannot be exported: {}",
+                describe_miss(&miss)
+            ))
+        })?;
+        // Re-made under the snapshot's own transaction, so the answer is about ONE state.
+        let confirmed = newest_active_scan_tx(&snapshot.tx)?;
+        let Some((confirmed_id, status)) = confirmed else {
+            return Err(AppError::msg(
+                "the selected session was moved to the trash while the export was starting; \
+                 nothing was written. Run the export again.",
+            ));
+        };
+        if confirmed_id != scan_id {
+            return Err(AppError::msg(format!(
+                "the newest active session changed from {scan_id} to {confirmed_id} while the \
+                 export was starting; nothing was written. Run the export again."
+            )));
+        }
+        if snapshot.mode() == MembershipMode::Unknown {
+            return Err(AppError::msg(format!(
+                "scan {scan_id} has no verified membership — it comes from an older version of \
+                 dedcom, or it never finished publishing. Re-run the scan to export it; opening \
+                 the checkpoint does not republish it. Nothing was written."
+            )));
+        }
+        if !status.is_completed() {
+            return Err(AppError::msg(format!(
+                "scan {scan_id} has not finished (status: {}); a CSV of a running scan would \
+                 describe a result that does not exist yet. Nothing was written.",
+                status.as_str()
+            )));
+        }
+        Ok(TrustedExport {
+            snapshot,
+            scan_id,
+            status,
         })
     }
 
@@ -5175,6 +5454,89 @@ impl MembershipSnapshot<'_> {
             groups,
             inconsistent,
         })
+    }
+
+    /// Streams the whole publication in `(rank, path)` order, handing the sink ONE group at a
+    /// time and dropping it before the next begins.
+    ///
+    /// This is what makes `--export-csv` bounded: the peak is the largest group's members, not
+    /// the scan's. `summaries()` is deliberately not used — it would materialise every identity
+    /// of the publication for an answer this reader already carries per row.
+    ///
+    /// Strict on both things a report can get quietly wrong: a link count of an impossible
+    /// storage class and a mark that does not decode both refuse the whole export. Skipping the
+    /// row instead would publish a file that silently omits it, and skipping the group would
+    /// publish one that silently under-reports.
+    pub fn for_each_export_group(
+        &self,
+        mut sink: impl FnMut(&ExportGroup) -> Result<()>,
+    ) -> Result<ExportTotals> {
+        self.require_authority()
+            .map_err(|miss| AppError::msg(describe_miss(&miss)))?;
+        if let Some(rank) = self.integrity.inconsistent_ranks.iter().next() {
+            return Err(AppError::msg(format!(
+                "group rank {rank} of scan {} declares a member count its membership does not \
+                 hold; the export refuses rather than writing a file that omits it. Nothing was \
+                 written.",
+                self.scan_id
+            )));
+        }
+        let mut stmt = self.tx.prepare(export_rows_sql(self.mode))?;
+        let mut rows = stmt.query(params![self.scan_id])?;
+        let mut totals = ExportTotals::default();
+        let mut current: Option<ExportGroup> = None;
+        while let Some(row) = rows.next()? {
+            let rank: i64 = row.get(0)?;
+            if current.as_ref().is_some_and(|group| group.id.rank != rank) {
+                let group = current.take().expect("checked above");
+                totals.groups += 1;
+                totals.rows += group.members.len() as u64;
+                sink(&group)?;
+                drop(group);
+                self.export_meter.release();
+            }
+            let path = PathBuf::from(row.get::<_, String>(2)?);
+            let nlink = row.get::<_, Value>(8)?;
+            let is_keeper = row.get::<_, Value>(9)?;
+            let action = row.get::<_, Value>(10)?;
+            let present = row.get::<_, Option<i64>>(11)?.is_some();
+            let mark = decode_mark(&path, present, &is_keeper, &action).map_err(|err| {
+                AppError::msg(format!(
+                    "{err}; the export refuses rather than guessing what the operator meant. \
+                     Nothing was written."
+                ))
+            })?;
+            let member = ExportMember {
+                size: row.get::<_, i64>(3)? as u64,
+                mtime: row.get::<_, i64>(4)?,
+                mtime_nsec: row.get::<_, i64>(5)?,
+                device: row.get::<_, i64>(6)? as u64,
+                inode: row.get::<_, i64>(7)? as u64,
+                links: link_count_from_sql(&nlink)?.to_u64(),
+                path,
+                mark,
+            };
+            let hash: String = row.get(1)?;
+            let group = current.get_or_insert_with(|| ExportGroup {
+                id: GroupId {
+                    scan_id: self.scan_id,
+                    rank,
+                    generation: self.generation,
+                },
+                hash,
+                members: Vec::new(),
+            });
+            group.members.push(member);
+            self.export_meter.push();
+        }
+        if let Some(group) = current.take() {
+            totals.groups += 1;
+            totals.rows += group.members.len() as u64;
+            sink(&group)?;
+            drop(group);
+            self.export_meter.release();
+        }
+        Ok(totals)
     }
 
     /// The exact group — trusted membership only, never a raw-digest fallback.
@@ -19467,6 +19829,178 @@ mod membership_staging_tests {
             ],
             "R4B-2a guards the new surface only; the existing readers switch with the UI that has \
              to render the refusal"
+        );
+    }
+}
+
+/// What the export reader buffers, and what SQLite does with the order it asks for.
+#[cfg(test)]
+mod export_reader_tests {
+    use super::*;
+
+    fn manifest(path: &str, inode: u64) -> ManifestRow {
+        ManifestRow {
+            path: PathBuf::from(path),
+            size: 8192,
+            mtime: 1000,
+            mtime_nsec: 0,
+            ctime_sec: 1000,
+            ctime_nsec: 0,
+            device: 7,
+            inode,
+            nlink: 1,
+        }
+    }
+
+    /// `sizes` = how many pathnames each digest gets; each pathname is its own allocation.
+    fn seed(store: &mut ScanStore, sizes: &[usize]) -> i64 {
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank")]))
+            .unwrap();
+        let mut rows = Vec::new();
+        let mut hashes = Vec::new();
+        let mut inode = 1u64;
+        for (group, count) in sizes.iter().enumerate() {
+            for member in 0..*count {
+                let path = format!("/tank/g{group}/f{member}");
+                rows.push(manifest(&path, inode));
+                hashes.push((PathBuf::from(path), [group as u8 + 1; 32]));
+                inode += 1;
+            }
+        }
+        store.record_files(id, &rows).unwrap();
+        store.record_hashes(id, &hashes).unwrap();
+        id
+    }
+
+    /// The bound the export promises: it holds ONE group, never the scan. Metered by the rows the
+    /// reader itself buffers — process memory would answer to the allocator instead.
+    #[test]
+    fn the_export_buffers_one_group_at_a_time() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = seed(&mut store, &[2, 5, 3]);
+        store.publish_results(id, PublishMode::Derived).unwrap();
+
+        let snapshot = store.membership_snapshot(id).unwrap();
+        let mut seen = Vec::new();
+        let totals = snapshot
+            .for_each_export_group(|group| {
+                seen.push(group.members.len());
+                Ok(())
+            })
+            .unwrap();
+        drop(snapshot);
+
+        assert_eq!(totals.groups, 3);
+        assert_eq!(totals.rows, 10);
+        seen.sort_unstable();
+        assert_eq!(seen, vec![2, 3, 5]);
+        assert_eq!(
+            store.export_buffered_rows_max(),
+            5,
+            "the peak is the largest group, exactly"
+        );
+        assert!(
+            store.export_buffered_rows_max() < totals.rows,
+            "and it is strictly below the whole scan"
+        );
+    }
+
+    /// Members arrive in `(rank, path)` order, so one group's rows are contiguous and the file is
+    /// deterministic for a fixed snapshot.
+    #[test]
+    fn the_export_streams_in_rank_then_path_order() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = seed(&mut store, &[3, 3]);
+        store.publish_results(id, PublishMode::Derived).unwrap();
+
+        let snapshot = store.membership_snapshot(id).unwrap();
+        let mut ranks = Vec::new();
+        snapshot
+            .for_each_export_group(|group| {
+                ranks.push(group.id.rank);
+                let paths: Vec<_> = group.members.iter().map(|m| m.path.clone()).collect();
+                let mut sorted = paths.clone();
+                sorted.sort();
+                assert_eq!(paths, sorted, "members arrive in path order");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(ranks, vec![0, 1], "and groups in rank order");
+    }
+
+    /// The identity every row carries is the published one.
+    #[test]
+    fn every_exported_group_carries_the_published_identity() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = seed(&mut store, &[2]);
+        let generation = store.publish_results(id, PublishMode::Derived).unwrap();
+        let republished = store.publish_results(id, PublishMode::Derived).unwrap();
+        assert_eq!(republished, generation + 1);
+
+        let snapshot = store.membership_snapshot(id).unwrap();
+        snapshot
+            .for_each_export_group(|group| {
+                assert_eq!(group.id.scan_id, id);
+                assert_eq!(group.id.generation, republished);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// A scan with no membership authority answers nothing here either — the export's own
+    /// eligibility gate is not the only thing standing between Unknown and an artifact.
+    #[test]
+    fn an_unknown_authority_answers_no_export_rows() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = seed(&mut store, &[2]);
+        let snapshot = store.membership_snapshot(id).unwrap();
+        let err = snapshot
+            .for_each_export_group(|_| Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no membership authority"), "{err}");
+    }
+
+    /// The ordering claim is about a query PLAN, so it is checked against the planner rather than
+    /// argued from index columns. `EXPLAIN QUERY PLAN` over the exact bound statement must not
+    /// contain a temporary sort — if it ever does, the export sorts the whole scan and the
+    /// bounded-memory story above is only half of the truth.
+    fn plan_of(store: &ScanStore, scan_id: i64, mode: MembershipMode) -> Vec<String> {
+        let sql = format!("EXPLAIN QUERY PLAN {}", export_rows_sql(mode));
+        let mut stmt = store.conn.prepare(&sql).unwrap();
+        let rows = stmt
+            .query_map(params![scan_id], |row| row.get::<_, String>(3))
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    }
+
+    #[test]
+    fn the_derived_export_plan_uses_no_temporary_sort() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = seed(&mut store, &[2, 2]);
+        store.publish_results(id, PublishMode::Derived).unwrap();
+
+        let plan = plan_of(&store, id, MembershipMode::Derived);
+        assert!(
+            !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+            "the Derived export must not sort the scan: {plan:#?}"
+        );
+    }
+
+    #[test]
+    fn the_explicit_export_plan_uses_no_temporary_sort() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = seed(&mut store, &[2, 2]);
+        let groups = store.duplicate_groups(id).unwrap();
+        store
+            .publish_results(id, PublishMode::Explicit(&groups))
+            .unwrap();
+
+        let plan = plan_of(&store, id, MembershipMode::Explicit);
+        assert!(
+            !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+            "the Explicit export must not sort the scan: {plan:#?}"
         );
     }
 }
