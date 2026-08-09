@@ -1452,8 +1452,12 @@ fn destination_parts(dest: &Path) -> Result<(PathBuf, std::ffi::OsString)> {
 /// directory — which a bind mount, a second mount of the same filesystem, a symlink or a `..`
 /// spelling all are, while their canonical paths differ.
 ///
-/// If the name is protected and the comparison cannot be made at all, it refuses: this is the one
-/// question where «could not tell» must not mean «go ahead».
+/// If the name is protected and the comparison cannot be made — the state directory will not open,
+/// or the two handles will not answer about their identity — it refuses. This is the one question
+/// where «could not tell» must not mean «go ahead»: the error can be transient, the state path can
+/// change between this check and the database open, and the thing at stake is every scan the
+/// operator has ever run. An ordinary destination name is unaffected either way; reporting a
+/// missing checkpoint stays the database open's job.
 fn refuse_dedcoms_own_state(
     cli: &cli::Cli,
     parent: &paths::DirHandle,
@@ -1464,10 +1468,15 @@ fn refuse_dedcoms_own_state(
         return Ok(());
     };
     let state_dir = paths::state_dir(cli);
-    let Ok(state) = paths::DirHandle::open(&state_dir) else {
-        // No state directory to protect; the checkpoint open below will say so properly.
-        return Ok(());
-    };
+    let state = paths::DirHandle::open(&state_dir).map_err(|err| {
+        AppError::msg(format!(
+            "{} is named {entry}, and whether {} is dedcom's state directory could not be \
+             established ({err}). Refusing rather than risking the checkpoint; nothing was \
+             written.",
+            textsan::terminal(&dest.display().to_string()),
+            textsan::terminal(&state_dir.display().to_string()),
+        ))
+    })?;
     if parent.is_same_object(&state).unwrap_or(true) {
         return Err(AppError::msg(format!(
             "{} is dedcom's own {entry} — that directory IS the state directory, whatever the \
@@ -1736,7 +1745,8 @@ mod export_csv_tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        cli, paths, run_export_csv, ExportFault, ExportParentSwap, ExportWriteFault, EXPORT_HEADER,
+        cli, paths, refuse_dedcoms_own_state, run_export_csv, ExportFault, ExportParentSwap,
+        ExportWriteFault, EXPORT_HEADER,
     };
     use crate::model::action::ActionKind;
     use crate::model::scan::{ScanConfig, ScanStatus};
@@ -2707,6 +2717,64 @@ mod export_csv_tests {
                 drop(ScanStore::open_read_only(&rig.db()).expect("the checkpoint still opens"));
             }
         }
+    }
+
+    /// An ordinary destination directory, opened for the helper under test.
+    fn state_check_rig(tag: &str) -> (Rig, PathBuf, paths::DirHandle) {
+        let rig = Rig::new(tag);
+        let out = rig.dir.join("out");
+        std::fs::create_dir(&out).unwrap();
+        let parent = paths::DirHandle::open(&out).unwrap();
+        (rig, out, parent)
+    }
+
+    /// A protected basename may not slip through because the state directory could not be
+    /// opened. «I could not establish whether this is live state» is not permission to publish
+    /// over it — the next DB open usually fails too, but usually is not a safety property: the
+    /// error can be transient and the state path can change between the two operations.
+    #[test]
+    fn an_unavailable_state_directory_still_refuses_a_protected_name() {
+        let (rig, out, parent) = state_check_rig("stategone");
+        let missing = rig.dir.join("no-such-state");
+        let cli = cli::Cli {
+            state_dir: Some(missing.clone()),
+            ..Default::default()
+        };
+        let dest = out.join("dedcom.db");
+
+        let err = refuse_dedcoms_own_state(&cli, &parent, std::ffi::OsStr::new("dedcom.db"), &dest)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dedcom.db"), "the entry is named: {err}");
+        assert!(
+            err.contains("could not"),
+            "and so is the reason it refused: {err}"
+        );
+        assert!(!dest.exists(), "nothing was created at the destination");
+        assert!(!missing.exists(), "and no state directory was conjured");
+        assert!(
+            std::fs::read_dir(&out).unwrap().next().is_none(),
+            "the destination directory is untouched"
+        );
+    }
+
+    /// The same unavailable state directory must NOT make an ordinary name fail here: reporting
+    /// a missing checkpoint is the database open's job, not this helper's.
+    #[test]
+    fn an_unavailable_state_directory_does_not_refuse_an_ordinary_name() {
+        let (rig, out, parent) = state_check_rig("stategone_ok");
+        let cli = cli::Cli {
+            state_dir: Some(rig.dir.join("no-such-state")),
+            ..Default::default()
+        };
+        let dest = out.join("groups.csv");
+
+        assert!(
+            refuse_dedcoms_own_state(&cli, &parent, std::ffi::OsStr::new("groups.csv"), &dest)
+                .is_ok(),
+            "an ordinary destination is not this helper's business"
+        );
+        assert!(std::fs::read_dir(&out).unwrap().next().is_none());
     }
 
     /// The protected names are matched without ASCII case, because a case-insensitive dataset
