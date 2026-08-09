@@ -4123,28 +4123,43 @@ fn decode_mark(
 // exactly how «one database state» would quietly become several.
 // ---------------------------------------------------------------------------------------------
 
-/// The newest session the operator has NOT moved to the trash, with the status it carries.
+/// EXACTLY the newest session the operator has not moved to the trash, with the status it
+/// carries — one row, `LIMIT 1`, no looking further down the list.
 ///
-/// Streamed newest-first and stopping at the first row this build can read — the same
-/// unknown-status discipline `find_resumable` uses — but with the trash predicate the session
-/// list uses (`scans_filtered`). A trashed session is hidden from every list the operator sees,
-/// and an export that hands its contents back would be answering about a session the product says
-/// is gone. Deliberately reads nothing else: an export needs an id and a status, not a session
-/// card, so none of the progress or reclaim aggregation is paid here.
+/// The trash predicate is the session list's (`scans_filtered`): a trashed session is hidden
+/// everywhere the operator looks, so an export handing its contents back would answer about a
+/// session the product says is gone.
+///
+/// The unknown-status rule is deliberately the OPPOSITE of `find_resumable`'s and the session
+/// lists'. They skip a row written by a newer build and move on, which is right for them: a
+/// resume looks for something it can continue, and a list shows what it can render. An export
+/// promises one specific session — the newest active one — so skipping it would hand the operator
+/// an artifact about an OLDER session under the name of the newest. That is a silent session
+/// switch, and it refuses here instead. Neither `find_resumable` nor the lists are changed.
+///
+/// Reads nothing else: an export needs an id and a status, not a session card, so none of the
+/// progress or reclaim aggregation is paid here.
 fn newest_active_scan_tx(tx: &Transaction<'_>) -> Result<Option<(i64, ScanStatus)>> {
-    let mut stmt =
-        tx.prepare("SELECT id, status FROM scan WHERE COALESCE(trashed, 0) = 0 ORDER BY id DESC")?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let scan_id: i64 = row.get(0)?;
-        let status_text: String = row.get(1)?;
-        let Some(status) = ScanStatus::parse(&status_text) else {
-            tracing::warn!(scan_id, status = %status_text, "skipping scan with unknown status");
-            continue;
-        };
-        return Ok(Some((scan_id, status)));
-    }
-    Ok(None)
+    use rusqlite::OptionalExtension;
+    let newest: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT id, status FROM scan WHERE COALESCE(trashed, 0) = 0 ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((scan_id, status_text)) = newest else {
+        return Ok(None);
+    };
+    let Some(status) = ScanStatus::parse(&status_text) else {
+        return Err(AppError::msg(format!(
+            "the newest session (scan {scan_id}) carries status {status_text:?}, which this build \
+             does not know — most likely it was written by a newer dedcom. Exporting an older \
+             session under the newest session's name is not something this mode will do. Nothing \
+             was written."
+        )));
+    };
+    Ok(Some((scan_id, status)))
 }
 
 fn scan_config_tx(tx: &Transaction<'_>, scan_id: i64) -> Result<ScanConfig> {
@@ -4299,6 +4314,17 @@ impl ExportMeter<'_> {
     }
 }
 
+/// Releases the live-buffer count on EVERY exit from an export — success, a corrupt row, a sink
+/// error, an unwind. Without it a failed export would leave the meter claiming a group that was
+/// already dropped, and the next export's high-water mark would be measured on top of a fiction.
+struct MeterScope<'m, 'a>(&'m ExportMeter<'a>);
+
+impl Drop for MeterScope<'_, '_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 /// One member row of an export, read strictly.
 ///
 /// `links` is `0` for a row whose link count was never recorded (a pre-v3 manifest), exactly as
@@ -4327,6 +4353,39 @@ pub struct ExportGroup {
     pub members: Vec<ExportMember>,
 }
 
+/// A cell an export prints as a physical fact, decoded instead of cast.
+///
+/// `row.get::<_, i64>(n)? as u64` turns a stored `-1` into 18446744073709551615, and a CSV that
+/// prints that has quietly converted a damaged row into a plausible size, device or inode. The
+/// storage class is checked with it, so a `NULL` or a text cell refuses here too.
+fn nonnegative_cell(value: &Value, field: &str, path: &Path) -> Result<u64> {
+    match value {
+        Value::Integer(raw) if *raw >= 0 => Ok(*raw as u64),
+        other => Err(AppError::msg(format!(
+            "{field} holds {} for {} — not a value a filesystem can report. The export refuses \
+             rather than printing it as fact. Nothing was written.",
+            authority_cell(other),
+            crate::textsan::terminal(&path.display().to_string())
+        ))),
+    }
+}
+
+/// The sub-second half of an mtime, in the domain a filesystem can produce.
+///
+/// It is not cosmetic here: the fallback keeper is the maximum by `(mtime, mtime_nsec, path)`, so
+/// a cell outside `0..1_000_000_000` would decide which file an operator's tooling keeps.
+fn nanoseconds_cell(value: &Value, path: &Path) -> Result<i64> {
+    match value {
+        Value::Integer(raw) if (0..1_000_000_000).contains(raw) => Ok(*raw),
+        other => Err(AppError::msg(format!(
+            "file.mtime_nsec holds {} for {} — outside the 0..999999999 a filesystem can report, \
+             and the exported keeper is chosen by it. Nothing was written.",
+            authority_cell(other),
+            crate::textsan::terminal(&path.display().to_string())
+        ))),
+    }
+}
+
 /// The one statement an export streams, per authority mode.
 ///
 /// Composed from the same member relation the trusted readers use (`member_source`), with the
@@ -4342,7 +4401,7 @@ pub struct ExportGroup {
 fn export_rows_sql(mode: MembershipMode) -> &'static str {
     match mode {
         MembershipMode::Explicit => {
-            "SELECT mm.group_rank, g.hash, f.path, f.size, f.mtime, f.mtime_nsec,
+            "SELECT mm.group_rank, g.hash, g.size, f.path, f.size, f.mtime, f.mtime_nsec,
                     f.device, f.inode, f.nlink, m.is_keeper, m.action, m.rowid
                FROM file_group_member mm
                JOIN file_group g     ON g.scan_id = mm.scan_id AND g.rank = mm.group_rank
@@ -4352,7 +4411,7 @@ fn export_rows_sql(mode: MembershipMode) -> &'static str {
               ORDER BY mm.group_rank, mm.path"
         }
         _ => {
-            "SELECT g.rank, g.hash, f.path, f.size, f.mtime, f.mtime_nsec,
+            "SELECT g.rank, g.hash, g.size, f.path, f.size, f.mtime, f.mtime_nsec,
                     f.device, f.inode, f.nlink, m.is_keeper, m.action, m.rowid
                FROM file_group g
                JOIN file f           ON f.scan_id = g.scan_id AND f.hash = unhex(g.hash)
@@ -5481,6 +5540,9 @@ impl MembershipSnapshot<'_> {
                 self.scan_id
             )));
         }
+        // Whatever happens below — a corrupt cell, a sink error, an unwind — the live-buffer
+        // meter must not be left holding a group that no longer exists.
+        let _meter = MeterScope(&self.export_meter);
         let mut stmt = self.tx.prepare(export_rows_sql(self.mode))?;
         let mut rows = stmt.query(params![self.scan_id])?;
         let mut totals = ExportTotals::default();
@@ -5495,23 +5557,44 @@ impl MembershipSnapshot<'_> {
                 drop(group);
                 self.export_meter.release();
             }
-            let path = PathBuf::from(row.get::<_, String>(2)?);
-            let nlink = row.get::<_, Value>(8)?;
-            let is_keeper = row.get::<_, Value>(9)?;
-            let action = row.get::<_, Value>(10)?;
-            let present = row.get::<_, Option<i64>>(11)?.is_some();
+            let path = PathBuf::from(row.get::<_, String>(3)?);
+            if path.as_os_str().is_empty() {
+                return Err(AppError::msg(format!(
+                    "scan {} holds a manifest row with an empty pathname in group rank {rank}; \
+                     the export refuses rather than naming nothing. Nothing was written.",
+                    self.scan_id
+                )));
+            }
+            let nlink = row.get::<_, Value>(9)?;
+            let is_keeper = row.get::<_, Value>(10)?;
+            let action = row.get::<_, Value>(11)?;
+            let present = row.get::<_, Option<i64>>(12)?.is_some();
             let mark = decode_mark(&path, present, &is_keeper, &action).map_err(|err| {
                 AppError::msg(format!(
                     "{err}; the export refuses rather than guessing what the operator meant. \
                      Nothing was written."
                 ))
             })?;
+            // The size the artifact prints is the published summary's, checked against the
+            // member's own cell: one of them being damaged is a disagreement worth refusing, not
+            // a number to pick between.
+            let summary_size =
+                nonnegative_cell(&row.get::<_, Value>(2)?, "file_group.size", &path)?;
+            let member_size = nonnegative_cell(&row.get::<_, Value>(4)?, "file.size", &path)?;
+            if summary_size != member_size {
+                return Err(AppError::msg(format!(
+                    "{} is {member_size} bytes while its group declares {summary_size}; the \
+                     export refuses a physical report its own authority contradicts. Nothing was \
+                     written.",
+                    crate::textsan::terminal(&path.display().to_string())
+                )));
+            }
             let member = ExportMember {
-                size: row.get::<_, i64>(3)? as u64,
-                mtime: row.get::<_, i64>(4)?,
-                mtime_nsec: row.get::<_, i64>(5)?,
-                device: row.get::<_, i64>(6)? as u64,
-                inode: row.get::<_, i64>(7)? as u64,
+                size: summary_size,
+                mtime: row.get::<_, i64>(5)?,
+                mtime_nsec: nanoseconds_cell(&row.get::<_, Value>(6)?, &path)?,
+                device: nonnegative_cell(&row.get::<_, Value>(7)?, "file.device", &path)?,
+                inode: nonnegative_cell(&row.get::<_, Value>(8)?, "file.inode", &path)?,
                 links: link_count_from_sql(&nlink)?.to_u64(),
                 path,
                 mark,
@@ -19904,6 +19987,78 @@ mod export_reader_tests {
             store.export_buffered_rows_max() < totals.rows,
             "and it is strictly below the whole scan"
         );
+    }
+
+    /// The same bound at scale: 51 000 member rows across five groups, and the export still holds
+    /// only the largest one. Deterministic — a row count, not a memory or timing measurement.
+    #[test]
+    fn the_export_buffers_one_group_at_a_time_at_scale() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = seed(&mut store, &[10_000, 20_000, 15_000, 5_000, 1_000]);
+        store.publish_results(id, PublishMode::Derived).unwrap();
+
+        let snapshot = store.membership_snapshot(id).unwrap();
+        let totals = snapshot.for_each_export_group(|_| Ok(())).unwrap();
+        drop(snapshot);
+
+        assert_eq!(totals.groups, 5);
+        assert_eq!(totals.rows, 51_000);
+        assert_eq!(
+            store.export_buffered_rows_max(),
+            20_000,
+            "the peak is the largest group, at any scale"
+        );
+        assert!(store.export_buffered_rows_max() < totals.rows);
+    }
+
+    /// A failed export must not leave the meter holding a group that was already dropped —
+    /// otherwise the next export's high-water mark is measured on top of a fiction.
+    #[test]
+    fn a_failing_sink_releases_the_live_buffer() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = seed(&mut store, &[2, 5, 3]);
+        store.publish_results(id, PublishMode::Derived).unwrap();
+
+        {
+            let snapshot = store.membership_snapshot(id).unwrap();
+            let err = snapshot
+                .for_each_export_group(|_| Err(AppError::msg("the sink refuses")))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("the sink refuses"), "{err}");
+        }
+        {
+            let snapshot = store.membership_snapshot(id).unwrap();
+            assert_eq!(snapshot.for_each_export_group(|_| Ok(())).unwrap().rows, 10);
+        }
+        assert_eq!(
+            store.export_buffered_rows_max(),
+            5,
+            "the failed export must not inflate what the next one measures"
+        );
+    }
+
+    /// The same, when the sink unwinds instead of returning an error.
+    #[test]
+    fn a_panicking_sink_releases_the_live_buffer() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = seed(&mut store, &[2, 5, 3]);
+        store.publish_results(id, PublishMode::Derived).unwrap();
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let snapshot = store.membership_snapshot(id).unwrap();
+            let _ = snapshot.for_each_export_group(|_| panic!("the sink panics"));
+        }));
+        std::panic::set_hook(previous);
+        assert!(outcome.is_err(), "the sink must have unwound");
+
+        {
+            let snapshot = store.membership_snapshot(id).unwrap();
+            assert_eq!(snapshot.for_each_export_group(|_| Ok(())).unwrap().rows, 10);
+        }
+        assert_eq!(store.export_buffered_rows_max(), 5);
     }
 
     /// Members arrive in `(rank, path)` order, so one group's rows are contiguous and the file is

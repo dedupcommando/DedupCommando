@@ -1255,6 +1255,17 @@ const EXPORT_WRITER_CAPACITY: usize = 256 * 1024;
 /// Read-only, and still without the instance lock: it opens the checkpoint read-only, writes only
 /// its own artifact, and takes one consistent snapshot rather than a lock.
 fn run_export_csv(cli: &cli::Cli, out_path: &Path) -> Result<()> {
+    // Before the checkpoint is even opened, let alone a snapshot taken: dedcom's own live state is
+    // not a destination. Replacing the checkpoint loses every scan the operator ever ran, and
+    // replacing the lock file pulls it out from under a running instance — neither is what
+    // «overwrite the file I named» means.
+    if let Some(entry) = paths::names_protected_state_entry(&paths::state_dir(cli), out_path) {
+        return Err(AppError::msg(format!(
+            "{} is dedcom's own {entry}; exporting over it would destroy the checkpoint or the \
+             lock a running instance holds. Choose another destination — nothing was written.",
+            textsan::terminal(&out_path.display().to_string())
+        )));
+    }
     // Export reads the checkpoint and writes only the CSV — same read-only contract as --stats.
     let store = ScanStore::open_read_only(&paths::checkpoint_db(cli))?;
     // Every eligibility refusal happens here, BEFORE any file exists: a destination that already
@@ -1803,6 +1814,11 @@ mod export_csv_tests {
             .collect()
     }
 
+    /// The destination's mtime, pinned so a refusal can be shown not to have touched it.
+    fn modified(path: &Path) -> std::time::SystemTime {
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    }
+
     fn find<'a>(rows: &'a [Row], path: &str) -> &'a Row {
         rows.iter()
             .find(|row| row.path == path)
@@ -2041,6 +2057,7 @@ mod export_csv_tests {
             store.save_marks(id, marked.iter()).unwrap();
         }
         std::fs::write(rig.dest(), b"previous export\n").unwrap();
+        let before = modified(&rig.dest());
 
         let err = rig.run().unwrap_err().to_string();
         assert!(
@@ -2053,6 +2070,7 @@ mod export_csv_tests {
             b"previous export\n",
             "the operator's existing file is untouched"
         );
+        assert_eq!(modified(&rig.dest()), before, "its mtime included");
         assert!(rig.residue().is_empty(), "and no temporary is left behind");
     }
 
@@ -2167,10 +2185,12 @@ mod export_csv_tests {
             );
         }
         std::fs::write(rig.dest(), b"previous export\n").unwrap();
+        let before = modified(&rig.dest());
 
         let err = rig.run().unwrap_err().to_string();
         assert!(err.contains("member count"), "{err}");
         assert_eq!(std::fs::read(rig.dest()).unwrap(), b"previous export\n");
+        assert_eq!(modified(&rig.dest()), before);
         assert!(rig.residue().is_empty());
     }
 
@@ -2222,13 +2242,58 @@ mod export_csv_tests {
         }
     }
 
-    /// A status this build cannot parse is skipped by the selector, exactly as it is everywhere
-    /// else — and with no other active scan the export says so instead of guessing.
+    /// A status this build cannot read on the NEWEST session refuses — it must never quietly
+    /// hand back an older session under the newest one's name.
+    ///
+    /// The earlier version of this test had a single scan, so `no saved scan` hid the fall-back
+    /// branch entirely.
     #[test]
-    fn an_unparseable_status_is_not_selected() {
-        let rig = Rig::new("badstatus");
+    fn an_unknown_newest_status_refuses_instead_of_exporting_an_older_scan() {
+        let rig = Rig::new("badstatus2");
+        let older = complete_derived(
+            &mut rig.store(),
+            &[row("/tank/one/a", 1, 1000), row("/tank/one/b", 2, 2000)],
+            0xC1,
+        );
+        let newest = {
+            let mut store = rig.store();
+            let newest = complete_derived(
+                &mut store,
+                &[row("/tank/two/a", 11, 1000), row("/tank/two/b", 12, 2000)],
+                0xC2,
+            );
+            assert!(newest > older);
+            assert_eq!(
+                store.corrupt_directly(
+                    "UPDATE scan SET status = 'quantum' WHERE id = ?1",
+                    rusqlite::params![newest],
+                ),
+                1
+            );
+            newest
+        };
+        std::fs::write(rig.dest(), b"previous export\n").unwrap();
+        let before = modified(&rig.dest());
+
+        let err = rig.run().unwrap_err().to_string();
+        assert!(err.contains(&format!("scan {newest}")), "{err}");
+        assert!(err.contains("quantum"), "the status is quoted: {err}");
+        assert!(
+            !err.contains(&format!("scan {older}")),
+            "the older session is not offered as a substitute: {err}"
+        );
+        assert_eq!(std::fs::read(rig.dest()).unwrap(), b"previous export\n");
+        assert_eq!(modified(&rig.dest()), before);
+        assert!(rig.residue().is_empty());
+    }
+
+    /// The same rule with only one session: it names that session instead of pretending there is
+    /// nothing saved.
+    #[test]
+    fn a_single_unknown_status_names_that_scan() {
+        let rig = Rig::new("badstatus1");
         let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
-        {
+        let id = {
             let mut store = rig.store();
             let id = complete_derived(&mut store, &rows, 0xAE);
             assert_eq!(
@@ -2238,9 +2303,14 @@ mod export_csv_tests {
                 ),
                 1
             );
-        }
+            id
+        };
         let err = rig.run().unwrap_err().to_string();
-        assert!(err.contains("no saved scan"), "{err}");
+        assert!(err.contains(&format!("scan {id}")), "{err}");
+        assert!(
+            !err.contains("no saved scan"),
+            "«no saved scan» is false here and used to hide the fall-back branch: {err}"
+        );
         assert!(!rig.dest().exists());
     }
 
@@ -2332,6 +2402,8 @@ mod export_csv_tests {
         complete_derived(&mut rig.store(), &rows, 0xB5);
         std::fs::write(rig.dest(), b"previous export\n").unwrap();
 
+        let before = modified(&rig.dest());
+
         let fault = ExportWriteFault::armed(ExportFault::Panic);
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
@@ -2342,6 +2414,11 @@ mod export_csv_tests {
         assert!(fault.fired());
         assert!(fault.bytes_written() > 0);
         assert_eq!(std::fs::read(rig.dest()).unwrap(), b"previous export\n");
+        assert_eq!(
+            modified(&rig.dest()),
+            before,
+            "the destination was not even opened"
+        );
         assert!(rig.residue().is_empty(), "Drop ran during the unwind");
     }
 
@@ -2509,5 +2586,222 @@ mod export_csv_tests {
             .to_string();
         assert!(err.contains("does not exist"), "{err}");
         assert!(rig.residue().is_empty());
+    }
+
+    /// dedcom's own live state is never a destination — not the checkpoint, not the files SQLite
+    /// keeps beside it, not the lock.
+    #[test]
+    fn the_export_refuses_to_replace_its_own_state_files() {
+        for entry in crate::paths::PROTECTED_STATE_ENTRIES {
+            let rig = Rig::new("protected");
+            let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+            complete_derived(&mut rig.store(), &rows, 0xC5);
+
+            let dest = rig.dir.join(entry);
+            if entry != "dedcom.db" {
+                std::fs::write(&dest, format!("{entry} content\n")).unwrap();
+            }
+            let before = std::fs::read(&dest).unwrap();
+            let stamp = modified(&dest);
+
+            let err = run_export_csv(&rig.cli(), &dest).unwrap_err().to_string();
+            assert!(err.contains(entry), "the refusal names the entry: {err}");
+            assert_eq!(
+                std::fs::read(&dest).unwrap(),
+                before,
+                "{entry} must be byte-identical"
+            );
+            assert_eq!(modified(&dest), stamp, "{entry} mtime must not move");
+            assert!(rig.residue().is_empty(), "no temporary for {entry}");
+            if entry == "dedcom.db" {
+                assert!(before.starts_with(b"SQLite format 3"));
+                // Still a checkpoint this build accepts, i.e. still schema v5.
+                drop(ScanStore::open_read_only(&rig.db()).expect("the checkpoint still opens"));
+            }
+        }
+    }
+
+    /// The comparison is on canonicalized PARENTS, so a `..` spelling and a symlinked alias of
+    /// the state directory are caught too.
+    #[test]
+    fn a_dotdot_or_aliased_parent_cannot_smuggle_the_checkpoint_in() {
+        let rig = Rig::new("aliasparent");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        complete_derived(&mut rig.store(), &rows, 0xC6);
+        std::fs::create_dir(rig.dir.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&rig.dir, rig.dir.join("alias")).unwrap();
+        let before = std::fs::read(rig.db()).unwrap();
+
+        for dest in [
+            rig.dir.join("sub").join("..").join("dedcom.db"),
+            rig.dir.join("alias").join("dedcom.db"),
+        ] {
+            let err = run_export_csv(&rig.cli(), &dest).unwrap_err().to_string();
+            assert!(err.contains("dedcom.db"), "{dest:?}: {err}");
+            assert_eq!(std::fs::read(rig.db()).unwrap(), before, "{dest:?}");
+            assert!(rig.residue().is_empty(), "{dest:?}");
+        }
+    }
+
+    /// Only those five entries are protected: an ordinary CSV inside the state directory is a
+    /// perfectly good destination and stays one.
+    #[test]
+    fn an_ordinary_name_in_the_state_directory_is_still_writable() {
+        let rig = Rig::new("ordinary");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        complete_derived(&mut rig.store(), &rows, 0xC7);
+
+        assert_eq!(rig.dest().parent().unwrap(), rig.dir);
+        let csv = rig.export();
+        assert!(csv.starts_with("group,keep"));
+    }
+
+    /// The lock is not replaced underneath the instance that holds it.
+    #[test]
+    fn the_lock_file_is_not_replaced_under_a_held_guard() {
+        use std::os::unix::fs::MetadataExt;
+        let rig = Rig::new("lockheld");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        complete_derived(&mut rig.store(), &rows, 0xC8);
+
+        let guard = match crate::lock::try_acquire(&rig.dir).unwrap() {
+            crate::lock::Acquire::Operator(guard) => guard,
+            crate::lock::Acquire::Busy(_) => panic!("the fixture must hold the lock itself"),
+        };
+        let lock_path = rig.dir.join("dedcom.lock");
+        let before = std::fs::metadata(&lock_path).unwrap();
+
+        let err = run_export_csv(&rig.cli(), &lock_path)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dedcom.lock"), "{err}");
+        let after = std::fs::metadata(&lock_path).unwrap();
+        assert_eq!(
+            after.ino(),
+            before.ino(),
+            "the path still names the file the guard holds"
+        );
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+        assert!(rig.residue().is_empty());
+        drop(guard);
+    }
+
+    /// One cell, read back from the database as text — a corruption fixture proves what it wrote
+    /// before the export is asked about it.
+    fn read_cell(db: &Path, sql: &str) -> String {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.query_row(sql, [], |row| row.get::<_, rusqlite::types::Value>(0))
+            .map(|value| format!("{value:?}"))
+            .unwrap()
+    }
+
+    /// A damaged physical cell refuses the export; it is never cast into a plausible huge number.
+    #[test]
+    fn a_damaged_physical_cell_refuses_the_export() {
+        let cases: [(&str, &str, &str, &str, &str); 8] = [
+            (
+                "size",
+                "UPDATE file SET size = -1 WHERE scan_id = ?1 AND path = '/tank/a'",
+                "SELECT size FROM file WHERE path = '/tank/a'",
+                "-1",
+                "file.size",
+            ),
+            (
+                "device",
+                "UPDATE file SET device = -2 WHERE scan_id = ?1 AND path = '/tank/a'",
+                "SELECT device FROM file WHERE path = '/tank/a'",
+                "-2",
+                "file.device",
+            ),
+            (
+                "inode",
+                "UPDATE file SET inode = -3 WHERE scan_id = ?1 AND path = '/tank/a'",
+                "SELECT inode FROM file WHERE path = '/tank/a'",
+                "-3",
+                "file.inode",
+            ),
+            (
+                "nsec_negative",
+                "UPDATE file SET mtime_nsec = -1 WHERE scan_id = ?1 AND path = '/tank/a'",
+                "SELECT mtime_nsec FROM file WHERE path = '/tank/a'",
+                "-1",
+                "mtime_nsec",
+            ),
+            (
+                "nsec_overflow",
+                "UPDATE file SET mtime_nsec = 1000000000 WHERE scan_id = ?1 AND path = '/tank/a'",
+                "SELECT mtime_nsec FROM file WHERE path = '/tank/a'",
+                "1000000000",
+                "mtime_nsec",
+            ),
+            (
+                "size_storage_class",
+                "UPDATE file SET size = 'huge' WHERE scan_id = ?1 AND path = '/tank/a'",
+                "SELECT size FROM file WHERE path = '/tank/a'",
+                "huge",
+                "file.size",
+            ),
+            (
+                "size_disagrees_with_summary",
+                "UPDATE file SET size = 4096 WHERE scan_id = ?1 AND path = '/tank/a'",
+                "SELECT size FROM file WHERE path = '/tank/a'",
+                "4096",
+                "declares",
+            ),
+            (
+                "empty_path",
+                "UPDATE file SET path = '' WHERE scan_id = ?1 AND path = '/tank/a'",
+                "SELECT COUNT(*) FROM file WHERE path = ''",
+                "1",
+                "empty pathname",
+            ),
+        ];
+        for (tag, corrupt, probe, expected_cell, needle) in cases {
+            let rig = Rig::new(tag);
+            let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+            {
+                let mut store = rig.store();
+                let id = complete_derived(&mut store, &rows, 0xCA);
+                assert_eq!(store.corrupt_directly(corrupt, rusqlite::params![id]), 1);
+            }
+            let cell = read_cell(&rig.db(), probe);
+            assert!(
+                cell.contains(expected_cell),
+                "{tag}: the fixture must hold the corrupt cell, got {cell}"
+            );
+            std::fs::write(rig.dest(), b"previous export\n").unwrap();
+            let stamp = modified(&rig.dest());
+
+            let err = rig.run().unwrap_err().to_string();
+            assert!(err.contains(needle), "{tag}: {err} (cell was {cell})");
+            assert_eq!(
+                std::fs::read(rig.dest()).unwrap(),
+                b"previous export\n",
+                "{tag}"
+            );
+            assert_eq!(modified(&rig.dest()), stamp, "{tag}");
+            assert!(rig.residue().is_empty(), "{tag}");
+        }
+    }
+
+    /// The healthy edges of those same domains export without complaint.
+    #[test]
+    fn healthy_boundary_values_still_export() {
+        let rig = Rig::new("boundary");
+        let mut rows = [row("/tank/a", 0, 1000), row("/tank/b", 2, 2000)];
+        rows[0].device = 0;
+        rows[0].mtime_nsec = 999_999_999;
+        rows[1].mtime_nsec = 0;
+        complete_derived(&mut rig.store(), &rows, 0xCB);
+
+        let csv = rig.export();
+        let parsed = rows_of(&csv);
+        assert_eq!(parsed.len(), 2);
+        let zeroed = find(&parsed, "/tank/a");
+        assert_eq!(
+            zeroed.device, "0",
+            "a device id of 0 is a value, not corruption"
+        );
+        assert_eq!(zeroed.inode, "0");
     }
 }

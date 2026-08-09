@@ -236,12 +236,27 @@ The export refuses, exits non-zero and leaves the destination file **exactly as
 it was** when:
 
 - the newest active session has not finished (still walking/hashing, or aborted);
+- its status was written by a **newer dedcom** and this build cannot read it —
+  the export names that session and stops. It never quietly exports an older
+  session instead;
 - it has no verified membership — an older checkpoint, or a scan that never
   published. Re-run the scan: opening the checkpoint does not republish it;
 - a group has no keeper mark and no unmarked file, so the CSV would say "delete
   every copy" for it;
 - a durable mark is damaged, or says both "keeper" and an action for one path;
-- a group summary disagrees with the membership it declares.
+- a group summary disagrees with the membership it declares;
+- a physical cell is outside what a filesystem can report — a negative size,
+  device or inode, or sub-second time outside `0..999999999`, or a size that
+  disagrees with the group's own. Such a row is never printed as a number.
+
+### The destination
+
+Any path you like, **except dedcom's own live state**: `dedcom.db`, its
+`-wal`/`-shm`/`-journal` companions and `dedcom.lock` in the state directory are
+refused, however the path is spelled (`..`, a symlinked directory). Exporting
+over the checkpoint would destroy every scan you have run, and over the lock
+would pull it out from under a running instance. An ordinary CSV name inside the
+state directory is fine.
 
 ### How `keep` is decided
 

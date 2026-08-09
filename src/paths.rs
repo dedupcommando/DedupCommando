@@ -325,6 +325,46 @@ pub fn checkpoint_db(cli: &Cli) -> PathBuf {
     state_dir(cli).join("dedcom.db")
 }
 
+/// The entries in the state directory that ARE dedcom's live state: the checkpoint, the three
+/// files SQLite may keep beside it, and the single-instance lock. Overwriting any of them is not
+/// «replacing a file the operator named», it is losing the scan history or the lock the running
+/// operator holds.
+///
+/// Deliberately short. Other names in the state directory — including a CSV the operator chose to
+/// keep there — are ordinary destinations and stay writable.
+pub const PROTECTED_STATE_ENTRIES: [&str; 5] = [
+    "dedcom.db",
+    "dedcom.db-wal",
+    "dedcom.db-shm",
+    "dedcom.db-journal",
+    "dedcom.lock",
+];
+
+/// Whether `dest` names one of those entries in `state_dir`, and which one.
+///
+/// The comparison is the canonicalized **parent directory** plus the final basename, never the
+/// canonicalized destination itself. That distinction is the whole point: `../dedcom/dedcom.db`
+/// and a symlinked alias of the state directory both resolve to the same parent and are caught,
+/// while an ordinary final symlink (`groups.csv -> elsewhere.csv`) keeps the accepted behaviour of
+/// being replaced as a NAME, with its target never followed.
+///
+/// `None` when the basename is not one of the protected entries, when the path has no filename, or
+/// when either directory cannot be canonicalized — a destination whose directory does not exist is
+/// refused by the writer anyway.
+pub fn names_protected_state_entry(state_dir: &Path, dest: &Path) -> Option<&'static str> {
+    let name = dest.file_name()?.to_str()?;
+    let protected = PROTECTED_STATE_ENTRIES
+        .iter()
+        .find(|entry| **entry == name)?;
+    let parent = match dest.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let parent = parent.canonicalize().ok()?;
+    let state = state_dir.canonicalize().ok()?;
+    (parent == state).then_some(*protected)
+}
+
 /// Path to the log file.
 pub fn log_file(cli: &Cli) -> PathBuf {
     state_dir(cli).join("dedcom.log")
