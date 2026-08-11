@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# test-e2e-g5-operator-contract.sh — what `scripts/e2e-g5.sh` TELLS the operator to do.
+# test-e2e-g5-operator-contract.sh — what `scripts/e2e-g5.sh` TELLS the operator to do, and how
+# it decides its own result.
 #
 # SCOPE, stated once so it is never mistaken for something bigger: this proves the printed
-# operator contract and the harness's own failure arithmetic. It runs no TUI, creates no pool,
-# touches no dataset and applies nothing, so it is NOT evidence that any scenario passed on real
-# hardware. It exists because the earlier guided run failed on the instructions rather than on the
-# product, and instructions are checkable without ZFS.
+# operator contract, the harness's failure arithmetic and its finalization. It runs no TUI,
+# creates no pool, touches no dataset and applies nothing, so it is NOT evidence that any
+# scenario passed on real hardware. It exists because the earlier guided run failed on the
+# instructions rather than on the product, and instructions are checkable without ZFS.
 #
 # It drives the harness's own offline modes, which re-use the production pause definitions,
-# formatter and verdict functions — so a contract that passes here is the contract that prints.
+# formatter, route generator, verdict and finalization — so what passes here is what runs.
 #
 # Usage: bash scripts/test-e2e-g5-operator-contract.sh
 set -uo pipefail
@@ -36,22 +37,25 @@ check "contract-dump exits zero" "$?"
 [ -s "$DUMP" ]; check "contract-dump produced output" "$?"
 
 # The record of one pause: everything between its BEGIN marker and the next one.
-record() {  # index -> that pause's text on stdout
-    awk -v idx="$1" '
+record() { awk -v idx="$1" '
         /^PAUSE [0-9][0-9] BEGIN /  { want = ($2 == idx) }
         want                        { print }
-    ' "$DUMP"
-}
-has() { record "$1" | grep -qF -- "$2"; }
-hasre() { record "$1" | grep -qE -- "$2"; }
+    ' "$DUMP"; }
+has()     { record "$1" | grep -qF -- "$2"; }
+hasre()   { record "$1" | grep -qE -- "$2"; }
 countre() { record "$1" | grep -cE -- "$2"; }
+# 1-based line of the first match inside a record; 0 when absent.
+line_of() { record "$1" | grep -nF -- "$2" | head -1 | cut -d: -f1 | grep . || echo 0; }
 
 ALL="01 02 03 04 05 06 07 08 09 10"
 # Every pause but 06 starts from a cold TUI; 06 continues the overlay 05 left open.
 ROUTED="01 02 03 04 05 07 08 09 10"
-# The pauses that open the confirmation themselves and apply it. Pause 06 also applies, but it
-# returns to the overlay pause 05 deliberately left open, so it must NOT press x again.
-APPLYING="01 02 03 04 08 09 10"
+# The pauses that open the confirmation themselves.
+OPENS="01 02 03 04 05 07 08 09 10"
+# The pauses that press Y. 06 applies the overlay it inherited and opens nothing.
+APPLIES="01 02 03 04 06 08 09 10"
+# The sample dataset list puts an unrelated pool and the pool root ahead of ds_a.
+CYCLES=2
 
 printf '\n== 1. ten pauses, unique and in order ==\n'
 indices="$(grep -E '^PAUSE [0-9][0-9] BEGIN ' "$DUMP" | awk '{print $2}' | tr '\n' ' ')"
@@ -60,28 +64,72 @@ check "indices are exactly 01..10, once each, in order (saw: $indices)" "$?"
 
 printf '\n== 2. every record names the run it belongs to ==\n'
 for idx in $ALL; do
-    line="$(grep -E "^PAUSE $idx BEGIN " "$DUMP")"
-    printf '%s' "$line" \
-        | grep -qE 'pool=[^ ]+ state=[^ ]+ fixture=[^ ]+ scan=[0-9]+$'
+    grep -E "^PAUSE $idx BEGIN " "$DUMP" | grep -qE 'pool=[^ ]+ state=[^ ]+ fixture=[^ ]+ scan=[0-9]+$'
     check "pause $idx marker carries pool/state/fixture/scan" "$?"
     has "$idx" "  binary  :" && has "$idx" "  state   :" \
         && has "$idx" "  pool    :" && has "$idx" "  fixture :" && has "$idx" "  scan id :"
     check "pause $idx body restates binary/state/pool/fixture/scan id" "$?"
 done
 
-printf '\n== 3. launch, consent, navigation, view and the installed scan ==\n'
+printf '\n== 3. launch, consent, files view and the installed scan ==\n'
 for idx in $ROUTED; do
-    has "$idx" "do NOT pass --classic";           check "pause $idx: Commander is the launch"        "$?"
-    has "$idx" "Notice and consent";              check "pause $idx: consent screen named"           "$?"
+    has "$idx" "do NOT pass --classic";            check "pause $idx: Commander is the launch"       "$?"
+    has "$idx" "Notice and consent";               check "pause $idx: consent screen named"          "$?"
     has "$idx" "I have read and agree (required)"; check "pause $idx: consent checkbox named"        "$?"
-    has "$idx" "[Enter] continue";                check "pause $idx: consent postcondition given"    "$?"
+    has "$idx" "[Enter] continue";                 check "pause $idx: consent postcondition given"   "$?"
     has "$idx" "Don't show this at startup again"; check "pause $idx: suppress box explicitly left"  "$?"
-    has "$idx" 'Enter on «g5»';                   check "pause $idx: navigates by the visible name"  "$?"
-    hasre "$idx" 'title must end with «/g5/';     check "pause $idx: header checked after Enter"     "$?"
-    has "$idx" "loading…";                        check "pause $idx: directory-read wait is visible" "$?"
-    has "$idx" "files view";                      check "pause $idx: files view required"            "$?"
-    hasre "$idx" 'header «scan #[0-9]+ · <age>»'; check "pause $idx: installed scan is visible"      "$?"
-    has "$idx" 'WITHOUT «(loading…)»';            check "pause $idx: scan must not be loading"       "$?"
+    has "$idx" "loading…";                         check "pause $idx: directory-read wait is visible" "$?"
+    has "$idx" "files view";                       check "pause $idx: files view required"           "$?"
+    hasre "$idx" 'header «scan #[0-9]+ · <age>»';  check "pause $idx: installed scan is visible"     "$?"
+    has "$idx" 'WITHOUT «(loading…)»';             check "pause $idx: scan must not be loading"      "$?"
+done
+
+printf '\n== 3b. the start route is GENERATED, not assumed ==\n'
+for idx in $ROUTED; do
+    has "$idx" "[0] /rpool/data"
+    check "pause $idx: the real item [0] is named, unrelated pool and all" "$?"
+    has "$idx" "Panel 1 is the ACTIVE panel and starts on item [0]"
+    check "pause $idx: the active panel's actual start is stated" "$?"
+    has "$idx" "ending with «/rpool/data»"
+    check "pause $idx: the starting title is verified before moving" "$?"
+    [ "$(countre "$idx" '^ +cycle [0-9]+ -> status must read «Panel 1 → ')" -eq "$CYCLES" ]
+    check "pause $idx: exactly $CYCLES generated Root cycle(s), each with its status" "$?"
+    has "$idx" "exactly $CYCLES"
+    check "pause $idx: the cycle count is stated as a number" "$?"
+    has "$idx" 'cycle 2 -> status must read «Panel 1 → /dedcom-g5-SAMPLE/ds_a»'
+    check "pause $idx: the last cycle lands on the target dataset" "$?"
+    has "$idx" "press the real F5 key"
+    check "pause $idx: Root is the second-layer F5 key itself" "$?"
+    has "$idx" "backtick followed by the DIGIT 5 is first-layer F5"
+    check "pause $idx: the Hardlink mis-key is called out" "$?"
+    has "$idx" 'Enter on «g5»'
+    check "pause $idx: the fixture is entered by its visible name" "$?"
+    hasre "$idx" 'title must end with «/g5/'
+    check "pause $idx: the title is checked after Enter" "$?"
+    # The dataset must be reached BEFORE g5 is entered.
+    a="$(line_of "$idx" 'After the last cycle')"; b="$(line_of "$idx" 'Enter on «g5»')"
+    [ "$a" -gt 0 ] && [ "$b" -gt 0 ] && [ "$a" -lt "$b" ]
+    check "pause $idx: the dataset is reached before g5 is entered ($a < $b)" "$?"
+done
+! grep -qE '^ +Enter on «g5»' <(record 01 | head -20)
+check "no record opens with «Enter on g5» straight after launch" "$?"
+
+printf '\n== 3c. the settlement line has to fit the terminal ==\n'
+for idx in $ALL; do
+    need="$(record "$idx" | grep -oE 'needs [0-9]+ columns' | head -1 | tr -dc '0-9')"
+    marks="$(countre "$idx" '«Mark saved: .* = ')"
+    if [ "$marks" -eq 0 ]; then
+        [ -z "$need" ]; check "pause $idx: no marks, so no width requirement" "$?"
+        continue
+    fi
+    [ -n "$need" ]; check "pause $idx: states the required terminal width" "$?"
+    worst=0
+    while IFS= read -r line; do
+        text="${line#«}"; text="${text%»}"
+        [ "${#text}" -gt "$worst" ] && worst="${#text}"
+    done < <(record "$idx" | grep -oE '«Mark saved: [^»]*»')
+    [ -n "$need" ] && [ "$need" -ge "$((worst + 2))" ]
+    check "pause $idx: required width $need covers the longest settlement line ($worst + 2)" "$?"
 done
 
 printf '\n== 4. one settlement checkpoint per durable mark ==\n'
@@ -98,35 +146,50 @@ done
 total_marks="$(grep -cE '^ +F[5678] on «' "$DUMP")"
 [ "$total_marks" -ge 10 ]; check "the contract marks through F5/F6/F7/F8 only ($total_marks keys)" "$?"
 
-printf '\n== 5. x into the confirmation, exactly one Y ==\n'
-for idx in $APPLYING; do
-    hasre "$idx" '(^| )x( |$)|x  \(F11'
-    check "pause $idx: the confirmation is opened with x" "$?"
-    ys="$(countre "$idx" 'Y +ONCE')"
-    [ "$ys" -eq 1 ]
-    check "pause $idx: exactly one Y ($ys)" "$?"
+printf '\n== 5. exactly one x, exactly one Y, and Q last ==\n'
+for idx in $OPENS; do
+    [ "$(countre "$idx" '^ +x  \(F11')" -eq 1 ]
+    check "pause $idx: exactly one x opens the confirmation" "$?"
+done
+[ "$(countre 06 '^ +x  \(F11')" -eq 0 ]
+check "pause 06: no x — it inherits the open overlay" "$?"
+for idx in $APPLIES; do
+    [ "$(countre "$idx" 'Y +ONCE')" -eq 1 ]
+    check "pause $idx: exactly one Y" "$?"
 done
 has 05 "do NOT press Y in this stage"; check "pause 05 presses no Y at all" "$?"
 [ "$(countre 07 'Y +ONCE')" -eq 0 ]; check "pause 07 (ScanScript) presses no Y at all" "$?"
-[ "$(countre 06 'Y +ONCE')" -eq 1 ]; check "pause 06 supplies the single Y" "$?"
-! hasre 06 'x  \(F11'
-check "pause 06 does not re-open a confirmation it was handed" "$?"
 grep -qF 'F11 is the same command' "$DUMP"
 check "F11 is offered only as the equivalent of x" "$?"
+# Q is the last instruction of every pause that reaches the summary.
+for idx in $APPLIES; do
+    y="$(line_of "$idx" 'Y  ONCE')"; q="$(line_of "$idx" 'Q  from that summary')"
+    [ "$y" -gt 0 ] && [ "$q" -gt 0 ] && [ "$y" -lt "$q" ]
+    check "pause $idx: Y precedes Q ($y < $q)" "$?"
+done
 
-printf '\n== 6. the two-stage preflight and the no-Y script route ==\n'
-has 05 "LEAVE THE OVERLAY OPEN";            check "pause 05 stops with the overlay open"        "$?"
-has 05 "stage 1 of 2";                      check "pause 05 names its stage"                    "$?"
-has 06 "stage 2 of 2";                      check "pause 06 names its stage"                    "$?"
-has 06 "BATCH REFUSED before any change";   check "pause 06 expects the refusal, not an apply"  "$?"
+printf '\n== 6. scenario-specific reading happens before the key that leaves ==\n'
+x03="$(line_of 03 'x  (F11')"; e03="$(line_of 03 'zero guaranteed reclaim')"
+y03="$(line_of 03 'Y  ONCE')"; q03="$(line_of 03 'Q  from that summary')"
+[ "$x03" -lt "$e03" ] && [ "$e03" -lt "$y03" ] && [ "$y03" -lt "$q03" ]
+check "pause 03: x < zero-reclaim warning < Y < Q ($x03 < $e03 < $y03 < $q03)" "$?"
+y06="$(line_of 06 'Y  ONCE')"; e06="$(line_of 06 'BATCH REFUSED before any change')"
+q06="$(line_of 06 'Q  from that summary')"
+[ "$y06" -lt "$e06" ] && [ "$e06" -lt "$q06" ]
+check "pause 06: Y < BATCH REFUSED < Q ($y06 < $e06 < $q06)" "$?"
+y09="$(line_of 09 'Y  ONCE')"; e09="$(line_of 09 'changed after the scan (content)')"
+q09="$(line_of 09 'Q  from that summary')"
+[ "$y09" -lt "$e09" ] && [ "$e09" -lt "$q09" ]
+check "pause 09: Y < the cancelled-action line < Q ($y09 < $e09 < $q09)" "$?"
+has 05 "LEAVE THE OVERLAY OPEN";          check "pause 05 stops with the overlay open"       "$?"
+has 05 "stage 1 of 2";                    check "pause 05 names its stage"                   "$?"
+has 06 "stage 2 of 2";                    check "pause 06 names its stage"                   "$?"
 ! has 06 "Notice and consent"
 check "pause 06 continues the open TUI instead of restarting it" "$?"
-has 07 "Script saved:";                     check "pause 07 requires the saved-script status"   "$?"
-has 07 "with that overlay visibly open";    check "pause 07 presses Tab only inside the overlay" "$?"
+has 07 "Script saved:";                   check "pause 07 requires the saved-script status"  "$?"
+has 07 "with that overlay visibly open";  check "pause 07 presses Tab only inside the overlay" "$?"
 has 07 "On the panels Tab switches the active panel"
 check "pause 07 warns that Tab means something else on the panels" "$?"
-has 09 "changed after the scan (content)"
-check "pause 09 expects a cancelled action, not a successful apply" "$?"
 
 printf '\n== 7. the acknowledgement fails closed ==\n'
 printf '' | bash "$G5" ack-probe 01 >"$WORK/eof.out" 2>&1
@@ -134,40 +197,71 @@ printf '' | bash "$G5" ack-probe 01 >"$WORK/eof.out" 2>&1
 grep -qF 'PAUSE 01 ABORT reason=eof' "$WORK/eof.out"; check "and says the input ended" "$?"
 printf '   \t \n' | bash "$G5" ack-probe 01 >"$WORK/blank.out" 2>&1
 [ "$?" -ne 0 ]; check "whitespace-only initials fail the pause" "$?"
-grep -qF 'PAUSE 01 ABORT reason=blank' "$WORK/blank.out"; check "and say the acknowledgement was blank" "$?"
+grep -qF 'PAUSE 01 ABORT reason=blank' "$WORK/blank.out"; check "and say it was blank" "$?"
 printf 'dk\n' | bash "$G5" ack-probe 01 >"$WORK/ok.out" 2>&1
 [ "$?" -eq 0 ]; check "real initials are accepted" "$?"
 grep -qF 'PAUSE 01 HUMAN-ACK initials=dk' "$WORK/ok.out"; check "and are recorded verbatim" "$?"
 ! grep -qE 'read[^|]*\|\| *true' "$G5"
 check "no acknowledgement read is swallowed with '|| true'" "$?"
 
-printf '\n== 8/9. verdicts decide the exit status, and cleanup cannot undo it ==\n'
+printf '\n== 8. every scenario verdict describes only that scenario ==\n'
+bash "$G5" scenario-seq-probe >"$WORK/seq.out" 2>&1
+[ "$?" -ne 0 ]; check "two failing scenarios exit nonzero" "$?"
+grep -qF 'SCENARIO seq-a FAIL' "$WORK/seq.out"; check "the first failure is reported" "$?"
+grep -qF 'SCENARIO seq-b FAIL' "$WORK/seq.out"
+check "the second failure is reported too — the total is a count, not a flag" "$?"
+! grep -qF 'SCENARIO seq-b PASS' "$WORK/seq.out"; check "and is never reported as a pass" "$?"
+grep -qF 'FINAL RESULT FAIL' "$WORK/seq.out"; check "the final verdict fails" "$?"
 bash "$G5" verdict-probe hardlink 0 0 >"$WORK/vp.out" 2>&1
 [ "$?" -eq 0 ]; check "a clean run exits zero" "$?"
 grep -qF 'SCENARIO hardlink PASS' "$WORK/vp.out"; check "and emits SCENARIO ... PASS" "$?"
-grep -qF 'FINAL RESULT PASS' "$WORK/vp.out";      check "and emits FINAL RESULT PASS" "$?"
-bash "$G5" verdict-probe hardlink 1 1 >"$WORK/vf.out" 2>&1
-[ "$?" -ne 0 ]; check "a failed scenario exits nonzero" "$?"
-grep -qF 'SCENARIO hardlink FAIL' "$WORK/vf.out"; check "and emits SCENARIO ... FAIL" "$?"
-grep -qF 'FINAL RESULT FAIL' "$WORK/vf.out";      check "and emits FINAL RESULT FAIL" "$?"
-! grep -qF 'FINAL RESULT PASS' "$WORK/vf.out"
-check "a failing run never also claims a pass" "$?"
-# Isolates the final verdict from the trap's fail-safe: here the scenario passed, so nothing but
-# `final_verdict` itself can carry the failure out. Without this the two mask each other and a
-# final verdict that stopped exiting nonzero would go unnoticed.
 bash "$G5" verdict-probe probe 0 1 >"$WORK/vf2.out" 2>&1
 [ "$?" -ne 0 ]; check "a failing FINAL verdict exits nonzero on its own" "$?"
-grep -qF 'FINAL RESULT FAIL' "$WORK/vf2.out"; check "and still emits the final marker" "$?"
-# The EXIT trap runs in the probe too: this is the assertion that it reports without deciding.
-grep -qE 'exit "\$rc"' "$G5"; check "the EXIT trap re-raises the status it was entered with" "$?"
 
-printf '\n== 10. no Browser key vocabulary in a Commander instruction ==\n'
+printf '\n== 9. nothing is called PASS until the run has given back what it owns ==\n'
+bash "$G5" finalize-probe "" 0 >"$WORK/f_ok.out" 2>&1
+[ "$?" -eq 0 ]; check "a clean cleanup exits zero" "$?"
+grep -qF 'FINAL RESULT PASS' "$WORK/f_ok.out"; check "and reaches PASS" "$?"
+c="$(grep -n 'CLEANUP RUN 1' "$WORK/f_ok.out" | cut -d: -f1)"
+p="$(grep -n 'FINAL RESULT PASS' "$WORK/f_ok.out" | cut -d: -f1)"
+[ -n "$c" ] && [ -n "$p" ] && [ "$c" -lt "$p" ]
+check "cleanup runs BEFORE the PASS is printed ($c < $p)" "$?"
+for step in state teardown leftover; do
+    bash "$G5" finalize-probe "$step" 0 >"$WORK/f_$step.out" 2>&1
+    [ "$?" -ne 0 ]; check "a failed '$step' cleanup exits nonzero" "$?"
+    grep -qF 'FINAL RESULT FAIL' "$WORK/f_$step.out"; check "and the final verdict is FAIL" "$?"
+    ! grep -qF 'FINAL RESULT PASS' "$WORK/f_$step.out"
+    check "and no PASS was printed first" "$?"
+    [ "$(grep -c 'FINAL RESULT' "$WORK/f_$step.out")" -eq 1 ]
+    check "exactly one final marker for a failed '$step'" "$?"
+    [ "$(grep -c 'CLEANUP RUN' "$WORK/f_$step.out")" -eq 1 ]
+    check "cleanup ran exactly once for a failed '$step'" "$?"
+done
+
+printf '\n== 10. signals end the run once, and only as a failure ==\n'
+for sig in INT TERM; do
+    case "$sig" in INT) want_rc=130 ;; TERM) want_rc=143 ;; esac
+    bash "$G5" signal-probe "$sig" >"$WORK/sig_$sig.out" 2>&1
+    got=$?
+    [ "$got" -eq "$want_rc" ]
+    check "SIG$sig exits $want_rc (got $got)" "$?"
+    [ "$(grep -c 'CLEANUP RUN' "$WORK/sig_$sig.out")" -eq 1 ]
+    check "SIG$sig runs cleanup exactly once" "$?"
+    [ "$(grep -c 'FINAL RESULT FAIL' "$WORK/sig_$sig.out")" -eq 1 ]
+    check "SIG$sig emits exactly one FINAL RESULT FAIL" "$?"
+    [ "$(grep -c 'FINAL RESULT PASS' "$WORK/sig_$sig.out")" -eq 0 ]
+    check "SIG$sig emits no PASS" "$?"
+done
+! grep -qE '^trap [a-z_]+ EXIT INT TERM' "$G5"
+check "EXIT and the signals do not share one handler" "$?"
+
+printf '\n== 11. no Browser key vocabulary in a Commander instruction ==\n'
 ! grep -qE '^ +(r|d|h|c|K|H|C|D) on «' "$DUMP"
 check "nothing is marked with a Browser letter key" "$?"
 ! grep -qiE 'press (r|d|h|c) ' "$DUMP"
 check "no Browser command key is pressed" "$?"
-# Case-sensitive on purpose: the Browser applies with two Y keystrokes, and «only Y» in ordinary
-# prose must not read as one.
+# Case-sensitive: the Browser applies with two Y keystrokes, and «only Y» in prose must not read
+# as one.
 ! grep -qE '\bY\b[, ]+\bY\b|\bY\b twice|press \bY\b again' "$DUMP"
 check "Y is never pressed twice" "$?"
 ! grep -qF 'Browser' "$DUMP"
@@ -177,7 +271,7 @@ check "no step is satisfied by repeating a key or by waiting" "$?"
 
 printf '\n'
 if [ "$FAILED" -eq 0 ]; then
-    printf 'OPERATOR CONTRACT: PASS (printed contract only — not a runtime G4 result)\n'
+    printf 'OPERATOR CONTRACT: PASS (printed contract and harness verdicts only — not a runtime G4 result)\n'
     exit 0
 fi
 printf 'OPERATOR CONTRACT: FAIL\n' >&2

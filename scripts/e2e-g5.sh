@@ -32,7 +32,10 @@
 # this harness TELLS the operator, never that an apply happened:
 #   scripts/e2e-g5.sh contract-dump              # print all ten operator records
 #   scripts/e2e-g5.sh ack-probe [NN]             # run the acknowledgement reader on stdin
-#   scripts/e2e-g5.sh verdict-probe NAME SF FF   # run the scenario/final verdict markers
+#   scripts/e2e-g5.sh verdict-probe NAME SF FF   # run the scenario marker and finalization
+#   scripts/e2e-g5.sh scenario-seq-probe         # two scenarios, both failing, through run()
+#   scripts/e2e-g5.sh finalize-probe STEP SF     # finalization with an injected cleanup failure
+#   scripts/e2e-g5.sh signal-probe INT|TERM      # the signal handlers and the single cleanup
 #
 # shellcheck disable=SC2015
 #   `<cond> && ok ... || fail ...` below is intentional: ok/fail/info are printf-based
@@ -47,7 +50,10 @@ g5_die() { printf '\nABORT: %s\n' "$*" >&2; exit 1; }
 # dataset and need neither root nor ZFS — and they are NOT runtime evidence: they prove what
 # this harness TELLS the operator to do, never that a real apply happened.
 G5_OFFLINE=0
-case "${1:-}" in contract-dump|ack-probe|verdict-probe) G5_OFFLINE=1 ;; esac
+case "${1:-}" in
+    contract-dump|ack-probe|verdict-probe|scenario-seq-probe|finalize-probe|signal-probe)
+        G5_OFFLINE=1 ;;
+esac
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS="${HARNESS:-$SCRIPT_DIR}"
@@ -109,35 +115,128 @@ case "$G5ROOT" in /tank/*|*/tank/*) g5_die "G5ROOT '$G5ROOT' touches /tank — r
 banner() { printf '\n========== %s ==========\n' "$*"; }
 info()   { printf '  %s\n' "$*"; }
 ok()     { printf '  [OK]   %s\n' "$*"; }
-fail()   { printf '  [FAIL] %s\n' "$*" >&2; G5_FAILED=1; }
-G5_FAILED=0
+# A COUNT, not a flag. A boolean is sticky: once the first scenario has failed, a later one can
+# raise its own [FAIL], leave the value at 1 -> 1, and be reported as a pass.
+fail()   { printf '  [FAIL] %s\n' "$*" >&2; G5_FAILS=$((G5_FAILS + 1)); }
+G5_FAILS=0
 
-G5_FINAL_EMITTED=0
+# ------------------------------------------------------------------ finalization
+#
+# One state machine owns the ending. The order is fixed and is the whole point: everything this
+# run owns is given back FIRST, and only a clean give-back may be followed by a PASS. A teardown
+# that fails after a printed PASS would leave an owned pool behind under a green verdict — the
+# exact false green the final-gate driver has to reject.
+G5_FINALIZED=0
+G5_CLEANUP_RUNS=0
+# Probe-only failure injection, reachable ONLY from an offline probe. A real run has
+# G5_OFFLINE=0, so the switch is never consulted and no step can be faked.
+G5_FORCE_FAIL="${G5_FORCE_FAIL:-}"
+forced() {  # step -> 0 when this step must report failure
+    [ "$G5_OFFLINE" -eq 1 ] || return 1
+    case " $G5_FORCE_FAIL " in *" $1 "*) return 0 ;; esac
+    return 1
+}
 
-cleanup() {
-    local rc=$?
-    if [ "$G5_OFFLINE" -eq 0 ]; then
-        banner "cleanup"
-        rm -rf "$STATE" 2>/dev/null || true
-        if LC_ALL=C zpool list "$POOL" >/dev/null 2>&1; then
-            info "destroying disposable pool $POOL (teardown-test-pool.sh, topology-verified)"
-            if ! "$HARNESS/teardown-test-pool.sh"; then
-                printf '\n  !! teardown of %s reported an error. Recover manually:\n' "$POOL" >&2
-                printf '       sudo zpool destroy %s && sudo rm -f %s/pool.img && sudo rmdir %s\n' \
-                       "$POOL" "$POOLDIR" "$POOLDIR" >&2
-            fi
-        fi
+remove_state() {
+    if [ "$G5_OFFLINE" -eq 1 ]; then
+        forced state && { fail "harness state $STATE could not be removed"; return 1; }
+        return 0
     fi
-    # The trap reports; it never decides. A run that died before its verdict still has to carry a
-    # final marker, and it may only ever be the failing one — cleanup cannot turn a failure into a
-    # pass, and the status the shell exits with is the status that got us here.
-    if [ "$G5_OFFLINE" -eq 0 ] && [ "$G5_FINAL_EMITTED" -eq 0 ]; then
+    rm -rf "$STATE" 2>/dev/null || true
+    if [ -e "$STATE" ]; then
+        fail "harness state $STATE is still present after cleanup"
+        return 1
+    fi
+    return 0
+}
+
+teardown_pool() {
+    if [ "$G5_OFFLINE" -eq 1 ]; then
+        forced teardown && { fail "teardown of $POOL reported an error"; return 1; }
+        return 0
+    fi
+    LC_ALL=C zpool list "$POOL" >/dev/null 2>&1 || return 0
+    info "destroying disposable pool $POOL (teardown-test-pool.sh, topology-verified)"
+    if "$HARNESS/teardown-test-pool.sh"; then
+        return 0
+    fi
+    fail "teardown of $POOL reported an error"
+    printf '       recover manually: sudo zpool destroy %s && sudo rm -f %s/pool.img && sudo rmdir %s\n' \
+           "$POOL" "$POOLDIR" "$POOLDIR" >&2
+    return 1
+}
+
+# Teardown reporting success is not the same as the pool being gone. This is the check that makes
+# the verdict about the machine's state rather than about a script's exit code.
+assert_no_leftovers() {
+    if [ "$G5_OFFLINE" -eq 1 ]; then
+        forced leftover && { fail "disposable pool $POOL is still imported after teardown"; return 1; }
+        return 0
+    fi
+    local rc=0
+    if LC_ALL=C zpool list "$POOL" >/dev/null 2>&1; then
+        fail "disposable pool $POOL is still imported after teardown"
+        rc=1
+    fi
+    if [ -e "$POOLDIR/pool.img" ]; then
+        fail "backing file $POOLDIR/pool.img is still present after teardown"
+        rc=1
+    fi
+    return $rc
+}
+
+cleanup_owned() {
+    G5_CLEANUP_RUNS=$((G5_CLEANUP_RUNS + 1))
+    printf '\nCLEANUP RUN %s\n' "$G5_CLEANUP_RUNS"
+    local rc=0
+    remove_state        || rc=1
+    teardown_pool       || rc=1
+    assert_no_leftovers || rc=1
+    return $rc
+}
+
+# The one ending. Idempotent, so a signal that exits cannot run it a second time through EXIT.
+# Exactly one final marker is ever printed, it is emitted only after cleanup, and it can only be
+# PASS when nothing at all failed.
+finalize() {  # extra-failure-flag
+    [ "$G5_FINALIZED" -eq 0 ] || return "$G5_FINAL_RC"
+    G5_FINALIZED=1
+    cleanup_owned || true
+    if [ "$G5_FAILS" -eq 0 ] && [ "${1:-0}" -eq 0 ]; then
+        printf '\nFINAL RESULT PASS\n'
+        G5_FINAL_RC=0
+    else
         printf '\nFINAL RESULT FAIL\n' >&2
+        G5_FINAL_RC=1
     fi
-    if [ "$rc" -eq 0 ] && [ "$G5_FAILED" -ne 0 ]; then rc=1; fi
+    return "$G5_FINAL_RC"
+}
+G5_FINAL_RC=1
+
+# The modes that only PRINT or READ own nothing and decide nothing, so they must not emit a final
+# verdict at all. Marking finalization done keeps EXIT from inventing one for them.
+skip_finalization() { G5_FINALIZED=1; G5_FINAL_RC=0; }
+
+# EXIT is the only place cleanup can happen. It preserves or strengthens a failure and can never
+# weaken one: a run that died before reaching its verdict finalizes here, and only as a failure.
+on_exit() {
+    local rc=$?
+    if [ "$G5_FINALIZED" -eq 0 ]; then
+        finalize 1 || true
+        [ "$rc" -ne 0 ] || rc=1
+    fi
+    if [ "$rc" -eq 0 ] && [ "$G5_FAILS" -ne 0 ]; then rc=1; fi
     exit "$rc"
 }
-trap cleanup EXIT INT TERM
+# Signals record why and exit; the exit triggers EXIT, which finalizes exactly once. Registering
+# the same handler for EXIT and INT/TERM would run cleanup twice and print two final markers.
+on_signal() {  # name status
+    fail "interrupted by SIG$1"
+    exit "$2"
+}
+trap on_exit EXIT
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
 
 # ------------------------------------------------------------------ the operator contract
 #
@@ -174,10 +273,90 @@ print(row[0])
 PY
 }
 
-# Launch, consent, navigation, view and scan installation — the part every destructive pause
-# starts with, printed in full rather than referred to.
-route_prologue() {
-    local leaf="${G5_FIXTURE##*/}"
+# The ordered panel roots the app will compute, reproduced exactly rather than assumed.
+#
+# `list_datasets()` keeps `zfs list` order and drops none/legacy/-/unmounted rows
+# (src/zfs/datasets.rs:15-36); the datasets are grouped into pools in FIRST-APPEARANCE order of
+# the pool name (src/zfs/mod.rs:69-79); `App::new` flattens pools in that order into
+# `commander_dirs` (src/app.rs:680-687); and `CommanderState::new` puts panel 1 on item 0,
+# panel 2 on item 1, with panel 1 active (src/tui/commander/state.rs:867-875).
+#
+# Nothing in that chain makes the active panel start at /$POOL/ds_a — the pool root, ds_b and any
+# unrelated pool on the host all sit in the same list.
+commander_roots() {
+    local raw
+    if [ -n "${G5_DATASETS_OVERRIDE:-}" ]; then
+        raw="$G5_DATASETS_OVERRIDE"
+    else
+        raw="$(zfs list -H -p -o name,mountpoint,mounted -t filesystem)" || return 1
+    fi
+    printf '%s\n' "$raw" | awk -F'\t' '
+        $2 == "none" || $2 == "legacy" || $2 == "-" || $3 != "yes" { next }
+        { split($1, p, "/"); pool = p[1]
+          if (!(pool in seen)) { seen[pool] = 1; order[++n] = pool }
+          list[pool] = list[pool] $2 "\n" }
+        END { for (i = 1; i <= n; i++) printf "%s", list[order[i]] }
+    '
+}
+
+# 0-based position of a mountpoint in that list, and only if it is there exactly once.
+root_index() {  # mountpoint
+    local want="$1" hits
+    hits="$(printf '%s\n' "$G5_ROOTS" | grep -cxF -- "$want")" || hits=0
+    [ "$hits" = "1" ] || return 2
+    printf '%s\n' "$G5_ROOTS" | grep -nxF -- "$want" | head -1 | cut -d: -f1 \
+        | awk '{ print $1 - 1 }'
+}
+
+# The durable keys of one pause: KEY, the meaning the database returns, and the pathname.
+# The settlement lines, the width requirement and the mark instructions are all generated from
+# this one list, so they cannot drift apart.
+pause_marks() {  # index
+    case "$1" in
+    01) printf 'F7\tkeeper\t%s\nF5\thardlink\t%s\n' \
+               "$G5_FIXTURE/keeper.bin" "$G5_FIXTURE/dup.bin" ;;
+    02) printf 'F7\tkeeper\t%s\nF6\treflink\t%s\n' \
+               "$G5_FIXTURE/keeper.bin" "$G5_FIXTURE/dup.bin" ;;
+    03) printf 'F7\tkeeper\t%s\nF8\tdelete\t%s\n' \
+               "$G5_FIXTURE/keeper.bin" "$G5_FIXTURE/alias_a.bin" ;;
+    04) printf 'F7\tkeeper\t%s\nF8\tdelete\t%s\n' \
+               "$G5_FIXTURE/keeper.bin" "$G5_FIXTURE/alias_b.bin" ;;
+    05|07) printf 'F7\tkeeper\t%s\nF8\tdelete\t%s\nF8\tdelete\t%s\n' \
+               "$G5_FIXTURE/keeper.bin" "$G5_FIXTURE/alias_a.bin" "$G5_FIXTURE/alias_b.bin" ;;
+    06) ;;
+    08) printf 'F7\tkeeper\t%s\nF8\tdelete\t%s\n' \
+               "$G5_FIXTURE/keeper.bin" "$G5_FIXTURE/dup.bin" ;;
+    09) printf 'F7\tkeeper\t%s\nF5\thardlink\t%s\n' \
+               "$G5_FIXTURE/keeper.bin" "$G5_FIXTURE/dup.bin" ;;
+    10) printf 'F7\tkeeper\t%s\nF8\tdelete\t%s\n' \
+               "$G5_FIXTURE/keeper.bin" "$G5_FIXTURE/dup.bin" ;;
+    esac
+}
+
+# The terminal width this pause's settlement lines need.
+#
+# C0A guarantees only that the «Mark saved» PREFIX survives a narrow terminal; the pathname and
+# the meaning are what get clipped, and those are exactly what the operator has to read here. The
+# status renders as « <status> » with no border and no wrapping (commander/mod.rs:418,428), so the
+# whole verdict needs two columns more than the longest generated line.
+settlement_cols() {  # index
+    local key meaning path line longest=0
+    while IFS="$(printf '\t')" read -r key meaning path; do
+        [ -n "${key:-}" ] || continue
+        line="Mark saved: $path = $meaning"
+        [ "${#line}" -gt "$longest" ] && longest="${#line}"
+    done <<MARKS
+$(pause_marks "$1")
+MARKS
+    [ "$longest" -eq 0 ] && { printf '0\n'; return 0; }
+    printf '%s\n' "$((longest + 2))"
+}
+
+# Launch, width, consent, the generated route to the fixture, view and scan installation — the
+# part every destructive pause starts with, printed in full rather than referred to.
+route_prologue() {  # index
+    local leaf="${G5_FIXTURE##*/}" cols i cur next
+    cols="$(settlement_cols "$1")"
     cat <<EOF
   binary  : $DEDCOM
   state   : $STATE
@@ -185,9 +364,12 @@ route_prologue() {
   fixture : $G5_FIXTURE
   scan id : $G5_SCAN
 
-  1. Start the tool. The Commander is the default screen — do NOT pass --classic:
+  1. Terminal width. This scenario's longest settlement line needs $cols columns; the status
+     line does not wrap, so a narrower window clips the pathname and the meaning off the very
+     verdict you are here to read. Size the window to at least $cols columns before starting.
+  2. Start the tool. The Commander is the default screen — do NOT pass --classic:
        $DEDCOM --state-dir $STATE
-  2. Consent gate. The box is titled « Notice » and its heading is «Notice and consent».
+  3. Consent gate. The box is titled « Notice » and its heading is «Notice and consent».
      The cursor is already on the required line: «▸ [ ] I have read and agree (required)».
        Space -> that line must read «▸ [x] I have read and agree (required)» and the
                 hint must change from «[Enter] unavailable — check the consent box»
@@ -195,22 +377,68 @@ route_prologue() {
        Enter -> the box disappears and the Commander panels are on screen.
      Do NOT check «Don't show this at startup again»: every scenario re-creates the state
      directory, so this gate is expected again next time.
-  3. Reach the fixture. The panels open on ZFS dataset mountpoints; the ACTIVE panel has a
-     cyan border and a title of the form « <n> · <path> · <sort> ». Move with Up/Down and
-     enter directories by their VISIBLE names — never by a counted number of arrow presses:
+  4. Reach the dataset. The panels open on the mounted ZFS filesystems of this host, in this
+     exact order — generated for this run, not assumed:
+EOF
+    i=0
+    while IFS= read -r cur; do
+        [ -n "$cur" ] || continue
+        printf '       [%s] %s%s\n' "$i" "$cur" \
+               "$(if [ "$i" = "$G5_ROOT_K" ]; then printf ' <- the target'; fi)"
+        i=$((i + 1))
+    done <<ROOTS
+$G5_ROOTS
+ROOTS
+    cat <<EOF
+     Panel 1 is the ACTIVE panel and starts on item [0]; panel 2 starts on item [1]. Verify
+     that the active panel (cyan border) has a title of the form « 1 · <path> · <sort> »
+     ending with «$(printf '%s\n' "$G5_ROOTS" | head -1)».
+EOF
+    if [ "$G5_ROOT_K" -eq 0 ]; then
+        printf '%s\n' "     The target dataset is already item [0]: no Root cycle is needed."
+    else
+        cat <<EOF
+     Now cycle the ACTIVE panel's root with the production Root command, exactly $G5_ROOT_K
+     time(s). Root is the SECOND-layer F5: press the backtick \` to arm layer 2 (the status
+     line shows «Layer 2: choose an F-key · Esc — cancel»), then press the real F5 key.
+     Shift+F5 does the same where the terminal passes it.
+     WARNING: backtick followed by the DIGIT 5 is first-layer F5 — that is the Hardlink mark,
+     not Root. Use the F5 key itself.
+EOF
+        i=1
+        while [ "$i" -le "$G5_ROOT_K" ]; do
+            next="$(printf '%s\n' "$G5_ROOTS" | sed -n "$((i + 1))p")"
+            printf '       cycle %s -> status must read «Panel 1 → %s»\n' "$i" "$next"
+            i=$((i + 1))
+        done
+        printf '%s\n' "     After the last cycle the active panel title must end with «$G5_TARGET_ROOT»."
+    fi
+    cat <<EOF
+  5. Enter the fixture by its VISIBLE name — never by a counted number of arrow presses:
        Enter on «g5»     -> the active panel title must end with «/g5»
        Enter on «$leaf»  -> the active panel title must end with «/g5/$leaf»
      While a directory is being read the panel shows «  loading…» in place of the rows; the
      step is done when the rows are listed, not after any amount of time.
-  4. View. The active panel must be in the files view, which is where the Commander starts:
+  6. View. The active panel must be in the files view, which is where the Commander starts:
      its title carries the PATH (the group views replace the path with a caption such as
      «groups» or «duplicates») and the rows list this fixture's *.bin files. Do not press «v».
-  5. The covering scan must be installed BEFORE any durable key:
+  7. The covering scan must be installed BEFORE any durable key:
        status «Scan #$G5_SCAN activated»
        header «scan #$G5_SCAN · <age>»  — and WITHOUT «(loading…)»
      «No scan for <path> · F12 — select» means it is not installed: stop and report that
      instead of marking anything.
 EOF
+}
+
+# Every durable key of this pause, from the one list.
+route_marks() {  # index
+    local key meaning path
+    while IFS="$(printf '\t')" read -r key meaning path; do
+        [ -n "${key:-}" ] || continue
+        route_mark "$key" "$meaning" "$path"
+    done <<MARKS
+$(pause_marks "$1")
+MARKS
 }
 
 # One durable mark, with the settlement that has to be read before the next one.
@@ -225,18 +453,31 @@ route_mark() {  # key meaning path
 EOF
 }
 
-# The one apply route: x into the Commander confirmation, one deliberate Y.
-route_apply() {
+# The apply route in three separable steps, so a scenario can put its own reading between them.
+# Each pause that opens a confirmation prints exactly ONE x, and Q is always last.
+route_open_confirmation() {
     cat <<'EOF'
        x  (F11 is the same command; x is the terminal-independent way in)
          -> status «Building the plan…», then the overlay « Confirmation — F11 » with the
             tab strip «Summary  Commands» and the line
             «[Tab] tab  [S] save .sh  [Y] execute  [N]/[Esc] cancel».
+EOF
+}
+
+route_apply_to_summary() {
+    cat <<'EOF'
        Y  ONCE, inside that overlay. This is the only Y in the whole scenario.
          -> the Commander is left behind: the wizard «Applying» screen runs, then the
             « DedupCommando — summary » screen appears, ending with
             «[Esc] to configuration · [Q] quit».
-       Leave the tool with Q from that summary screen.
+EOF
+}
+
+# Always the last instruction of a pause: everything that has to be read on the summary is
+# printed before the key that leaves it.
+route_exit_summary() {
+    cat <<'EOF'
+       Q  from that summary screen, once everything above has been read.
 EOF
 }
 
@@ -254,61 +495,64 @@ pause_record() {  # index -> operator text on stdout
     case "$1" in
     01)
         printf '%s\n' "hardlink — keeper.bin stays, dup.bin becomes a second name for its inode."
-        route_prologue
-        printf '%s\n' "  6. Mark, waiting for each settlement:"
-        route_mark 'F7' 'keeper'   "$G5_FIXTURE/keeper.bin"
-        route_mark 'F5' 'hardlink' "$G5_FIXTURE/dup.bin"
-        printf '%s\n' "  7. Apply:"
-        route_apply
+        route_prologue "$1"
+        printf '%s\n' "  8. Mark, waiting for each settlement:"
+        route_marks "$1"
+        printf '%s\n' "  9. Apply:"
+        route_open_confirmation
+        route_apply_to_summary
+        route_exit_summary
         ;;
     02)
         printf '%s\n' "reflink — dup.bin keeps its own inode and its own 0600 / 12345:12345 / xattr,"
         printf '%s\n' "and shares the keeper's blocks."
-        route_prologue
-        printf '%s\n' "  6. Mark, waiting for each settlement:"
-        route_mark 'F7' 'keeper'  "$G5_FIXTURE/keeper.bin"
-        route_mark 'F6' 'reflink' "$G5_FIXTURE/dup.bin"
-        printf '%s\n' "  7. Apply:"
-        route_apply
+        route_prologue "$1"
+        printf '%s\n' "  8. Mark, waiting for each settlement:"
+        route_marks "$1"
+        printf '%s\n' "  9. Apply:"
+        route_open_confirmation
+        route_apply_to_summary
+        route_exit_summary
         ;;
     03)
         printf '%s\n' "two aliases, part 1 of 2 — cover ONE of the two names of a single allocation."
         printf '%s\n' "alias_a.bin and alias_b.bin are two names of ONE inode. Only alias_a.bin is"
         printf '%s\n' "marked here; alias_b.bin is deliberately LEFT UNMARKED, which is what makes the"
         printf '%s\n' "plan worth nothing."
-        route_prologue
-        printf '%s\n' "  6. Mark, waiting for each settlement (alias_b.bin gets no key at all):"
-        route_mark 'F7' 'keeper' "$G5_FIXTURE/keeper.bin"
-        route_mark 'F8' 'delete' "$G5_FIXTURE/alias_a.bin"
-        printf '%s\n' "  7. Open the confirmation and READ it before applying:"
-        printf '%s\n' "       x -> « Confirmation — F11 ». The Summary tab must carry the line"
+        route_prologue "$1"
+        printf '%s\n' "  8. Mark, waiting for each settlement (alias_b.bin gets no key at all):"
+        route_marks "$1"
+        printf '%s\n' "  9. Open the confirmation and READ it before applying:"
+        route_open_confirmation
+        printf '%s\n' "         The Summary tab must carry the line"
         printf '%s\n' "            «guaranteed after quarantine purge: 0 B» and the warning"
         printf '%s\n' "            «zero guaranteed reclaim — 1 pathname(s) of this allocation stay"
         printf '%s\n' "            outside the plan». If that warning is absent, stop and report it."
-        route_apply
+        printf '%s\n' " 10. Only then apply:"
+        route_apply_to_summary
+        route_exit_summary
         ;;
     04)
         printf '%s\n' "two aliases, part 2 of 2 — cover the remaining name, on a FRESH scan."
         printf '%s\n' "alias_a.bin is gone; the group is keeper.bin + alias_b.bin. The confirmation"
         printf '%s\n' "must now claim one allocation's worth (about 1 MiB), not two."
-        route_prologue
-        printf '%s\n' "  6. Mark, waiting for each settlement:"
-        route_mark 'F7' 'keeper' "$G5_FIXTURE/keeper.bin"
-        route_mark 'F8' 'delete' "$G5_FIXTURE/alias_b.bin"
-        printf '%s\n' "  7. Apply:"
-        route_apply
+        route_prologue "$1"
+        printf '%s\n' "  8. Mark, waiting for each settlement:"
+        route_marks "$1"
+        printf '%s\n' "  9. Apply:"
+        route_open_confirmation
+        route_apply_to_summary
+        route_exit_summary
         ;;
     05)
         printf '%s\n' "second preflight, stage 1 of 2 — stop with the confirmation OPEN, before any Y."
         printf '%s\n' "Both names of the shared allocation are marked here."
-        route_prologue
-        printf '%s\n' "  6. Mark, waiting for each settlement:"
-        route_mark 'F7' 'keeper' "$G5_FIXTURE/keeper.bin"
-        route_mark 'F8' 'delete' "$G5_FIXTURE/alias_a.bin"
-        route_mark 'F8' 'delete' "$G5_FIXTURE/alias_b.bin"
-        printf '%s\n' "  7. Open the confirmation and STOP there — do NOT press Y in this stage:"
-        printf '%s\n' "       x -> « Confirmation — F11 » with «[Y] execute  [N]/[Esc] cancel»."
-        printf '%s\n' "  8. LEAVE THE OVERLAY OPEN, leave the TUI on screen, and acknowledge here."
+        route_prologue "$1"
+        printf '%s\n' "  8. Mark, waiting for each settlement:"
+        route_marks "$1"
+        printf '%s\n' "  9. Open the confirmation and STOP there — do NOT press Y in this stage:"
+        route_open_confirmation
+        printf '%s\n' " 10. LEAVE THE OVERLAY OPEN, leave the TUI on screen, and acknowledge here."
         printf '%s\n' "     The harness then removes one covered pathname underneath the open plan."
         ;;
     06)
@@ -322,63 +566,70 @@ pause_record() {  # index -> operator text on stdout
   fixture : $G5_FIXTURE
   scan id : $G5_SCAN
 
-  1. Return to the still-open « Confirmation — F11 » overlay.
-  2. Press Y ONCE. This is the only Y of this scenario.
-       -> the batch must REFUSE itself: the « DedupCommando — summary » screen appears
-          carrying «BATCH REFUSED before any change: <reason>».
-       -> no file may have been moved and nothing may reach the quarantine.
-     A summary WITHOUT that line means the batch ran: stop and report it as a failure.
-  3. Leave the tool with Q from the summary screen.
+  1. Return to the still-open « Confirmation — F11 » overlay. It is already open, so this
+     stage opens nothing and marks nothing.
+  2. Apply:
 EOF
+        route_apply_to_summary
+        printf '%s\n' "  3. On that summary screen, BEFORE leaving it, the batch must have refused"
+        printf '%s\n' "     itself: the screen carries «BATCH REFUSED before any change: <reason>»,"
+        printf '%s\n' "     no file has been moved and nothing has reached the quarantine."
+        printf '%s\n' "     A summary WITHOUT that line means the batch ran: stop and report it."
+        printf '%s\n' "  4. Leave the summary:"
+        route_exit_summary
         ;;
     07)
         printf '%s\n' "saved ScanScript — save the plan's .sh from the confirmation and apply NOTHING."
-        route_prologue
-        printf '%s\n' "  6. Mark, waiting for each settlement:"
-        route_mark 'F7' 'keeper' "$G5_FIXTURE/keeper.bin"
-        route_mark 'F8' 'delete' "$G5_FIXTURE/alias_a.bin"
-        route_mark 'F8' 'delete' "$G5_FIXTURE/alias_b.bin"
-        printf '%s\n' "  7. Open the confirmation, switch tab, save — no Y anywhere in this scenario:"
-        printf '%s\n' "       x   -> « Confirmation — F11 », tab strip «Summary  Commands»."
+        route_prologue "$1"
+        printf '%s\n' "  8. Mark, waiting for each settlement:"
+        route_marks "$1"
+        printf '%s\n' "  9. Open the confirmation, switch tab, save — no Y anywhere in this scenario:"
+        route_open_confirmation
         printf '%s\n' "       Tab -> ONLY now, with that overlay visibly open: the highlight moves to"
         printf '%s\n' "              «Commands» and the title gains «· lines <a>-<b> of <n>»."
         printf '%s\n' "              (On the panels Tab switches the active panel instead — that is"
         printf '%s\n' "              why this key is pressed inside the overlay and nowhere else.)"
         printf '%s\n' "       S   -> status «Script saved: $STATE/plans/<name>.sh». Read the path."
+        printf '%s\n' " 10. Cancel instead of applying:"
         route_cancel
         ;;
     08)
         printf '%s\n' "delete to quarantine — dup.bin leaves its path, keeper.bin is untouched."
-        route_prologue
-        printf '%s\n' "  6. Mark, waiting for each settlement:"
-        route_mark 'F7' 'keeper' "$G5_FIXTURE/keeper.bin"
-        route_mark 'F8' 'delete' "$G5_FIXTURE/dup.bin"
-        printf '%s\n' "  7. Apply:"
-        route_apply
+        route_prologue "$1"
+        printf '%s\n' "  8. Mark, waiting for each settlement:"
+        route_marks "$1"
+        printf '%s\n' "  9. Apply:"
+        route_open_confirmation
+        route_apply_to_summary
+        route_exit_summary
         ;;
     09)
         printf '%s\n' "revalidation — dup.bin was overwritten AFTER the scan, so the action must be"
         printf '%s\n' "cancelled. This scenario expects a REFUSED action, not a successful apply."
-        route_prologue
-        printf '%s\n' "  6. Mark, waiting for each settlement:"
-        route_mark 'F7' 'keeper'   "$G5_FIXTURE/keeper.bin"
-        route_mark 'F5' 'hardlink' "$G5_FIXTURE/dup.bin"
-        printf '%s\n' "  7. Apply, and expect the refusal:"
-        route_apply
-        printf '%s\n' "     On the summary screen the action must appear as a failure line"
+        route_prologue "$1"
+        printf '%s\n' "  8. Mark, waiting for each settlement:"
+        route_marks "$1"
+        printf '%s\n' "  9. Apply, and expect the refusal:"
+        route_open_confirmation
+        route_apply_to_summary
+        printf '%s\n' " 10. On that summary screen, BEFORE leaving it, the action must appear as a"
+        printf '%s\n' "     failure line"
         printf '%s\n' "       «✗ Hardlink $G5_FIXTURE/dup.bin — … changed after the scan (content)"
         printf '%s\n' "        — action cancelled»"
         printf '%s\n' "     and dup.bin must still be at its own path with its new content. A summary"
         printf '%s\n' "     that reports the hardlink as done is a failure of this scenario."
+        printf '%s\n' " 11. Only then leave the summary:"
+        route_exit_summary
         ;;
     10)
         printf '%s\n' "snapshot — the safety snapshot taken before a destructive batch."
-        route_prologue
-        printf '%s\n' "  6. Mark, waiting for each settlement:"
-        route_mark 'F7' 'keeper' "$G5_FIXTURE/keeper.bin"
-        route_mark 'F8' 'delete' "$G5_FIXTURE/dup.bin"
-        printf '%s\n' "  7. Apply:"
-        route_apply
+        route_prologue "$1"
+        printf '%s\n' "  8. Mark, waiting for each settlement:"
+        route_marks "$1"
+        printf '%s\n' "  9. Apply:"
+        route_open_confirmation
+        route_apply_to_summary
+        route_exit_summary
         ;;
     *)
         return 1
@@ -414,17 +665,27 @@ operator_pause() {  # index scenario
     printf 'PAUSE %s HUMAN-ACK initials=%s\n' "$idx" "$ack"
 }
 
-# Sets the identity every pause of a scenario prints, and fails the scenario if the scan this
-# harness just ran left no id to name.
+# Sets everything a pause prints about identity and route, and fails the scenario if any of it
+# cannot be established. The route is REGENERATED per scenario, because a scenario may re-scan
+# and because nothing lets this harness assume where the panels start.
 pause_context() {  # fixture-dir
     G5_FIXTURE="$1"
     if ! G5_SCAN="$(latest_scan_id)"; then
         fail "no scan row in $STATE/dedcom.db — the pause cannot name the scan the operator must see"
         return 1
     fi
+    if ! G5_ROOTS="$(commander_roots)" || [ -z "$G5_ROOTS" ]; then
+        fail "could not enumerate the mounted ZFS filesystems the Commander will show"
+        return 1
+    fi
+    G5_TARGET_ROOT="/$POOL/ds_a"
+    if ! G5_ROOT_K="$(root_index "$G5_TARGET_ROOT")"; then
+        fail "$G5_TARGET_ROOT is not exactly one entry of the Commander's root list — the route cannot be generated"
+        return 1
+    fi
 }
 
-# The two verdict markers. Both production and `verdict-probe` go through these.
+# The per-scenario verdict. Both production and `verdict-probe` go through it.
 scenario_verdict() {  # name failed
     if [ "$2" -eq 0 ]; then
         printf '\nSCENARIO %s PASS\n' "$1"
@@ -434,14 +695,18 @@ scenario_verdict() {  # name failed
     return 1
 }
 
-final_verdict() {  # failed
-    G5_FINAL_EMITTED=1
-    if [ "$1" -eq 0 ]; then
-        printf '\nFINAL RESULT PASS\n'
-        return 0
-    fi
-    printf '\nFINAL RESULT FAIL\n' >&2
-    return 1
+G5_RAN=0
+G5_SCENARIO_FAILS=0
+# One scenario, one verdict marker describing only that scenario.
+run() {
+    case "$want" in all|"$1") ;; *) return 0 ;; esac
+    local name="$1" before="$G5_FAILS" rc=0
+    "scenario_${1//-/_}" || rc=1
+    G5_RAN=$((G5_RAN + 1))
+    # The COUNT is what makes this per-scenario: a sticky boolean already at 1 from an earlier
+    # failure would be unchanged here, and this scenario would be reported as a pass.
+    if [ "$G5_FAILS" -ne "$before" ]; then rc=1; fi
+    scenario_verdict "$name" "$rc" || G5_SCENARIO_FAILS=$((G5_SCENARIO_FAILS + 1))
 }
 
 scan() { rm -rf "$STATE"; "$DEDCOM" --state-dir "$STATE" --scan "$1" --no-resume; }
@@ -900,11 +1165,33 @@ PAUSES="01 02 03 04 05 06 07 08 09 10"
 # The offline modes. They render or exercise the SAME pause definitions, formatter and verdict
 # functions production uses — and they set up no pool, touch no dataset and apply nothing, so
 # they are a proof about the printed contract and never about a run.
-case "${1:-}" in
-contract-dump)
+# A sample dataset list for the offline modes. It deliberately puts an UNRELATED pool and the
+# disposable pool's own root ahead of ds_a, so a route that assumes the active panel starts on
+# the target cannot pass the contract test.
+G5_SAMPLE_DATASETS="$(printf '%s\t%s\t%s\n' \
+    rpool/data                /rpool/data                yes \
+    rpool/swap                none                       no  \
+    dedcom-g5-SAMPLE          /dedcom-g5-SAMPLE          yes \
+    dedcom-g5-SAMPLE/ds_a     /dedcom-g5-SAMPLE/ds_a     yes \
+    dedcom-g5-SAMPLE/ds_b     /dedcom-g5-SAMPLE/ds_b     yes)"
+
+offline_sample_context() {
     POOL="dedcom-g5-SAMPLE"
+    POOLDIR="/var/lib/$POOL"
     STATE="/tmp/dedcom-g5-SAMPLE-state"
     DEDCOM="/tmp/dedcom-e2e/dedcom"
+    G5_DATASETS_OVERRIDE="$G5_SAMPLE_DATASETS"
+    G5_ROOTS="$(commander_roots)"
+    G5_TARGET_ROOT="/$POOL/ds_a"
+    G5_ROOT_K="$(root_index "$G5_TARGET_ROOT")" \
+        || { printf 'ABORT: the sample dataset list does not hold %s exactly once\n' \
+                    "$G5_TARGET_ROOT" >&2; exit 1; }
+}
+
+case "${1:-}" in
+contract-dump)
+    offline_sample_context
+    skip_finalization
     for idx in $PAUSES; do
         case "$idx" in
             01) scen=hardlink;        fixture="/$POOL/ds_a/g5/hardlink" ;;
@@ -929,18 +1216,49 @@ contract-dump)
 ack-probe)
     # Runs the production acknowledgement reader once, on a real pause record, so EOF and blank
     # initials are proved against the code the operator meets — not against a copy of it.
-    POOL="dedcom-g5-SAMPLE"
-    STATE="/tmp/dedcom-g5-SAMPLE-state"
+    offline_sample_context
+    skip_finalization
     G5_FIXTURE="/$POOL/ds_a/g5/hardlink"
     G5_SCAN=1
     operator_pause "${2:-01}" ack-probe
     exit $?
     ;;
 verdict-probe)
-    # Runs the production verdict markers with the given failure counts, and lets the EXIT trap
-    # run afterwards: what this proves is that cleanup cannot turn a failure into a zero.
-    scenario_verdict "${2:-probe}" "${3:-0}" || G5_FAILED=1
-    final_verdict "${4:-0}" || exit 1
+    # The per-scenario marker on its own, plus the finalization, so the two can be told apart.
+    offline_sample_context
+    scenario_verdict "${2:-probe}" "${3:-0}" || fail "scenario ${2:-probe} failed"
+    finalize "${4:-0}" || exit 1
+    exit 0
+    ;;
+scenario-seq-probe)
+    # Two sequential scenarios through the production `run()` bookkeeping. The first fails; the
+    # second raises its own [FAIL] while its function returns zero. A sticky boolean would report
+    # the second as a pass, because the total would already be non-zero.
+    offline_sample_context
+    scenario_seq_a() { fail "first scenario failed"; return 1; }
+    scenario_seq_b() { fail "second scenario failed independently"; return 0; }
+    want=all
+    G5_RAN=0
+    run seq-a
+    run seq-b
+    finalize 0 || exit 1
+    exit 0
+    ;;
+finalize-probe)
+    # The finalization state machine with a chosen cleanup outcome. No mount, no zpool, no rm:
+    # the three give-back steps report the injected result and do nothing else.
+    offline_sample_context
+    G5_FORCE_FAIL="${2:-}"
+    [ "${3:-0}" -eq 0 ] || fail "a scenario failed before finalization"
+    finalize 0 || exit 1
+    exit 0
+    ;;
+signal-probe)
+    # Sends itself the signal and lets the production handlers run: one cleanup, one final
+    # marker, a signal-appropriate status. Nothing destructive is reachable — cleanup is offline.
+    offline_sample_context
+    kill -"${2:-INT}" $$
+    sleep 5
     exit 0
     ;;
 esac
@@ -962,17 +1280,6 @@ info "creating disposable loopback-ZFS pool via make-test-pool.sh"
 "$HARNESS/make-test-pool.sh"
 mkdir -p "$G5ROOT"
 
-G5_RAN=0
-# One scenario, one verdict marker. It passes only if it neither returned non-zero nor raised a
-# [FAIL] of its own, and the final result is built from these verdicts and nothing else.
-run() {
-    case "$want" in all|"$1") ;; *) return 0 ;; esac
-    local name="$1" before="$G5_FAILED" rc=0
-    "scenario_${1//-/_}" || rc=1
-    G5_RAN=$((G5_RAN + 1))
-    if [ "$G5_FAILED" != "$before" ]; then rc=1; fi
-    scenario_verdict "$name" "$rc" || G5_FAILED=1
-}
 run hardlink
 run reflink
 run two-alias
@@ -996,4 +1303,7 @@ if [ "$want" = "all" ]; then
         esac
     done
 fi
-final_verdict "$G5_FAILED" || exit 1
+# Finalization gives back everything this run owns BEFORE it says anything about the result, so
+# a teardown that fails cannot arrive after a printed PASS.
+finalize "$G5_SCENARIO_FAILS" || exit 1
+exit 0
