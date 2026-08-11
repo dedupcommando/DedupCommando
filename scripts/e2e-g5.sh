@@ -115,12 +115,16 @@ case "$POOL" in dedcom-g5-*) ;; *) g5_die "pool name '$POOL' is not dedcom-g5-* 
 case "$G5ROOT" in /tank/*|*/tank/*) g5_die "G5ROOT '$G5ROOT' touches /tank — refusing." ;; esac
 
 # --------------------------------------------------------------------- logging / helpers
-banner() { printf '\n========== %s ==========\n' "$*"; }
-info()   { printf '  %s\n' "$*"; }
-ok()     { printf '  [OK]   %s\n' "$*"; }
+# Every reporter below is a DIAGNOSTIC, and a diagnostic that cannot be written must not become
+# the verdict: without the `|| true` a failing stream turns `errexit` into an exit status of 1,
+# which would quietly replace a latched 130/143 — or abort a signal handler before the give-back
+# had finished. Only `write_marker` is allowed to let a failed write decide anything.
+banner() { printf '\n========== %s ==========\n' "$*" || true; }
+info()   { printf '  %s\n' "$*" || true; }
+ok()     { printf '  [OK]   %s\n' "$*" || true; }
 # A COUNT, not a flag. A boolean is sticky: once the first scenario has failed, a later one can
 # raise its own [FAIL], leave the value at 1 -> 1, and be reported as a pass.
-fail()   { printf '  [FAIL] %s\n' "$*" >&2; G5_FAILS=$((G5_FAILS + 1)); }
+fail()   { printf '  [FAIL] %s\n' "$*" >&2 || true; G5_FAILS=$((G5_FAILS + 1)); }
 G5_FAILS=0
 
 # ------------------------------------------------------------------ finalization
@@ -159,7 +163,7 @@ forced() {  # step -> 0 when this step must report failure
 trace_step() {  # name
     [ "$G5_OFFLINE" -eq 1 ] || return 0
     G5_STEP_TRACE="$G5_STEP_TRACE $1"
-    printf 'CLEANUP STEP %s\n' "$1"
+    printf 'CLEANUP STEP %s\n' "$1" || true
 }
 
 # Probe-only signal injection at a named point of the ending. Offline only.
@@ -275,7 +279,7 @@ assert_no_leftovers() {
 # back, and «entered cleanup» is not the same fact as «cleanup ran».
 cleanup_owned() {
     G5_CLEANUP_RUNS=$((G5_CLEANUP_RUNS + 1))
-    printf '\nCLEANUP RUN %s\n' "$G5_CLEANUP_RUNS"
+    printf '\nCLEANUP RUN %s\n' "$G5_CLEANUP_RUNS" || true
     maybe_signal entry
     local rc=0
     remove_state        || rc=1
@@ -285,28 +289,75 @@ cleanup_owned() {
     return $rc
 }
 
+# One marker write, and its RESULT is a fact, not a formality.
+#
+# `printf` fails on a full filesystem, a closed descriptor or a broken pipe, and an uninspected
+# one is exactly how a PASS that never reached the terminal could still exit zero.
+write_marker() {  # PASS|FAIL  1|2
+    if [ "$2" = "1" ]; then
+        printf '\nFINAL RESULT %s\n' "$1"
+    else
+        printf '\nFINAL RESULT %s\n' "$1" >&2
+    fi
+}
+
+# Probe-only record that the run ended with no stream willing to take a marker. It exists because
+# a process that has lost both streams cannot report anything about itself; it is never a second
+# verdict channel, and it is unreachable outside an offline mode.
+G5_OUTPUT_TRACE="${G5_OUTPUT_TRACE:-}"
+trace_output_failure() {
+    [ "$G5_OFFLINE" -eq 1 ] || return 0
+    [ -n "$G5_OUTPUT_TRACE" ] || return 0
+    printf 'OUTPUT_FAILED rc=%s\n' "$G5_FINAL_RC" >>"$G5_OUTPUT_TRACE" 2>/dev/null || true
+}
+
 # The single marker, and the one commit point of the whole run.
 #
 # Everything before the mask below is interruptible, and a signal there forces FAIL with the
 # signal's own status. At the mask, cleanup is over and the process has nothing left to do but
 # print and leave, so INT and TERM are ignored from here on and are never restored: a signal can
 # no longer leave the run markerless, and it can no longer pair a PASS with an interrupted status.
-# `done` is published only once the marker actually exists.
+#
+# `done` means A MARKER EXISTS. It is published only after a write actually succeeded, so a PASS
+# the terminal refused cannot be reported as a pass — the verdict falls back to FAIL on the other
+# stream, and if neither stream will take one the run ends in `output_failed` with a non-zero
+# status and no claim that a marker was ever produced.
 emit_final() {  # extra-failure-flag
     trap '' INT TERM
     local rc
     if [ "$G5_FAILS" -eq 0 ] && [ "$G5_SIGNAL_LATCHED" -eq 0 ] && [ "${1:-0}" -eq 0 ]; then
-        printf '\nFINAL RESULT PASS\n'
-        rc=0
-    else
-        printf '\nFINAL RESULT FAIL\n' >&2
-        rc=1
-        # A latched signal owns the status: 130/143 must survive to the caller.
-        [ "$G5_SIGNAL_LATCHED" -eq 0 ] || rc="$G5_SIGNAL_STATUS"
+        if write_marker PASS 1; then
+            G5_FINAL_RC=0
+            G5_FINAL_STATE=done
+            maybe_signal postcommit
+            return 0
+        fi
+        # The PASS was never written, so there is no PASS. Say why on the other stream, then let
+        # the verdict be what it now is. A diagnostic that also fails changes nothing.
+        printf '  the PASS marker could not be written to stdout\n' >&2 || true
+        if write_marker FAIL 2; then
+            G5_FINAL_RC=1
+            G5_FINAL_STATE=done
+            maybe_signal postcommit
+            return 1
+        fi
+        G5_FINAL_RC=1
+        G5_FINAL_STATE=output_failed
+        trace_output_failure
+        return 1
+    fi
+    # A latched signal owns the status: 130/143 must survive the fallback and reach the caller.
+    rc=1
+    [ "$G5_SIGNAL_LATCHED" -eq 0 ] || rc="$G5_SIGNAL_STATUS"
+    if write_marker FAIL 2 || write_marker FAIL 1; then
+        G5_FINAL_RC="$rc"
+        G5_FINAL_STATE=done
+        maybe_signal postcommit
+        return "$rc"
     fi
     G5_FINAL_RC="$rc"
-    G5_FINAL_STATE=done
-    maybe_signal postcommit
+    G5_FINAL_STATE=output_failed
+    trace_output_failure
     return "$rc"
 }
 
@@ -332,7 +383,9 @@ skip_finalization() { G5_FINAL_STATE=done; G5_FINAL_RC=0; }
 on_exit() {
     local rc=$?
     case "$G5_FINAL_STATE" in
-        done) ;;
+        # A marker exists, or no stream would take one. Either way the ending happened: retrying
+        # here would only produce a second marker or loop against the same dead stream.
+        done|output_failed) ;;
         cleaning)
             # The give-back died mid-flight without reaching the commit point. It is not repeated
             # — that was the double teardown — but the run still owes exactly one marker.
@@ -1403,7 +1456,7 @@ finalize-probe)
     shift 3 2>/dev/null || true
     G5_PRESENCE_SEQ="${*:-absent}"
     finalize 0 || true
-    printf 'STEP TRACE:%s\n' "$G5_STEP_TRACE"
+    printf 'STEP TRACE:%s\n' "$G5_STEP_TRACE" || true
     exit "$G5_FINAL_RC"
     ;;
 signal-probe)
@@ -1420,14 +1473,14 @@ signal-probe)
         entry|after-step1|precommit|postcommit)
             G5_SIGNAL_AT="$3:${2:-INT}"
             finalize 0 || true
-            printf 'STEP TRACE:%s\n' "$G5_STEP_TRACE"
+            printf 'STEP TRACE:%s\n' "$G5_STEP_TRACE" || true
             exit "$G5_FINAL_RC" ;;
         double)
             # Two different signals in one run: the first latch must own the status, and the
             # second must neither overwrite it nor start a second give-back.
             G5_SIGNAL_AT="entry:TERM precommit:INT"
             finalize 0 || true
-            printf 'STEP TRACE:%s\n' "$G5_STEP_TRACE"
+            printf 'STEP TRACE:%s\n' "$G5_STEP_TRACE" || true
             printf 'LATCHED:%s\n' "$G5_SIGNAL_NAME"
             exit "$G5_FINAL_RC" ;;
         *)

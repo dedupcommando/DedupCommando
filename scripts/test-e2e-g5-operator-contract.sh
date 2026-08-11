@@ -334,16 +334,100 @@ grep -qF 'G5_FINAL_STATE=cleaning' "$G5"
 check "finalization has an explicit in-flight state" "$?"
 # `done` may only be published once the marker exists, and the commit point must mask signals.
 awk '/^emit_final\(\)/,/^}/' "$G5" >"$WORK/emit.txt"
-[ "$(grep -n "trap '' INT TERM" "$WORK/emit.txt" | cut -d: -f1)" -lt \
-  "$(grep -n 'FINAL RESULT PASS' "$WORK/emit.txt" | cut -d: -f1)" ]
-check "signals are masked before the marker is printed" "$?"
-[ "$(grep -n 'FINAL RESULT FAIL' "$WORK/emit.txt" | cut -d: -f1)" -lt \
-  "$(grep -n 'G5_FINAL_STATE=done' "$WORK/emit.txt" | cut -d: -f1)" ]
-check "«done» is published only after the marker exists" "$?"
+[ "$(grep -n "trap '' INT TERM" "$WORK/emit.txt" | head -1 | cut -d: -f1)" -lt \
+  "$(grep -n 'write_marker' "$WORK/emit.txt" | head -1 | cut -d: -f1)" ]
+check "signals are masked before any marker is attempted" "$?"
+# Every publication of `done` must come after a write attempt whose result was inspected.
+[ "$(grep -n 'write_marker' "$WORK/emit.txt" | head -1 | cut -d: -f1)" -lt \
+  "$(grep -n 'G5_FINAL_STATE=done' "$WORK/emit.txt" | head -1 | cut -d: -f1)" ]
+check "«done» is never published before a marker was written" "$?"
+[ "$(grep -c 'G5_FINAL_STATE=done' "$WORK/emit.txt")" \
+  -eq "$(grep -cE 'if write_marker|\|\| write_marker' "$WORK/emit.txt")" ]
+check "and each publication sits behind its own checked write" "$?"
 ! grep -qE 'finalize [^|]*\|\| exit 1' "$G5"
 check "no caller replaces the finalized status with a hard-coded 1" "$?"
 
+printf '\n== 10c. a marker nobody could write is not a marker ==\n'
+# A stream that refuses every write. /dev/full is the real short-write class; where it does not
+# exist a closed descriptor fails just as deterministically (EBADF). Whichever is used is named,
+# because «the environment had no /dev/full» must never read as «this case was skipped».
+if : >/dev/full 2>/dev/null; then
+    DEAD=/dev/full
+    printf '  (using /dev/full as the refusing stream)\n'
+else
+    DEAD=""
+    printf '  (no /dev/full here — using a closed descriptor instead)\n'
+fi
+dead_out() {  # runs the harness with stdout refusing; stderr goes to $1
+    if [ -n "$DEAD" ]; then shift; bash "$G5" "$@" >"$DEAD" 2>"$CAP"
+    else shift; bash "$G5" "$@" >&- 2>"$CAP"; fi
+}
+dead_err() {  # runs the harness with stderr refusing; stdout goes to $CAP
+    if [ -n "$DEAD" ]; then bash "$G5" "$@" >"$CAP" 2>"$DEAD"
+    else bash "$G5" "$@" >"$CAP" 2>&-; fi
+}
+dead_both() {
+    if [ -n "$DEAD" ]; then bash "$G5" "$@" >"$DEAD" 2>"$DEAD"
+    else bash "$G5" "$@" >&- 2>&-; fi
+}
+
+CAP="$WORK/cap.txt"
+bash "$G5" verdict-probe iotest 0 0 >"$WORK/io_ok.out" 2>"$WORK/io_ok.err"
+[ "$?" -eq 0 ]; check "a clean run with working streams exits zero" "$?"
+[ "$(grep -c 'FINAL RESULT PASS' "$WORK/io_ok.out")" -eq 1 ]
+check "and writes exactly one PASS" "$?"
+
+dead_out x verdict-probe iotest 0 0
+rc=$?
+[ "$rc" -ne 0 ]; check "an intended PASS whose stream refuses it exits nonzero (got $rc)" "$?"
+! grep -qF 'FINAL RESULT PASS' "$CAP"; check "and no PASS is claimed anywhere" "$?"
+[ "$(grep -c 'FINAL RESULT FAIL' "$CAP")" -eq 1 ]
+check "and exactly one FAIL is written on the other stream" "$?"
+grep -qF 'could not be written' "$CAP"; check "and the I/O failure is named" "$?"
+
+dead_err verdict-probe iotest 1 1
+rc=$?
+[ "$rc" -ne 0 ]; check "an intended FAIL whose stream refuses it exits nonzero (got $rc)" "$?"
+[ "$(grep -c 'FINAL RESULT FAIL' "$CAP")" -eq 1 ]
+check "and exactly one FAIL falls back to the other stream" "$?"
+
+# The offline trace exists only because a process with no streams cannot report on itself.
+G5_OUTPUT_TRACE="$WORK/t_both" dead_both verdict-probe iotest 0 0
+rc=$?
+[ "$rc" -ne 0 ]; check "with both streams refusing, the status still fails (got $rc)" "$?"
+grep -qF 'OUTPUT_FAILED' "$WORK/t_both" 2>/dev/null
+check "and the run ends in the terminal output-failure state" "$?"
+[ "$(grep -c 'OUTPUT_FAILED' "$WORK/t_both" 2>/dev/null)" -eq 1 ]
+check "once — no retry loop through EXIT" "$?"
+
+# A latched signal owns the status through every fallback, including total output loss.
+dead_err signal-probe TERM precommit
+rc=$?
+[ "$rc" -eq 143 ]; check "a latched SIGTERM survives the marker fallback (got $rc)" "$?"
+[ "$(grep -c 'CLEANUP STEP' "$CAP")" -eq 3 ]
+check "and cleanup still attempted all three owned steps first" "$?"
+[ "$(grep -c 'FINAL RESULT FAIL' "$CAP")" -eq 1 ]
+check "and exactly one FAIL reached the surviving stream" "$?"
+G5_OUTPUT_TRACE="$WORK/t_sig" dead_both signal-probe INT precommit
+rc=$?
+[ "$rc" -eq 130 ]; check "a latched SIGINT survives even total output loss (got $rc)" "$?"
+grep -qF 'rc=130' "$WORK/t_sig" 2>/dev/null
+check "and the recorded status is the signal's, not an ordinary 1" "$?"
+
+# The shape of the fix, not just its symptoms.
+awk '/^emit_final\(\)/,/^}/' "$G5" >"$WORK/emit2.txt"
+! grep -qE "^ +printf '.nFINAL RESULT" "$WORK/emit2.txt"
+check "the committed marker never goes through an uninspected printf" "$?"
+grep -qE 'if write_marker PASS 1; then' "$WORK/emit2.txt"
+check "the PASS write's result is what decides the state" "$?"
+grep -qF 'G5_FINAL_STATE=output_failed' "$G5"
+check "there is an explicit terminal output-failure state" "$?"
+awk '/^on_exit\(\)/,/^}/' "$G5" | grep -qF 'done|output_failed'
+check "and EXIT treats it as an ending, retrying neither cleanup nor the marker" "$?"
+
 printf '\n== 10a. the signal and trace seams are offline-only ==\n'
+awk '/^trace_output_failure\(\)/,/^}/' "$G5" | grep -qF 'G5_OFFLINE" -eq 1 ] || return 0'
+check "the output-failure trace is refused outside an offline mode" "$?"
 awk '/^maybe_signal\(\)/,/^}/' "$G5" | grep -qF 'G5_OFFLINE" -eq 1 ] || return 0'
 check "the signal injection is refused outside an offline mode" "$?"
 awk '/^trace_step\(\)/,/^}/' "$G5" | grep -qF 'G5_OFFLINE" -eq 1 ] || return 0'
