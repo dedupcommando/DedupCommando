@@ -34,8 +34,11 @@
 #   scripts/e2e-g5.sh ack-probe [NN]             # run the acknowledgement reader on stdin
 #   scripts/e2e-g5.sh verdict-probe NAME SF FF   # run the scenario marker and finalization
 #   scripts/e2e-g5.sh scenario-seq-probe         # two scenarios, both failing, through run()
-#   scripts/e2e-g5.sh finalize-probe STEP SF     # finalization with an injected cleanup failure
-#   scripts/e2e-g5.sh signal-probe INT|TERM      # the signal handlers and the single cleanup
+#   scripts/e2e-g5.sh finalize-probe STEP SF [PRESENCE...]
+#                                                # finalization with injected cleanup outcomes
+#   scripts/e2e-g5.sh signal-probe INT|TERM [before|during]
+#                                                # the signal handlers and the single cleanup
+#   scripts/e2e-g5.sh roots-probe [forge]        # the dataset list in real-source mode
 #
 # shellcheck disable=SC2015
 #   `<cond> && ok ... || fail ...` below is intentional: ok/fail/info are printf-based
@@ -51,7 +54,7 @@ g5_die() { printf '\nABORT: %s\n' "$*" >&2; exit 1; }
 # this harness TELLS the operator to do, never that a real apply happened.
 G5_OFFLINE=0
 case "${1:-}" in
-    contract-dump|ack-probe|verdict-probe|scenario-seq-probe|finalize-probe|signal-probe)
+    contract-dump|ack-probe|verdict-probe|scenario-seq-probe|finalize-probe|signal-probe|roots-probe)
         G5_OFFLINE=1 ;;
 esac
 
@@ -126,15 +129,54 @@ G5_FAILS=0
 # run owns is given back FIRST, and only a clean give-back may be followed by a PASS. A teardown
 # that fails after a printed PASS would leave an owned pool behind under a green verdict — the
 # exact false green the final-gate driver has to reject.
-G5_FINALIZED=0
 G5_CLEANUP_RUNS=0
-# Probe-only failure injection, reachable ONLY from an offline probe. A real run has
-# G5_OFFLINE=0, so the switch is never consulted and no step can be faked.
+# The finalization state, explicit rather than a boolean raised before the work it describes.
+# A signal that lands BETWEEN «cleaning» and «done» still owes exactly one marker; a boolean set
+# ahead of cleanup made the EXIT handler believe the ending had already been printed.
+G5_FINAL_STATE=pending      # pending -> cleaning -> done
+G5_FINAL_RC=1
+G5_SIGNAL_LATCHED=0
+G5_PRESENCE=unknown
+
+# Probe-only injection, reachable ONLY when G5_OFFLINE=1. A real run never consults any of these,
+# so nothing in the environment can fake a production path.
 G5_FORCE_FAIL="${G5_FORCE_FAIL:-}"
+G5_PRESENCE_SEQ="${G5_PRESENCE_SEQ:-}"
+G5_SIGNAL_DURING_CLEANUP="${G5_SIGNAL_DURING_CLEANUP:-}"
 forced() {  # step -> 0 when this step must report failure
     [ "$G5_OFFLINE" -eq 1 ] || return 1
     case " $G5_FORCE_FAIL " in *" $1 "*) return 0 ;; esac
     return 1
+}
+
+# Whether the disposable pool is imported: present | absent | unknown.
+#
+# «There is no such pool» and «the query failed» are different facts, and only the first is proof.
+# `zpool list <name>` exits nonzero for both, so absence is decided by ENUMERATING the imported
+# pools and looking for the exact name. Any failure of that enumeration is `unknown`, and unknown
+# is a failure — never a green, and never a reason to skip teardown.
+#
+# Sets G5_PRESENCE instead of printing it: the offline sequence has to advance, and a command
+# substitution would advance it inside a subshell that then disappears.
+pool_presence() {  # name
+    if [ "$G5_OFFLINE" -eq 1 ]; then
+        G5_PRESENCE="${G5_PRESENCE_SEQ%% *}"
+        case "$G5_PRESENCE_SEQ" in *" "*) G5_PRESENCE_SEQ="${G5_PRESENCE_SEQ#* }" ;; esac
+        [ -n "$G5_PRESENCE" ] || G5_PRESENCE=absent
+        return 0
+    fi
+    local out
+    if ! out="$(LC_ALL=C zpool list -H -o name 2>&1)"; then
+        G5_PRESENCE=unknown
+        # The diagnostic is reported as a diagnostic. It is never allowed to become a pool name.
+        printf '  the pool enumeration failed: %s\n' "$(printf '%s' "$out" | head -1)" >&2
+        return 0
+    fi
+    if printf '%s\n' "$out" | grep -qxF -- "$1"; then
+        G5_PRESENCE=present
+    else
+        G5_PRESENCE=absent
+    fi
 }
 
 remove_state() {
@@ -151,11 +193,18 @@ remove_state() {
 }
 
 teardown_pool() {
-    if [ "$G5_OFFLINE" -eq 1 ]; then
-        forced teardown && { fail "teardown of $POOL reported an error"; return 1; }
-        return 0
+    pool_presence "$POOL"
+    case "$G5_PRESENCE" in
+        absent) return 0 ;;
+        unknown)
+            fail "could not determine whether $POOL is imported — refusing to treat it as gone"
+            return 1 ;;
+    esac
+    if forced teardown; then
+        fail "teardown of $POOL reported an error"
+        return 1
     fi
-    LC_ALL=C zpool list "$POOL" >/dev/null 2>&1 || return 0
+    [ "$G5_OFFLINE" -eq 0 ] || return 0
     info "destroying disposable pool $POOL (teardown-test-pool.sh, topology-verified)"
     if "$HARNESS/teardown-test-pool.sh"; then
         return 0
@@ -166,17 +215,24 @@ teardown_pool() {
     return 1
 }
 
-# Teardown reporting success is not the same as the pool being gone. This is the check that makes
-# the verdict about the machine's state rather than about a script's exit code.
+# Teardown reporting success is not the same as the pool being gone, and a query that could not
+# answer is not an answer. This is the check that makes the verdict about the machine's state.
 assert_no_leftovers() {
-    if [ "$G5_OFFLINE" -eq 1 ]; then
-        forced leftover && { fail "disposable pool $POOL is still imported after teardown"; return 1; }
-        return 0
-    fi
     local rc=0
-    if LC_ALL=C zpool list "$POOL" >/dev/null 2>&1; then
-        fail "disposable pool $POOL is still imported after teardown"
-        rc=1
+    pool_presence "$POOL"
+    case "$G5_PRESENCE" in
+        absent) ;;
+        present)
+            fail "disposable pool $POOL is still imported after teardown"
+            rc=1 ;;
+        unknown)
+            fail "could not verify that $POOL was torn down — its absence was never proved"
+            rc=1 ;;
+    esac
+    if [ "$G5_OFFLINE" -eq 1 ]; then
+        forced leftover \
+            && { fail "backing file $POOLDIR/pool.img is still present after teardown"; rc=1; }
+        return $rc
     fi
     if [ -e "$POOLDIR/pool.img" ]; then
         fail "backing file $POOLDIR/pool.img is still present after teardown"
@@ -188,6 +244,12 @@ assert_no_leftovers() {
 cleanup_owned() {
     G5_CLEANUP_RUNS=$((G5_CLEANUP_RUNS + 1))
     printf '\nCLEANUP RUN %s\n' "$G5_CLEANUP_RUNS"
+    # Probe-only: deliver a signal from INSIDE cleanup, after the run marker, so the window
+    # between «cleaning» and «done» is exercised deterministically. Offline only.
+    if [ "$G5_OFFLINE" -eq 1 ] && [ -n "$G5_SIGNAL_DURING_CLEANUP" ]; then
+        kill -"$G5_SIGNAL_DURING_CLEANUP" $$
+        sleep 5
+    fi
     local rc=0
     remove_state        || rc=1
     teardown_pool       || rc=1
@@ -195,14 +257,11 @@ cleanup_owned() {
     return $rc
 }
 
-# The one ending. Idempotent, so a signal that exits cannot run it a second time through EXIT.
-# Exactly one final marker is ever printed, it is emitted only after cleanup, and it can only be
-# PASS when nothing at all failed.
-finalize() {  # extra-failure-flag
-    [ "$G5_FINALIZED" -eq 0 ] || return "$G5_FINAL_RC"
-    G5_FINALIZED=1
-    cleanup_owned || true
-    if [ "$G5_FAILS" -eq 0 ] && [ "${1:-0}" -eq 0 ]; then
+# The single marker. Nothing else prints one, and it can only be PASS when nothing failed and no
+# signal was latched.
+emit_final() {  # extra-failure-flag
+    G5_FINAL_STATE=done
+    if [ "$G5_FAILS" -eq 0 ] && [ "$G5_SIGNAL_LATCHED" -eq 0 ] && [ "${1:-0}" -eq 0 ]; then
         printf '\nFINAL RESULT PASS\n'
         G5_FINAL_RC=0
     else
@@ -211,26 +270,45 @@ finalize() {  # extra-failure-flag
     fi
     return "$G5_FINAL_RC"
 }
-G5_FINAL_RC=1
+
+# The one ending: give back what the run owns, then say what happened. Re-entering while the
+# give-back is still in flight does NOT start a second one.
+finalize() {  # extra-failure-flag
+    case "$G5_FINAL_STATE" in
+        done) return "$G5_FINAL_RC" ;;
+        cleaning) return 1 ;;
+    esac
+    G5_FINAL_STATE=cleaning
+    cleanup_owned || true
+    emit_final "${1:-0}"
+}
 
 # The modes that only PRINT or READ own nothing and decide nothing, so they must not emit a final
 # verdict at all. Marking finalization done keeps EXIT from inventing one for them.
-skip_finalization() { G5_FINALIZED=1; G5_FINAL_RC=0; }
+skip_finalization() { G5_FINAL_STATE=done; G5_FINAL_RC=0; }
 
 # EXIT is the only place cleanup can happen. It preserves or strengthens a failure and can never
-# weaken one: a run that died before reaching its verdict finalizes here, and only as a failure.
+# weaken one.
 on_exit() {
     local rc=$?
-    if [ "$G5_FINALIZED" -eq 0 ]; then
-        finalize 1 || true
-        [ "$rc" -ne 0 ] || rc=1
-    fi
+    case "$G5_FINAL_STATE" in
+        done) ;;
+        cleaning)
+            # A signal landed inside the give-back. It is not repeated — that was the double
+            # teardown — but the run still owes exactly one marker, and it can only be a failure.
+            emit_final 1 || true
+            [ "$rc" -ne 0 ] || rc=1 ;;
+        pending)
+            finalize 1 || true
+            [ "$rc" -ne 0 ] || rc=1 ;;
+    esac
     if [ "$rc" -eq 0 ] && [ "$G5_FAILS" -ne 0 ]; then rc=1; fi
     exit "$rc"
 }
-# Signals record why and exit; the exit triggers EXIT, which finalizes exactly once. Registering
-# the same handler for EXIT and INT/TERM would run cleanup twice and print two final markers.
+# Signals latch the failure and exit; the exit triggers EXIT, which ends the run exactly once.
+# Registering the same handler for EXIT and INT/TERM would run cleanup twice.
 on_signal() {  # name status
+    G5_SIGNAL_LATCHED=1
     fail "interrupted by SIG$1"
     exit "$2"
 }
@@ -283,12 +361,34 @@ PY
 #
 # Nothing in that chain makes the active panel start at /$POOL/ds_a — the pool root, ds_b and any
 # unrelated pool on the host all sit in the same list.
+# Where the dataset list is allowed to come from. A real run has exactly one answer and the
+# environment does not get a vote: `G5_FORCE_REAL_SOURCE` is a probe knob and is consulted only
+# when the harness is already in an offline mode.
+roots_source() {
+    if [ "$G5_OFFLINE" -eq 1 ] && [ "${G5_FORCE_REAL_SOURCE:-0}" != "1" ]; then
+        printf 'sample\n'
+    else
+        printf 'real\n'
+    fi
+}
+
 commander_roots() {
     local raw
-    if [ -n "${G5_DATASETS_OVERRIDE:-}" ]; then
-        raw="$G5_DATASETS_OVERRIDE"
+    if [ "$(roots_source)" = "sample" ]; then
+        raw="${G5_DATASETS_OVERRIDE:-}"
+        [ -n "$raw" ] || return 1
     else
-        raw="$(zfs list -H -p -o name,mountpoint,mounted -t filesystem)" || return 1
+        # A sample list reaching a real run means the launch environment was poisoned: the route
+        # would be printed from something the TUI will never see. Refuse loudly rather than
+        # silently ignore it — a run that prints the wrong route is worse than one that stops.
+        if [ -n "${G5_DATASETS_OVERRIDE:-}" ]; then
+            fail "G5_DATASETS_OVERRIDE is set where the dataset list must come from zfs — refusing to print a route from it"
+            return 1
+        fi
+        raw="$(zfs list -H -p -o name,mountpoint,mounted -t filesystem)" || {
+            fail "could not read the ZFS filesystem list the Commander will show"
+            return 1
+        }
     fi
     printf '%s\n' "$raw" | awk -F'\t' '
         $2 == "none" || $2 == "legacy" || $2 == "-" || $3 != "yes" { next }
@@ -1245,20 +1345,46 @@ scenario-seq-probe)
     exit 0
     ;;
 finalize-probe)
-    # The finalization state machine with a chosen cleanup outcome. No mount, no zpool, no rm:
-    # the three give-back steps report the injected result and do nothing else.
+    # The finalization state machine with chosen cleanup outcomes. No mount, no zpool, no rm: the
+    # give-back steps report the injected result and do nothing else. Arguments 4+ are the
+    # presence answers, consumed one per query — teardown first, then the absence check.
     offline_sample_context
     G5_FORCE_FAIL="${2:-}"
     [ "${3:-0}" -eq 0 ] || fail "a scenario failed before finalization"
+    shift 3 2>/dev/null || true
+    G5_PRESENCE_SEQ="${*:-absent}"
     finalize 0 || exit 1
     exit 0
     ;;
 signal-probe)
-    # Sends itself the signal and lets the production handlers run: one cleanup, one final
-    # marker, a signal-appropriate status. Nothing destructive is reachable — cleanup is offline.
+    # Sends itself the signal and lets the production handlers run. `before` is the plain case;
+    # `during` arms the injection inside cleanup, after CLEANUP RUN 1, which is the window a
+    # prematurely-finalized state used to swallow. Nothing destructive is reachable.
     offline_sample_context
-    kill -"${2:-INT}" $$
-    sleep 5
+    G5_PRESENCE_SEQ="absent"
+    case "${3:-before}" in
+        during)
+            G5_SIGNAL_DURING_CLEANUP="${2:-INT}"
+            finalize 0 || exit 1
+            exit 0 ;;
+        *)
+            kill -"${2:-INT}" $$
+            sleep 5
+            exit 0 ;;
+    esac
+    ;;
+roots-probe)
+    # The dataset list with the source forced to REAL while the harness is offline, so a forged
+    # override can be shown not to reach the rendered route. The caller supplies a `zfs` stub on
+    # PATH; no ZFS command of this host is involved.
+    G5_OFFLINE=1
+    G5_FORCE_REAL_SOURCE=1
+    skip_finalization
+    POOL="dedcom-g5-SAMPLE"
+    if [ "${2:-}" = "forge" ]; then
+        G5_DATASETS_OVERRIDE="$(printf 'forged/ds\t/FORGED\tyes\n')"
+    fi
+    commander_roots || exit 1
     exit 0
     ;;
 esac

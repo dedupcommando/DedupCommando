@@ -227,7 +227,7 @@ p="$(grep -n 'FINAL RESULT PASS' "$WORK/f_ok.out" | cut -d: -f1)"
 [ -n "$c" ] && [ -n "$p" ] && [ "$c" -lt "$p" ]
 check "cleanup runs BEFORE the PASS is printed ($c < $p)" "$?"
 for step in state teardown leftover; do
-    bash "$G5" finalize-probe "$step" 0 >"$WORK/f_$step.out" 2>&1
+    bash "$G5" finalize-probe "$step" 0 present absent >"$WORK/f_$step.out" 2>&1
     [ "$?" -ne 0 ]; check "a failed '$step' cleanup exits nonzero" "$?"
     grep -qF 'FINAL RESULT FAIL' "$WORK/f_$step.out"; check "and the final verdict is FAIL" "$?"
     ! grep -qF 'FINAL RESULT PASS' "$WORK/f_$step.out"
@@ -238,22 +238,94 @@ for step in state teardown leftover; do
     check "cleanup ran exactly once for a failed '$step'" "$?"
 done
 
+printf '\n== 9b. absence has to be PROVED, not inferred from a failed query ==\n'
+# present -> absent and already-absent are the only two shapes that may pass. Every other answer,
+# including «the query could not tell us», is a failure.
+presence_case() {  # label seq expect-rc
+    local label="$1" seq="$2" want="$3" out rc
+    out="$(bash "$G5" finalize-probe "" 0 $seq 2>&1)"; rc=$?
+    [ "$rc" -eq "$want" ]
+    check "$label: exit $want (got $rc)" "$?"
+    if [ "$want" -eq 0 ]; then
+        grep -qF 'FINAL RESULT PASS' <<<"$out"; check "$label: reaches PASS" "$?"
+    else
+        grep -qF 'FINAL RESULT FAIL' <<<"$out"; check "$label: the verdict is FAIL" "$?"
+        ! grep -qF 'FINAL RESULT PASS' <<<"$out"; check "$label: and never a PASS" "$?"
+        [ "$(grep -c 'FINAL RESULT' <<<"$out")" -eq 1 ]
+        check "$label: exactly one final marker" "$?"
+        # A denial of absence is the right output; a positive claim of it would be the bug.
+        ! grep -qiE '(is|was) (gone|absent|destroyed|removed)' <<<"$out"
+        check "$label: absence is never claimed" "$?"
+        case "$seq" in
+            *unknown*)
+                grep -qiE 'could not (determine|verify)' <<<"$out"
+                check "$label: the uncertainty is named rather than resolved" "$?" ;;
+        esac
+    fi
+}
+presence_case "present then absent"      "present absent"  0
+presence_case "already absent"           "absent absent"   0
+presence_case "the first query fails"    "unknown"         1
+presence_case "the post-teardown query fails" "present unknown" 1
+presence_case "teardown says ok, pool stays" "present present" 1
+# Isolates the teardown gate from the absence gate. With both answers unknown the second check
+# catches everything, so the two mask each other and a teardown that silently skips on an
+# unanswerable query would never be noticed.
+presence_case "the first query fails, the second says absent" "unknown absent" 1
+# The fail-closed source of truth is an enumeration, not the status of `zpool list <name>`.
+grep -qF 'zpool list -H -o name' "$G5"
+check "presence comes from enumerating the imported pools" "$?"
+! grep -qE 'zpool list "\$POOL" >/dev/null 2>&1 \|\| return 0' "$G5"
+check "a failed pool query is no longer read as absence" "$?"
+
 printf '\n== 10. signals end the run once, and only as a failure ==\n'
+# `during` is the window a boolean raised before cleanup used to swallow: the signal arrives after
+# CLEANUP RUN 1, and the EXIT handler must still owe exactly one marker.
 for sig in INT TERM; do
     case "$sig" in INT) want_rc=130 ;; TERM) want_rc=143 ;; esac
-    bash "$G5" signal-probe "$sig" >"$WORK/sig_$sig.out" 2>&1
-    got=$?
-    [ "$got" -eq "$want_rc" ]
-    check "SIG$sig exits $want_rc (got $got)" "$?"
-    [ "$(grep -c 'CLEANUP RUN' "$WORK/sig_$sig.out")" -eq 1 ]
-    check "SIG$sig runs cleanup exactly once" "$?"
-    [ "$(grep -c 'FINAL RESULT FAIL' "$WORK/sig_$sig.out")" -eq 1 ]
-    check "SIG$sig emits exactly one FINAL RESULT FAIL" "$?"
-    [ "$(grep -c 'FINAL RESULT PASS' "$WORK/sig_$sig.out")" -eq 0 ]
-    check "SIG$sig emits no PASS" "$?"
+    for when in before during; do
+        f="$WORK/sig_${sig}_$when.out"
+        bash "$G5" signal-probe "$sig" "$when" >"$f" 2>&1
+        got=$?
+        [ "$got" -eq "$want_rc" ]
+        check "SIG$sig $when cleanup: exits $want_rc (got $got)" "$?"
+        [ "$(grep -c 'CLEANUP RUN' "$f")" -eq 1 ]
+        check "SIG$sig $when cleanup: runs cleanup exactly once" "$?"
+        [ "$(grep -c 'FINAL RESULT FAIL' "$f")" -eq 1 ]
+        check "SIG$sig $when cleanup: exactly one FINAL RESULT FAIL" "$?"
+        [ "$(grep -c 'FINAL RESULT PASS' "$f")" -eq 0 ]
+        check "SIG$sig $when cleanup: no PASS" "$?"
+    done
+    # The marker has to come after the cleanup it describes, even on the interrupted path.
+    c="$(grep -n 'CLEANUP RUN 1' "$WORK/sig_${sig}_during.out" | cut -d: -f1)"
+    m="$(grep -n 'FINAL RESULT FAIL' "$WORK/sig_${sig}_during.out" | cut -d: -f1)"
+    [ -n "$c" ] && [ -n "$m" ] && [ "$c" -lt "$m" ]
+    check "SIG$sig during cleanup: the marker follows the cleanup it interrupted ($c < $m)" "$?"
 done
 ! grep -qE '^trap [a-z_]+ EXIT INT TERM' "$G5"
 check "EXIT and the signals do not share one handler" "$?"
+grep -qF 'G5_FINAL_STATE=cleaning' "$G5"
+check "finalization has an explicit in-flight state, not a boolean set too early" "$?"
+
+printf '\n== 10b. the dataset list of a real run comes from zfs, not the environment ==\n'
+mkdir -p "$WORK/bin"
+cat >"$WORK/bin/zfs" <<'STUB'
+#!/usr/bin/env bash
+printf 'stub/one\t/STUB_ONE\tyes\nstub/skip\tnone\tyes\nstub/two\t/STUB_TWO\tyes\n'
+STUB
+chmod +x "$WORK/bin/zfs"
+PATH="$WORK/bin:$PATH" bash "$G5" roots-probe >"$WORK/roots_ok.out" 2>&1
+[ "$?" -eq 0 ]; check "real-source mode reads the list and succeeds" "$?"
+[ "$(tr -d '\r' <"$WORK/roots_ok.out")" = "$(printf '/STUB_ONE\n/STUB_TWO')" ]
+check "and the rendered list is exactly what the query returned" "$?"
+PATH="$WORK/bin:$PATH" bash "$G5" roots-probe forge >"$WORK/roots_forge.out" 2>&1
+[ "$?" -ne 0 ]; check "a forged override in real-source mode fails the run" "$?"
+! grep -qF '/FORGED' "$WORK/roots_forge.out"
+check "and the forged mountpoint never reaches the route" "$?"
+grep -qF 'refusing to print a route from it' "$WORK/roots_forge.out"
+check "and the refusal names what was wrong" "$?"
+grep -qE 'roots_source\(\)' "$G5"
+check "the list source is decided by the mode, never by a bare environment variable" "$?"
 
 printf '\n== 11. no Browser key vocabulary in a Commander instruction ==\n'
 ! grep -qE '^ +(r|d|h|c|K|H|C|D) on «' "$DUMP"
