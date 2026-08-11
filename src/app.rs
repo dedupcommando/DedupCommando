@@ -42,6 +42,11 @@ use crate::zfs::ZfsEnvironment;
 pub const MARKS_NOT_SETTLED: &str =
     "WARNING: the saved marks were not updated — the plan on disk still lists what was applied";
 
+/// Shown when browsing stopped while a mark write was still unacknowledged. The window goes back
+/// to what the database last said; the acknowledgement the operator was told to wait for is never
+/// arriving, so the wait has to be ended in words rather than left on screen.
+const MARKS_STRANDED: &str = "browsing stopped before the marks were acknowledged";
+
 /// Shown when the batch refused itself before touching anything. Nothing was applied, so the marks
 /// are exactly where the operator left them and the plan can simply be run again.
 pub const BATCH_REFUSED: &str =
@@ -551,7 +556,35 @@ pub(crate) enum MarkOrigin {
         panel: usize,
         path: PathBuf,
         previous: Option<crate::tui::commander::state::Mark>,
+        /// What this keystroke asked for. Kept only to correlate the acknowledgement: the
+        /// durable meaning shown to the operator is read back out of the after-image, never
+        /// from this field.
+        requested: Option<crate::tui::commander::state::Mark>,
     },
+}
+
+/// How a durable mark reads to the operator — taken from what the database returned.
+fn durable_meaning(intent: Option<&MarkIntent>) -> &'static str {
+    match intent {
+        Some(MarkIntent::Keeper) => "keeper",
+        Some(MarkIntent::Act(ActionKind::Hardlink)) => "hardlink",
+        Some(MarkIntent::Act(ActionKind::Reflink)) => "reflink",
+        Some(MarkIntent::Act(ActionKind::Delete)) => "delete",
+        None => "cleared",
+    }
+}
+
+/// The durable meaning a keystroke asked for. A triage selection is not durable, so it reads as
+/// «cleared»: the database holds no row for it either way.
+fn requested_meaning(mark: Option<crate::tui::commander::state::Mark>) -> &'static str {
+    use crate::tui::commander::state::Mark;
+    match mark {
+        Some(Mark::Keeper) => "keeper",
+        Some(Mark::Hardlink) => "hardlink",
+        Some(Mark::Reflink) => "reflink",
+        Some(Mark::Delete) => "delete",
+        Some(Mark::Selected) | None => "cleared",
+    }
 }
 
 /// Whether the marks on screen are settled against the database.
@@ -2226,6 +2259,9 @@ impl App {
                 panel,
                 path,
                 previous,
+                // The rollback restores what the panel showed before the keystroke; what that
+                // keystroke asked for is correlation evidence and has no part in it.
+                requested: _,
             } => {
                 if let Some(panel) = self.commander.panels.get_mut(panel) {
                     match previous {
@@ -2247,8 +2283,21 @@ impl App {
         if !self.is_current(act) {
             return;
         }
+        // What this keystroke asked for, kept for correlation only. The success line is built from
+        // the after-image the database returned, never from this.
+        let asked = match &origin {
+            Some(MarkOrigin::CommanderMark {
+                path, requested, ..
+            }) => Some((path.clone(), *requested)),
+            _ => None,
+        };
         match outcome {
-            MarkOutcome::Settled { after } => self.apply_mark_image(&after),
+            MarkOutcome::Settled { after } => {
+                self.apply_mark_image(&after);
+                if let Some((path, requested)) = asked {
+                    self.report_commander_mark_settled(&path, requested, &after);
+                }
+            }
             // The write refused, but the database still told us what it holds for exactly these
             // pathnames: settle from that, not from the guess the window made.
             MarkOutcome::Failed { error, after } => {
@@ -2265,6 +2314,38 @@ impl App {
         }
         let _ = self.refresh_marked_count();
         self.invalidate_confirmation("the marks changed");
+    }
+
+    /// The one place a Commander mark is allowed to be called saved.
+    ///
+    /// `Settled` alone is not the proof: the reply must actually carry the pathname this keystroke
+    /// wrote, holding the durable meaning that was asked for. A reply that omits the path, or that
+    /// returns a different meaning, is reported fail-closed — the operator must never read
+    /// «Mark saved» over a database that says something else. The displayed meaning is read out of
+    /// the after-image, so it states what the database holds rather than what the window hoped.
+    fn report_commander_mark_settled(
+        &mut self,
+        path: &std::path::Path,
+        requested: Option<crate::tui::commander::state::Mark>,
+        after: &[(PathBuf, Option<MarkIntent>)],
+    ) {
+        let shown = crate::textsan::terminal(&path.display().to_string());
+        let Some((_, returned)) = after.iter().find(|(candidate, _)| candidate == path) else {
+            self.commander.status = format!(
+                "The mark was not confirmed: the database did not report {shown} — do not treat it as saved"
+            );
+            return;
+        };
+        let returned_meaning = durable_meaning(returned.as_ref());
+        let asked_meaning = requested_meaning(requested);
+        if returned_meaning != asked_meaning {
+            self.commander.status = format!(
+                "The mark was not confirmed: the database holds {returned_meaning} for {shown}, not {asked_meaning}"
+            );
+            return;
+        }
+        // Prefix first, so a 36-column status line clips the pathname and never the verdict.
+        self.commander.status = format!("Mark saved: {shown} = {returned_meaning}");
     }
 
     /// One place turns a typed mark failure into what the operator sees — and uninstalls the
@@ -2704,8 +2785,12 @@ impl App {
             self.marks_unsettled = true;
             self.marks_gate = MarksGate::Blocked {
                 act: self.installed_act,
-                reason: "browsing stopped before the marks were acknowledged".to_string(),
+                reason: MARKS_STRANDED.to_string(),
             };
+            // The commander may still be showing «Saving mark» over a write that is now never
+            // going to be answered. Leaving it there would point the operator at a «Mark saved»
+            // that cannot arrive — the one fence they were told to wait at.
+            self.commander.status = MARKS_STRANDED.to_string();
         }
         if let Some(operation) = long_op {
             operation.cancel.cancel();
@@ -4616,6 +4701,7 @@ impl App {
         panel: usize,
         file: FileEntry,
         previous: Option<crate::tui::commander::state::Mark>,
+        requested: Option<crate::tui::commander::state::Mark>,
     ) -> crate::error::Result<()> {
         let path = file.path.clone();
         let durable = previous.and_then(|mark| match mark {
@@ -4639,12 +4725,19 @@ impl App {
         };
         match handle.send_set_marks(act, req, vec![file], vec![(path.clone(), durable)]) {
             Ok(()) => {
+                // «Submitted», never «saved». The operator learns the write landed only from the
+                // acknowledgement, and only after the after-image is checked against the request.
+                self.commander.status = format!(
+                    "Saving mark: {}",
+                    crate::textsan::terminal(&path.display().to_string())
+                );
                 self.pending_marks.insert(
                     req.0,
                     MarkOrigin::CommanderMark {
                         panel,
                         path,
                         previous,
+                        requested,
                     },
                 );
                 Ok(())
@@ -5102,6 +5195,81 @@ where
         let result = crate::panics::guard("the purge worker", job);
         let _ = events.send(AppEvent::SessionDeleted(result));
     });
+}
+
+/// `Settled` is not by itself permission to say «saved».
+///
+/// These read the verdict straight out of the one function allowed to render the success prefix,
+/// with the after-image supplied by hand — the two shapes a real store could hand back that must
+/// never become a success line.
+#[cfg(test)]
+mod mark_settlement_is_checked_tests {
+    use super::*;
+    use crate::tui::commander::state::Mark;
+
+    #[test]
+    fn an_after_image_that_omits_the_path_is_not_saved() {
+        let (mut app, _rx) = test_app();
+        let path = PathBuf::from("/tank/a.bin");
+
+        // The reply settled — but it says nothing about the pathname this keystroke wrote.
+        app.report_commander_mark_settled(&path, Some(Mark::Keeper), &[]);
+
+        assert!(
+            !app.commander.status.starts_with("Mark saved"),
+            "a silent after-image is not an acknowledgement: {}",
+            app.commander.status
+        );
+        assert!(
+            app.commander.status.contains("did not report"),
+            "and it says exactly what was missing: {}",
+            app.commander.status
+        );
+    }
+
+    #[test]
+    fn an_after_image_holding_a_different_meaning_is_not_saved() {
+        let (mut app, _rx) = test_app();
+        let path = PathBuf::from("/tank/a.bin");
+        let after = vec![(
+            path.clone(),
+            Some(MarkIntent::Act(crate::model::action::ActionKind::Delete)),
+        )];
+
+        // Keeper was asked for; the database says delete. Success here would print a lie.
+        app.report_commander_mark_settled(&path, Some(Mark::Keeper), &after);
+
+        assert!(
+            !app.commander.status.starts_with("Mark saved"),
+            "a disagreeing after-image must never read as success: {}",
+            app.commander.status
+        );
+        assert!(
+            app.commander.status.contains("delete") && app.commander.status.contains("keeper"),
+            "and it names both meanings so the operator can see the disagreement: {}",
+            app.commander.status
+        );
+    }
+
+    #[test]
+    fn an_agreeing_after_image_is_the_only_thing_that_is_saved() {
+        let (mut app, _rx) = test_app();
+        let path = PathBuf::from("/tank/a.bin");
+        let after = vec![(path.clone(), Some(MarkIntent::Keeper))];
+
+        app.report_commander_mark_settled(&path, Some(Mark::Keeper), &after);
+
+        assert!(
+            app.commander.status.starts_with("Mark saved"),
+            "the agreeing case is the one that earns the prefix: {}",
+            app.commander.status
+        );
+        assert!(
+            app.commander.status.contains("keeper"),
+            "stating the meaning the database returned: {}",
+            app.commander.status
+        );
+    }
 }
 
 /// A shutdown signal must not abandon background work that has no cancel flag: a move batch
@@ -6181,6 +6349,107 @@ mod actor_route_tests {
         assert!(
             app.opening_started.is_none(),
             "and the «Opening results…» animation stops with it"
+        );
+    }
+
+    /// A durable Commander mark the actor never acknowledged, because browsing stopped first.
+    ///
+    /// The retirement here is the production one: the ticket is taken out of the real registry
+    /// exactly as `retire_actor` takes it, and handed to the production settlement. What an
+    /// actor's death itself looks like belongs to the browsing suite; what only exists here is
+    /// what the window does with a write that is never going to be answered — it goes back to
+    /// what the database last said, it stops pointing at an acknowledgement that cannot arrive,
+    /// and neither the retirement nor the actor's late reply may render the success prefix.
+    #[test]
+    fn a_retired_mark_ticket_restores_the_row_and_never_says_saved() {
+        use crate::tui::commander::state::{EntryKind, Mark, PanelEntry};
+
+        let _role = crate::state::store::role_guard();
+        let scenario = PlanScenario::new("commander_mark_retired");
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper, twin.clone()]);
+        drop(store);
+
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        app.show_disclaimer = false;
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        assert_eq!(
+            app.commander.dedup_scan_id,
+            Some(scan_id),
+            "the fixture's scan must open: {}",
+            app.commander.status
+        );
+        drain(&mut app, &rx);
+
+        let panel = app.commander.active_panel_mut();
+        panel.entries = vec![PanelEntry {
+            path: twin.clone(),
+            name: "twin.bin".to_string(),
+            kind: EntryKind::File,
+            size: 0,
+            mtime: 0,
+            device: 0,
+            inode: 0,
+        }];
+        panel.list.select(Some(0));
+
+        // F7 is the keeper key, pressed through the production dispatcher.
+        app.handle_event(AppEvent::Key(KeyEvent::from(KeyCode::F(7))));
+        assert_eq!(app.pending_marks.len(), 1, "one durable write is in flight");
+        assert!(
+            app.commander.status.starts_with("Saving mark"),
+            "and the operator was told to wait for it: {}",
+            app.commander.status
+        );
+        assert_eq!(
+            app.commander.panels[app.commander.active].marks.get(&twin),
+            Some(&Mark::Keeper),
+            "with an optimistic row on screen"
+        );
+
+        // Browsing stops while that write is still unacknowledged.
+        let drained = app
+            .browse
+            .live()
+            .expect("the actor is live")
+            .drain_tickets();
+        assert_eq!(
+            drained.tickets.len(),
+            1,
+            "the unacknowledged ticket is exactly what retirement has to settle"
+        );
+        app.settle_retired(drained, &CloseCause::Requested);
+
+        assert!(app.pending_marks.is_empty(), "nothing is left in flight");
+        assert!(
+            !app.commander.panels[app.commander.active]
+                .marks
+                .contains_key(&twin),
+            "the optimistic row is gone — nothing ever said the database holds it"
+        );
+        assert!(
+            !app.commander.status.starts_with("Mark saved"),
+            "a write nobody answered is not a saved mark: {}",
+            app.commander.status
+        );
+        assert_eq!(
+            app.commander.status, MARKS_STRANDED,
+            "and the wait ends in words instead of resting on «Saving mark»"
+        );
+        assert!(
+            matches!(app.marks_gate, MarksGate::Blocked { .. }),
+            "with planning blocked until a fresh open"
+        );
+
+        // The reply lands after its ticket was retired. It may settle the picture from the
+        // after-image, but it has no origin left to correlate and cannot borrow the success line.
+        drain(&mut app, &rx);
+        assert!(
+            !app.commander.status.starts_with("Mark saved"),
+            "a late reply may not resurrect the acknowledgement: {}",
+            app.commander.status
         );
     }
 

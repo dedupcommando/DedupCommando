@@ -1903,6 +1903,14 @@ fn mark_cursor(app: &mut App, mark: Mark) {
             "reflink unavailable — needs ZFS 2.3+ with block cloning enabled".to_string();
         return;
     }
+    // One unacknowledged durable write at a time. Refused HERE, before the row is touched and
+    // before the cursor moves: a second keystroke that left an optimistic glyph behind would put
+    // a mark on screen that no answer is coming for, and the operator would have no way to tell
+    // which of the two the database actually holds.
+    if let Some(waiting) = single_flight_refusal(app) {
+        app.commander.status = waiting;
+        return;
+    }
     let active = app.commander.active;
     let panel = app.commander.active_panel_mut();
     let entry = match panel.selected() {
@@ -1939,11 +1947,28 @@ fn toggle_mark_cursor(app: &mut App) {
         return;
     }
     let active = app.commander.active;
-    let panel = app.commander.active_panel_mut();
-    let entry = match panel.selected() {
-        Some(entry) if matches!(entry.kind, EntryKind::File | EntryKind::Dir) => entry.clone(),
-        _ => return,
+    let (entry, standing) = {
+        let panel = app.commander.active_panel_mut();
+        let entry = match panel.selected() {
+            Some(entry) if matches!(entry.kind, EntryKind::File | EntryKind::Dir) => entry.clone(),
+            _ => return,
+        };
+        let standing = panel.marks.get(&entry.path).copied();
+        (entry, standing)
     };
+    // Only CLEARING a durable mark is a database write; setting or dropping a triage selection
+    // never leaves the panel. The single flight therefore gates the former and must not touch the
+    // latter — an operator sorting rows with Space has no reason to wait for someone else's write.
+    if matches!(
+        standing,
+        Some(Mark::Keeper | Mark::Delete | Mark::Hardlink | Mark::Reflink)
+    ) {
+        if let Some(waiting) = single_flight_refusal(app) {
+            app.commander.status = waiting;
+            return;
+        }
+    }
+    let panel = app.commander.active_panel_mut();
     let previous = panel.marks.remove(&entry.path);
     let new_mark = if previous.is_some() {
         None
@@ -2754,7 +2779,20 @@ fn persist_mark(
         action: mark.and_then(|mark| mark.action()),
         ..Default::default()
     };
-    app.send_commander_mark(panel, file, previous)
+    app.send_commander_mark(panel, file, previous, mark)
+}
+
+/// Why a durable mark keystroke must wait, if it must.
+///
+/// The Commander allows exactly one unacknowledged durable write. While one is in flight the
+/// operator gets a sentence that names both states they care about — the one they are in, and the
+/// one they are waiting for — so the wait is a fence they can see rather than a duration they
+/// have to guess.
+fn single_flight_refusal(app: &App) -> Option<String> {
+    if !app.pending_marks.is_empty() {
+        return Some("Mark still saving — wait for Mark saved before marking again".to_string());
+    }
+    None
 }
 
 /// The commander's help overlay.
@@ -3110,6 +3148,398 @@ mod mark_is_fail_closed_tests {
         crate::app::pump_until(app, rx, "the mark acknowledgement", |app| {
             app.pending_marks.is_empty()
         });
+    }
+
+    /// Submitted is not saved. The keystroke draws its optimistic row and says so in those exact
+    /// words, with exactly one write in flight and no claim that anything landed.
+    #[test]
+    fn an_enqueued_mark_says_saving_and_never_saved() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, scan_id, twin) = scenario_with_scan("commander_mark_saving");
+        let (mut app, rx) = commander_on(&scenario, scan_id);
+        panel_over(&mut app, &twin);
+
+        mark_cursor(&mut app, Mark::Keeper);
+
+        assert_eq!(
+            app.pending_marks.len(),
+            1,
+            "exactly one durable write is in flight"
+        );
+        assert!(
+            app.commander.status.starts_with("Saving mark"),
+            "the operator is told the write was submitted: {}",
+            app.commander.status
+        );
+        assert!(
+            !app.commander.status.starts_with("Mark saved"),
+            "nothing may claim the database accepted it yet: {}",
+            app.commander.status
+        );
+        assert_eq!(
+            app.commander.panels[app.commander.active].marks.get(&twin),
+            Some(&Mark::Keeper),
+            "the optimistic row is drawn — it is the claim of durability that is withheld"
+        );
+        settle_mark(&mut app, &rx);
+        let _ = &rx;
+    }
+
+    /// The one positive fence: after the real acknowledgement, and only then, the status names the
+    /// pathname and the durable meaning the DATABASE returned.
+    #[test]
+    fn a_settled_mark_reports_the_meaning_the_database_returned() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, scan_id, twin) = scenario_with_scan("commander_mark_saved");
+        let (mut app, rx) = commander_on(&scenario, scan_id);
+        panel_over(&mut app, &twin);
+
+        mark_cursor(&mut app, Mark::Keeper);
+        settle_mark(&mut app, &rx);
+
+        assert!(
+            app.pending_marks.is_empty(),
+            "the flight is over before anything is called saved"
+        );
+        assert!(
+            app.commander.status.starts_with("Mark saved"),
+            "the positive acknowledgement is what the operator waits for: {}",
+            app.commander.status
+        );
+        assert!(
+            app.commander.status.contains("keeper"),
+            "and it states the durable meaning the after-image carried: {}",
+            app.commander.status
+        );
+        assert!(
+            app.commander.status.contains(&twin.display().to_string()),
+            "naming the pathname it settled: {}",
+            app.commander.status
+        );
+        assert_eq!(
+            app.commander.panels[app.commander.active].marks.get(&twin),
+            Some(&Mark::Keeper),
+            "and the row now agrees with the database"
+        );
+    }
+
+    /// A second durable keystroke while one is unacknowledged changes nothing on screen: no
+    /// request, no optimistic row, no cursor movement — only a sentence naming the fence.
+    #[test]
+    fn a_second_mark_is_refused_before_it_touches_the_panel() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, scan_id, twin) = scenario_with_scan("commander_mark_single_flight");
+        let (mut app, rx) = commander_on(&scenario, scan_id);
+        panel_over(&mut app, &twin);
+
+        mark_cursor(&mut app, Mark::Keeper);
+        let cursor_before = app.commander.active_panel().list.selected();
+        let marks_before = app.commander.panels[app.commander.active].marks.clone();
+        assert_eq!(app.pending_marks.len(), 1, "one write is in flight");
+
+        mark_cursor(&mut app, Mark::Delete);
+
+        assert_eq!(
+            app.pending_marks.len(),
+            1,
+            "the second keystroke sent nothing"
+        );
+        assert!(
+            app.commander.status.starts_with("Mark still saving"),
+            "and it names the state the operator is in: {}",
+            app.commander.status
+        );
+        assert!(
+            app.commander.status.contains("Mark saved"),
+            "and the state they are waiting for: {}",
+            app.commander.status
+        );
+        assert_eq!(
+            app.commander.active_panel().list.selected(),
+            cursor_before,
+            "the cursor did not move"
+        );
+        assert_eq!(
+            app.commander.panels[app.commander.active].marks, marks_before,
+            "and no optimistic row was left behind"
+        );
+        settle_mark(&mut app, &rx);
+    }
+
+    /// Clearing is a durable write too: it reports `cleared`, and only after settlement.
+    #[test]
+    fn clearing_a_mark_reports_cleared_after_settlement() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, scan_id, twin) = scenario_with_scan("commander_mark_cleared");
+        let (mut app, rx) = commander_on(&scenario, scan_id);
+        panel_over(&mut app, &twin);
+
+        mark_cursor(&mut app, Mark::Delete);
+        settle_mark(&mut app, &rx);
+        assert!(app.commander.status.starts_with("Mark saved"));
+
+        app.commander.active_panel_mut().list.select(Some(0));
+        panel_over(&mut app, &twin);
+        toggle_mark_cursor(&mut app);
+        assert!(
+            app.commander.status.starts_with("Saving mark"),
+            "the clear is submitted, not yet saved: {}",
+            app.commander.status
+        );
+        settle_mark(&mut app, &rx);
+
+        assert!(
+            app.commander.status.starts_with("Mark saved")
+                && app.commander.status.contains("cleared"),
+            "and settles as `cleared`: {}",
+            app.commander.status
+        );
+    }
+
+    /// The `Unreadable` acknowledgement in full — the refusal an operator actually meets, since
+    /// the settled writer refuses before it writes and so carries no after-image at all.
+    ///
+    /// It may restore the row, it must say why, and it may never borrow the success prefix.
+    #[test]
+    fn a_refused_mark_restores_the_row_and_never_renders_the_success_prefix() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, scan_id, twin) = scenario_with_scan("commander_mark_refused_prefix");
+        let (mut app, rx) = commander_on(&scenario, scan_id);
+        panel_over(&mut app, &twin);
+        mark_cursor(&mut app, Mark::Keeper);
+        settle_mark(&mut app, &rx);
+        assert!(
+            app.commander.status.starts_with("Mark saved"),
+            "the durable keeper is what the row must fall back to: {}",
+            app.commander.status
+        );
+
+        // The manifest row leaves, so the next write is refused with nothing readable behind it.
+        drop_from_manifest(&scenario, &twin);
+        app.commander.active_panel_mut().list.select(Some(0));
+        mark_cursor(&mut app, Mark::Delete);
+        assert!(
+            app.commander.status.starts_with("Saving mark"),
+            "the keystroke was submitted like any other: {}",
+            app.commander.status
+        );
+        settle_mark(&mut app, &rx);
+
+        assert!(
+            !app.commander.status.starts_with("Mark saved"),
+            "a refusal that reads as success is the whole failure mode: {}",
+            app.commander.status
+        );
+        assert!(
+            app.commander.status.contains("not part of the loaded scan"),
+            "and it names what was refused: {}",
+            app.commander.status
+        );
+        assert_eq!(
+            app.commander.panels[app.commander.active].marks.get(&twin),
+            Some(&Mark::Keeper),
+            "the row is back to the last thing the database confirmed, not the refused delete"
+        );
+    }
+
+    /// The database file the view was opened over is replaced while a mark is in flight. The
+    /// acknowledgement is a typed refusal: browsing is uninstalled, the optimistic row goes back,
+    /// and nothing anywhere reads as saved.
+    #[test]
+    fn a_replaced_database_refuses_the_mark_and_never_says_saved() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, scan_id, twin) = scenario_with_scan("commander_mark_path_changed");
+        let (mut app, rx) = commander_on(&scenario, scan_id);
+        panel_over(&mut app, &twin);
+
+        // Class B: the configured path now carries something that is not the checkpoint.
+        std::fs::remove_file(&scenario.db_path).unwrap();
+        std::fs::create_dir(&scenario.db_path).unwrap();
+
+        mark_cursor(&mut app, Mark::Keeper);
+        assert_eq!(
+            app.pending_marks.len(),
+            1,
+            "the window cannot know yet, so the keystroke is submitted"
+        );
+        settle_mark(&mut app, &rx);
+
+        assert!(
+            !app.commander.status.starts_with("Mark saved"),
+            "a replaced checkpoint cannot produce a saved mark: {}",
+            app.commander.status
+        );
+        assert!(
+            app.commander.dedup_scan_id.is_none(),
+            "and the scan it was marked over is uninstalled: {}",
+            app.commander.status
+        );
+        assert!(
+            !app.commander.panels[app.commander.active]
+                .marks
+                .contains_key(&twin),
+            "the optimistic row went back to nothing"
+        );
+    }
+
+    /// Every line of a rendered frame, so a status assertion reads what the terminal shows rather
+    /// than the string the code meant to show.
+    fn rendered_lines(app: &mut App, term_width: u16) -> Vec<String> {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(term_width, 20)).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let area = *buffer.area();
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The verdict must survive the narrowest supported terminal. Only the detail may be clipped —
+    /// a status whose prefix is cut off is a fence the operator cannot read.
+    #[test]
+    fn the_three_lifecycle_states_are_readable_at_36_columns() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, scan_id, twin) = scenario_with_scan("commander_mark_36col");
+        let (mut app, rx) = commander_on(&scenario, scan_id);
+        panel_over(&mut app, &twin);
+
+        mark_cursor(&mut app, Mark::Keeper);
+        assert!(
+            rendered_lines(&mut app, 36)
+                .iter()
+                .any(|line| line.contains("Saving mark")),
+            "«Saving mark» must be readable at 36 columns"
+        );
+
+        mark_cursor(&mut app, Mark::Delete);
+        assert!(
+            rendered_lines(&mut app, 36)
+                .iter()
+                .any(|line| line.contains("Mark still saving")),
+            "«Mark still saving» must be readable at 36 columns"
+        );
+
+        settle_mark(&mut app, &rx);
+        assert!(
+            rendered_lines(&mut app, 36)
+                .iter()
+                .any(|line| line.contains("Mark saved")),
+            "«Mark saved» must be readable at 36 columns"
+        );
+    }
+
+    /// The fence guards the database, not the keyboard. A triage selection writes nothing, so it
+    /// keeps working while somebody else's durable write is still in flight.
+    #[test]
+    fn a_triage_selection_is_not_blocked_by_a_pending_write() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, scan_id, twin) = scenario_with_scan("commander_mark_selected_free");
+        let (mut app, rx) = commander_on(&scenario, scan_id);
+
+        // A durable write on one pathname, deliberately left unacknowledged.
+        panel_over(&mut app, &twin);
+        mark_cursor(&mut app, Mark::Keeper);
+        assert_eq!(app.pending_marks.len(), 1, "one durable write is in flight");
+
+        // Space on a DIFFERENT row: panel-local, nothing durable, nothing to wait for.
+        let other = scenario.outside.join("selectable.bin");
+        std::fs::write(&other, b"panel-local only").unwrap();
+        panel_over(&mut app, &other);
+        toggle_mark_cursor(&mut app);
+
+        assert_eq!(
+            app.commander.panels[app.commander.active].marks.get(&other),
+            Some(&Mark::Selected),
+            "the selection landed even though a durable write is pending: {}",
+            app.commander.status
+        );
+        assert!(
+            !app.commander.status.starts_with("Mark still saving"),
+            "a panel-local selection must not be fenced: {}",
+            app.commander.status
+        );
+        // Cursor movement is deliberately not asserted here: `move_cursor(1)` clamps at the end of
+        // the list, so on a short listing «advanced» and «clamped» are the same index and the
+        // assertion would prove nothing about the fence.
+        assert_eq!(
+            app.pending_marks.len(),
+            1,
+            "while sending nothing of its own"
+        );
+
+        // Clearing that same selection is still panel-local, so it is still free.
+        panel_over(&mut app, &other);
+        toggle_mark_cursor(&mut app);
+        assert!(
+            !app.commander.panels[app.commander.active]
+                .marks
+                .contains_key(&other),
+            "and dropping it is equally free: {}",
+            app.commander.status
+        );
+
+        settle_mark(&mut app, &rx);
+    }
+
+    /// Clearing a DURABLE mark is a write, so it does queue behind the flight — refused before the
+    /// row changes and before the cursor moves.
+    #[test]
+    fn clearing_a_durable_mark_is_fenced_by_the_pending_write() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, scan_id, twin) = scenario_with_scan("commander_mark_clear_fenced");
+        let (mut app, rx) = commander_on(&scenario, scan_id);
+        panel_over(&mut app, &twin);
+        mark_cursor(&mut app, Mark::Delete);
+        settle_mark(&mut app, &rx);
+
+        // A second durable write elsewhere, left in flight.
+        let second = scenario.outside.join("second.bin");
+        std::fs::write(&second, b"second").unwrap();
+        panel_over(&mut app, &twin);
+        mark_cursor(&mut app, Mark::Keeper);
+        assert_eq!(app.pending_marks.len(), 1);
+
+        panel_over(&mut app, &twin);
+        let cursor_before = app.commander.active_panel().list.selected();
+        let marks_before = app.commander.panels[app.commander.active].marks.clone();
+        toggle_mark_cursor(&mut app);
+
+        assert!(
+            app.commander.status.starts_with("Mark still saving"),
+            "clearing a durable mark is a write and waits its turn: {}",
+            app.commander.status
+        );
+        assert_eq!(
+            app.commander.active_panel().list.selected(),
+            cursor_before,
+            "the cursor did not move"
+        );
+        assert_eq!(
+            app.commander.panels[app.commander.active].marks, marks_before,
+            "and the row was not touched"
+        );
+        settle_mark(&mut app, &rx);
+    }
+
+    /// The plan gate is unchanged: nothing may be built while a write is unacknowledged.
+    #[test]
+    fn a_plan_cannot_be_built_while_a_mark_is_in_flight() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, scan_id, twin) = scenario_with_scan("commander_mark_plan_gate");
+        let (mut app, rx) = commander_on(&scenario, scan_id);
+        panel_over(&mut app, &twin);
+
+        mark_cursor(&mut app, Mark::Keeper);
+        assert!(
+            app.plan_gate_refusal().is_some(),
+            "an unacknowledged mark still refuses a plan"
+        );
+        settle_mark(&mut app, &rx);
     }
 
     /// A pathname the loaded scan never saw cannot acquire a mark that looks durable.
