@@ -278,34 +278,76 @@ check "presence comes from enumerating the imported pools" "$?"
 ! grep -qE 'zpool list "\$POOL" >/dev/null 2>&1 \|\| return 0' "$G5"
 check "a failed pool query is no longer read as absence" "$?"
 
-printf '\n== 10. signals end the run once, and only as a failure ==\n'
-# `during` is the window a boolean raised before cleanup used to swallow: the signal arrives after
-# CLEANUP RUN 1, and the EXIT handler must still owe exactly one marker.
+printf '\n== 10. signals at every materially different point of the ending ==\n'
+# The owned steps, in the order cleanup_owned attempts them. «Entered cleanup» is not the same
+# fact as «cleanup ran», so the trace is what the assertions read.
+STEPS="remove_state teardown_pool assert_no_leftovers"
+steps_of() { grep -oE '^CLEANUP STEP [a-z_]+' "$1" | awk '{print $3}' | tr '\n' ' '; }
+
 for sig in INT TERM; do
     case "$sig" in INT) want_rc=130 ;; TERM) want_rc=143 ;; esac
-    for when in before during; do
+    # Points 1-4: the run is interrupted, so it must fail — and it must still give back what it
+    # owns before saying so.
+    for when in before entry after-step1 precommit; do
         f="$WORK/sig_${sig}_$when.out"
         bash "$G5" signal-probe "$sig" "$when" >"$f" 2>&1
         got=$?
         [ "$got" -eq "$want_rc" ]
-        check "SIG$sig $when cleanup: exits $want_rc (got $got)" "$?"
+        check "SIG$sig @$when: exits $want_rc (got $got)" "$?"
         [ "$(grep -c 'CLEANUP RUN' "$f")" -eq 1 ]
-        check "SIG$sig $when cleanup: runs cleanup exactly once" "$?"
+        check "SIG$sig @$when: exactly one cleanup invocation" "$?"
+        [ "$(steps_of "$f")" = "$STEPS " ]
+        check "SIG$sig @$when: all three owned steps attempted once, in order" "$?"
         [ "$(grep -c 'FINAL RESULT FAIL' "$f")" -eq 1 ]
-        check "SIG$sig $when cleanup: exactly one FINAL RESULT FAIL" "$?"
+        check "SIG$sig @$when: exactly one FINAL RESULT FAIL" "$?"
         [ "$(grep -c 'FINAL RESULT PASS' "$f")" -eq 0 ]
-        check "SIG$sig $when cleanup: no PASS" "$?"
+        check "SIG$sig @$when: no PASS" "$?"
+        c="$(grep -n 'CLEANUP RUN 1' "$f" | cut -d: -f1)"
+        m="$(grep -n 'FINAL RESULT' "$f" | cut -d: -f1)"
+        [ -n "$c" ] && [ -n "$m" ] && [ "$c" -lt "$m" ]
+        check "SIG$sig @$when: the marker follows the cleanup it describes ($c < $m)" "$?"
     done
-    # The marker has to come after the cleanup it describes, even on the interrupted path.
-    c="$(grep -n 'CLEANUP RUN 1' "$WORK/sig_${sig}_during.out" | cut -d: -f1)"
-    m="$(grep -n 'FINAL RESULT FAIL' "$WORK/sig_${sig}_during.out" | cut -d: -f1)"
-    [ -n "$c" ] && [ -n "$m" ] && [ "$c" -lt "$m" ]
-    check "SIG$sig during cleanup: the marker follows the cleanup it interrupted ($c < $m)" "$?"
+    # Point 5: past the commit point the pair is fixed. Signals are masked there, so a clean run
+    # stays PASS/0 — never PASS with an interrupted status, never markerless, never two markers.
+    f="$WORK/sig_${sig}_postcommit.out"
+    bash "$G5" signal-probe "$sig" postcommit >"$f" 2>&1
+    got=$?
+    [ "$got" -eq 0 ]
+    check "SIG$sig @postcommit: the decided status survives (got $got)" "$?"
+    [ "$(grep -c 'FINAL RESULT' "$f")" -eq 1 ]
+    check "SIG$sig @postcommit: exactly one marker" "$?"
+    grep -qF 'FINAL RESULT PASS' "$f"
+    check "SIG$sig @postcommit: marker and status agree" "$?"
 done
+# A second signal may neither overwrite the first latch nor start a second give-back.
+bash "$G5" signal-probe X double >"$WORK/sig_double.out" 2>&1
+[ "$?" -eq 143 ]; check "two signals: the FIRST latched status is the one that survives" "$?"
+grep -qF 'LATCHED:TERM' "$WORK/sig_double.out"; check "and the first signal is the latched one" "$?"
+[ "$(grep -c 'CLEANUP RUN' "$WORK/sig_double.out")" -eq 1 ]
+check "and the second signal starts no second cleanup" "$?"
+[ "$(grep -c 'FINAL RESULT' "$WORK/sig_double.out")" -eq 1 ]
+check "and only one marker is emitted" "$?"
+
 ! grep -qE '^trap [a-z_]+ EXIT INT TERM' "$G5"
 check "EXIT and the signals do not share one handler" "$?"
 grep -qF 'G5_FINAL_STATE=cleaning' "$G5"
-check "finalization has an explicit in-flight state, not a boolean set too early" "$?"
+check "finalization has an explicit in-flight state" "$?"
+# `done` may only be published once the marker exists, and the commit point must mask signals.
+awk '/^emit_final\(\)/,/^}/' "$G5" >"$WORK/emit.txt"
+[ "$(grep -n "trap '' INT TERM" "$WORK/emit.txt" | cut -d: -f1)" -lt \
+  "$(grep -n 'FINAL RESULT PASS' "$WORK/emit.txt" | cut -d: -f1)" ]
+check "signals are masked before the marker is printed" "$?"
+[ "$(grep -n 'FINAL RESULT FAIL' "$WORK/emit.txt" | cut -d: -f1)" -lt \
+  "$(grep -n 'G5_FINAL_STATE=done' "$WORK/emit.txt" | cut -d: -f1)" ]
+check "«done» is published only after the marker exists" "$?"
+! grep -qE 'finalize [^|]*\|\| exit 1' "$G5"
+check "no caller replaces the finalized status with a hard-coded 1" "$?"
+
+printf '\n== 10a. the signal and trace seams are offline-only ==\n'
+awk '/^maybe_signal\(\)/,/^}/' "$G5" | grep -qF 'G5_OFFLINE" -eq 1 ] || return 0'
+check "the signal injection is refused outside an offline mode" "$?"
+awk '/^trace_step\(\)/,/^}/' "$G5" | grep -qF 'G5_OFFLINE" -eq 1 ] || return 0'
+check "the cleanup trace is refused outside an offline mode" "$?"
 
 printf '\n== 10b. the dataset list of a real run comes from zfs, not the environment ==\n'
 mkdir -p "$WORK/bin"

@@ -133,20 +133,46 @@ G5_CLEANUP_RUNS=0
 # The finalization state, explicit rather than a boolean raised before the work it describes.
 # A signal that lands BETWEEN «cleaning» and «done» still owes exactly one marker; a boolean set
 # ahead of cleanup made the EXIT handler believe the ending had already been printed.
-G5_FINAL_STATE=pending      # pending -> cleaning -> done
+G5_FINAL_STATE=pending      # pending -> cleaning -> done, and `done` means the marker EXISTS
 G5_FINAL_RC=1
 G5_SIGNAL_LATCHED=0
+G5_SIGNAL_STATUS=0
+G5_SIGNAL_NAME=""
 G5_PRESENCE=unknown
+G5_STEP_TRACE=""
 
 # Probe-only injection, reachable ONLY when G5_OFFLINE=1. A real run never consults any of these,
 # so nothing in the environment can fake a production path.
 G5_FORCE_FAIL="${G5_FORCE_FAIL:-}"
 G5_PRESENCE_SEQ="${G5_PRESENCE_SEQ:-}"
-G5_SIGNAL_DURING_CLEANUP="${G5_SIGNAL_DURING_CLEANUP:-}"
+# A space-separated list of `<point>:<SIGNAL>` pairs, so more than one signal can be delivered in
+# one run and the «first latch wins» rule is checkable.
+G5_SIGNAL_AT="${G5_SIGNAL_AT:-}"
 forced() {  # step -> 0 when this step must report failure
     [ "$G5_OFFLINE" -eq 1 ] || return 1
     case " $G5_FORCE_FAIL " in *" $1 "*) return 0 ;; esac
     return 1
+}
+
+# Which owned step was entered, in order. Probe evidence only — it records that a step was
+# ATTEMPTED and says nothing about whether it succeeded; the return values still decide that.
+trace_step() {  # name
+    [ "$G5_OFFLINE" -eq 1 ] || return 0
+    G5_STEP_TRACE="$G5_STEP_TRACE $1"
+    printf 'CLEANUP STEP %s\n' "$1"
+}
+
+# Probe-only signal injection at a named point of the ending. Offline only.
+maybe_signal() {  # point
+    [ "$G5_OFFLINE" -eq 1 ] || return 0
+    local spec sig=""
+    for spec in $G5_SIGNAL_AT; do
+        case "$spec" in "$1":*) sig="${spec#*:}" ;; esac
+    done
+    [ -n "$sig" ] || return 0
+    kill -"$sig" $$
+    # The handler runs between commands; this gives it that boundary.
+    :
 }
 
 # Whether the disposable pool is imported: present | absent | unknown.
@@ -180,6 +206,7 @@ pool_presence() {  # name
 }
 
 remove_state() {
+    trace_step remove_state
     if [ "$G5_OFFLINE" -eq 1 ]; then
         forced state && { fail "harness state $STATE could not be removed"; return 1; }
         return 0
@@ -193,6 +220,7 @@ remove_state() {
 }
 
 teardown_pool() {
+    trace_step teardown_pool
     pool_presence "$POOL"
     case "$G5_PRESENCE" in
         absent) return 0 ;;
@@ -218,6 +246,7 @@ teardown_pool() {
 # Teardown reporting success is not the same as the pool being gone, and a query that could not
 # answer is not an answer. This is the check that makes the verdict about the machine's state.
 assert_no_leftovers() {
+    trace_step assert_no_leftovers
     local rc=0
     pool_presence "$POOL"
     case "$G5_PRESENCE" in
@@ -241,34 +270,44 @@ assert_no_leftovers() {
     return $rc
 }
 
+# The give-back, attempted exactly once. All three owned steps are attempted in order even when a
+# signal arrives midway: a run that was interrupted before touching its pool has given nothing
+# back, and «entered cleanup» is not the same fact as «cleanup ran».
 cleanup_owned() {
     G5_CLEANUP_RUNS=$((G5_CLEANUP_RUNS + 1))
     printf '\nCLEANUP RUN %s\n' "$G5_CLEANUP_RUNS"
-    # Probe-only: deliver a signal from INSIDE cleanup, after the run marker, so the window
-    # between «cleaning» and «done» is exercised deterministically. Offline only.
-    if [ "$G5_OFFLINE" -eq 1 ] && [ -n "$G5_SIGNAL_DURING_CLEANUP" ]; then
-        kill -"$G5_SIGNAL_DURING_CLEANUP" $$
-        sleep 5
-    fi
+    maybe_signal entry
     local rc=0
     remove_state        || rc=1
+    maybe_signal after-step1
     teardown_pool       || rc=1
     assert_no_leftovers || rc=1
     return $rc
 }
 
-# The single marker. Nothing else prints one, and it can only be PASS when nothing failed and no
-# signal was latched.
+# The single marker, and the one commit point of the whole run.
+#
+# Everything before the mask below is interruptible, and a signal there forces FAIL with the
+# signal's own status. At the mask, cleanup is over and the process has nothing left to do but
+# print and leave, so INT and TERM are ignored from here on and are never restored: a signal can
+# no longer leave the run markerless, and it can no longer pair a PASS with an interrupted status.
+# `done` is published only once the marker actually exists.
 emit_final() {  # extra-failure-flag
-    G5_FINAL_STATE=done
+    trap '' INT TERM
+    local rc
     if [ "$G5_FAILS" -eq 0 ] && [ "$G5_SIGNAL_LATCHED" -eq 0 ] && [ "${1:-0}" -eq 0 ]; then
         printf '\nFINAL RESULT PASS\n'
-        G5_FINAL_RC=0
+        rc=0
     else
         printf '\nFINAL RESULT FAIL\n' >&2
-        G5_FINAL_RC=1
+        rc=1
+        # A latched signal owns the status: 130/143 must survive to the caller.
+        [ "$G5_SIGNAL_LATCHED" -eq 0 ] || rc="$G5_SIGNAL_STATUS"
     fi
-    return "$G5_FINAL_RC"
+    G5_FINAL_RC="$rc"
+    G5_FINAL_STATE=done
+    maybe_signal postcommit
+    return "$rc"
 }
 
 # The one ending: give back what the run owns, then say what happened. Re-entering while the
@@ -280,6 +319,7 @@ finalize() {  # extra-failure-flag
     esac
     G5_FINAL_STATE=cleaning
     cleanup_owned || true
+    maybe_signal precommit
     emit_final "${1:-0}"
 }
 
@@ -294,23 +334,32 @@ on_exit() {
     case "$G5_FINAL_STATE" in
         done) ;;
         cleaning)
-            # A signal landed inside the give-back. It is not repeated — that was the double
-            # teardown — but the run still owes exactly one marker, and it can only be a failure.
-            emit_final 1 || true
-            [ "$rc" -ne 0 ] || rc=1 ;;
+            # The give-back died mid-flight without reaching the commit point. It is not repeated
+            # — that was the double teardown — but the run still owes exactly one marker.
+            emit_final 1 || true ;;
         pending)
-            finalize 1 || true
-            [ "$rc" -ne 0 ] || rc=1 ;;
+            finalize 1 || true ;;
     esac
+    # A latched signal or a recorded failure owns the status; the trap can only strengthen it.
+    if [ "$rc" -eq 0 ] && [ "$G5_FINAL_RC" -ne 0 ]; then rc="$G5_FINAL_RC"; fi
     if [ "$rc" -eq 0 ] && [ "$G5_FAILS" -ne 0 ]; then rc=1; fi
     exit "$rc"
 }
-# Signals latch the failure and exit; the exit triggers EXIT, which ends the run exactly once.
-# Registering the same handler for EXIT and INT/TERM would run cleanup twice.
+# Signals latch the failure, its name and its status — once. A second signal cannot overwrite the
+# first, and it cannot start a second give-back.
+#
+# While the give-back is in flight the handler RETURNS instead of exiting: the three owned steps
+# still have to be attempted, exactly once, and the run still owes one marker afterwards. Exiting
+# from here is what left a cleanup that had touched nothing looking like a cleanup that ran.
 on_signal() {  # name status
-    G5_SIGNAL_LATCHED=1
-    fail "interrupted by SIG$1"
-    exit "$2"
+    if [ "$G5_SIGNAL_LATCHED" -eq 0 ]; then
+        G5_SIGNAL_LATCHED=1
+        G5_SIGNAL_NAME="$1"
+        G5_SIGNAL_STATUS="$2"
+        fail "interrupted by SIG$1"
+    fi
+    [ "$G5_FINAL_STATE" != "cleaning" ] || return 0
+    exit "$G5_SIGNAL_STATUS"
 }
 trap on_exit EXIT
 trap 'on_signal INT 130' INT
@@ -1327,8 +1376,8 @@ verdict-probe)
     # The per-scenario marker on its own, plus the finalization, so the two can be told apart.
     offline_sample_context
     scenario_verdict "${2:-probe}" "${3:-0}" || fail "scenario ${2:-probe} failed"
-    finalize "${4:-0}" || exit 1
-    exit 0
+    finalize "${4:-0}" || true
+    exit "$G5_FINAL_RC"
     ;;
 scenario-seq-probe)
     # Two sequential scenarios through the production `run()` bookkeeping. The first fails; the
@@ -1341,8 +1390,8 @@ scenario-seq-probe)
     G5_RAN=0
     run seq-a
     run seq-b
-    finalize 0 || exit 1
-    exit 0
+    finalize 0 || true
+    exit "$G5_FINAL_RC"
     ;;
 finalize-probe)
     # The finalization state machine with chosen cleanup outcomes. No mount, no zpool, no rm: the
@@ -1353,24 +1402,37 @@ finalize-probe)
     [ "${3:-0}" -eq 0 ] || fail "a scenario failed before finalization"
     shift 3 2>/dev/null || true
     G5_PRESENCE_SEQ="${*:-absent}"
-    finalize 0 || exit 1
-    exit 0
+    finalize 0 || true
+    printf 'STEP TRACE:%s\n' "$G5_STEP_TRACE"
+    exit "$G5_FINAL_RC"
     ;;
 signal-probe)
-    # Sends itself the signal and lets the production handlers run. `before` is the plain case;
-    # `during` arms the injection inside cleanup, after CLEANUP RUN 1, which is the window a
-    # prematurely-finalized state used to swallow. Nothing destructive is reachable.
+    # Sends itself the signal and lets the production handlers run, at each materially different
+    # point of the ending: before cleanup, on entry to cleanup, after the first owned step, after
+    # cleanup but before the commit point, and after it. Nothing destructive is reachable.
     offline_sample_context
-    G5_PRESENCE_SEQ="absent"
+    G5_PRESENCE_SEQ="present absent"
     case "${3:-before}" in
-        during)
-            G5_SIGNAL_DURING_CLEANUP="${2:-INT}"
-            finalize 0 || exit 1
-            exit 0 ;;
-        *)
+        before)
             kill -"${2:-INT}" $$
             sleep 5
             exit 0 ;;
+        entry|after-step1|precommit|postcommit)
+            G5_SIGNAL_AT="$3:${2:-INT}"
+            finalize 0 || true
+            printf 'STEP TRACE:%s\n' "$G5_STEP_TRACE"
+            exit "$G5_FINAL_RC" ;;
+        double)
+            # Two different signals in one run: the first latch must own the status, and the
+            # second must neither overwrite it nor start a second give-back.
+            G5_SIGNAL_AT="entry:TERM precommit:INT"
+            finalize 0 || true
+            printf 'STEP TRACE:%s\n' "$G5_STEP_TRACE"
+            printf 'LATCHED:%s\n' "$G5_SIGNAL_NAME"
+            exit "$G5_FINAL_RC" ;;
+        *)
+            printf 'ABORT: unknown signal point %s\n' "$3" >&2
+            exit 1 ;;
     esac
     ;;
 roots-probe)
@@ -1430,6 +1492,7 @@ if [ "$want" = "all" ]; then
     done
 fi
 # Finalization gives back everything this run owns BEFORE it says anything about the result, so
-# a teardown that fails cannot arrive after a printed PASS.
-finalize "$G5_SCENARIO_FAILS" || exit 1
-exit 0
+# a teardown that fails cannot arrive after a printed PASS. The status it computed is the status
+# the process leaves with — a hard-coded 1 here would erase a latched 130/143.
+finalize "$G5_SCENARIO_FAILS" || true
+exit "$G5_FINAL_RC"
