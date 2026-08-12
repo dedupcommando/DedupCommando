@@ -38,8 +38,10 @@ pub enum AppEvent {
     /// A background move batch is ready — apply to the UI: the Undo journal,
     /// the hash index, re-read the panels. The UI was not blocked during the move.
     CommanderMoveDone(Box<crate::tui::commander::move_batch::MoveBatchOutcome>),
-    /// List of saved sessions, loaded in the background.
-    SessionsReady(Vec<ResumeInfo>),
+    /// List of saved sessions, loaded in the background — or the store error that stopped it.
+    /// Result-bearing on purpose: an unopenable checkpoint must not be representable as the same
+    /// value as one that genuinely holds no sessions.
+    SessionsReady(std::result::Result<Vec<ResumeInfo>, String>),
     /// Background purge of a session from the trash finished: a heavy
     /// multi-index DELETE by `file` ran in the background so as not to hang the UI.
     SessionDeleted(std::result::Result<i64, String>),
@@ -49,10 +51,13 @@ pub enum AppEvent {
     Browse(Box<crate::state::browse::BrowseEvent>),
     /// Background session probe for F2: unfinished + the last Complete of the same
     /// roots — F2 gives an instant response, while the heavy `list_scans` runs in the background.
+    ///
+    /// `probe` is a Result because this is the destructive member of the cluster: only a real
+    /// `Ok((None, None))` — the checkpoint opened and holds no history for these roots — may be
+    /// read as permission to start a new scan. A store error must never reach that branch.
     CommanderResumeProbe {
         roots: Vec<std::path::PathBuf>,
-        unfinished: Option<ResumeInfo>,
-        complete: Option<ResumeInfo>,
+        probe: std::result::Result<(Option<ResumeInfo>, Option<ResumeInfo>), String>,
     },
     /// Diff of two scans, computed in the background.
     ScanDiffReady(Box<crate::state::move_track::DiffReport>),

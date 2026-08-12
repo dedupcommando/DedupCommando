@@ -118,6 +118,23 @@ fn main() {
     }
 }
 
+/// The classic wizard's eager session load, run on the boot thread.
+///
+/// Fail-closed by construction: the only empty list it can produce is the deliberate skip for the
+/// commander and for `--no-resume`, which load lazily or not at all. A checkpoint that refuses to
+/// open returns its own error, which travels the boot channel and becomes `run_tui`'s error — an
+/// unreadable database must never reach the operator as a wizard with no saved scans.
+fn boot_session_load(
+    db_path: &std::path::Path,
+    commander: bool,
+    no_resume: bool,
+) -> Result<Vec<model::scan::ResumeInfo>> {
+    if commander || no_resume {
+        return Ok(Vec::new());
+    }
+    ScanStore::open(db_path).and_then(|store| store.list_scans())
+}
+
 /// Interactive mode: the TUI with a background scan worker.
 fn run_tui(cli: &cli::Cli) -> Result<()> {
     // The event loop checks for an arrived signal every iteration and turns it into the same
@@ -243,14 +260,7 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
             let zfs = zfs::ZfsEnvironment::detect();
             // The host profile (CPU/RAM/disks/ZFS/inotify) — also here, in the background.
             let host = HostProfile::detect();
-            // Commander loads sessions lazily (F12); the classic wizard — immediately.
-            let sessions = if commander || no_resume {
-                Vec::new()
-            } else {
-                ScanStore::open(&db_path)
-                    .and_then(|store| store.list_scans())
-                    .unwrap_or_default()
-            };
+            let sessions = boot_session_load(&db_path, commander, no_resume);
             let _ = boot_tx.send((zfs, host, sessions));
         });
     }
@@ -282,6 +292,11 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
             }
         }
     };
+
+    // The boot session load is fail-closed: its error is the run's error. `main` prefixes it with
+    // `dedcom: error: ` and exits non-zero, so an unreadable checkpoint can never present itself
+    // as a wizard with no saved scans.
+    let sessions = sessions?;
 
     tracing::info!(
         "ZFS: version={:?}, datasets={}",
@@ -3014,5 +3029,90 @@ mod export_csv_tests {
             "a device id of 0 is a value, not corruption"
         );
         assert_eq!(zeroed.inode, "0");
+    }
+}
+
+/// The classic wizard's boot session load is fail-closed: its error becomes the run's error, so
+/// an unreadable checkpoint exits non-zero instead of presenting a wizard with no saved scans.
+#[cfg(test)]
+mod boot_session_load_is_fail_closed_tests {
+    use super::*;
+
+    const NEWER: &str = "dedcom.db was created by a newer version (schema v6; this build supports v5). Upgrade dedcom, or move the old dedcom.db aside.";
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("dedcom-bootload-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn v5_db(dir: &std::path::Path) -> std::path::PathBuf {
+        let db = dir.join("dedcom.db");
+        let store = ScanStore::open(&db).expect("the product creates its own v5 checkpoint");
+        drop(store);
+        db
+    }
+
+    fn v6_db(dir: &std::path::Path) -> std::path::PathBuf {
+        let db = v5_db(dir);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.pragma_update(None, "user_version", 6i64).unwrap();
+        drop(conn);
+        db
+    }
+
+    #[test]
+    fn a_readable_checkpoint_returns_its_real_list() {
+        let dir = scratch("ok");
+        let list = boot_session_load(&v5_db(&dir), false, false).expect("a v5 checkpoint opens");
+        assert!(list.is_empty(), "a fresh checkpoint holds no sessions yet");
+    }
+
+    #[test]
+    fn a_newer_checkpoint_returns_the_exact_error_instead_of_an_empty_list() {
+        let dir = scratch("v6");
+        let db = v6_db(&dir);
+        let before = std::fs::read(&db).unwrap();
+
+        let err = boot_session_load(&db, false, false)
+            .expect_err("a v6 checkpoint must refuse, not report zero sessions");
+
+        assert_eq!(
+            err.to_string(),
+            NEWER,
+            "the diagnostic body is the store's own, byte for byte"
+        );
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            before,
+            "the refused load wrote nothing"
+        );
+    }
+
+    #[test]
+    fn commander_and_no_resume_skip_only_this_eager_load() {
+        let dir = scratch("skip");
+        let db = v6_db(&dir);
+
+        // Both deliberately load lazily or not at all, so neither touches the store here — and
+        // that skip is the ONLY way this function can yield an empty list.
+        assert!(
+            boot_session_load(&db, true, false)
+                .expect("commander skips")
+                .is_empty(),
+            "commander loads sessions lazily at F12"
+        );
+        assert!(
+            boot_session_load(&db, false, true)
+                .expect("--no-resume skips")
+                .is_empty(),
+            "--no-resume asks for no session list"
+        );
+        // Their later operations are governed by the F12 route, which fails closed on the same DB.
+        assert!(
+            boot_session_load(&db, false, false).is_err(),
+            "and the classic route still refuses the same checkpoint"
+        );
     }
 }

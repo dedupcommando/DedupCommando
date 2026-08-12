@@ -878,11 +878,18 @@ impl App {
                     self.request_shutdown(false);
                 }
             }
-            AppEvent::SessionsReady(list) => {
+            AppEvent::SessionsReady(Ok(list)) => {
                 self.sessions = list;
                 self.sessions_loading = false;
                 self.sessions_loaded = true;
                 self.session_cursor = 0;
+            }
+            // The checkpoint could not be opened or read. Nothing is installed: the previous list
+            // and cursor stand, the load is NOT marked successful, and the store's own words are
+            // what the operator sees. An empty list here would be a fabricated answer.
+            AppEvent::SessionsReady(Err(err)) => {
+                self.sessions_loading = false;
+                self.status = err;
             }
             AppEvent::SessionDeleted(result) => {
                 self.purge_pending = self.purge_pending.saturating_sub(1);
@@ -895,20 +902,20 @@ impl App {
                     self.request_shutdown(false);
                 }
             }
-            AppEvent::CommanderResumeProbe {
-                roots,
-                unfinished,
-                complete,
-            } => {
-                if unfinished.is_none() && complete.is_none() {
-                    self.commander_scan_new(roots);
-                } else {
+            AppEvent::CommanderResumeProbe { roots, probe } => match probe {
+                // Only a checkpoint that actually opened and holds no history for these roots is
+                // permission to start scanning.
+                Ok((None, None)) => self.commander_scan_new(roots),
+                Ok((unfinished, complete)) => {
                     self.commander.resume_unfinished = unfinished;
                     self.commander.resume_complete = complete;
                     self.commander.pending_scan_roots = roots;
                     self.commander.overlay = crate::tui::commander::state::Overlay::ResumeScan;
                 }
-            }
+                // The store refused. No worker starts, no pending roots, no resume choice and no
+                // overlay change — a database we could not read is not a database without history.
+                Err(err) => self.commander.status = err,
+            },
             AppEvent::ScanDiffReady(report) => {
                 self.scan_diff.report = Some(*report);
                 self.scan_diff.loading = false;
@@ -3797,16 +3804,22 @@ impl App {
 
     /// `t` on the sessions screen: open the trash.
     fn open_trash(&mut self) {
-        self.trashed = ScanStore::open(&self.db_path)
-            .and_then(|store| store.list_trashed())
-            .unwrap_or_default();
-        self.trash_cursor = 0;
-        self.screen = Screen::Trash;
-        self.status = if self.trashed.is_empty() {
-            "Trash is empty · Esc back".to_string()
-        } else {
-            "Trash · R restore · Del purge forever · Esc back".to_string()
-        };
+        // A checkpoint that will not open says nothing about what the trash holds. On refusal the
+        // previous trash data, cursor and screen stand and the store's words are shown — printing
+        // «Trash is empty» here would answer a question the database never answered.
+        match ScanStore::open(&self.db_path).and_then(|store| store.list_trashed()) {
+            Ok(trashed) => {
+                self.trashed = trashed;
+                self.trash_cursor = 0;
+                self.screen = Screen::Trash;
+                self.status = if self.trashed.is_empty() {
+                    "Trash is empty · Esc back".to_string()
+                } else {
+                    "Trash · R restore · Del purge forever · Esc back".to_string()
+                };
+            }
+            Err(err) => self.status = err.to_string(),
+        }
     }
 
     fn on_key_trash(&mut self, key: KeyEvent) {
@@ -5018,10 +5031,10 @@ impl App {
         let db_path = self.db_path.clone();
         let events = self.events.clone();
         std::thread::spawn(move || {
-            let list = ScanStore::open(&db_path)
+            let outcome = ScanStore::open(&db_path)
                 .and_then(|store| store.list_scans())
-                .unwrap_or_default();
-            let _ = events.send(AppEvent::SessionsReady(list));
+                .map_err(|err| err.to_string());
+            let _ = events.send(AppEvent::SessionsReady(outcome));
         });
     }
 
@@ -5043,14 +5056,10 @@ impl App {
         let db_path = self.db_path.clone();
         let events = self.events.clone();
         std::thread::spawn(move || {
-            let (unfinished, complete) = ScanStore::open(&db_path)
+            let probe = ScanStore::open(&db_path)
                 .and_then(|store| store.resume_probe_for_roots(&roots))
-                .unwrap_or((None, None));
-            let _ = events.send(AppEvent::CommanderResumeProbe {
-                roots,
-                unfinished,
-                complete,
-            });
+                .map_err(|err| err.to_string());
+            let _ = events.send(AppEvent::CommanderResumeProbe { roots, probe });
         });
     }
 
@@ -6913,6 +6922,296 @@ mod group_list_navigation_tests {
             app.browser.dir_group_state.selected(),
             Some(17),
             "18 rows inside the borders, one row a group"
+        );
+    }
+}
+
+/// A refused session store may never become successful empty data, and may never become
+/// permission to start a scan. Four routes used to erase `ScanStore::open` errors; these tests
+/// drive the production handlers through the real event channel and hold each one fail-closed.
+#[cfg(test)]
+mod session_store_failures_are_never_empty_data_tests {
+    use super::*;
+
+    const NEWER: &str = "dedcom.db was created by a newer version (schema v6; this build supports v5). Upgrade dedcom, or move the old dedcom.db aside.";
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dedcom-failclosed-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A real v5 checkpoint the product itself created and migrated.
+    fn v5_db(dir: &std::path::Path) -> PathBuf {
+        let db = dir.join("dedcom.db");
+        let store = ScanStore::open(&db).expect("the product creates its own v5 checkpoint");
+        drop(store);
+        db
+    }
+
+    /// The same checkpoint stamped one version into the future. The error under test is the
+    /// product's own newer-schema refusal, not a hand-written string.
+    fn v6_db(dir: &std::path::Path) -> PathBuf {
+        let db = v5_db(dir);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.pragma_update(None, "user_version", 6i64).unwrap();
+        drop(conn);
+        db
+    }
+
+    /// Everything a refusal must leave exactly as it was.
+    fn census(db: &std::path::Path) -> (Vec<u8>, i64, Vec<String>) {
+        let bytes = std::fs::read(db).unwrap();
+        let version: i64 = rusqlite::Connection::open(db)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        let mut siblings: Vec<String> = std::fs::read_dir(db.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n != "dedcom.db")
+            .collect();
+        siblings.sort();
+        (bytes, version, siblings)
+    }
+
+    fn pump(rx: &crossbeam_channel::Receiver<AppEvent>) -> AppEvent {
+        rx.recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the background job must deliver its real event")
+    }
+
+    // ------------------------------------------------------------------ F12 / session list
+
+    #[test]
+    fn f12_installs_the_real_list_when_the_store_opens() {
+        let dir = scratch("f12-ok");
+        let (mut app, rx) = test_app_with_db(v5_db(&dir));
+        app.spawn_sessions_load();
+        app.handle_event(pump(&rx));
+
+        assert!(app.sessions_loaded, "a real answer marks the load done");
+        assert!(!app.sessions_loading);
+        assert_eq!(app.session_cursor, 0);
+    }
+
+    #[test]
+    fn f12_refusal_shows_the_exact_error_and_installs_nothing() {
+        let dir = scratch("f12-v6");
+        let db = v6_db(&dir);
+        let before = census(&db);
+        let (mut app, rx) = test_app_with_db(db.clone());
+
+        // A list and a cursor that must survive the refusal untouched.
+        app.sessions = vec![ResumeInfo {
+            scan_id: 41,
+            created_at: "2026-08-13 00:00:00".to_string(),
+            status: crate::model::scan::ScanStatus::Complete,
+            roots: vec![PathBuf::from("/tank/kept")],
+            files_total: 1,
+            files_hashed: 1,
+            cand_bytes_total: 1,
+            cand_bytes_hashed: 1,
+            files_scanned: 1,
+            reclaim: crate::model::reclaim::ReclaimEstimate::unknown(),
+            already_linked_sets: None,
+        }];
+        app.session_cursor = 0;
+        let kept = app.sessions.len();
+
+        app.spawn_sessions_load();
+        app.handle_event(pump(&rx));
+
+        assert_eq!(
+            app.status, NEWER,
+            "the store's own words reach the operator"
+        );
+        assert!(!app.sessions_loading, "the spinner is cleared");
+        assert!(
+            !app.sessions_loaded,
+            "a refusal is not a successful load - F12 may be retried"
+        );
+        assert_eq!(
+            app.sessions.len(),
+            kept,
+            "the previous list is not replaced"
+        );
+        assert_eq!(app.session_cursor, 0, "and neither is the cursor");
+        assert!(app.scan.is_none(), "no scan is opened, selected or created");
+        assert_eq!(
+            census(&db),
+            before,
+            "bytes, user_version and the sidecar census are untouched"
+        );
+    }
+
+    // ------------------------------------------------------------------ F2 / resume probe
+
+    #[test]
+    fn f2_starts_a_new_scan_only_on_a_real_empty_history() {
+        let dir = scratch("f2-ok");
+        let roots = scratch("f2-ok-root");
+        std::fs::write(roots.join("a.bin"), b"a").unwrap();
+        let (mut app, _rx) = test_app_with_db(v5_db(&dir));
+
+        app.handle_event(AppEvent::CommanderResumeProbe {
+            roots: vec![roots],
+            probe: Ok((None, None)),
+        });
+
+        assert_eq!(app.screen, Screen::Scanning, "Ok((None,None)) still scans");
+        assert!(app.scan.is_some(), "and the worker really started");
+    }
+
+    #[test]
+    fn f2_refusal_starts_no_worker_and_moves_no_resume_state() {
+        let dir = scratch("f2-v6");
+        let roots = scratch("f2-v6-root");
+        std::fs::write(roots.join("a.bin"), b"a").unwrap();
+        let db = v6_db(&dir);
+        let before = census(&db);
+        let (mut app, rx) = test_app_with_db(db.clone());
+        let screen_before = app.screen;
+
+        app.commander_scan(vec![roots]);
+        app.handle_event(pump(&rx));
+
+        assert_eq!(
+            app.commander.status, NEWER,
+            "the store's own words are shown"
+        );
+        assert!(
+            app.scan.is_none(),
+            "a refused open never starts a scan worker"
+        );
+        assert_eq!(app.screen, screen_before, "the screen does not move");
+        assert!(
+            app.commander.pending_scan_roots.is_empty(),
+            "no pending roots are recorded"
+        );
+        assert!(app.commander.resume_unfinished.is_none());
+        assert!(app.commander.resume_complete.is_none());
+        assert!(
+            !matches!(
+                app.commander.overlay,
+                crate::tui::commander::state::Overlay::ResumeScan
+            ),
+            "no resume overlay is raised on a refusal"
+        );
+        assert_eq!(
+            census(&db),
+            before,
+            "the filesystem and database are unchanged"
+        );
+    }
+
+    // ------------------------------------------------------------------ t / trash
+
+    #[test]
+    fn trash_opens_the_real_list_when_the_store_opens() {
+        let dir = scratch("trash-ok");
+        let (mut app, _rx) = test_app_with_db(v5_db(&dir));
+        app.open_trash();
+        assert_eq!(app.screen, Screen::Trash);
+        assert!(app.status.contains("Trash"), "status: {}", app.status);
+    }
+
+    #[test]
+    fn trash_refusal_never_prints_an_empty_trash() {
+        let dir = scratch("trash-v6");
+        let db = v6_db(&dir);
+        let before = census(&db);
+        let (mut app, _rx) = test_app_with_db(db.clone());
+        let screen_before = app.screen;
+        app.trash_cursor = 0;
+
+        app.open_trash();
+
+        assert_eq!(
+            app.status, NEWER,
+            "the store's own words reach the operator"
+        );
+        assert!(
+            !app.status.contains("Trash is empty"),
+            "an unreadable checkpoint says nothing about what the trash holds"
+        );
+        assert_eq!(
+            app.screen, screen_before,
+            "the screen does not move to the trash"
+        );
+        assert!(app.trashed.is_empty(), "no fabricated rows were installed");
+        assert_eq!(app.trash_cursor, 0);
+        assert_eq!(
+            census(&db),
+            before,
+            "bytes, user_version and the sidecar census are untouched"
+        );
+    }
+
+    // ------------------------------------------------------------------ structural inventory
+
+    /// The four accepted routes may not end in an erasing default. Deliberately narrow: it names
+    /// those four store expressions and does not ban option defaults elsewhere, which express
+    /// real optional values (a missing lock holder, an unopened group).
+    #[test]
+    fn no_session_store_open_ends_in_an_erasing_default() {
+        // Scan the PRODUCTION half only: this module quotes the forbidden expressions as string
+        // literals, so including itself would make the test fail against its own text.
+        let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let production = |src: &'static str, marker: &str| {
+            let cut = src
+                .split(marker)
+                .next()
+                .expect("the file has a production half");
+            squash(cut)
+        };
+        let app_flat = production(
+            include_str!("app.rs"),
+            "mod session_store_failures_are_never_empty_data_tests",
+        );
+        let main_flat = production(
+            include_str!("main.rs"),
+            "mod boot_session_load_is_fail_closed_tests",
+        );
+
+        let erasures = [
+            (
+                "classic boot",
+                &main_flat,
+                ".and_then(|store| store.list_scans()) .unwrap_or_default()",
+            ),
+            (
+                "F12 session load",
+                &app_flat,
+                ".and_then(|store| store.list_scans()) .unwrap_or_default()",
+            ),
+            (
+                "F2 resume probe",
+                &app_flat,
+                ".and_then(|store| store.resume_probe_for_roots(&roots)) .unwrap_or((None, None))",
+            ),
+            (
+                "trash list",
+                &app_flat,
+                ".and_then(|store| store.list_trashed()) .unwrap_or_default()",
+            ),
+        ];
+        for (label, flat, needle) in erasures {
+            assert!(
+                !flat.contains(needle),
+                "{label}: a session-store open still ends in an erasing default"
+            );
+        }
+
+        // The honest defaults elsewhere are untouched, so this test cannot be satisfied by
+        // deleting every `unwrap_or_default` in the crate.
+        assert!(
+            app_flat.contains(".map(|open| open.files.clone()) .unwrap_or_default()"),
+            "the open-group rows keep their real optional default"
+        );
+        assert!(
+            main_flat.contains("h.pid, h.since)) .unwrap_or_default()"),
+            "the lock-holder description keeps its real optional default"
         );
     }
 }
