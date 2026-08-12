@@ -390,6 +390,11 @@ pub struct App {
     pub sessions_loading: bool,
     /// The session list is already loaded — don't start loading again.
     pub sessions_loaded: bool,
+    /// The refusal THIS session-load lifecycle put on screen, owned so a later success of the
+    /// same lifecycle can take it back. Ownership rather than a string prefix: an automatic
+    /// refresh must clear its own error and nothing else, and a status some other operation
+    /// installed afterwards is not ours to erase.
+    pub session_load_error: Option<String>,
     pub scanning: ScanningState,
     /// State of the action-application screen (background worker).
     pub applying: ApplyingState,
@@ -743,6 +748,7 @@ impl App {
             session_cursor: 0,
             sessions_loading: false,
             sessions_loaded: matches!(mode, AppMode::Wizard),
+            session_load_error: None,
             scanning: ScanningState::default(),
             applying: ApplyingState::default(),
             scan_diff: ScanDiffState::default(),
@@ -883,13 +889,22 @@ impl App {
                 self.sessions_loading = false;
                 self.sessions_loaded = true;
                 self.session_cursor = 0;
+                // Take back the refusal this lifecycle installed — but only if it is still the
+                // one on screen. Clearing unconditionally would swallow a scan's own status
+                // whenever the session list refreshed behind it.
+                if let Some(owned) = self.session_load_error.take() {
+                    if self.status == owned {
+                        self.status.clear();
+                    }
+                }
             }
             // The checkpoint could not be opened or read. Nothing is installed: the previous list
             // and cursor stand, the load is NOT marked successful, and the store's own words are
             // what the operator sees. An empty list here would be a fabricated answer.
             AppEvent::SessionsReady(Err(err)) => {
                 self.sessions_loading = false;
-                self.status = err;
+                self.status = err.clone();
+                self.session_load_error = Some(err);
             }
             AppEvent::SessionDeleted(result) => {
                 self.purge_pending = self.purge_pending.saturating_sub(1);
@@ -6935,11 +6950,30 @@ mod session_store_failures_are_never_empty_data_tests {
 
     const NEWER: &str = "dedcom.db was created by a newer version (schema v6; this build supports v5). Upgrade dedcom, or move the old dedcom.db aside.";
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("dedcom-failclosed-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A scratch directory that removes itself when the test returns: a green test may not leave
+    /// a persistent fixture behind merely because the cargo process eventually exits.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("dedcom-failclosed-{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(name: &str) -> Scratch {
+        Scratch::new(name)
     }
 
     /// A real v5 checkpoint the product itself created and migrated.
@@ -6960,20 +6994,35 @@ mod session_store_failures_are_never_empty_data_tests {
         db
     }
 
-    /// Everything a refusal must leave exactly as it was.
-    fn census(db: &std::path::Path) -> (Vec<u8>, i64, Vec<String>) {
+    /// Everything a refusal must leave exactly as it was: exact bytes, the filesystem mtime at
+    /// the platform's full precision, `user_version`, and the sibling census.
+    ///
+    /// The observation must not disturb what it observes. Metadata is taken BEFORE any inspection
+    /// connection is opened, the connection is closed, and the same metadata is then re-read and
+    /// required to match — so a census that itself touched the file cannot pass.
+    fn census(db: &std::path::Path) -> (Vec<u8>, std::time::SystemTime, i64, Vec<String>) {
         let bytes = std::fs::read(db).unwrap();
-        let version: i64 = rusqlite::Connection::open(db)
-            .unwrap()
+        let before = std::fs::metadata(db).unwrap().modified().unwrap();
+
+        let conn = rusqlite::Connection::open(db).unwrap();
+        let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
+        drop(conn);
+
+        let after = std::fs::metadata(db).unwrap().modified().unwrap();
+        assert_eq!(
+            before, after,
+            "the census helper itself must not modify the checkpoint"
+        );
+
         let mut siblings: Vec<String> = std::fs::read_dir(db.parent().unwrap())
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
             .filter(|n| n != "dedcom.db")
             .collect();
         siblings.sort();
-        (bytes, version, siblings)
+        (bytes, after, version, siblings)
     }
 
     fn pump(rx: &crossbeam_channel::Receiver<AppEvent>) -> AppEvent {
@@ -6986,7 +7035,7 @@ mod session_store_failures_are_never_empty_data_tests {
     #[test]
     fn f12_installs_the_real_list_when_the_store_opens() {
         let dir = scratch("f12-ok");
-        let (mut app, rx) = test_app_with_db(v5_db(&dir));
+        let (mut app, rx) = test_app_with_db(v5_db(dir.path()));
         app.spawn_sessions_load();
         app.handle_event(pump(&rx));
 
@@ -6998,7 +7047,7 @@ mod session_store_failures_are_never_empty_data_tests {
     #[test]
     fn f12_refusal_shows_the_exact_error_and_installs_nothing() {
         let dir = scratch("f12-v6");
-        let db = v6_db(&dir);
+        let db = v6_db(dir.path());
         let before = census(&db);
         let (mut app, rx) = test_app_with_db(db.clone());
 
@@ -7051,29 +7100,51 @@ mod session_store_failures_are_never_empty_data_tests {
     fn f2_starts_a_new_scan_only_on_a_real_empty_history() {
         let dir = scratch("f2-ok");
         let roots = scratch("f2-ok-root");
-        std::fs::write(roots.join("a.bin"), b"a").unwrap();
-        let (mut app, _rx) = test_app_with_db(v5_db(&dir));
+        std::fs::write(roots.path().join("a.bin"), b"a").unwrap();
+        let (mut app, rx) = test_app_with_db(v5_db(dir.path()));
 
         app.handle_event(AppEvent::CommanderResumeProbe {
-            roots: vec![roots],
+            roots: vec![roots.path().to_path_buf()],
             probe: Ok((None, None)),
         });
 
         assert_eq!(app.screen, Screen::Scanning, "Ok((None,None)) still scans");
         assert!(app.scan.is_some(), "and the worker really started");
+
+        // The worker is production's and owes us a terminal event. Wait for the real
+        // `ScanFinished` with a bounded timeout, dispatching the progress events production
+        // dispatches, and settle it BEFORE returning: a test may not leave a live worker running,
+        // and the fixture may not be removed from under it. No sleep, no detached thread, no
+        // reliance on the cargo process exiting.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let mut finished = false;
+        while !finished && std::time::Instant::now() < deadline {
+            let Ok(event) = rx.recv_timeout(std::time::Duration::from_secs(10)) else {
+                break;
+            };
+            finished = matches!(event, AppEvent::ScanFinished(_));
+            app.handle_event(event);
+        }
+
+        assert!(finished, "the real ScanFinished event must arrive");
+        assert!(
+            app.scan.is_none(),
+            "the worker is settled before the test returns"
+        );
+        // Only now may the guards remove the roots and the state directory.
     }
 
     #[test]
     fn f2_refusal_starts_no_worker_and_moves_no_resume_state() {
         let dir = scratch("f2-v6");
         let roots = scratch("f2-v6-root");
-        std::fs::write(roots.join("a.bin"), b"a").unwrap();
-        let db = v6_db(&dir);
+        std::fs::write(roots.path().join("a.bin"), b"a").unwrap();
+        let db = v6_db(dir.path());
         let before = census(&db);
         let (mut app, rx) = test_app_with_db(db.clone());
         let screen_before = app.screen;
 
-        app.commander_scan(vec![roots]);
+        app.commander_scan(vec![roots.path().to_path_buf()]);
         app.handle_event(pump(&rx));
 
         assert_eq!(
@@ -7110,7 +7181,7 @@ mod session_store_failures_are_never_empty_data_tests {
     #[test]
     fn trash_opens_the_real_list_when_the_store_opens() {
         let dir = scratch("trash-ok");
-        let (mut app, _rx) = test_app_with_db(v5_db(&dir));
+        let (mut app, _rx) = test_app_with_db(v5_db(dir.path()));
         app.open_trash();
         assert_eq!(app.screen, Screen::Trash);
         assert!(app.status.contains("Trash"), "status: {}", app.status);
@@ -7119,7 +7190,7 @@ mod session_store_failures_are_never_empty_data_tests {
     #[test]
     fn trash_refusal_never_prints_an_empty_trash() {
         let dir = scratch("trash-v6");
-        let db = v6_db(&dir);
+        let db = v6_db(dir.path());
         let before = census(&db);
         let (mut app, _rx) = test_app_with_db(db.clone());
         let screen_before = app.screen;
@@ -7212,6 +7283,167 @@ mod session_store_failures_are_never_empty_data_tests {
         assert!(
             main_flat.contains("h.pid, h.since)) .unwrap_or_default()"),
             "the lock-holder description keeps its real optional default"
+        );
+    }
+}
+
+/// F12 recovery: a refusal must be shown, and must disappear when — and only when — the same
+/// session-load lifecycle later succeeds. It must never outlive its own cause, and it must never
+/// swallow an unrelated status that some other operation installed afterwards.
+#[cfg(test)]
+mod session_load_error_ownership_tests {
+    use super::*;
+
+    const NEWER: &str = "dedcom.db was created by a newer version (schema v6; this build supports v5). Upgrade dedcom, or move the old dedcom.db aside.";
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("dedcom-f12recovery-{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A real v5 checkpoint the product created and migrated, with every connection closed.
+    fn make_v5(db: &std::path::Path) {
+        let store = ScanStore::open(db).expect("the product creates its own v5 checkpoint");
+        drop(store);
+        for suffix in ["-wal", "-shm"] {
+            let mut side = db.as_os_str().to_owned();
+            side.push(suffix);
+            assert!(
+                !std::path::Path::new(&side).exists(),
+                "the checkpoint must be self-contained: {suffix} is present"
+            );
+        }
+    }
+
+    fn stamp_v6(db: &std::path::Path) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.pragma_update(None, "user_version", 6i64).unwrap();
+        drop(conn);
+    }
+
+    fn pump(rx: &crossbeam_channel::Receiver<AppEvent>) -> AppEvent {
+        rx.recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the background job must deliver its real event")
+    }
+
+    /// Drives one full F12 session load and dispatches whatever the production thread sent.
+    fn f12(app: &mut App, rx: &crossbeam_channel::Receiver<AppEvent>) {
+        app.spawn_sessions_load();
+        let event = pump(rx);
+        app.handle_event(event);
+    }
+
+    #[test]
+    fn a_repaired_checkpoint_clears_the_refusal_it_caused() {
+        let scratch = Scratch::new("clears");
+        let db = scratch.path().join("dedcom.db");
+        make_v5(&db);
+        stamp_v6(&db);
+        let (mut app, rx) = test_app_with_db(db.clone());
+
+        // 1. the refusal is visible and installs nothing
+        f12(&mut app, &rx);
+        assert_eq!(app.status, NEWER, "the exact store error is shown");
+        assert!(!app.sessions_loaded, "a refusal is not a successful load");
+
+        // 2. the operator repairs the checkpoint in place: a complete valid v5 at the SAME path,
+        //    written with no connection attached and no WAL/SHM left behind.
+        std::fs::remove_file(&db).unwrap();
+        make_v5(&db);
+        let version: i64 = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 5, "the replacement really is a v5 checkpoint");
+
+        // 3. an EXPLICIT retry — no automatic loop exists to do it for us
+        f12(&mut app, &rx);
+
+        assert!(app.sessions_loaded, "the retry really succeeded");
+        assert_ne!(
+            app.status, NEWER,
+            "the sessions screen must not present real data beside a stale refusal"
+        );
+        assert!(
+            app.status.is_empty(),
+            "the owned error is consumed, not merely overwritten: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_later_unrelated_status_survives_the_retry() {
+        let scratch = Scratch::new("unrelated");
+        let db = scratch.path().join("dedcom.db");
+        make_v5(&db);
+        stamp_v6(&db);
+        let (mut app, rx) = test_app_with_db(db.clone());
+
+        f12(&mut app, &rx);
+        assert_eq!(app.status, NEWER);
+
+        // Something else speaks after the refusal — an automatic refresh must not erase it.
+        let unrelated = "Scan finished: 12 groups".to_string();
+        app.status = unrelated.clone();
+
+        std::fs::remove_file(&db).unwrap();
+        make_v5(&db);
+        f12(&mut app, &rx);
+
+        assert!(app.sessions_loaded, "the load still succeeded");
+        assert_eq!(
+            app.status, unrelated,
+            "a successful session load clears only the error it owns"
+        );
+    }
+
+    #[test]
+    fn a_second_refusal_replaces_the_owned_error_rather_than_losing_it() {
+        let scratch = Scratch::new("replaces");
+        let db = scratch.path().join("dedcom.db");
+        make_v5(&db);
+        stamp_v6(&db);
+        let (mut app, rx) = test_app_with_db(db.clone());
+
+        f12(&mut app, &rx);
+        assert_eq!(app.status, NEWER);
+
+        // A different refusal from the same route: the checkpoint is gone entirely.
+        std::fs::remove_file(&db).unwrap();
+        std::fs::create_dir(&db).unwrap(); // a directory where the DB should be
+        f12(&mut app, &rx);
+
+        assert!(!app.sessions_loaded, "still no successful load");
+        assert!(!app.status.is_empty(), "the newest refusal is shown");
+        assert_ne!(
+            app.status, NEWER,
+            "the newest exact store error replaces the previous one"
+        );
+
+        // And that newest error is the one a later success consumes.
+        std::fs::remove_dir(&db).unwrap();
+        make_v5(&db);
+        f12(&mut app, &rx);
+        assert!(app.sessions_loaded);
+        assert!(
+            app.status.is_empty(),
+            "the replaced error is still owned, and success consumes it: {:?}",
+            app.status
         );
     }
 }

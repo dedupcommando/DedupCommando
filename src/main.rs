@@ -3062,6 +3062,34 @@ mod boot_session_load_is_fail_closed_tests {
         db
     }
 
+    /// Exact bytes, mtime at the platform's full precision, `user_version` and the sibling
+    /// census. Metadata is taken before the inspection connection and re-verified after it, so a
+    /// census that disturbed the file cannot pass.
+    fn census(db: &std::path::Path) -> (Vec<u8>, std::time::SystemTime, i64, Vec<String>) {
+        let bytes = std::fs::read(db).unwrap();
+        let before = std::fs::metadata(db).unwrap().modified().unwrap();
+
+        let conn = rusqlite::Connection::open(db).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+
+        let after = std::fs::metadata(db).unwrap().modified().unwrap();
+        assert_eq!(
+            before, after,
+            "the census helper itself must not modify the checkpoint"
+        );
+
+        let mut siblings: Vec<String> = std::fs::read_dir(db.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n != "dedcom.db")
+            .collect();
+        siblings.sort();
+        (bytes, after, version, siblings)
+    }
+
     #[test]
     fn a_readable_checkpoint_returns_its_real_list() {
         let dir = scratch("ok");
@@ -3073,7 +3101,7 @@ mod boot_session_load_is_fail_closed_tests {
     fn a_newer_checkpoint_returns_the_exact_error_instead_of_an_empty_list() {
         let dir = scratch("v6");
         let db = v6_db(&dir);
-        let before = std::fs::read(&db).unwrap();
+        let before = census(&db);
 
         let err = boot_session_load(&db, false, false)
             .expect_err("a v6 checkpoint must refuse, not report zero sessions");
@@ -3084,9 +3112,9 @@ mod boot_session_load_is_fail_closed_tests {
             "the diagnostic body is the store's own, byte for byte"
         );
         assert_eq!(
-            std::fs::read(&db).unwrap(),
+            census(&db),
             before,
-            "the refused load wrote nothing"
+            "bytes, mtime, user_version and the sidecar census are untouched"
         );
     }
 
