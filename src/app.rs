@@ -5055,8 +5055,13 @@ impl App {
         }
         self.sessions_loading = true;
         // Claim the next request number. Any reply still in flight from an earlier request is
-        // stale by construction, and the handler drops it whole.
-        self.session_load_generation = self.session_load_generation.wrapping_add(1);
+        // stale by construction, and the handler drops it whole. Checked, not wrapping: a reused
+        // number would make a superseded reply look current again, which is the very confusion
+        // this counter exists to remove. Same discipline as the browsing activation counter.
+        self.session_load_generation = self
+            .session_load_generation
+            .checked_add(1)
+            .expect("the session-load request counter is exhausted — restart dedcom");
         let generation = self.session_load_generation;
         let db_path = self.db_path.clone();
         let events = self.events.clone();
@@ -7162,9 +7167,34 @@ mod session_store_failures_are_never_empty_data_tests {
         pump_until(&mut app, &rx, "the superseded session refresh", |a| {
             !a.sessions_loading
         });
-        drain(&mut app, &rx);
+        // Every browsing route the finish fanned out is settled by event, not by a single sweep.
+        pump_until(&mut app, &rx, "the browsing routes", |a| {
+            !a.browse.terminal_owed() || a.browse.phase() == crate::state::browse::FleetPhase::Live
+        });
         app.request_shutdown(false);
-        drain(&mut app, &rx);
+        // The actor's terminal is owed, so this is a wait for something that is coming — not a
+        // sweep of whatever happens to be queued. A single `drain` returns long before it lands.
+        pump_until(&mut app, &rx, "the actor's terminal", |a| {
+            a.should_quit
+                && matches!(a.shutdown, ShutdownStage::Done)
+                && a.browse.phase() == crate::state::browse::FleetPhase::Idle
+                && !a.browse.terminal_owed()
+        });
+
+        assert!(app.should_quit, "the application reached its exit");
+        assert!(
+            matches!(app.shutdown, ShutdownStage::Done),
+            "shutdown is Done"
+        );
+        assert_eq!(
+            app.browse.phase(),
+            crate::state::browse::FleetPhase::Idle,
+            "the browsing fleet is idle"
+        );
+        assert!(
+            !app.browse.terminal_owed(),
+            "and nobody still owes a terminal"
+        );
         assert!(
             !app.sessions_loading,
             "no session load may still be reading the checkpoint"
@@ -7534,19 +7564,24 @@ mod session_load_request_scoping_tests {
             .expect("an accepted request owes exactly one reply")
     }
 
-    /// Two loads really are reachable without inventing state by hand: `supersede_sessions_load`
-    /// is what `on_finished` and `restore_selected_trash` call, and it abandons a load already in
-    /// flight to ask again. Returns (stale reply, fresh reply) — both real, both from production
-    /// threads, held so the test can dispatch them in either order.
+    /// Two loads really are reachable without inventing state by hand. A scan finishing is the
+    /// production transition: `on_finished` abandons the list and asks again. The test dispatches
+    /// the real `ScanFinished` event and lets the handler do it, rather than calling
+    /// `supersede_sessions_load` itself — so deleting that call from `on_finished` fails here.
+    ///
+    /// Returns (stale reply, fresh reply): both real, both from production threads, held so the
+    /// test can dispatch them in either order.
     fn two_real_replies_in_flight(
         app: &mut App,
         rx: &crossbeam_channel::Receiver<AppEvent>,
     ) -> (AppEvent, AppEvent) {
         app.spawn_sessions_load();
         let first = take(rx);
-        // The screen is still waiting for `first` when a new fact abandons it. This is the
-        // production transition, not a hand-set flag.
-        app.supersede_sessions_load();
+        // The screen is still waiting for `first` when a scan finishes. Nothing here touches the
+        // session-load state directly; `on_finished` is what supersedes it.
+        app.handle_event(AppEvent::ScanFinished(Err(
+            "scan stopped for this test".to_string()
+        )));
         let second = take(rx);
 
         let (
@@ -7554,7 +7589,7 @@ mod session_load_request_scoping_tests {
             AppEvent::SessionsReady { generation: g2, .. },
         ) = (&first, &second)
         else {
-            panic!("both replies must be session loads");
+            panic!("a finished scan must have asked for the session list again");
         };
         assert!(g2 > g1, "the superseding request takes a later number");
         assert_eq!(
@@ -7564,12 +7599,71 @@ mod session_load_request_scoping_tests {
         (first, second)
     }
 
+    /// An exhausted counter must stop the request, not silently reuse a number. Nothing may be
+    /// spawned or sent before the panic: a reply carrying a reused generation would be accepted
+    /// as current, which is exactly the confusion the counter removes.
+    #[test]
+    fn an_exhausted_request_counter_panics_before_anything_is_started() {
+        let scratch = Scratch::new("exhausted");
+        let db = v5(scratch.path());
+        let (mut app, rx) = test_app_with_db(db);
+        app.session_load_generation = u64::MAX;
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            app.spawn_sessions_load();
+        }));
+
+        assert!(outcome.is_err(), "a wrapping counter would have carried on");
+        assert!(
+            rx.try_recv().is_err(),
+            "no event may exist: the claim is taken before any thread is spawned"
+        );
+        assert_eq!(
+            app.session_load_generation,
+            u64::MAX,
+            "and no number was reused"
+        );
+    }
+
+    /// `restore_selected_trash` must supersede too. Structural and deliberately narrow: it reads
+    /// only that function's body out of the PRODUCTION half of this file, so deleting the call
+    /// fails here while unrelated code is untouched.
+    #[test]
+    fn restore_selected_trash_supersedes_the_session_load() {
+        let src = include_str!("app.rs");
+        let production = src
+            .split("mod session_store_failures_are_never_empty_data_tests")
+            .next()
+            .expect("the file has a production half");
+        let start = production
+            .find("    fn restore_selected_trash(&mut self) {")
+            .expect("restore_selected_trash exists");
+        let body = &production[start..];
+        let end = body.find("\n    }\n").expect("its body ends") + start;
+        let body = &production[start..end];
+
+        assert!(
+            body.contains("self.supersede_sessions_load();"),
+            "restoring a session leaves the list stale — it must supersede the load in flight"
+        );
+        assert!(
+            !body.contains("self.spawn_sessions_load();"),
+            "and must not spawn a second, indistinguishable load beside the one in flight"
+        );
+    }
+
     #[test]
     fn a_stale_error_cannot_undo_the_new_success() {
         let scratch = Scratch::new("stale-err");
         let db = v5(scratch.path());
         let (mut app, rx) = test_app_with_db(db);
         let (stale, fresh) = two_real_replies_in_flight(&mut app, &rx);
+        // The finished scan spoke; that status is nobody else's to touch.
+        let after_scan = app.status.clone();
+        assert!(
+            !after_scan.is_empty(),
+            "the finished scan installed its own status"
+        );
 
         // Rewrite only the payloads; the generations stay exactly as production issued them.
         let AppEvent::SessionsReady { generation: gs, .. } = stale else {
@@ -7584,7 +7678,10 @@ mod session_load_request_scoping_tests {
             result: Ok(Vec::new()),
         });
         assert!(app.sessions_loaded, "the active request settled");
-        assert!(app.status.is_empty());
+        assert_eq!(
+            app.status, after_scan,
+            "and a successful load owns no error here, so it clears nothing"
+        );
 
         app.handle_event(AppEvent::SessionsReady {
             generation: gs,
@@ -7596,7 +7693,10 @@ mod session_load_request_scoping_tests {
             "a stale Err may not unmark a request that really succeeded"
         );
         assert!(!app.sessions_loading, "and may not raise the spinner again");
-        assert!(app.status.is_empty(), "and may not put its words on screen");
+        assert_eq!(
+            app.status, after_scan,
+            "and may not put its words on screen over the scan's own"
+        );
         assert!(
             app.session_load_error.is_none(),
             "and may not take ownership of an error"
