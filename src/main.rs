@@ -3040,11 +3040,30 @@ mod boot_session_load_is_fail_closed_tests {
 
     const NEWER: &str = "dedcom.db was created by a newer version (schema v6; this build supports v5). Upgrade dedcom, or move the old dedcom.db aside.";
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("dedcom-bootload-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A scratch directory that removes itself when the test returns: a green test may not leave
+    /// a persistent fixture behind merely because the cargo process eventually exits.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("dedcom-bootload-{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(name: &str) -> Scratch {
+        Scratch::new(name)
     }
 
     fn v5_db(dir: &std::path::Path) -> std::path::PathBuf {
@@ -3093,14 +3112,15 @@ mod boot_session_load_is_fail_closed_tests {
     #[test]
     fn a_readable_checkpoint_returns_its_real_list() {
         let dir = scratch("ok");
-        let list = boot_session_load(&v5_db(&dir), false, false).expect("a v5 checkpoint opens");
+        let list =
+            boot_session_load(&v5_db(dir.path()), false, false).expect("a v5 checkpoint opens");
         assert!(list.is_empty(), "a fresh checkpoint holds no sessions yet");
     }
 
     #[test]
     fn a_newer_checkpoint_returns_the_exact_error_instead_of_an_empty_list() {
         let dir = scratch("v6");
-        let db = v6_db(&dir);
+        let db = v6_db(dir.path());
         let before = census(&db);
 
         let err = boot_session_load(&db, false, false)
@@ -3121,7 +3141,7 @@ mod boot_session_load_is_fail_closed_tests {
     #[test]
     fn commander_and_no_resume_skip_only_this_eager_load() {
         let dir = scratch("skip");
-        let db = v6_db(&dir);
+        let db = v6_db(dir.path());
 
         // Both deliberately load lazily or not at all, so neither touches the store here — and
         // that skip is the ONLY way this function can yield an empty list.

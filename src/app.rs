@@ -390,6 +390,10 @@ pub struct App {
     pub sessions_loading: bool,
     /// The session list is already loaded — don't start loading again.
     pub sessions_loaded: bool,
+    /// The session-load request currently being awaited. Monotonic: every `spawn_sessions_load`
+    /// takes the next value, so a reply carrying an older one belongs to a load we have already
+    /// abandoned and may not speak for the checkpoint we are waiting on.
+    pub session_load_generation: u64,
     /// The refusal THIS session-load lifecycle put on screen, owned so a later success of the
     /// same lifecycle can take it back. Ownership rather than a string prefix: an automatic
     /// refresh must clear its own error and nothing else, and a status some other operation
@@ -748,6 +752,7 @@ impl App {
             session_cursor: 0,
             sessions_loading: false,
             sessions_loaded: matches!(mode, AppMode::Wizard),
+            session_load_generation: 0,
             session_load_error: None,
             scanning: ScanningState::default(),
             applying: ApplyingState::default(),
@@ -884,27 +889,37 @@ impl App {
                     self.request_shutdown(false);
                 }
             }
-            AppEvent::SessionsReady(Ok(list)) => {
-                self.sessions = list;
-                self.sessions_loading = false;
-                self.sessions_loaded = true;
-                self.session_cursor = 0;
-                // Take back the refusal this lifecycle installed — but only if it is still the
-                // one on screen. Clearing unconditionally would swallow a scan's own status
-                // whenever the session list refreshed behind it.
-                if let Some(owned) = self.session_load_error.take() {
-                    if self.status == owned {
-                        self.status.clear();
+            AppEvent::SessionsReady { generation, result } => {
+                // A superseded request answering late says nothing about the checkpoint we are
+                // waiting on. It is dropped WHOLE: list, cursor, both flags, the status and the
+                // owned error are left exactly as the active request found them.
+                if generation == self.session_load_generation {
+                    match result {
+                        Ok(list) => {
+                            self.sessions = list;
+                            self.sessions_loading = false;
+                            self.sessions_loaded = true;
+                            self.session_cursor = 0;
+                            // Take back the refusal this lifecycle installed — but only if it is
+                            // still the one on screen. Clearing unconditionally would swallow a
+                            // scan's own status whenever the session list refreshed behind it.
+                            if let Some(owned) = self.session_load_error.take() {
+                                if self.status == owned {
+                                    self.status.clear();
+                                }
+                            }
+                        }
+                        // The checkpoint could not be opened or read. The previous list and cursor
+                        // stand but are NOT promoted to the answer of a request that failed, and
+                        // the store's own words are what the operator sees.
+                        Err(err) => {
+                            self.sessions_loading = false;
+                            self.sessions_loaded = false;
+                            self.status = err.clone();
+                            self.session_load_error = Some(err);
+                        }
                     }
                 }
-            }
-            // The checkpoint could not be opened or read. Nothing is installed: the previous list
-            // and cursor stand, the load is NOT marked successful, and the store's own words are
-            // what the operator sees. An empty list here would be a fabricated answer.
-            AppEvent::SessionsReady(Err(err)) => {
-                self.sessions_loading = false;
-                self.status = err.clone();
-                self.session_load_error = Some(err);
             }
             AppEvent::SessionDeleted(result) => {
                 self.purge_pending = self.purge_pending.saturating_sub(1);
@@ -2655,9 +2670,7 @@ impl App {
         // updated candidate progress). Re-read in the background so that F12 shows
         // the current state without a restart. DB progress is live (per-chunk flush);
         // only the cache was lying. Mirror of restore_selected_trash.
-        self.sessions_loaded = false;
-        self.sessions_loading = false;
-        self.spawn_sessions_load();
+        self.supersede_sessions_load();
         // The coverage cache is stale too. A new Complete scan
         // could become covering for already-visited cwd's for which an older
         // id was previously found (#10 vs #9 on /tank). Without a full clear, `maybe_auto_switch_scan` on
@@ -3880,9 +3893,7 @@ impl App {
                     self.trash_cursor = self.trashed.len().saturating_sub(1);
                 }
                 // The active list is stale — re-read in the background.
-                self.sessions_loaded = false;
-                self.sessions_loading = false;
-                self.spawn_sessions_load();
+                self.supersede_sessions_load();
                 self.status = "Session restored".to_string();
             }
             Err(err) => self.status = format!("Failed to restore: {err}"),
@@ -5043,14 +5054,27 @@ impl App {
             return;
         }
         self.sessions_loading = true;
+        // Claim the next request number. Any reply still in flight from an earlier request is
+        // stale by construction, and the handler drops it whole.
+        self.session_load_generation = self.session_load_generation.wrapping_add(1);
+        let generation = self.session_load_generation;
         let db_path = self.db_path.clone();
         let events = self.events.clone();
         std::thread::spawn(move || {
-            let outcome = ScanStore::open(&db_path)
+            let result = ScanStore::open(&db_path)
                 .and_then(|store| store.list_scans())
                 .map_err(|err| err.to_string());
-            let _ = events.send(AppEvent::SessionsReady(outcome));
+            let _ = events.send(AppEvent::SessionsReady { generation, result });
         });
+    }
+
+    /// A new fact made the session list stale: abandon the answer still in flight and ask again.
+    /// Explicit, because clearing `sessions_loading` and spawning would otherwise leave two
+    /// replies racing with no way to tell which one the screen is waiting for.
+    fn supersede_sessions_load(&mut self) {
+        self.sessions_loaded = false;
+        self.sessions_loading = false;
+        self.spawn_sessions_load();
     }
 
     /// F2: scans `roots`. If for these roots there is an unfinished session and/or
@@ -7129,9 +7153,23 @@ mod session_store_failures_are_never_empty_data_tests {
         assert!(finished, "the real ScanFinished event must arrive");
         assert!(
             app.scan.is_none(),
-            "the worker is settled before the test returns"
+            "the scan worker is settled before the test returns"
         );
-        // Only now may the guards remove the roots and the state directory.
+
+        // `on_finished` supersedes the session list, so a fresh load is now in flight against the
+        // very database this test is about to delete. Settle it, then the browsing routes the
+        // finish fanned out, then close the actor the way the application closes it.
+        pump_until(&mut app, &rx, "the superseded session refresh", |a| {
+            !a.sessions_loading
+        });
+        drain(&mut app, &rx);
+        app.request_shutdown(false);
+        drain(&mut app, &rx);
+        assert!(
+            !app.sessions_loading,
+            "no session load may still be reading the checkpoint"
+        );
+        // Only now may the guards remove the scan root and the state directory.
     }
 
     #[test]
@@ -7445,5 +7483,187 @@ mod session_load_error_ownership_tests {
             "the replaced error is still owned, and success consumes it: {:?}",
             app.status
         );
+    }
+}
+
+/// Several session loads can be in flight at once — a finished scan and a restored session both
+/// abandon the list and ask again — so a reply must say which request it answers. A superseded
+/// answer is dropped whole, in either direction, and never disturbs the request on screen.
+#[cfg(test)]
+mod session_load_request_scoping_tests {
+    use super::*;
+
+    const NEWER: &str = "dedcom.db was created by a newer version (schema v6; this build supports v5). Upgrade dedcom, or move the old dedcom.db aside.";
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("dedcom-reqscope-{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn v5(dir: &std::path::Path) -> PathBuf {
+        let db = dir.join("dedcom.db");
+        drop(ScanStore::open(&db).expect("the product creates its own v5 checkpoint"));
+        db
+    }
+
+    fn v6(dir: &std::path::Path) -> PathBuf {
+        let db = v5(dir);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.pragma_update(None, "user_version", 6i64).unwrap();
+        drop(conn);
+        db
+    }
+
+    fn take(rx: &crossbeam_channel::Receiver<AppEvent>) -> AppEvent {
+        rx.recv_timeout(std::time::Duration::from_secs(20))
+            .expect("an accepted request owes exactly one reply")
+    }
+
+    /// Two loads really are reachable without inventing state by hand: `supersede_sessions_load`
+    /// is what `on_finished` and `restore_selected_trash` call, and it abandons a load already in
+    /// flight to ask again. Returns (stale reply, fresh reply) — both real, both from production
+    /// threads, held so the test can dispatch them in either order.
+    fn two_real_replies_in_flight(
+        app: &mut App,
+        rx: &crossbeam_channel::Receiver<AppEvent>,
+    ) -> (AppEvent, AppEvent) {
+        app.spawn_sessions_load();
+        let first = take(rx);
+        // The screen is still waiting for `first` when a new fact abandons it. This is the
+        // production transition, not a hand-set flag.
+        app.supersede_sessions_load();
+        let second = take(rx);
+
+        let (
+            AppEvent::SessionsReady { generation: g1, .. },
+            AppEvent::SessionsReady { generation: g2, .. },
+        ) = (&first, &second)
+        else {
+            panic!("both replies must be session loads");
+        };
+        assert!(g2 > g1, "the superseding request takes a later number");
+        assert_eq!(
+            *g2, app.session_load_generation,
+            "and it is the one the screen is waiting for"
+        );
+        (first, second)
+    }
+
+    #[test]
+    fn a_stale_error_cannot_undo_the_new_success() {
+        let scratch = Scratch::new("stale-err");
+        let db = v5(scratch.path());
+        let (mut app, rx) = test_app_with_db(db);
+        let (stale, fresh) = two_real_replies_in_flight(&mut app, &rx);
+
+        // Rewrite only the payloads; the generations stay exactly as production issued them.
+        let AppEvent::SessionsReady { generation: gs, .. } = stale else {
+            unreachable!()
+        };
+        let AppEvent::SessionsReady { generation: gf, .. } = fresh else {
+            unreachable!()
+        };
+
+        app.handle_event(AppEvent::SessionsReady {
+            generation: gf,
+            result: Ok(Vec::new()),
+        });
+        assert!(app.sessions_loaded, "the active request settled");
+        assert!(app.status.is_empty());
+
+        app.handle_event(AppEvent::SessionsReady {
+            generation: gs,
+            result: Err(NEWER.to_string()),
+        });
+
+        assert!(
+            app.sessions_loaded,
+            "a stale Err may not unmark a request that really succeeded"
+        );
+        assert!(!app.sessions_loading, "and may not raise the spinner again");
+        assert!(app.status.is_empty(), "and may not put its words on screen");
+        assert!(
+            app.session_load_error.is_none(),
+            "and may not take ownership of an error"
+        );
+    }
+
+    #[test]
+    fn a_stale_success_cannot_erase_the_new_refusal() {
+        let scratch = Scratch::new("stale-ok");
+        let db = v6(scratch.path());
+        let (mut app, rx) = test_app_with_db(db);
+        let (stale, fresh) = two_real_replies_in_flight(&mut app, &rx);
+        let AppEvent::SessionsReady { generation: gs, .. } = stale else {
+            unreachable!()
+        };
+        let AppEvent::SessionsReady { generation: gf, .. } = fresh else {
+            unreachable!()
+        };
+
+        app.handle_event(AppEvent::SessionsReady {
+            generation: gf,
+            result: Err(NEWER.to_string()),
+        });
+        assert_eq!(app.status, NEWER);
+        assert!(!app.sessions_loaded, "a refusal is not a successful load");
+        let kept = app.sessions.len();
+
+        app.handle_event(AppEvent::SessionsReady {
+            generation: gs,
+            result: Ok(vec![]),
+        });
+
+        assert!(
+            !app.sessions_loaded,
+            "a stale Ok may not mark the failed request loaded"
+        );
+        assert_eq!(app.status, NEWER, "nor erase the refusal on screen");
+        assert_eq!(
+            app.session_load_error.as_deref(),
+            Some(NEWER),
+            "nor consume the error the active request owns"
+        );
+        assert_eq!(app.sessions.len(), kept, "nor install its list");
+    }
+
+    #[test]
+    fn a_stale_reply_does_not_clear_the_spinner_of_the_active_request() {
+        let scratch = Scratch::new("spinner");
+        let db = v5(scratch.path());
+        let (mut app, rx) = test_app_with_db(db);
+        let (stale, _fresh) = two_real_replies_in_flight(&mut app, &rx);
+        let AppEvent::SessionsReady { generation: gs, .. } = stale else {
+            unreachable!()
+        };
+
+        assert!(
+            app.sessions_loading,
+            "the active request is still in flight"
+        );
+        app.handle_event(AppEvent::SessionsReady {
+            generation: gs,
+            result: Ok(Vec::new()),
+        });
+        assert!(
+            app.sessions_loading,
+            "a superseded reply must not tell the screen its own request has landed"
+        );
+        assert!(!app.sessions_loaded);
     }
 }

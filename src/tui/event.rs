@@ -41,7 +41,15 @@ pub enum AppEvent {
     /// List of saved sessions, loaded in the background — or the store error that stopped it.
     /// Result-bearing on purpose: an unopenable checkpoint must not be representable as the same
     /// value as one that genuinely holds no sessions.
-    SessionsReady(std::result::Result<Vec<ResumeInfo>, String>),
+    ///
+    /// `generation` is the request this reply answers. Several loads can be in flight at once —
+    /// a finished scan and a restored session both abandon the list and ask again — and without
+    /// the tag their replies are indistinguishable, so a superseded answer could overwrite the
+    /// current one in either direction.
+    SessionsReady {
+        generation: u64,
+        result: std::result::Result<Vec<ResumeInfo>, String>,
+    },
     /// Background purge of a session from the trash finished: a heavy
     /// multi-index DELETE by `file` ran in the background so as not to hang the UI.
     SessionDeleted(std::result::Result<i64, String>),
