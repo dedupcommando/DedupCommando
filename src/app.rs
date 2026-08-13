@@ -5053,16 +5053,17 @@ impl App {
         if self.sessions_loaded || self.sessions_loading {
             return;
         }
-        self.sessions_loading = true;
-        // Claim the next request number. Any reply still in flight from an earlier request is
-        // stale by construction, and the handler drops it whole. Checked, not wrapping: a reused
-        // number would make a superseded reply look current again, which is the very confusion
-        // this counter exists to remove. Same discipline as the browsing activation counter.
-        self.session_load_generation = self
+        // Claim the next request number FIRST. Checked, not wrapping: a reused number would make
+        // a superseded reply look current again, which is the very confusion this counter exists
+        // to remove — same discipline as the browsing activation counter. Nothing is mutated
+        // until the number is known good, so an exhausted counter leaves the whole session-load
+        // state exactly as it was rather than a raised spinner nobody will ever lower.
+        let generation = self
             .session_load_generation
             .checked_add(1)
             .expect("the session-load request counter is exhausted — restart dedcom");
-        let generation = self.session_load_generation;
+        self.session_load_generation = generation;
+        self.sessions_loading = true;
         let db_path = self.db_path.clone();
         let events = self.events.clone();
         std::thread::spawn(move || {
@@ -7029,6 +7030,23 @@ mod session_store_failures_are_never_empty_data_tests {
     /// The observation must not disturb what it observes. Metadata is taken BEFORE any inspection
     /// connection is opened, the connection is closed, and the same metadata is then re-read and
     /// required to match — so a census that itself touched the file cannot pass.
+    /// Every browsing route this application can have outstanding, named one by one. A route
+    /// left out here is a route the teardown would not wait for.
+    fn routes_settled(app: &App) -> bool {
+        app.routes.open.is_none()
+            && app.routes.groups.is_empty()
+            && app.routes.counts.is_empty()
+            && app.routes.infos.is_empty()
+            && app.routes.dirs_at.is_empty()
+            && app.routes.dir_opens.is_empty()
+            && app.routes.panels.is_empty()
+            && app.routes.marked.is_none()
+            && app.routes.latest.is_none()
+            && app.routes.covering.is_empty()
+            && app.routes.plan.is_none()
+            && app.routes.reconcile.is_none()
+    }
+
     fn census(db: &std::path::Path) -> (Vec<u8>, std::time::SystemTime, i64, Vec<String>) {
         let bytes = std::fs::read(db).unwrap();
         let before = std::fs::metadata(db).unwrap().modified().unwrap();
@@ -7167,10 +7185,14 @@ mod session_store_failures_are_never_empty_data_tests {
         pump_until(&mut app, &rx, "the superseded session refresh", |a| {
             !a.sessions_loading
         });
-        // Every browsing route the finish fanned out is settled by event, not by a single sweep.
-        pump_until(&mut app, &rx, "the browsing routes", |a| {
-            !a.browse.terminal_owed() || a.browse.phase() == crate::state::browse::FleetPhase::Live
-        });
+        // Every browsing route the finish fanned out is settled by event, and settlement is read
+        // from the routes themselves. A fleet phase says only that an actor exists; it is true
+        // while an `open` is still in flight, so waiting on it would wait for nothing.
+        pump_until(&mut app, &rx, "the browsing routes", routes_settled);
+        assert!(
+            routes_settled(&app),
+            "no browsing route may still be in flight when the shutdown begins"
+        );
         app.request_shutdown(false);
         // The actor's terminal is owed, so this is a wait for something that is coming — not a
         // sweep of whatever happens to be queued. A single `drain` returns long before it lands.
@@ -7609,6 +7631,7 @@ mod session_load_request_scoping_tests {
         let (mut app, rx) = test_app_with_db(db);
         app.session_load_generation = u64::MAX;
 
+        let loaded_before = app.sessions_loaded;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             app.spawn_sessions_load();
         }));
@@ -7622,6 +7645,18 @@ mod session_load_request_scoping_tests {
             app.session_load_generation,
             u64::MAX,
             "and no number was reused"
+        );
+        assert!(
+            !app.sessions_loading,
+            "a spinner raised here would never be lowered: no reply is coming"
+        );
+        assert_eq!(
+            app.sessions_loaded, loaded_before,
+            "and the load's success flag is untouched"
+        );
+        assert!(
+            app.session_load_error.is_none(),
+            "an exhausted counter is not a store refusal and owns no error"
         );
     }
 
