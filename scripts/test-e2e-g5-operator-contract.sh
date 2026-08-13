@@ -96,7 +96,7 @@ for idx in $ROUTED; do
     check "pause $idx: exactly $CYCLES generated Root cycle(s), each with its status" "$?"
     has "$idx" "exactly $CYCLES"
     check "pause $idx: the cycle count is stated as a number" "$?"
-    has "$idx" 'cycle 2 -> status must read «Panel 1 → /dedcom-g5-SAMPLE/ds_a»'
+    has "$idx" "cycle 2 -> status must read «Panel 1 → ${DEDCOM_E2E_ROOT:-<DEDCOM_E2E_ROOT>}/pools/dedcom-g5-SAMPLE/mount/ds_a»"
     check "pause $idx: the last cycle lands on the target dataset" "$?"
     has "$idx" "press the real F5 key"
     check "pause $idx: Root is the second-layer F5 key itself" "$?"

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # E2E test: the scan-root guard, including a real bind mount.
 #
-# SAFETY: everything happens inside ONE disposable fixture created by `mktemp -d` under a temp
-# directory. Every mount and umount target is verified to be inside that fixture before the call,
-# mounts are undone newest-first and the fixture is removed by an EXIT trap. Nothing outside the
-# fixture is ever mounted, unmounted, scanned or deleted -- no production path is touched.
+# SAFETY: everything happens inside ONE disposable fixture created under $DEDCOM_E2E_ROOT, the
+# caller's declared containment root. Every mount and umount target is verified to be inside that
+# fixture before the call, mounts are undone newest-first and the fixture is removed by an EXIT
+# trap. Nothing outside the fixture is ever mounted, unmounted, scanned or deleted -- no
+# production path is touched, and without a declared root nothing runs at all.
 #
 # `mount --bind` needs CAP_SYS_ADMIN. Grant it to a throwaway container only, never host-wide:
 #
@@ -30,11 +31,28 @@ fail() {
 
 test -x "$DEDCOM" || fail "no dedcom binary at $DEDCOM (set DEDCOM=/path/to/dedcom)"
 
-FIXTURE="$(mktemp -d "${TMPDIR:-/tmp}/dedcom-rootguard-XXXXXX")"
+# SHARED-HOST CONTAINMENT: the fixture is created inside the caller's declared root, never in a
+# world-writable spool. A missing root refuses — this script binds and unmounts, and a bind
+# whose target was chosen by a default is a bind aimed at somebody else's machine.
+E2E_ROOT="${DEDCOM_E2E_ROOT:-}"
+[ -n "$E2E_ROOT" ] || fail "DEDCOM_E2E_ROOT is not set — refusing to place a mount fixture by default"
+case "$E2E_ROOT" in
+/*) ;;
+*) fail "DEDCOM_E2E_ROOT='$E2E_ROOT' is not absolute" ;;
+esac
+[ -d "$E2E_ROOT" ] || fail "DEDCOM_E2E_ROOT='$E2E_ROOT' does not exist"
+[ ! -L "$E2E_ROOT" ] || fail "DEDCOM_E2E_ROOT='$E2E_ROOT' is a symbolic link"
+E2E_ROOT="$(realpath "$E2E_ROOT")"
+case "$E2E_ROOT" in
+/ | /home | /tmp | /var/tmp | /var/lib | /root | /run) fail "DEDCOM_E2E_ROOT='$E2E_ROOT' is a system directory" ;;
+esac
+
+mkdir -p -m 0700 "$E2E_ROOT/tmp"
+FIXTURE="$(mktemp -d "$E2E_ROOT/tmp/dedcom-rootguard-XXXXXX")"
 FIXTURE="$(realpath "$FIXTURE")"
 case "$FIXTURE" in
-/tmp/* | /var/tmp/*) ;;
-*) fail "the fixture must live under a temp directory, got $FIXTURE" ;;
+"$E2E_ROOT"/*) ;;
+*) fail "the fixture must live inside $E2E_ROOT, got $FIXTURE" ;;
 esac
 
 MOUNTS=()
@@ -86,8 +104,11 @@ cleanup() {
 		*) printf 'warning: not unmounting %s (outside the fixture)\n' "$target" >&2 ;;
 		esac
 	done
+	# The error path obeys the same containment rule as the happy one: a fixture that is not
+	# inside the declared root is left alone and reported, never removed on a guess.
 	case "$FIXTURE" in
-	/tmp/* | /var/tmp/*) rm -rf "$FIXTURE" ;;
+	"$E2E_ROOT"/*) rm -rf "$FIXTURE" ;;
+	*) printf 'warning: not removing %s (outside %s)\n' "$FIXTURE" "$E2E_ROOT" >&2 ;;
 	esac
 }
 trap cleanup EXIT

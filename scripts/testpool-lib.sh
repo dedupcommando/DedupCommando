@@ -3,34 +3,43 @@
 # ONLY for `source` (make-test-pool.sh / teardown-test-pool.sh / tests), not for
 # direct execution.
 #
-# Config (overridable via env — set identically for make and teardown):
-#   DEDCOM_TESTPOOL_NAME  pool name          (default testpool)
-#   DEDCOM_TESTPOOL_DIR   directory for image (default /var/lib/dedcom-testpool)
-#   DEDCOM_TESTPOOL_SIZE  image size         (default 3G)
+# SHARED-HOST CONTAINMENT. This harness is run on machines that are not sandboxes:
+# they carry other people's pools, guests and data. Everything it creates therefore
+# lives inside ONE caller-supplied root, and every destructive call names one exact
+# object that this run itself created. There is no default root, no default owner and
+# no prefix-based cleanup: a missing or ambiguous value refuses, it never guesses.
 #
-# The image is $DIR/pool.img inside its OWN root directory 0700. Safety:
-#   * make creates $DIR with a single `mkdir -m 0700` (the directory MUST be absent) —
-#     it NEVER chmod's an existing directory (otherwise an override onto /etc etc.
-#     would lower the permissions of a system directory);
-#   * the entire chain of parents is checked for symlinks and writability by others;
-#   * teardown destroys the pool only if its single leaf-vdev is our image,
-#     and $TP_IMG MUST be a REGULAR FILE (not a symlink): otherwise substituting
-#     pool.img -> /dev/null would match by canonical path and trigger destroy.
+# Required environment — absent or malformed is a refusal, not a default:
+#   DEDCOM_E2E_ROOT       absolute path; the ONLY tree this harness may write in
+#   DEDCOM_E2E_OWNER_UID  numeric uid which, besides root, may own the chain
+#
+# Optional:
+#   DEDCOM_TESTPOOL_NAME  pool name   (default testpool)
+#   DEDCOM_TESTPOOL_SIZE  image size  (default 3G)
+#
+# Fixed layout — nothing is placed outside it:
+#   $DEDCOM_E2E_ROOT/pools/<pool>/pool.img      backing file
+#   $DEDCOM_E2E_ROOT/pools/<pool>/mount/        pool and dataset mountpoints
+#   $DEDCOM_E2E_ROOT/pools/<pool>/manifest.txt  identity captured at create
+#   $DEDCOM_E2E_ROOT/state/<scenario>/          checkpoint state directories
+#   $DEDCOM_E2E_ROOT/tmp/<scenario>/            temporary files, FIFOs, logs
+#   $DEDCOM_E2E_ROOT/evidence/<scenario>/       captures kept after the run
+#
+# Safety, unchanged from before and still load-bearing:
+#   * the whole chain of parents is checked for symlinks and for writability by others;
+#   * the image directory MUST be absent and is created by a single `mkdir -m 0700`;
+#   * teardown destroys a pool only if its name, GUID, single leaf-vdev and every
+#     dataset mountpoint still match the manifest this run wrote at create time.
 
-# shellcheck disable=SC2034  # TP_POOL is read by the scripts that source this lib
-TP_POOL="${DEDCOM_TESTPOOL_NAME:-testpool}"
-TP_DIR="${DEDCOM_TESTPOOL_DIR:-/var/lib/dedcom-testpool}"
-# shellcheck disable=SC2034  # TP_SIZE is read by make-test-pool.sh
-TP_SIZE="${DEDCOM_TESTPOOL_SIZE:-3G}"
-TP_IMG="$TP_DIR/pool.img"
-
-# zpool in the stable C locale — locale-independent output.
-tp_zpool() { LC_ALL=C zpool "$@"; }
-
-# Unified fail-closed diagnostics.
+# --------------------------------------------------------------- fail-closed diagnostics
 tp_die() { printf 'REFUSED: %s\n' "$*" >&2; }
 
-# Check one existing node: a directory, owner root(0)/our euid,
+# zpool/zfs in the stable C locale — locale-independent output.
+tp_zpool() { LC_ALL=C zpool "$@"; }
+tp_zfs()   { LC_ALL=C zfs "$@"; }
+
+# --------------------------------------------------------------- path predicates
+# Check one existing node: a directory, owner root(0) or the declared owner uid,
 # without the write bit for group/other (otherwise an outsider could substitute the component).
 tp_check_node() {
     local node="$1" uid="$2" owner mode m
@@ -48,18 +57,20 @@ tp_check_node() {
     return 0
 }
 
-# Check the ENTIRE chain of parents up to $1 (no-follow): no existing
-# component is a symbolic link, and each passes tp_check_node. Closes off
-# path substitution for the root script (an outsider does not own the components and cannot
-# write into them → cannot redirect creation/deletion). Non-existent
-# components (e.g. a not-yet-created leaf) are skipped.
+# Check the ENTIRE chain of parents up to $1 (no-follow): no existing component is a
+# symbolic link, and each passes tp_check_node. Closes off path substitution — an outsider
+# owns no component and cannot write into one, so creation/deletion cannot be redirected.
+# Non-existent components (e.g. a not-yet-created leaf) are skipped.
+#
+# The owner accepted besides root is TP_OWNER_UID when the environment has been validated,
+# and the caller's own euid otherwise (unit tests of this function alone).
 tp_verify_chain() {
     local target="$1" uid built="" comp path
     case "$target" in
         /*) ;;
         *) tp_die "path '$target' is not absolute"; return 1;;
     esac
-    uid="$(id -u)"
+    uid="${TP_OWNER_UID:-$(id -u)}"
     path="${target#/}"
     while [ -n "$path" ]; do
         comp="${path%%/*}"
@@ -72,26 +83,163 @@ tp_verify_chain() {
     return 0
 }
 
-# Safely CREATE the image directory. Fail-closed (return !=0).
-# The directory MUST be absent — it is created with a single `mkdir -m 0700` (without -p).
-# An existing directory is NOT accepted and NOT chmod'ed (protection against an override onto
-# a system path like /etc, /var/lib).
-tp_secure_dir() {
-    local dir="$TP_DIR" uid
-    case "$dir" in /) tp_die "refusing to operate on the root /"; return 1;; esac
-    # 1) Check existing ancestors (no-follow, permissions). The leaf — separately below.
-    tp_verify_chain "$dir" || return 1
-    # 2) The leaf MUST be absent (including not being a symlink/file).
-    if [ -L "$dir" ] || [ -e "$dir" ]; then
-        tp_die "$dir already exists — NOT touching it (run teardown or delete it manually)"; return 1
+# Roots this harness refuses outright, whatever else is true about them. Each is either the
+# whole machine, a shared spool everyone can write to, or a place where other software already
+# keeps state — none of them is a tree one run may claim and later destroy.
+tp_root_is_forbidden() {
+    local root="$1" home
+    home="${HOME:-}"
+    case "$root" in
+        /|/home|/tmp|/var/tmp|/var/lib|/var|/usr|/etc|/root|/srv|/opt|/mnt|/media|/run)
+            return 0;;
+    esac
+    if [ -n "$home" ] && [ "$root" = "$home" ]; then return 0; fi
+    return 1
+}
+
+# Validate the containment root and the owner uid, then freeze both. Fail-closed: every
+# refusal returns non-zero and sets nothing the caller could go on to use.
+tp_require_env() {
+    local root uid real
+
+    uid="${DEDCOM_E2E_OWNER_UID-}"
+    if [ -z "$uid" ]; then
+        tp_die "DEDCOM_E2E_OWNER_UID is not set — this harness never guesses an owner"; return 1
     fi
-    # 3) Create exactly the leaf with permissions 0700 (without -p: the parent MUST exist).
-    mkdir -m 0700 -- "$dir" 2>/dev/null || { tp_die "failed to create $dir (no parent?)"; return 1; }
-    # 4) Post-check (without chmod): not a symlink, is a directory, is ours.
+    case "$uid" in
+        ''|*[!0-9]*) tp_die "DEDCOM_E2E_OWNER_UID='$uid' is not a decimal uid"; return 1;;
+    esac
+
+    root="${DEDCOM_E2E_ROOT-}"
+    if [ -z "$root" ]; then
+        tp_die "DEDCOM_E2E_ROOT is not set — this harness has no default root and creates nothing without one"
+        return 1
+    fi
+    case "$root" in
+        /*) ;;
+        *) tp_die "DEDCOM_E2E_ROOT='$root' is not absolute"; return 1;;
+    esac
+    case "$root" in
+        */) tp_die "DEDCOM_E2E_ROOT='$root' must not end in '/'"; return 1;;
+    esac
+    case "$root" in
+        *//*|*/./*|*/../*|*/.|*/..)
+            tp_die "DEDCOM_E2E_ROOT='$root' contains an empty, '.' or '..' component"; return 1;;
+    esac
+    # Whitespace in the root would survive into every derived path and into the shell words the
+    # harness builds from them. Refusing it here is cheaper than quoting perfectly everywhere.
+    case "$root" in
+        *[$' \t\n']*) tp_die "DEDCOM_E2E_ROOT='$root' contains whitespace"; return 1;;
+    esac
+    if tp_root_is_forbidden "$root"; then
+        tp_die "DEDCOM_E2E_ROOT='$root' is a system or shared directory — refusing to claim it"; return 1
+    fi
+
+    # The root itself must exist, must be a real directory and must not be reached through a
+    # symlink; realpath must agree with the spelling we were given, so no component can be
+    # swapped for a link into somebody else's tree.
+    if [ -L "$root" ]; then tp_die "DEDCOM_E2E_ROOT='$root' is a symbolic link"; return 1; fi
+    if [ ! -d "$root" ]; then tp_die "DEDCOM_E2E_ROOT='$root' does not exist or is not a directory"; return 1; fi
+    if ! real="$(readlink -f -- "$root" 2>/dev/null)"; then
+        tp_die "canonicalization of DEDCOM_E2E_ROOT='$root' failed"; return 1
+    fi
+    if [ "$real" != "$root" ]; then
+        tp_die "DEDCOM_E2E_ROOT='$root' canonicalizes to '$real' — refusing an aliased root"; return 1
+    fi
+    if tp_root_is_forbidden "$real"; then
+        tp_die "DEDCOM_E2E_ROOT canonicalizes to the system directory '$real' — refusing"; return 1
+    fi
+
+    TP_OWNER_UID="$uid"
+    tp_verify_chain "$real" || { tp_die "the chain of '$real' is not trustworthy"; return 1; }
+
+    TP_ROOT="$real"
+    return 0
+}
+
+# True when $1 lies strictly inside the containment root. Both the spelling and, for paths
+# that already exist, the canonical form are checked: a symlink pointing out of the root is
+# refused even though its spelling looks contained.
+tp_contained() {
+    local path="$1" real parent
+    case "$path" in
+        /*) ;;
+        *) tp_die "path '$path' is not absolute"; return 1;;
+    esac
+    case "$path" in
+        *//*|*/./*|*/../*|*/.|*/..)
+            tp_die "path '$path' contains an empty, '.' or '..' component"; return 1;;
+    esac
+    case "$path" in
+        "$TP_ROOT"/*) ;;
+        *) tp_die "path '$path' is outside the containment root $TP_ROOT"; return 1;;
+    esac
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        if ! real="$(readlink -f -- "$path" 2>/dev/null)"; then
+            tp_die "canonicalization of '$path' failed"; return 1
+        fi
+    else
+        # Not created yet: canonicalize the deepest existing ancestor instead, so a symlinked
+        # parent cannot be used to place a new object outside the root.
+        parent="${path%/*}"
+        while [ -n "$parent" ] && [ ! -e "$parent" ]; do parent="${parent%/*}"; done
+        [ -n "$parent" ] || parent="/"
+        if ! real="$(readlink -f -- "$parent" 2>/dev/null)"; then
+            tp_die "canonicalization of the parent of '$path' failed"; return 1
+        fi
+    fi
+    case "$real" in
+        "$TP_ROOT"|"$TP_ROOT"/*) return 0 ;;
+        *) tp_die "path '$path' resolves to '$real', outside the containment root $TP_ROOT"; return 1 ;;
+    esac
+}
+
+# ----------------------------------------------------------------- fixed layout
+# A scenario label is part of a path, so it is restricted to characters that cannot travel:
+# no slash, no dot-run, no whitespace.
+tp_check_label() {
+    local label="$1"
+    case "$label" in
+        ''|*/*|*' '*|.|..|*..*) tp_die "invalid scenario/pool label '$label'"; return 1;;
+        *[!A-Za-z0-9._-]*) tp_die "invalid character in label '$label'"; return 1;;
+    esac
+    return 0
+}
+
+tp_pool_dir()     { printf '%s/pools/%s\n'    "$TP_ROOT" "$1"; }
+tp_state_dir()    { printf '%s/state/%s\n'    "$TP_ROOT" "$1"; }
+tp_tmp_dir()      { printf '%s/tmp/%s\n'      "$TP_ROOT" "$1"; }
+tp_evidence_dir() { printf '%s/evidence/%s\n' "$TP_ROOT" "$1"; }
+
+# Create one contained working directory (state/tmp/evidence), 0700, refusing anything that
+# would land outside the root.
+tp_make_dir() {
+    local dir="$1"
+    tp_contained "$dir" || return 1
+    if [ -L "$dir" ]; then tp_die "$dir is a symbolic link"; return 1; fi
+    mkdir -p -m 0700 -- "$dir" || { tp_die "failed to create $dir"; return 1; }
+    tp_verify_chain "$dir" || return 1
+    return 0
+}
+
+# --------------------------------------------------------------- image directory
+# Safely CREATE the pool directory and its mount point. Fail-closed (return != 0).
+# $TP_DIR MUST be absent — it is created with `mkdir -m 0700`; an existing directory is
+# NOT accepted and NOT chmod'ed, so an override onto a system path cannot lower its mode.
+tp_secure_dir() {
+    local dir="$TP_DIR"
+    tp_contained "$dir" || return 1
+    tp_verify_chain "${dir%/*}" || return 1
+    if [ -L "$dir" ] || [ -e "$dir" ]; then
+        tp_die "$dir already exists — NOT touching it (run teardown or remove it manually)"; return 1
+    fi
+    mkdir -p -m 0700 -- "${dir%/*}" || { tp_die "failed to create $(dirname -- "$dir")"; return 1; }
+    mkdir -m 0700 -- "$dir" 2>/dev/null || { tp_die "failed to create $dir"; return 1; }
     if [ -L "$dir" ]; then tp_die "$dir — symbolic link"; return 1; fi
     if [ ! -d "$dir" ]; then tp_die "$dir — not a directory"; return 1; fi
-    uid="$(id -u)"
-    tp_check_node "$dir" "$uid" || return 1
+    tp_check_node "$dir" "$TP_OWNER_UID" || return 1
+    mkdir -m 0700 -- "$TP_MNT" 2>/dev/null || { tp_die "failed to create $TP_MNT"; return 1; }
+    tp_contained "$TP_MNT" || return 1
     return 0
 }
 
@@ -104,8 +252,8 @@ tp_assert_image_absent() {
     return 0
 }
 
-# The image MUST exist, be a REGULAR file and NOT a symlink (for teardown,
-# before destroy). Closes off substituting pool.img -> /dev/null|/dev/sdX|directory.
+# The image MUST exist, be a REGULAR file and NOT a symlink (for teardown, before destroy).
+# Closes off substituting pool.img -> /dev/null|/dev/sdX|directory.
 tp_require_real_image() {
     if [ -L "$TP_IMG" ]; then tp_die "image '$TP_IMG' — symbolic link, not trusting it"; return 1; fi
     if [ ! -e "$TP_IMG" ]; then tp_die "image '$TP_IMG' does not exist"; return 1; fi
@@ -113,29 +261,23 @@ tp_require_real_image() {
     return 0
 }
 
-# The expected single leaf-vdev is the canonical path of the image. Fail-closed:
-# if canonicalization failed, returns !=0 (the caller MUST refuse).
-# Call ONLY after tp_require_real_image (then the symlink is already excluded and
-# readlink will not lead to someone else's target).
+# The expected single leaf-vdev is the canonical path of the image. Fail-closed: if
+# canonicalization failed, returns != 0 (the caller MUST refuse). Call ONLY after
+# tp_require_real_image, so the symlink case is already excluded.
 tp_expected_vdevs() { readlink -f -- "$TP_IMG"; }
 
+# --------------------------------------------------------------- pool identity
 # The actual leaf-vdevs of the pool (canonical paths, one per line).
-# Returns !=0 on ANY zpool error OR an unexpected structure (fail-closed).
+# Returns != 0 on ANY zpool error OR an unexpected structure (fail-closed).
 #
-# We request the minimal format — the name column (-o name); -v adds vdev
-# rows. IMPORTANT (ZFS 2.3+): the detailed vdev rows under -v IGNORE -o name and
-# carry the full set of property columns (SIZE ALLOC FREE … HEALTH), whereas the
-# pool summary row stays name-only. Therefore the vdev name is taken positionally ($2), and
-# the trailing property columns are IGNORED. Safety rests NOT on the number of columns,
-# but on cross-checking the SET of leaf-vdevs against our image (below, after awk).
+# We request the minimal format — the name column (-o name); -v adds vdev rows. IMPORTANT
+# (ZFS 2.3+): the detailed vdev rows under -v IGNORE -o name and carry the full set of
+# property columns (SIZE ALLOC FREE … HEALTH), whereas the pool summary row stays name-only.
+# Therefore the vdev name is taken positionally ($2) and the trailing property columns are
+# IGNORED. Safety rests NOT on the number of columns, but on cross-checking the SET of
+# leaf-vdevs against our image (below, after awk).
 #     zpool list -vHPL -o name <pool>
 #   -H = TAB-separator, -P = full paths, -L = resolve symlinks.
-# Parsing by field boundaries (-F'\t'):
-#   - pool row     : no leading tab, name == $1 (we expect EXACTLY the pool name);
-#   - vdev row     : leading tab, name == $2, then — property columns (ignored);
-#   - containers (mirror-/raidz-/…) and sections (logs/cache/…) → refuse;
-#   - the name MUST be an absolute path;
-#   - a row without a leading tab (other than the summary) → refuse.
 tp_pool_leaf_vdevs() {
     local pool="$1" raw out rc=0
     if ! raw="$(tp_zpool list -vHPL -o name "$pool" 2>/dev/null)"; then
@@ -179,8 +321,8 @@ tp_pool_leaf_vdevs() {
         local p canon
         while IFS= read -r p; do
             [ -n "$p" ] || continue
-            # Canonicalization of the actual vdev path is fail-closed: on a readlink error
-            # we do NOT substitute the raw path (otherwise it could falsely match the expected one).
+            # Canonicalization of the actual vdev path is fail-closed: on a readlink error we do
+            # NOT substitute the raw path (otherwise it could falsely match the expected one).
             if ! canon="$(readlink -f -- "$p" 2>/dev/null)"; then
                 tp_die "canonicalization of the actual vdev path '$p' failed"
                 return 1
@@ -190,3 +332,151 @@ tp_pool_leaf_vdevs() {
     fi
     return "$rc"
 }
+
+# The pool GUID, as a bare decimal string. Fail-closed on any error or on anything that is
+# not a single all-digit token: a GUID we could not read is not a GUID we may compare.
+tp_pool_guid() {
+    local pool="$1" guid
+    if ! guid="$(tp_zpool get -H -p -o value guid "$pool" 2>/dev/null)"; then
+        tp_die "could not read the GUID of pool '$pool'"; return 1
+    fi
+    guid="${guid%$'\n'}"
+    case "$guid" in
+        ''|*[!0-9]*) tp_die "unexpected GUID for pool '$pool': [$guid]"; return 1;;
+    esac
+    printf '%s\n' "$guid"
+    return 0
+}
+
+# Every dataset of the pool with its mountpoint, one `<name>\t<mountpoint>` per line, sorted.
+# Fail-closed: an error, empty output, or a row that does not belong to this pool refuses.
+#
+# Validation happens BEFORE the sort and outside any pipeline on purpose: a `return` on the
+# upstream side of a pipe only leaves that pipe's subshell, so a refusal there would vanish
+# and the function would still exit 0 — a fail-open on the exact query teardown trusts.
+tp_pool_dataset_mounts() {
+    local pool="$1" raw name mp out=""
+    if ! raw="$(tp_zfs list -H -p -r -t filesystem -o name,mountpoint "$pool" 2>/dev/null)"; then
+        tp_die "could not list the datasets of pool '$pool'"; return 1
+    fi
+    [ -n "$raw" ] || { tp_die "empty dataset listing for pool '$pool'"; return 1; }
+    while IFS=$'\t' read -r name mp; do
+        [ -n "$name" ] || continue
+        case "$name" in
+            "$pool"|"$pool"/*) ;;
+            *) tp_die "dataset '$name' does not belong to pool '$pool'"; return 1;;
+        esac
+        if [ -z "$mp" ]; then tp_die "dataset '$name' has no mountpoint column"; return 1; fi
+        out="${out}${name}"$'\t'"${mp}"$'\n'
+    done <<< "$raw"
+    printf '%s' "$out" | LC_ALL=C sort
+    return 0
+}
+
+# Every dataset mountpoint must be inside the containment root. `none` and `legacy` are
+# refused too: this harness mounts its datasets where it says it does, and an unmounted or
+# legacy dataset is an unverifiable one.
+tp_assert_dataset_mounts_contained() {
+    local pool="$1" rows line name mp
+    rows="$(tp_pool_dataset_mounts "$pool")" || return 1
+    while IFS=$'\t' read -r name mp; do
+        [ -n "$name" ] || continue
+        case "$mp" in
+            "$TP_MNT"|"$TP_MNT"/*) ;;
+            *) tp_die "dataset '$name' is mounted at '$mp', outside $TP_MNT"; return 1;;
+        esac
+    done <<< "$rows"
+    return 0
+}
+
+# --------------------------------------------------------------- identity manifest
+# The manifest is written once, at create time, and is the ONLY thing teardown is allowed to
+# act on. It names one pool: no prefix, no pattern, no listing.
+tp_manifest_path() { printf '%s/manifest.txt\n' "$TP_DIR"; }
+
+tp_manifest_write() {
+    local pool="$1" guid vdevs mounts path
+    path="$(tp_manifest_path)"
+    tp_contained "$path" || return 1
+    guid="$(tp_pool_guid "$pool")" || return 1
+    vdevs="$(tp_pool_leaf_vdevs "$pool")" || return 1
+    mounts="$(tp_pool_dataset_mounts "$pool")" || return 1
+    {
+        printf 'root\t%s\n' "$TP_ROOT"
+        printf 'pool\t%s\n' "$pool"
+        printf 'guid\t%s\n' "$guid"
+        printf 'image\t%s\n' "$(readlink -f -- "$TP_IMG")"
+        printf 'mount\t%s\n' "$TP_MNT"
+        printf '%s\n' "$vdevs" | while IFS= read -r v; do [ -n "$v" ] && printf 'vdev\t%s\n' "$v"; done
+        printf '%s\n' "$mounts" | while IFS= read -r m; do [ -n "$m" ] && printf 'dataset\t%s\n' "$m"; done
+    } > "$path" || { tp_die "failed to write the manifest $path"; return 1; }
+    chmod 0600 -- "$path" 2>/dev/null || true
+    return 0
+}
+
+tp_manifest_field() {  # field -> all values, one per line
+    local path
+    path="$(tp_manifest_path)"
+    [ -r "$path" ] || { tp_die "manifest '$path' is missing or unreadable"; return 1; }
+    awk -F'\t' -v f="$1" '$1==f { print substr($0, length($1)+2) }' "$path"
+}
+
+# Re-verify, immediately before destroy, that the pool still IS the object this run created.
+# Name, GUID, the set of leaf-vdevs and every dataset mountpoint must match the manifest. Any
+# mismatch, any query that could not answer, and any mountpoint outside the root refuses —
+# BLOCKED, with nothing destroyed.
+tp_manifest_verify() {
+    local pool m_pool m_guid a_guid m_vdevs a_vdevs m_ds a_ds
+
+    m_pool="$(tp_manifest_field pool)" || return 1
+    [ -n "$m_pool" ] || { tp_die "manifest names no pool"; return 1; }
+    pool="$m_pool"
+    if [ "$pool" != "$TP_POOL" ]; then
+        tp_die "manifest names pool '$pool' but this run is configured for '$TP_POOL'"; return 1
+    fi
+
+    m_guid="$(tp_manifest_field guid)" || return 1
+    a_guid="$(tp_pool_guid "$pool")" || { tp_die "pool GUID unreadable — refusing to destroy"; return 1; }
+    if [ "$m_guid" != "$a_guid" ]; then
+        tp_die "pool '$pool' now has GUID $a_guid, the manifest recorded $m_guid — this is not our pool"
+        return 1
+    fi
+
+    m_vdevs="$(tp_manifest_field vdev | LC_ALL=C sort)" || return 1
+    a_vdevs="$(tp_pool_leaf_vdevs "$pool" | LC_ALL=C sort)" \
+        || { tp_die "pool topology unreadable — refusing to destroy"; return 1; }
+    if [ "$m_vdevs" != "$a_vdevs" ]; then
+        tp_die "leaf-vdevs of '$pool' changed since create — refusing to destroy"
+        printf '  manifest: %s\n' "$(printf '%s' "$m_vdevs" | tr '\n' '|')" >&2
+        printf '  actual:   %s\n' "$(printf '%s' "$a_vdevs" | tr '\n' '|')" >&2
+        return 1
+    fi
+
+    m_ds="$(tp_manifest_field dataset | LC_ALL=C sort)" || return 1
+    a_ds="$(tp_pool_dataset_mounts "$pool")" \
+        || { tp_die "dataset listing unreadable — refusing to destroy"; return 1; }
+    if [ "$m_ds" != "$a_ds" ]; then
+        tp_die "dataset set or mountpoints of '$pool' changed since create — refusing to destroy"
+        printf '  manifest: %s\n' "$(printf '%s' "$m_ds" | tr '\n' '|')" >&2
+        printf '  actual:   %s\n' "$(printf '%s' "$a_ds" | tr '\n' '|')" >&2
+        return 1
+    fi
+
+    tp_assert_dataset_mounts_contained "$pool" || return 1
+    return 0
+}
+
+# --------------------------------------------------------------- environment, frozen at source time
+# Sourcing this library without a valid containment root is itself a refusal: there is no
+# code path in which a caller ends up with a usable default.
+tp_require_env || return 1
+
+TP_POOL="${DEDCOM_TESTPOOL_NAME:-testpool}"
+tp_check_label "$TP_POOL" || return 1
+# shellcheck disable=SC2034  # TP_SIZE is read by make-test-pool.sh
+TP_SIZE="${DEDCOM_TESTPOOL_SIZE:-3G}"
+TP_DIR="$(tp_pool_dir "$TP_POOL")"
+TP_IMG="$TP_DIR/pool.img"
+TP_MNT="$TP_DIR/mount"
+
+tp_contained "$TP_DIR" || return 1

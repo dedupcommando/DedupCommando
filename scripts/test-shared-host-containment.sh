@@ -1,0 +1,570 @@
+#!/usr/bin/env bash
+# Contract test for shared-host containment.
+#
+# The harness in this directory is run on machines that are not sandboxes. This test pins the
+# rules that keep it from touching anything it did not create:
+#
+#   * DEDCOM_E2E_ROOT is mandatory, absolute, symlink-free and never a system directory;
+#   * DEDCOM_E2E_OWNER_UID is mandatory and numeric, and only root or that uid may own the chain;
+#   * every backing file, mountpoint, state directory, capture, log and temporary file is inside
+#     the root;
+#   * `zpool create` carries an explicit mountpoint under the root and `cachefile=none`;
+#   * destruction names one exact object from this run's manifest — never a prefix, a glob or a
+#     listing — and re-verifies name, GUID, leaf-vdevs and dataset mountpoints first;
+#   * anything uncertain refuses without destroying.
+#
+# NOTHING REAL RUNS. `zpool`, `zfs` and friends are PATH stubs that only record their arguments;
+# no ZFS command, no mount, no sudo and no network call is made. The pool-creating cases need
+# uid 0 (make-test-pool.sh requires it) and SKIP when the test is not run as root.
+#
+# The second half applies eight mutations to copies of the scripts and requires each one to be
+# caught: a rule nothing fails on is not a rule.
+#
+# Run:  bash scripts/test-shared-host-containment.sh
+set -uo pipefail
+
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+LIB="$HERE/testpool-lib.sh"
+
+PASS=0; FAIL=0; SKIP=0
+ok()   { PASS=$((PASS+1)); printf 'PASS  %s\n' "$1"; }
+bad()  { FAIL=$((FAIL+1)); printf 'FAIL  %s\n' "$1"; [ -n "${2:-}" ] && printf '%s\n' "$2" | sed 's/^/        /'; }
+skip() { SKIP=$((SKIP+1)); printf 'SKIP  %s (%s)\n' "$1" "$2"; }
+
+WORK="$(mktemp -d)"; trap 'rm -rf "$WORK" "${E2E:-}"' EXIT
+BIN="$WORK/bin"; mkdir -p "$BIN"
+CMDLOG="$WORK/cmds.log"; : > "$CMDLOG"
+
+# ---------------------------------------------------------------- PATH stubs
+# Each stub records its full argument vector and answers the minimum the harness needs. None of
+# them touches a pool, a dataset or a mount.
+make_stub() {  # name body
+  cat > "$BIN/$1" <<STUBHEAD
+#!/usr/bin/env bash
+printf '%s' "$1" >> "\$STUB_CMDLOG"
+for a in "\$@"; do printf ' %s' "\$a" >> "\$STUB_CMDLOG"; done
+printf '\n' >> "\$STUB_CMDLOG"
+STUBHEAD
+  cat >> "$BIN/$1" <<STUBBODY
+$2
+STUBBODY
+  chmod +x "$BIN/$1"
+}
+
+make_stub zpool '
+case "$1" in
+  list)
+    for a in "$@"; do case "$a" in -*v*) exec printf "%b" "${STUB_VDEV:-}";; esac; done
+    exit "${STUB_POOL_PRESENT:-1}" ;;
+  get)     printf "%s\n" "${STUB_GUID-7777777777777777777}"; exit 0 ;;
+  create)  exit 0 ;;
+  destroy) exit 0 ;;
+  sync)    exit 0 ;;
+esac
+exit 0'
+
+make_stub zfs '
+case "$1" in
+  list)     printf "%b" "${STUB_DS:-}"; exit 0 ;;
+  create)   exit 0 ;;
+  snapshot) exit 0 ;;
+  destroy)  exit 0 ;;
+esac
+exit 0'
+
+make_stub seq 'printf "1\n2\n3\n"'   # keeps the fixture loop to three files
+
+export STUB_CMDLOG="$CMDLOG"
+
+# ---------------------------------------------------------------- containment root
+E2E=""
+for cand in /var/lib /run /root "$HOME"; do
+  [ -d "$cand" ] && [ -w "$cand" ] || continue
+  c="$(mktemp -d "$cand/dedcom-e2e-ct.XXXXXX" 2>/dev/null)" || continue
+  chmod 0700 "$c" 2>/dev/null || true
+  if DEDCOM_E2E_ROOT="$c" DEDCOM_E2E_OWNER_UID="$(id -u)" bash -c '. "$1"' _ "$LIB" >/dev/null 2>&1; then
+    E2E="$c"; break
+  fi
+  rmdir "$c" 2>/dev/null || rm -rf "$c"
+done
+[ -n "$E2E" ] || { echo "ABORT: no clean-chain containment root available here" >&2; exit 1; }
+UID_NOW="$(id -u)"
+
+# Source the library in a subshell with a given environment; prints nothing, returns its status.
+lib_env() { env "$@" bash -c '. "$1"' _ "$LIB" >/dev/null 2>&1; }
+
+echo "== 1. the environment contract =="
+
+lib_env DEDCOM_E2E_OWNER_UID="$UID_NOW" && bad "missing DEDCOM_E2E_ROOT -> refuse" \
+  || ok "missing DEDCOM_E2E_ROOT -> refuse"
+
+lib_env DEDCOM_E2E_ROOT="$E2E" && bad "missing DEDCOM_E2E_OWNER_UID -> refuse" \
+  || ok "missing DEDCOM_E2E_OWNER_UID -> refuse"
+
+lib_env DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="nobody" \
+  && bad "non-numeric DEDCOM_E2E_OWNER_UID -> refuse" \
+  || ok "non-numeric DEDCOM_E2E_OWNER_UID -> refuse"
+
+lib_env DEDCOM_E2E_ROOT="relative/path" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
+  && bad "relative DEDCOM_E2E_ROOT -> refuse" || ok "relative DEDCOM_E2E_ROOT -> refuse"
+
+for forbidden in / /home /tmp /var/tmp /var/lib /root /run; do
+  if lib_env DEDCOM_E2E_ROOT="$forbidden" DEDCOM_E2E_OWNER_UID="$UID_NOW"; then
+    bad "forbidden root '$forbidden' -> refuse"
+  else
+    ok "forbidden root '$forbidden' -> refuse"
+  fi
+done
+
+if [ -n "${HOME:-}" ] && [ -d "$HOME" ]; then
+  lib_env DEDCOM_E2E_ROOT="$HOME" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
+    && bad "the user's home as root -> refuse" || ok "the user's home as root -> refuse"
+else
+  skip "the user's home as root -> refuse" "no HOME"
+fi
+
+lib_env DEDCOM_E2E_ROOT="$E2E/.." DEDCOM_E2E_OWNER_UID="$UID_NOW" \
+  && bad "'..' in the root -> refuse" || ok "'..' in the root -> refuse"
+
+lib_env DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
+  && ok "a valid root and uid -> accepted" || bad "a valid root and uid -> accepted"
+
+echo "== 2. ownership and symlink escape =="
+
+if [ "$UID_NOW" = "0" ]; then
+  foreign="$E2E/foreign"; mkdir -p "$foreign"
+  if chown 12345:12345 "$foreign" 2>/dev/null; then
+    if lib_env DEDCOM_E2E_ROOT="$foreign" DEDCOM_E2E_OWNER_UID="$UID_NOW"; then
+      bad "a component owned by a third uid -> refuse"
+    else
+      ok "a component owned by a third uid -> refuse"
+    fi
+    if lib_env DEDCOM_E2E_ROOT="$foreign" DEDCOM_E2E_OWNER_UID=12345; then
+      ok "the declared owner uid is accepted"
+    else
+      bad "the declared owner uid is accepted"
+    fi
+  else
+    skip "a component owned by a third uid -> refuse" "chown unavailable"
+    skip "the declared owner uid is accepted" "chown unavailable"
+  fi
+else
+  skip "a component owned by a third uid -> refuse" "not root"
+  skip "the declared owner uid is accepted" "not root"
+fi
+
+ww="$E2E/worldwritable"; mkdir -p "$ww"; chmod 0777 "$ww" 2>/dev/null || true
+if [ "$(stat -c '%a' "$ww" 2>/dev/null)" = "777" ]; then
+  lib_env DEDCOM_E2E_ROOT="$ww" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
+    && bad "a world-writable root -> refuse" || ok "a world-writable root -> refuse"
+else
+  skip "a world-writable root -> refuse" "no POSIX modes here"
+fi
+
+if ln -s "$E2E" "$WORK/rootlink" 2>/dev/null && [ -L "$WORK/rootlink" ]; then
+  lib_env DEDCOM_E2E_ROOT="$WORK/rootlink" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
+    && bad "a symlinked root -> refuse" || ok "a symlinked root -> refuse"
+
+  # An escape one level down: pools/<name> is a link out of the root.
+  mkdir -p "$E2E/pools" "$WORK/outside"
+  ln -sfn "$WORK/outside" "$E2E/pools/escapee" 2>/dev/null
+  if env DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME=escapee \
+       bash -c '. "$1"; tp_contained "$TP_IMG"' _ "$LIB" >/dev/null 2>&1; then
+    bad "a symlink out of the root -> refuse"
+  else
+    ok "a symlink out of the root -> refuse"
+  fi
+  rm -f "$E2E/pools/escapee"
+else
+  skip "a symlinked root -> refuse" "symlinks unavailable"
+  skip "a symlink out of the root -> refuse" "symlinks unavailable"
+fi
+
+echo "== 3. every derived path is inside the root =="
+
+paths="$(env DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME=probe \
+         bash -c '. "$1"
+                  printf "%s\n" "$TP_DIR" "$TP_IMG" "$TP_MNT" \
+                                "$(tp_state_dir s)" "$(tp_tmp_dir s)" "$(tp_evidence_dir s)" \
+                                "$(tp_manifest_path)"' _ "$LIB" 2>/dev/null)"
+outside=0
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  case "$p" in "$E2E"/*) ;; *) outside=1; printf '        outside: %s\n' "$p" ;; esac
+done <<< "$paths"
+[ "$outside" -eq 0 ] && ok "backing file, mount, state, tmp, evidence and manifest are all under the root" \
+                     || bad "backing file, mount, state, tmp, evidence and manifest are all under the root"
+
+echo "== 4. the exact zpool create command =="
+
+if [ "$UID_NOW" != "0" ]; then
+  skip "zpool create carries -m under the root and cachefile=none" "not root"
+  skip "the manifest records name, GUID, vdev and dataset mountpoints" "not root"
+else
+  POOL="ct-$$"
+  PDIR="$E2E/pools/$POOL"
+  : > "$CMDLOG"
+  createlog="$WORK/create.out"
+  env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" \
+      DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID=0 \
+      DEDCOM_TESTPOOL_NAME="$POOL" DEDCOM_TESTPOOL_SIZE=1M \
+      STUB_POOL_PRESENT=1 \
+      STUB_VDEV="$POOL\n\t$PDIR/pool.img\n" \
+      STUB_DS="$(printf '%s\t%s\n%s/ds_a\t%s/ds_a\n%s/ds_b\t%s/ds_b\n' \
+                 "$POOL" "$PDIR/mount" "$POOL" "$PDIR/mount" "$POOL" "$PDIR/mount")" \
+      bash "$HERE/make-test-pool.sh" > "$createlog" 2>&1
+  mk_rc=$?
+
+  create_line="$(grep -m1 '^zpool create ' "$CMDLOG" || true)"
+  if [ -z "$create_line" ]; then
+    bad "zpool create carries -m under the root and cachefile=none" \
+        "no zpool create was issued (rc=$mk_rc)"$'\n'"$(tail -20 "$createlog")"
+  else
+    err=""
+    case "$create_line" in *" -m $PDIR/mount "*) ;; *) err="$err no explicit -m under the root;";; esac
+    case "$create_line" in *" -o cachefile=none "*) ;; *) err="$err no cachefile=none;";; esac
+    case "$create_line" in *" /$POOL"*) err="$err mountpoint at the filesystem root;";; esac
+    if [ -z "$err" ]; then
+      ok "zpool create carries -m under the root and cachefile=none"
+    else
+      bad "zpool create carries -m under the root and cachefile=none" "$err"$'\n'"$create_line"
+    fi
+  fi
+
+  man="$PDIR/manifest.txt"
+  if [ -r "$man" ] &&
+     grep -q "^pool	$POOL$" "$man" &&
+     grep -q '^guid	[0-9][0-9]*$' "$man" &&
+     grep -q "^vdev	$PDIR/pool.img$" "$man" &&
+     grep -q "^dataset	$POOL	$PDIR/mount$" "$man"; then
+    ok "the manifest records name, GUID, vdev and dataset mountpoints"
+  else
+    bad "the manifest records name, GUID, vdev and dataset mountpoints" \
+        "$( [ -r "$man" ] && cat "$man" || echo 'no manifest written')"
+  fi
+
+  # Everything the run created stays inside the root.
+  stray="$(grep -E '^(zpool|zfs) ' "$CMDLOG" | grep -oE ' /[A-Za-z0-9._/-]+' | tr -d ' ' \
+           | grep -v "^$E2E" | grep -v '^/dev/' || true)"
+  [ -z "$stray" ] && ok "no ZFS argument names a path outside the root" \
+                  || bad "no ZFS argument names a path outside the root" "$stray"
+fi
+
+echo "== 5. a dataset mounted outside the root refuses =="
+
+esc="$E2E/pools/escaped-mount"; mkdir -p "$esc/mount"
+if env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" \
+       DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
+       DEDCOM_TESTPOOL_NAME=escaped-mount \
+       STUB_DS="$(printf 'escaped-mount\t/dedcom-escaped-mount\n')" \
+       bash -c '. "$1"; tp_assert_dataset_mounts_contained escaped-mount' _ "$LIB" >/dev/null 2>&1; then
+  bad "a dataset mounted outside the root -> refuse"
+else
+  ok "a dataset mounted outside the root -> refuse"
+fi
+
+echo "== 6. clean-stale refuses prefix and listing forms =="
+
+# The gate envs are supplied so the refusal under test is the ARGUMENT check itself, not the
+# earlier destructive-E2E gate: with them present, a permissive clean-stale would sail through
+# to the stubbed "pool not found" and exit 0.
+G5="$HERE/e2e-g5.sh"
+clean_stale() {  # args... -> exit status of clean-stale under gate envs and stubs
+  env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" DEDCOM_G5_E2E=1 \
+      DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
+      DEDCOM="$BIN/zpool" \
+      bash "$G5" clean-stale "$@" >/dev/null 2>&1
+}
+if [ "$UID_NOW" = "0" ]; then
+  if clean_stale; then
+    bad "clean-stale without an exact pool name -> refuse"
+  else
+    ok "clean-stale without an exact pool name -> refuse"
+  fi
+  if clean_stale 'dedcom-g5-*'; then
+    bad "clean-stale with a glob -> refuse"
+  else
+    ok "clean-stale with a glob -> refuse"
+  fi
+  if clean_stale 'rpool'; then
+    bad "clean-stale with a foreign pool name -> refuse"
+  else
+    ok "clean-stale with a foreign pool name -> refuse"
+  fi
+else
+  skip "clean-stale without an exact pool name -> refuse" "not root"
+  skip "clean-stale with a glob -> refuse" "not root"
+  skip "clean-stale with a foreign pool name -> refuse" "not root"
+fi
+# The old form iterated every imported pool and matched a prefix; its loop message is the
+# static fingerprint. The new form must refuse without a name and never print the old marker.
+if grep -q 'tearing down stale pool:' "$G5"; then
+  bad "clean-stale no longer iterates a pool listing"
+elif grep -q 'clean-stale needs the EXACT pool name' "$G5"; then
+  ok "clean-stale no longer iterates a pool listing"
+else
+  bad "clean-stale no longer iterates a pool listing" "the refusal message is gone too"
+fi
+
+echo "== 7. no executable path escapes the root, statically =="
+
+# Comments may discuss /tmp; executable lines may not use it. The check looks at code only.
+static_clean=1
+for f in testpool-lib.sh make-test-pool.sh teardown-test-pool.sh e2e-g5.sh \
+         e2e-root-guard.sh e2e-dir-completeness.sh; do
+  hits="$(sed 's/[[:space:]]*#.*$//' "$HERE/$f" \
+          | grep -nE '(^|[^A-Za-z0-9_])(/tmp/|/var/tmp/|/var/lib/|"/\$POOL|/dedcomdirtest)' || true)"
+  if [ -n "$hits" ]; then
+    static_clean=0
+    printf '        %s:\n%s\n' "$f" "$(printf '%s' "$hits" | sed 's/^/          /')"
+  fi
+done
+[ "$static_clean" -eq 1 ] && ok "no executable line names /tmp, /var/tmp, /var/lib or a pool at the filesystem root" \
+                          || bad "no executable line names /tmp, /var/tmp, /var/lib or a pool at the filesystem root"
+
+if grep -nE '(^|[[:space:]])--force([[:space:]]|$)' "$HERE"/*.sh | grep -v '^\s*#' | grep -q .; then
+  bad "--force appears in no harness script"
+else
+  ok "--force appears in no harness script"
+fi
+
+echo "== 8. mutations must be caught =="
+
+# Each mutation is applied to a private copy of the scripts and the named check is re-run there.
+# The check MUST fail on the mutant: a guard nothing trips is not a guard.
+#
+# Replacement is literal — FROM and TO are plain strings, not patterns. A regex here would need
+# escaping that quietly stops matching after an unrelated edit, and a mutation that silently
+# matches nothing is a test that proves nothing.
+literal_sub() {  # file from to  -> non-zero when FROM does not occur
+  local file="$1" from="$2" to="$3" src
+  src="$(cat "$file")"
+  case "$src" in *"$from"*) ;; *) return 3;; esac
+  printf '%s\n' "${src/"$from"/"$to"}" > "$file"
+}
+
+mutate() {  # label file from to check-fn
+  local label="$1" file="$2" from="$3" to="$4" fn="$5"
+  local dir="$WORK/mut-$MUTN"; MUTN=$((MUTN+1))
+  mkdir -p "$dir"
+  cp "$HERE"/*.sh "$dir/" 2>/dev/null
+  if ! literal_sub "$dir/$file" "$from" "$to"; then
+    bad "mutation '$label' changed nothing — the target text is no longer present in $file"; return
+  fi
+  if "$fn" "$dir"; then
+    bad "mutation '$label' SURVIVED — the contract does not catch it"
+  else
+    ok "mutation '$label' is caught"
+  fi
+}
+MUTN=0
+
+# Every chk_* is THE CONTRACT CHECK for its guard, phrased positively: it returns 0 when the
+# guard holds and non-zero when it does not. On a mutant the check must fail — that is the
+# kill. The static checks are scoped to the six harness scripts: the test files themselves
+# carry these very strings inside their heredocs and must not be read as violations.
+HARNESS_FILES="testpool-lib.sh make-test-pool.sh teardown-test-pool.sh e2e-g5.sh e2e-root-guard.sh e2e-dir-completeness.sh"
+
+chk_create_opts() {  # 0 = zpool create still carries -m under the root and cachefile=none
+  local dir="$1" line
+  [ "$UID_NOW" = "0" ] || return 1     # make refuses as non-root: cannot prove, report caught
+  local pool="mu-$$-$RANDOM" log="$dir/cmds.log"; : > "$log"
+  local pdir="$E2E/pools/$pool"
+  env PATH="$BIN:$PATH" STUB_CMDLOG="$log" \
+      DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID=0 \
+      DEDCOM_TESTPOOL_NAME="$pool" DEDCOM_TESTPOOL_SIZE=1M STUB_POOL_PRESENT=1 \
+      STUB_VDEV="$pool\n\t$pdir/pool.img\n" \
+      STUB_DS="$(printf '%s\t%s\n' "$pool" "$pdir/mount")" \
+      bash "$dir/make-test-pool.sh" >/dev/null 2>&1
+  line="$(grep -m1 '^zpool create ' "$log" || true)"
+  rm -rf "$pdir"
+  [ -n "$line" ] || return 1
+  case "$line" in *" -m $pdir/mount "*) ;; *) return 1;; esac
+  case "$line" in *" -o cachefile=none "*) ;; *) return 1;; esac
+  return 0
+}
+
+# Both scanners CAPTURE grep's full output instead of using `grep -q` on the pipe: -q exits at
+# the first match, sed catches SIGPIPE (141), and under pipefail that turns a FOUND violation
+# into a not-found — a timing-dependent fail-open on exactly the files big enough to matter.
+chk_no_root_mount() {  # 0 = no harness script places a pool at the filesystem root
+  local dir="$1" f hits
+  for f in $HARNESS_FILES; do
+    hits="$(sed 's/[[:space:]]*#.*$//' "$dir/$f" | grep -E '"/\$POOL' || true)"
+    [ -n "$hits" ] && return 1
+  done
+  return 0
+}
+
+chk_no_tmp() {  # 0 = no executable harness line names /tmp or /var/lib
+  local dir="$1" f hits
+  for f in $HARNESS_FILES; do
+    hits="$(sed 's/[[:space:]]*#.*$//' "$dir/$f" | grep -E '(/tmp/|/var/lib/)' || true)"
+    [ -n "$hits" ] && return 1
+  done
+  return 0
+}
+
+chk_uid_guard() {  # 0 = a non-numeric owner uid still refuses
+  local dir="$1"
+  if env DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="nobody" \
+       bash -c '. "$1"' _ "$dir/testpool-lib.sh" >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+chk_symlink_guard() {  # 0 = a symlinked root still refuses
+  local dir="$1"
+  [ -L "$WORK/rootlink" ] || return 1
+  if env DEDCOM_E2E_ROOT="$WORK/rootlink" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
+       bash -c '. "$1"' _ "$dir/testpool-lib.sh" >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+chk_prefix_cleanup() {  # 0 = clean-stale without an exact name still refuses
+  local dir="$1"
+  [ "$UID_NOW" = "0" ] || return 1     # the gate needs root; cannot prove here, report caught
+  # Every earlier gate is satisfied on purpose — env, root, stubs — so the only thing standing
+  # between a defaulted pool name and a "pool not found" exit 0 is the argument check itself.
+  if env PATH="$BIN:$PATH" STUB_CMDLOG="$WORK/mut.log" DEDCOM_G5_E2E=1 \
+       DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
+       DEDCOM="$BIN/zpool" \
+       bash "$dir/e2e-g5.sh" clean-stale >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+chk_dataset_mounts() {  # 0 = a dataset mounted outside the root still refuses
+  local dir="$1"
+  if env PATH="$BIN:$PATH" STUB_CMDLOG="$WORK/mut.log" \
+       DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME=escaped-mount \
+       STUB_DS="$(printf 'escaped-mount\t/dedcom-escaped-mount\n')" \
+       bash -c '. "$1"; tp_assert_dataset_mounts_contained escaped-mount' \
+       _ "$dir/testpool-lib.sh" >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+chk_guid_failopen() {  # 0 = an unreadable or empty GUID still refuses
+  local dir="$1"
+  if env PATH="$BIN:$PATH" STUB_CMDLOG="$WORK/mut.log" \
+       DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME=guidprobe \
+       STUB_GUID="" \
+       bash -c '. "$1"; tp_pool_guid guidprobe' _ "$dir/testpool-lib.sh" >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+# FROM/TO strings are assigned through quoted heredocs: the target lines carry every kind of
+# quote themselves, and a heredoc reproduces them without any escaping to get subtly wrong.
+setvar() { IFS= read -r "$1" || true; }
+
+setvar M_FROM <<'EOT'
+zpool create -o cachefile=none -m "$TP_MNT" "$TP_POOL" "$TP_IMG"
+EOT
+setvar M_TO <<'EOT'
+zpool create "$TP_POOL" "$TP_IMG"
+EOT
+mutate "1. explicit mountpoint removed from zpool create" make-test-pool.sh \
+  "$M_FROM" "$M_TO" chk_create_opts
+
+setvar M_FROM <<'EOT'
+G5ROOT="$PMNT/ds_a/g5"
+EOT
+setvar M_TO <<'EOT'
+G5ROOT="/$POOL/ds_a/g5"
+EOT
+mutate "2. pool placed back at the filesystem root" e2e-g5.sh \
+  "$M_FROM" "$M_TO" chk_no_root_mount
+
+setvar M_FROM <<'EOT'
+    STATE="$(tp_state_dir "$POOL")"
+EOT
+setvar M_TO <<'EOT'
+    STATE="/tmp/$POOL-state"
+EOT
+mutate "3. state moved back to /tmp" e2e-g5.sh \
+  "$M_FROM" "$M_TO" chk_no_tmp
+
+setvar M_FROM <<'EOT'
+    POOLDIR="$TP_DIR"
+EOT
+setvar M_TO <<'EOT'
+    POOLDIR="/var/lib/$POOL"
+EOT
+mutate "3b. pool directory moved back to /var/lib" e2e-g5.sh \
+  "$M_FROM" "$M_TO" chk_no_tmp
+
+setvar M_FROM <<'EOT'
+        ''|*[!0-9]*) tp_die "DEDCOM_E2E_OWNER_UID='$uid' is not a decimal uid"; return 1;;
+EOT
+setvar M_TO <<'EOT'
+        '') tp_die "DEDCOM_E2E_OWNER_UID is empty"; return 1;;
+EOT
+mutate "4. arbitrary owner uid accepted" testpool-lib.sh \
+  "$M_FROM" "$M_TO" chk_uid_guard
+
+# Mutation 5 removes BOTH symlink layers — the lstat refusal and the canonical-spelling
+# comparison. Removing only one is an equivalent mutant: the other layer still refuses, which
+# is the defence working, not a hole. The kill therefore targets the composite.
+mut5_dir="$WORK/mut-$MUTN"; MUTN=$((MUTN+1))
+mkdir -p "$mut5_dir"
+cp "$HERE"/*.sh "$mut5_dir/" 2>/dev/null
+setvar M_FROM <<'EOT'
+    if [ -L "$root" ]; then tp_die "DEDCOM_E2E_ROOT='$root' is a symbolic link"; return 1; fi
+EOT
+setvar M_TO <<'EOT'
+    :
+EOT
+setvar M_FROM2 <<'EOT'
+    if [ "$real" != "$root" ]; then
+EOT
+setvar M_TO2 <<'EOT'
+    if false; then
+EOT
+if literal_sub "$mut5_dir/testpool-lib.sh" "$M_FROM" "$M_TO" &&
+   literal_sub "$mut5_dir/testpool-lib.sh" "$M_FROM2" "$M_TO2"; then
+  if chk_symlink_guard "$mut5_dir"; then
+    bad "mutation '5. symlink guard removed (both layers)' SURVIVED — the contract does not catch it"
+  else
+    ok "mutation '5. symlink guard removed (both layers)' is caught"
+  fi
+else
+  bad "mutation '5. symlink guard removed (both layers)' changed nothing — a target line is gone"
+fi
+
+setvar M_FROM <<'EOT'
+    stale="${2:-}"
+EOT
+setvar M_TO <<'EOT'
+    stale="${2:-dedcom-g5-any}"
+EOT
+mutate "6. prefix clean-stale restored" e2e-g5.sh \
+  "$M_FROM" "$M_TO" chk_prefix_cleanup
+
+setvar M_FROM <<'EOT'
+            *) tp_die "dataset '$name' is mounted at '$mp', outside $TP_MNT"; return 1;;
+EOT
+setvar M_TO <<'EOT'
+            *) ;;
+EOT
+mutate "7. dataset mountpoint check removed" testpool-lib.sh \
+  "$M_FROM" "$M_TO" chk_dataset_mounts
+
+setvar M_FROM <<'EOT'
+        ''|*[!0-9]*) tp_die "unexpected GUID for pool '$pool': [$guid]"; return 1;;
+EOT
+setvar M_TO <<'EOT'
+        *) ;;
+EOT
+mutate "8. GUID query fails open" testpool-lib.sh \
+  "$M_FROM" "$M_TO" chk_guid_failopen
+
+echo "== result: PASS=$PASS FAIL=$FAIL SKIP=$SKIP =="
+[ "$FAIL" -eq 0 ]

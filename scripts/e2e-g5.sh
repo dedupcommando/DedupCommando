@@ -60,7 +60,8 @@ esac
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS="${HARNESS:-$SCRIPT_DIR}"
-DEDCOM="${DEDCOM:-/tmp/dedcom-e2e/dedcom}"
+# No default under /tmp: on a shared host a guessed binary path is a guessed target.
+DEDCOM="${DEDCOM:-}"
 
 if [ "$G5_OFFLINE" -eq 0 ]; then
     [ "${DEDCOM_G5_E2E:-}" = "1" ] \
@@ -78,22 +79,30 @@ if [ "$G5_OFFLINE" -eq 0 ]; then
     done
 fi
 
-# --------------------------------- clean-stale: tear down leftover dedcom-g5-* pools only
+# --------------------------------- clean-stale: ONE exact pool, named by the caller
+# The earlier form listed every imported pool and matched `dedcom-g5-*`. That is a pattern
+# teardown, and on a shared host a pattern can select an object this run never created — the
+# one thing a destructive step must never do. Removal now names one pool explicitly, and
+# teardown re-verifies its manifest identity (name, GUID, vdev, dataset mountpoints) before
+# destroying anything.
 if [ "${1:-}" = "clean-stale" ]; then
-    found=0
-    while IFS= read -r p; do
-        case "$p" in
-            dedcom-g5-*)
-                found=1
-                echo "tearing down stale pool: $p"
-                DEDCOM_TESTPOOL_NAME="$p" DEDCOM_TESTPOOL_DIR="/var/lib/$p" \
-                    "$HARNESS/teardown-test-pool.sh" \
-                    || echo "  (teardown of $p reported an error; inspect manually)"
-                ;;
-        esac
-    done < <(LC_ALL=C zpool list -H -o name 2>/dev/null || true)
-    [ "$found" = 1 ] || echo "no dedcom-g5-* pools found."
-    exit 0
+    stale="${2:-}"
+    [ -n "$stale" ] \
+        || g5_die "clean-stale needs the EXACT pool name: e2e-g5.sh clean-stale <pool>. No prefix, no glob, no listing."
+    case "$stale" in
+        dedcom-g5-*) ;;
+        *) g5_die "'$stale' is not a dedcom-g5-* pool of this harness — refusing." ;;
+    esac
+    case "$stale" in
+        *[!A-Za-z0-9._-]*) g5_die "pool name '$stale' carries characters this harness never generates." ;;
+    esac
+    [ -n "${DEDCOM_E2E_ROOT:-}" ] \
+        || g5_die "DEDCOM_E2E_ROOT is not set — teardown has no containment root to verify against."
+    [ -n "${DEDCOM_E2E_OWNER_UID:-}" ] \
+        || g5_die "DEDCOM_E2E_OWNER_UID is not set — refusing to guess who may own the tree."
+    echo "tearing down exactly one pool: $stale"
+    DEDCOM_TESTPOOL_NAME="$stale" "$HARNESS/teardown-test-pool.sh"
+    exit $?
 fi
 
 [ "$G5_OFFLINE" -eq 1 ] || [ -x "$DEDCOM" ] \
@@ -102,16 +111,38 @@ fi
 # ----------------------------------------------------------- config / unique disposable pool
 TS="$(date +%Y%m%d-%H%M%S)-$$"
 POOL="dedcom-g5-$TS"
-POOLDIR="/var/lib/$POOL"
-export DEDCOM_TESTPOOL_NAME="$POOL"
-export DEDCOM_TESTPOOL_DIR="$POOLDIR"
-export DEDCOM_TESTPOOL_SIZE="${DEDCOM_G5_SIZE:-2G}"
-
-G5ROOT="/$POOL/ds_a/g5"          # ds_a is created by make-test-pool.sh
-STATE="/tmp/$POOL-state"
 
 # never operate outside our own pool; never touch /tank
 case "$POOL" in dedcom-g5-*) ;; *) g5_die "pool name '$POOL' is not dedcom-g5-* — refusing." ;; esac
+
+# Every path this run writes is derived from the containment root, never from /tmp, /var/lib or
+# the filesystem root. Offline modes create nothing and render a parameterized sample instead.
+if [ "$G5_OFFLINE" -eq 0 ]; then
+    [ -n "${DEDCOM_E2E_ROOT:-}" ] \
+        || g5_die "DEDCOM_E2E_ROOT is not set — this harness creates nothing outside a declared root."
+    [ -n "${DEDCOM_E2E_OWNER_UID:-}" ] \
+        || g5_die "DEDCOM_E2E_OWNER_UID is not set — refusing to guess who may own the tree."
+    export DEDCOM_TESTPOOL_NAME="$POOL"
+    export DEDCOM_TESTPOOL_SIZE="${DEDCOM_G5_SIZE:-2G}"
+    # shellcheck source=testpool-lib.sh
+    . "$HARNESS/testpool-lib.sh"
+    POOLDIR="$TP_DIR"
+    PMNT="$TP_MNT"
+    STATE="$(tp_state_dir "$POOL")"
+    TMPD="$(tp_tmp_dir "$POOL")"
+    tp_make_dir "$STATE" || g5_die "could not create the contained state directory $STATE."
+    tp_make_dir "$TMPD"  || g5_die "could not create the contained temp directory $TMPD."
+else
+    # Illustrative only. `<DEDCOM_E2E_ROOT>` is printed literally so the operator sees that the
+    # tree is parameterized rather than rooted at /, and no offline mode ever touches it.
+    E2ESAMPLE="${DEDCOM_E2E_ROOT:-<DEDCOM_E2E_ROOT>}"
+    POOLDIR="$E2ESAMPLE/pools/$POOL"
+    PMNT="$POOLDIR/mount"
+    STATE="$E2ESAMPLE/state/$POOL"
+    TMPD="$E2ESAMPLE/tmp/$POOL"
+fi
+
+G5ROOT="$PMNT/ds_a/g5"          # ds_a is created by make-test-pool.sh
 case "$G5ROOT" in /tank/*|*/tank/*) g5_die "G5ROOT '$G5ROOT' touches /tank — refusing." ;; esac
 
 # --------------------------------------------------------------------- logging / helpers
@@ -461,7 +492,7 @@ PY
 # `commander_dirs` (src/app.rs:680-687); and `CommanderState::new` puts panel 1 on item 0,
 # panel 2 on item 1, with panel 1 active (src/tui/commander/state.rs:867-875).
 #
-# Nothing in that chain makes the active panel start at /$POOL/ds_a — the pool root, ds_b and any
+# Nothing in that chain makes the active panel start at $PMNT/ds_a — the pool root, ds_b and any
 # unrelated pool on the host all sit in the same list.
 # Where the dataset list is allowed to come from. A real run has exactly one answer and the
 # environment does not get a vote: `G5_FORCE_REAL_SOURCE` is a probe knob and is consulted only
@@ -880,7 +911,7 @@ pause_context() {  # fixture-dir
         fail "could not enumerate the mounted ZFS filesystems the Commander will show"
         return 1
     fi
-    G5_TARGET_ROOT="/$POOL/ds_a"
+    G5_TARGET_ROOT="$PMNT/ds_a"
     if ! G5_ROOT_K="$(root_index "$G5_TARGET_ROOT")"; then
         fail "$G5_TARGET_ROOT is not exactly one entry of the Commander's root list — the route cannot be generated"
         return 1
@@ -937,7 +968,7 @@ except OSError: pass' "$1" "$2"
         return 127
     fi
 }
-quarantined() { find "/$POOL" -path '*/.dedcom-quarantine/*' -name "$1" 2>/dev/null | grep -q .; }
+quarantined() { find "$PMNT" -path '*/.dedcom-quarantine/*' -name "$1" 2>/dev/null | grep -q .; }
 
 # Data-block addresses of one file, sorted and de-duplicated (R2D-C5-2).
 #
@@ -966,7 +997,7 @@ purge_and_release() {
     zfs list -H -t snapshot -o name -r "$POOL" 2>/dev/null \
         | grep '@dedcom-' \
         | while read -r snap; do zfs destroy "$snap"; done
-    find "/$POOL" -type d -name '.dedcom-quarantine' -prune -print0 2>/dev/null \
+    find "$PMNT" -type d -name '.dedcom-quarantine' -prune -print0 2>/dev/null \
         | xargs -0 -r rm -rf --
     sync; zpool sync "$POOL" 2>/dev/null || true
 }
@@ -1072,7 +1103,7 @@ scenario_delete_restore() {
     [ -f "$d/keeper.bin" ] && ok "keeper.bin intact" || fail "keeper.bin missing"
     [ -e "$d/dup.bin" ] && fail "dup.bin still at original path (expected moved to quarantine)" \
                         || ok "dup.bin removed from original path"
-    local q; q="$(find "/$POOL" -path '*/.dedcom-quarantine/*' -name 'dup.bin' 2>/dev/null | head -1 || true)"
+    local q; q="$(find "$PMNT" -path '*/.dedcom-quarantine/*' -name 'dup.bin' 2>/dev/null | head -1 || true)"
     [ -n "$q" ] && ok "dup.bin found in quarantine: $q" || { fail "dup.bin not found in quarantine"; return; }
     banner "restore from quarantine"
     info "restoring: mv '$q' '$d/dup.bin'"
@@ -1309,18 +1340,18 @@ scenario_script_preflight() {
     # Now drift the plan and run it: it must exit non-zero before the snapshot and before any mv.
     rm -f -- "$d/alias_b.bin"
     local snaps_before; snaps_before="$(zfs list -H -t snapshot -o name -r "$POOL" | wc -l)"
-    if bash "$sh" >/tmp/$POOL-script.out 2>/tmp/$POOL-script.err; then
+    if bash "$sh" >"$TMPD/script.out" 2>"$TMPD/script.err"; then
         fail "the drifted script ran to completion"
     else
         ok "the drifted script exited non-zero"
     fi
-    grep -q 'since the plan' /tmp/$POOL-script.err && ok "and said what moved" \
-        || fail "no preflight message: $(head -2 /tmp/$POOL-script.err)"
+    grep -q 'since the plan' "$TMPD/script.err" && ok "and said what moved" \
+        || fail "no preflight message: $(head -2 "$TMPD/script.err")"
     local snaps_after; snaps_after="$(zfs list -H -t snapshot -o name -r "$POOL" | wc -l)"
     [ "$snaps_after" -eq "$snaps_before" ] && ok "no snapshot was taken" \
                                            || fail "the script reached the snapshot section"
     [ -f "$d/alias_a.bin" ] && ok "no file was moved" || fail "alias_a.bin moved"
-    rm -f "/tmp/$POOL-script.out" "/tmp/$POOL-script.err"
+    rm -f "$TMPD/script.out" "$TMPD/script.err"
     rm -rf "$d"
 }
 
@@ -1331,7 +1362,7 @@ scenario_dir_dedup() {
     cp "$d/twinA/a.bin" "$d/twinB/a.bin"; cp "$d/twinA/b.bin" "$d/twinB/b.bin"
     head -c 32K /dev/urandom > "$d/lone/c.bin"
     info "fixture: twinA == twinB (identical trees), lone is unique"
-    local so="/tmp/$POOL-old" sm="/tmp/$POOL-merkle"; rm -rf "$so" "$sm"
+    local so="$TMPD/old" sm="$TMPD/merkle"; rm -rf "$so" "$sm"
     "$DEDCOM" --state-dir "$so" --scan "$d" --no-resume
     "$DEDCOM" --state-dir "$sm" --scan "$d" --no-resume --merkle-dirs
     banner "verify dir_dedup groups twins, suppresses lone, Old==Merkle"
@@ -1370,21 +1401,26 @@ PAUSES="01 02 03 04 05 06 07 08 09 10"
 # A sample dataset list for the offline modes. It deliberately puts an UNRELATED pool and the
 # disposable pool's own root ahead of ds_a, so a route that assumes the active panel starts on
 # the target cannot pass the contract test.
+G5_SAMPLE_ROOT="${DEDCOM_E2E_ROOT:-<DEDCOM_E2E_ROOT>}"
+G5_SAMPLE_MNT="$G5_SAMPLE_ROOT/pools/dedcom-g5-SAMPLE/mount"
 G5_SAMPLE_DATASETS="$(printf '%s\t%s\t%s\n' \
     rpool/data                /rpool/data                yes \
     rpool/swap                none                       no  \
-    dedcom-g5-SAMPLE          /dedcom-g5-SAMPLE          yes \
-    dedcom-g5-SAMPLE/ds_a     /dedcom-g5-SAMPLE/ds_a     yes \
-    dedcom-g5-SAMPLE/ds_b     /dedcom-g5-SAMPLE/ds_b     yes)"
+    dedcom-g5-SAMPLE          "$G5_SAMPLE_MNT"           yes \
+    dedcom-g5-SAMPLE/ds_a     "$G5_SAMPLE_MNT/ds_a"      yes \
+    dedcom-g5-SAMPLE/ds_b     "$G5_SAMPLE_MNT/ds_b"      yes)"
 
 offline_sample_context() {
     POOL="dedcom-g5-SAMPLE"
-    POOLDIR="/var/lib/$POOL"
-    STATE="/tmp/dedcom-g5-SAMPLE-state"
-    DEDCOM="/tmp/dedcom-e2e/dedcom"
+    POOLDIR="$G5_SAMPLE_ROOT/pools/$POOL"
+    PMNT="$G5_SAMPLE_MNT"
+    STATE="$G5_SAMPLE_ROOT/state/$POOL"
+    TMPD="$G5_SAMPLE_ROOT/tmp/$POOL"
+    DEDCOM="$G5_SAMPLE_ROOT/bin/dedcom"
+    G5ROOT="$PMNT/ds_a/g5"
     G5_DATASETS_OVERRIDE="$G5_SAMPLE_DATASETS"
     G5_ROOTS="$(commander_roots)"
-    G5_TARGET_ROOT="/$POOL/ds_a"
+    G5_TARGET_ROOT="$PMNT/ds_a"
     G5_ROOT_K="$(root_index "$G5_TARGET_ROOT")" \
         || { printf 'ABORT: the sample dataset list does not hold %s exactly once\n' \
                     "$G5_TARGET_ROOT" >&2; exit 1; }
@@ -1396,16 +1432,16 @@ contract-dump)
     skip_finalization
     for idx in $PAUSES; do
         case "$idx" in
-            01) scen=hardlink;        fixture="/$POOL/ds_a/g5/hardlink" ;;
-            02) scen=reflink;         fixture="/$POOL/ds_a/g5/reflink" ;;
-            03) scen=two-alias;       fixture="/$POOL/ds_a/g5/twoalias" ;;
-            04) scen=two-alias;       fixture="/$POOL/ds_a/g5/twoalias" ;;
-            05) scen=preflight;       fixture="/$POOL/ds_a/g5/preflight" ;;
-            06) scen=preflight;       fixture="/$POOL/ds_a/g5/preflight" ;;
-            07) scen=script-preflight; fixture="/$POOL/ds_a/g5/script" ;;
-            08) scen=delete-restore;  fixture="/$POOL/ds_a/g5/delete" ;;
-            09) scen=revalidate;      fixture="/$POOL/ds_a/g5/reval" ;;
-            10) scen=snapshot;        fixture="/$POOL/ds_a/g5/snap" ;;
+            01) scen=hardlink;        fixture="$PMNT/ds_a/g5/hardlink" ;;
+            02) scen=reflink;         fixture="$PMNT/ds_a/g5/reflink" ;;
+            03) scen=two-alias;       fixture="$PMNT/ds_a/g5/twoalias" ;;
+            04) scen=two-alias;       fixture="$PMNT/ds_a/g5/twoalias" ;;
+            05) scen=preflight;       fixture="$PMNT/ds_a/g5/preflight" ;;
+            06) scen=preflight;       fixture="$PMNT/ds_a/g5/preflight" ;;
+            07) scen=script-preflight; fixture="$PMNT/ds_a/g5/script" ;;
+            08) scen=delete-restore;  fixture="$PMNT/ds_a/g5/delete" ;;
+            09) scen=revalidate;      fixture="$PMNT/ds_a/g5/reval" ;;
+            10) scen=snapshot;        fixture="$PMNT/ds_a/g5/snap" ;;
         esac
         G5_FIXTURE="$fixture"
         G5_SCAN="$((10#$idx))"
@@ -1420,7 +1456,7 @@ ack-probe)
     # initials are proved against the code the operator meets — not against a copy of it.
     offline_sample_context
     skip_finalization
-    G5_FIXTURE="/$POOL/ds_a/g5/hardlink"
+    G5_FIXTURE="$PMNT/ds_a/g5/hardlink"
     G5_SCAN=1
     operator_pause "${2:-01}" ack-probe
     exit $?

@@ -2,22 +2,29 @@
 # E2E test: directory-completeness invariant on a disposable loopback-ZFS pool.
 # Exercises the false-twin suppression case end-to-end.
 #
-# Run as ROOT on a disposable ZFS host: root steps run directly; the unprivileged
-# hash-failure case uses `runuser -u nobody` (no sudo required).
-# SAFETY: operates ONLY on the disposable pool $DEDCOM_TESTPOOL_NAME (default
-# dedcomdirtest) under $DEDCOM_TESTPOOL_DIR (default /var/lib/dedcom-dirtest) --
-# never on production data. Override DEDCOM / HARNESS to point at the dedcom binary
-# and the harness scripts dir. Does NOT tear down the pool -- run
-# teardown-test-pool.sh separately after observing the result.
+# Run as ROOT on a ZFS host: root steps run directly; the unprivileged hash-failure case uses
+# `runuser -u nobody` (no sudo required).
+#
+# SHARED-HOST CONTAINMENT: operates ONLY on one disposable pool whose name is unique to this run
+# (dedcomdir-<ts>), whose backing file and mountpoints live under $DEDCOM_E2E_ROOT, and whose
+# state directories, captures and temporary files live there too. Nothing is placed in /tmp or
+# /var/lib, and no pool name is reused between runs, so a leftover from an earlier run can never
+# be mistaken for this one's. DEDCOM and HARNESS must be given explicitly. Does NOT tear down the
+# pool -- run teardown-test-pool.sh with the same DEDCOM_TESTPOOL_NAME after observing the result.
 set -euo pipefail
-cd /tmp
 
-DEDCOM="${DEDCOM:-/tmp/dedcom-e2e/dedcom}"
-HARNESS="${HARNESS:-/tmp/dedcom-e2e/scripts}"
+DEDCOM="${DEDCOM:-}"
+HARNESS="${HARNESS:-}"
 
 banner() { printf '\n========== %s ==========\n' "$*"; }
 
 banner "preconditions"
+[ -n "$DEDCOM" ]  || { echo "DEDCOM is not set — point it at the binary under test" >&2; exit 1; }
+[ -n "$HARNESS" ] || { echo "HARNESS is not set — point it at the harness scripts dir" >&2; exit 1; }
+[ -n "${DEDCOM_E2E_ROOT:-}" ] \
+    || { echo "DEDCOM_E2E_ROOT is not set — this harness creates nothing outside a declared root" >&2; exit 1; }
+[ -n "${DEDCOM_E2E_OWNER_UID:-}" ] \
+    || { echo "DEDCOM_E2E_OWNER_UID is not set — refusing to guess who may own the tree" >&2; exit 1; }
 test -x "$DEDCOM"
 test -x "$HARNESS/make-test-pool.sh"
 test -x "$HARNESS/teardown-test-pool.sh"
@@ -25,12 +32,27 @@ test -x "$HARNESS/teardown-test-pool.sh"
 python3 -c 'import sqlite3; print("python sqlite3", sqlite3.sqlite_version)'
 
 banner "1. create disposable pool + fixtures"
-export DEDCOM_TESTPOOL_NAME=dedcomdirtest
-export DEDCOM_TESTPOOL_DIR=/var/lib/dedcom-dirtest
+# A unique name per run: `dedcomdirtest` was a fixed name, and a fixed name on a shared host is
+# an invitation to adopt somebody else's leftover.
+export DEDCOM_TESTPOOL_NAME="dedcomdir-$(date +%Y%m%d-%H%M%S)-$$"
 export DEDCOM_TESTPOOL_SIZE=2G
+# shellcheck source=testpool-lib.sh
+. "$HARNESS/testpool-lib.sh"
+STATEBASE="$(tp_state_dir "$DEDCOM_TESTPOOL_NAME")"
+DIRTMP="$(tp_tmp_dir "$DEDCOM_TESTPOOL_NAME")"
+tp_make_dir "$STATEBASE"
+tp_make_dir "$DIRTMP"
+cd "$DIRTMP"
 "$HARNESS/make-test-pool.sh"
 
-export ROOT=/dedcomdirtest/ds_a/dir-completeness
+# Two scenarios scan as `nobody`, which needs TRAVERSE (x) through the chain down to the
+# fixture and the state directory. 0711 keeps every write bit closed — tp_check_node and the
+# product's own chain check accept it (both test the 022 write bits, never x) — while letting
+# an unprivileged uid pass through. Nothing becomes listable or writable to others.
+chmod 0711 "$DEDCOM_E2E_ROOT" "$DEDCOM_E2E_ROOT/pools" "$DEDCOM_E2E_ROOT/state" \
+           "$STATEBASE" "$TP_DIR" "$TP_MNT"
+
+export ROOT="$TP_MNT/ds_a/dir-completeness"
 rm -rf "$ROOT"
 mkdir -p "$ROOT/false/A" "$ROOT/false/B" "$ROOT/true/C" "$ROOT/true/D"
 # false-twin case: unique.dat has a unique size -> scanned into manifest, NOT hashed
@@ -46,8 +68,8 @@ echo "--- fixture (size, path) ---"
 find "$ROOT" -type f -printf '%s\t%p\n' | sort
 
 banner "2. scan Old and Merkle (fresh state dirs)"
-export STATE_OLD=/tmp/dedcom-dir-old-state
-export STATE_MERKLE=/tmp/dedcom-dir-merkle-state
+export STATE_OLD=${STATEBASE}/old-state
+export STATE_MERKLE=${STATEBASE}/merkle-state
 rm -rf "$STATE_OLD" "$STATE_MERKLE"
 echo "--- OLD scan ---"
 "$DEDCOM" --state-dir "$STATE_OLD" --scan "$ROOT" --no-resume
@@ -112,7 +134,7 @@ print("Old/Merkle memberships match")
 PY
 
 banner "4. hash-failure suppression (scan as nobody)"
-export FAILROOT=/dedcomdirtest/ds_a/dir-completeness-hashfail
+export FAILROOT="$TP_MNT/ds_a/dir-completeness-hashfail"
 rm -rf "$FAILROOT"
 mkdir -p "$FAILROOT/A" "$FAILROOT/B"
 dd if=/dev/zero of="$FAILROOT/A/shared.bin" bs=64K count=1 status=none
@@ -120,9 +142,12 @@ cp "$FAILROOT/A/shared.bin" "$FAILROOT/B/shared.bin"
 dd if=/dev/zero of="$FAILROOT/A/secret.bin" bs=64K count=1 status=none
 chmod 000 "$FAILROOT/A/secret.bin"
 
-export STATE_FAIL=/tmp/dedcom-dir-fail-state
+export STATE_FAIL=${STATEBASE}/fail-state
 rm -rf "$STATE_FAIL"
-runuser -u nobody -- install -d -m 700 "$STATE_FAIL"
+# Created by root INSIDE the contained state base, then handed to nobody: the base is not
+# world-writable (unlike the old /tmp), so nobody cannot create the directory itself.
+install -d -m 700 "$STATE_FAIL"
+chown nobody "$STATE_FAIL"
 runuser -u nobody -- "$DEDCOM" --state-dir "$STATE_FAIL" --scan "$FAILROOT" --no-resume
 
 python3 - <<'PY'
@@ -156,7 +181,7 @@ banner "5. ledger publication: registered roots vs real omission rows"
 # expected ledger is EXACTLY one min_size row — rows exist only for actual omissions, while
 # scan_root holds one row per registered root.
 echo x > "$ROOT/false/A/undersize.tiny"
-export STATE_LEDGER=/tmp/dedcom-dir-ledger-state
+export STATE_LEDGER=${STATEBASE}/ledger-state
 rm -rf "$STATE_LEDGER"
 "$DEDCOM" --state-dir "$STATE_LEDGER" --scan "$ROOT" --no-resume
 python3 - <<'PY'
@@ -183,7 +208,7 @@ print(f"[ledger] one registered root gen>0; one real omission row; status={statu
 PY
 
 banner "6. walk-error suppression + CompleteWithWarnings (scan as nobody)"
-export ERRROOT=/dedcomdirtest/ds_a/dir-completeness-walkerr
+export ERRROOT="$TP_MNT/ds_a/dir-completeness-walkerr"
 rm -rf "$ERRROOT"
 mkdir -p "$ERRROOT/E" "$ERRROOT/F" "$ERRROOT/E/locked"
 dd if=/dev/zero of="$ERRROOT/E/same.bin" bs=64K count=1 status=none
@@ -192,13 +217,14 @@ dd if=/dev/urandom of="$ERRROOT/E/locked/hidden.bin" bs=4K count=1 status=none
 chmod 700 "$ERRROOT/E/locked"
 chown root:root "$ERRROOT/E/locked"
 
-export STATE_ERR=/tmp/dedcom-dir-err-state
+export STATE_ERR=${STATEBASE}/err-state
 rm -rf "$STATE_ERR"
-runuser -u nobody -- install -d -m 700 "$STATE_ERR"
-runuser -u nobody -- "$DEDCOM" --state-dir "$STATE_ERR" --scan "$ERRROOT" --no-resume | tee /tmp/dedcom-err-scan.out
-grep -q "Scan left gaps:" /tmp/dedcom-err-scan.out || {
+install -d -m 700 "$STATE_ERR"
+chown nobody "$STATE_ERR"
+runuser -u nobody -- "$DEDCOM" --state-dir "$STATE_ERR" --scan "$ERRROOT" --no-resume | tee ${DIRTMP}/err-scan.out
+grep -q "Scan left gaps:" ${DIRTMP}/err-scan.out || {
     echo "the aggregate omission notice is missing"; exit 1; }
-grep -q "^Omissions:" /tmp/dedcom-err-scan.out || {
+grep -q "^Omissions:" ${DIRTMP}/err-scan.out || {
     echo "the omission summary line is missing"; exit 1; }
 python3 - <<'PY'
 import os, sqlite3
@@ -248,7 +274,7 @@ PY
 
 banner "8. interrupted Hashing resume: authoritative = no re-walk; no authority = re-walk"
 # Enough duplicate payload that SIGTERM lands inside the hashing phase.
-export BIGROOT=/dedcomdirtest/ds_a/dir-completeness-resume
+export BIGROOT="$TP_MNT/ds_a/dir-completeness-resume"
 rm -rf "$BIGROOT"
 mkdir -p "$BIGROOT/one" "$BIGROOT/two"
 for i in $(seq 1 24); do
@@ -277,7 +303,7 @@ walk_count() { # how many walks this state dir has performed (one log line per w
 }
 
 # 8a. Authoritative ledger (absolute root): the resume performs ZERO walks.
-export STATE_RESUME_AUTH=/tmp/dedcom-dir-resume-auth
+export STATE_RESUME_AUTH=${STATEBASE}/resume-auth
 interrupted_scan "$STATE_RESUME_AUTH" --scan "$BIGROOT" --no-resume
 [ "$(walk_count "$STATE_RESUME_AUTH")" = "1" ] || { echo "run 1 walks exactly once"; exit 1; }
 "$DEDCOM" --state-dir "$STATE_RESUME_AUTH" --scan "$BIGROOT" > "$STATE_RESUME_AUTH/run2.out"
@@ -299,8 +325,8 @@ test -p "$BIGROOT/one/resume-observed.pipe" || {
 
 # 8b. Roots-unavailable (relative root spelling): the resume MUST re-walk and reconstruct
 # the observed account before completing.
-export STATE_RESUME_REL=/tmp/dedcom-dir-resume-rel
-cd /dedcomdirtest/ds_a
+export STATE_RESUME_REL=${STATEBASE}/resume-rel
+cd "$TP_MNT/ds_a"
 interrupted_scan "$STATE_RESUME_REL" --scan ./dir-completeness-resume --no-resume
 [ "$(walk_count "$STATE_RESUME_REL")" = "1" ] || { echo "run 1 walks exactly once"; exit 1; }
 "$DEDCOM" --state-dir "$STATE_RESUME_REL" --scan ./dir-completeness-resume > "$STATE_RESUME_REL/run2.out"
@@ -320,7 +346,7 @@ grep -q "Scan left gaps: 1 unsupported entries" "$STATE_RESUME_REL/run2.out" || 
     echo "the notice must name the reconstructed event:"; cat "$STATE_RESUME_REL/run2.out"; exit 1; }
 grep -qF "(details not persisted: no completeness authority)" "$STATE_RESUME_REL/run2.out" || {
     echo "the notice must say the account was not persisted:"; cat "$STATE_RESUME_REL/run2.out"; exit 1; }
-cd /tmp
+cd "$DIRTMP"
 python3 - <<'PY'
 import os, sqlite3
 # One expected status for both cases would hide the whole point: the authoritative root finishes
@@ -347,9 +373,10 @@ for name, state, want_root, want_status in (
 PY
 
 banner "9. Old/Merkle parity holds for the walk-error fixture too"
-export STATE_ERR_MERKLE=/tmp/dedcom-dir-err-merkle-state
+export STATE_ERR_MERKLE=${STATEBASE}/err-merkle-state
 rm -rf "$STATE_ERR_MERKLE"
-runuser -u nobody -- install -d -m 700 "$STATE_ERR_MERKLE"
+install -d -m 700 "$STATE_ERR_MERKLE"
+chown nobody "$STATE_ERR_MERKLE"
 runuser -u nobody -- "$DEDCOM" --state-dir "$STATE_ERR_MERKLE" --scan "$ERRROOT" --no-resume --merkle-dirs
 python3 - <<'PY'
 import os, sqlite3
@@ -371,7 +398,7 @@ PY
 banner "10. live states over tmux: Trusted highlights, Unknown shows rescan required"
 # An Unknown copy: same data, generations zeroed — every stored group becomes an
 # unverified candidate and the list must say so instead of claiming savings.
-export STATE_UNKNOWN=/tmp/dedcom-dir-unknown-state
+export STATE_UNKNOWN=${STATEBASE}/unknown-state
 rm -rf "$STATE_UNKNOWN"
 cp -a "$STATE_LEDGER" "$STATE_UNKNOWN"
 python3 - <<'PY'
@@ -401,19 +428,19 @@ capture_dir_groups() { # $1 = state dir, $2 = capture file: open commander, cycl
     tmux kill-session -t dircomp 2>/dev/null || true
 }
 
-capture_dir_groups "$STATE_LEDGER" /tmp/dircomp-trusted.cap
-grep -q "directory groups" /tmp/dircomp-trusted.cap || {
-    echo "the DirGroupList view was not reached:"; cat /tmp/dircomp-trusted.cap; exit 1; }
-grep -q "free" /tmp/dircomp-trusted.cap || {
-    echo "trusted groups must state their savings:"; cat /tmp/dircomp-trusted.cap; exit 1; }
-grep -q "rescan required" /tmp/dircomp-trusted.cap && {
-    echo "a trusted ledger must not demand a rescan:"; cat /tmp/dircomp-trusted.cap; exit 1; }
+capture_dir_groups "$STATE_LEDGER" ${DIRTMP}/dircomp-trusted.cap
+grep -q "directory groups" ${DIRTMP}/dircomp-trusted.cap || {
+    echo "the DirGroupList view was not reached:"; cat ${DIRTMP}/dircomp-trusted.cap; exit 1; }
+grep -q "free" ${DIRTMP}/dircomp-trusted.cap || {
+    echo "trusted groups must state their savings:"; cat ${DIRTMP}/dircomp-trusted.cap; exit 1; }
+grep -q "rescan required" ${DIRTMP}/dircomp-trusted.cap && {
+    echo "a trusted ledger must not demand a rescan:"; cat ${DIRTMP}/dircomp-trusted.cap; exit 1; }
 
-capture_dir_groups "$STATE_UNKNOWN" /tmp/dircomp-unknown.cap
-grep -q "rescan required" /tmp/dircomp-unknown.cap || {
-    echo "unverified candidates must say rescan required:"; cat /tmp/dircomp-unknown.cap; exit 1; }
-grep -q "free" /tmp/dircomp-unknown.cap && {
-    echo "an unverified candidate must never claim savings:"; cat /tmp/dircomp-unknown.cap; exit 1; }
+capture_dir_groups "$STATE_UNKNOWN" ${DIRTMP}/dircomp-unknown.cap
+grep -q "rescan required" ${DIRTMP}/dircomp-unknown.cap || {
+    echo "unverified candidates must say rescan required:"; cat ${DIRTMP}/dircomp-unknown.cap; exit 1; }
+grep -q "free" ${DIRTMP}/dircomp-unknown.cap && {
+    echo "an unverified candidate must never claim savings:"; cat ${DIRTMP}/dircomp-unknown.cap; exit 1; }
 tmux kill-server 2>/dev/null || true
 echo "[live] trusted list claims savings; unknown list demands rescan and claims none"
 

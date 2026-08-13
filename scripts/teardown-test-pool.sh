@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # Removes the test pool created by make-test-pool.sh.
 #
-# Footgun protection (safety-critical): `zpool destroy` runs ONLY if EVERYTHING
-# listed below is true:
-#   1) the $TP_DIR directory chain has no symlinks and is not writable by others;
+# Footgun protection (safety-critical): `zpool destroy` runs ONLY if EVERYTHING listed below
+# is true, and the pool it names is read from THIS run's manifest — never from a listing, a
+# prefix or a glob:
+#   1) the $TP_DIR directory chain has no symlinks, is not writable by others, and lies
+#      inside $DEDCOM_E2E_ROOT;
 #   2) $TP_IMG exists, is a REGULAR file, NOT a symlink (otherwise swapping pool.img ->
 #      /dev/null|/dev/sdX would match by canonical path and would destroy the pool);
-#   3) the pool's only leaf-vdev == the canonical $TP_IMG, and nothing else.
-# Any error/ambiguity → refuse, touch nothing. The backing image is removed
-# only after a successful destroy. Config and safety functions — testpool-lib.sh.
+#   3) the pool's only leaf-vdev == the canonical $TP_IMG, and nothing else;
+#   4) the pool's name and GUID, and the set of datasets with their mountpoints, still match
+#      the manifest written at create time, and every mountpoint is inside the root.
+# Any error or ambiguity → refuse, touch nothing. The backing image is removed only after a
+# successful destroy. Config and safety functions — testpool-lib.sh.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,6 +26,10 @@ if ! tp_zpool list "$TP_POOL" >/dev/null 2>&1; then
 fi
 
 # (1) directory chain and (2) image — a regular file, not a symlink — BEFORE destroy.
+if ! tp_contained "$TP_DIR"; then
+    echo "  Pool directory '$TP_DIR' is not inside $TP_ROOT — not running destroy." >&2
+    exit 1
+fi
 if ! tp_verify_chain "$TP_DIR"; then
     echo "  Directory chain '$TP_DIR' not confirmed — not running destroy." >&2
     exit 1
@@ -52,18 +60,27 @@ if [ "$act_sorted" != "$exp_sorted" ]; then
     exit 1
 fi
 
+# (4) exact identity: name, GUID, vdev set and every dataset mountpoint, against the manifest
+# this run's own create step wrote. A pool that no longer matches it is somebody else's.
+if ! tp_manifest_verify; then
+    echo "  Identity of pool '$TP_POOL' not confirmed against its manifest — BLOCKED, nothing destroyed." >&2
+    exit 1
+fi
+
 if ! tp_zpool destroy "$TP_POOL"; then
     echo "REFUSED: 'zpool destroy $TP_POOL' failed — image NOT removed." >&2
     exit 1
 fi
 echo "Pool '$TP_POOL' destroyed."
 
-# Removing the backing image: the image is already confirmed as a regular file, the chain
-# is verified. A final no-follow recheck as protection against a race.
-if [ ! -L "$TP_IMG" ] && [ -f "$TP_IMG" ]; then
+# Removing the backing image: the image is already confirmed as a regular file, the chain is
+# verified and contained. A final no-follow recheck as protection against a race.
+if [ ! -L "$TP_IMG" ] && [ -f "$TP_IMG" ] && tp_contained "$TP_IMG"; then
     rm -f -- "$TP_IMG" && echo "Image '$TP_IMG' removed."
+    rm -f -- "$(tp_manifest_path)" 2>/dev/null || true
+    rmdir -- "$TP_MNT" 2>/dev/null || true
     rmdir -- "$TP_DIR" 2>/dev/null && echo "Directory '$TP_DIR' removed." || true
 else
-    echo "Warning: '$TP_IMG' is no longer a regular file — NOT removing." >&2
+    echo "Warning: '$TP_IMG' is no longer a contained regular file — NOT removing." >&2
 fi
 echo "Done."
