@@ -36,6 +36,8 @@ test -x "$HARNESS/make-test-pool.sh"
 test -x "$HARNESS/teardown-test-pool.sh"
 "$DEDCOM" -V
 python3 -c 'import sqlite3; print("python sqlite3", sqlite3.sqlite_version)'
+command -v tmux >/dev/null 2>&1 \
+    || { echo "tmux is required for the live-state scenario and was not found" >&2; exit 1; }
 
 # The unprivileged identity is DERIVED from the owner uid, never guessed and never `nobody`.
 # pwd.getpwuid is the same host python this script already requires; the round-trip through
@@ -431,23 +433,50 @@ con.commit()
 print("[unknown] generations zeroed on the copy")
 PY
 
-tmux kill-server 2>/dev/null || true
+# The TUI runs on a PRIVATE tmux server, addressed exclusively through a socket that lives
+# inside this run's contained tmp directory. The default server — where a human or root
+# session may be running on a shared host — is never probed, never joined and never killed;
+# there is no bare `tmux` call and no global kill-server anywhere in this script. Failing to
+# start, drive or shut down the private server is a scenario failure, not a shrug.
+TMUX_SOCKET="${DIRTMP}/tmux-dircomp-$$.sock"
+ptmux() { tmux -S "$TMUX_SOCKET" "$@"; }
+
 capture_dir_groups() { # $1 = state dir, $2 = capture file: open commander, cycle to DirGroupList
     local state="$1" out="$2"
-    tmux new-session -d -s dircomp -x 120 -y 35 "\"$DEDCOM\" --state-dir \"$state\""
+    ptmux new-session -d -s dircomp -x 120 -y 35 "\"$DEDCOM\" --state-dir \"$state\"" \
+        || { echo "could not start the private tmux session on $TMUX_SOCKET" >&2; return 1; }
     sleep 3
-    # Consent gate on a fresh state dir: Space checks the consent box, Enter continues.
-    tmux send-keys -t dircomp Space 2>/dev/null || true
+    # Consent gate on a fresh state dir: Space checks the consent box, Enter continues. The
+    # sends may land after the pane already advanced, so their status is not load-bearing —
+    # the capture loop below is what decides.
+    ptmux send-keys -t dircomp Space 2>/dev/null || true
     sleep 1
-    tmux send-keys -t dircomp Enter 2>/dev/null || true
+    ptmux send-keys -t dircomp Enter 2>/dev/null || true
     sleep 2
     for _ in 1 2 3 4 5 6 7; do
-        tmux send-keys -t dircomp v
+        ptmux send-keys -t dircomp v \
+            || { echo "the private tmux session died under send-keys" >&2; return 1; }
         sleep 1
-        tmux capture-pane -t dircomp -p > "$out"
+        ptmux capture-pane -t dircomp -p > "$out" \
+            || { echo "could not capture the private tmux pane" >&2; return 1; }
         grep -q "directory groups" "$out" && break
     done
-    tmux kill-session -t dircomp 2>/dev/null || true
+    ptmux kill-session -t dircomp \
+        || { echo "could not close the private tmux session" >&2; return 1; }
+}
+
+# The private server must be gone at the end of the scenario — and proving that is part of
+# the scenario, because a surviving server keeps the product process alive with it.
+cleanup_private_tmux() {
+    if [ -S "$TMUX_SOCKET" ] && ptmux has-session 2>/dev/null; then
+        ptmux kill-server 2>/dev/null \
+            || { echo "could not shut down the private tmux server on $TMUX_SOCKET" >&2; return 1; }
+    fi
+    rm -f -- "$TMUX_SOCKET"
+    if [ -e "$TMUX_SOCKET" ]; then
+        echo "private tmux socket $TMUX_SOCKET is still present" >&2; return 1
+    fi
+    return 0
 }
 
 capture_dir_groups "$STATE_LEDGER" ${DIRTMP}/dircomp-trusted.cap
@@ -463,7 +492,7 @@ grep -q "rescan required" ${DIRTMP}/dircomp-unknown.cap || {
     echo "unverified candidates must say rescan required:"; cat ${DIRTMP}/dircomp-unknown.cap; exit 1; }
 grep -q "free" ${DIRTMP}/dircomp-unknown.cap && {
     echo "an unverified candidate must never claim savings:"; cat ${DIRTMP}/dircomp-unknown.cap; exit 1; }
-tmux kill-server 2>/dev/null || true
+cleanup_private_tmux || exit 1
 echo "[live] trusted list claims savings; unknown list demands rescan and claims none"
 
 banner "ALL ASSERTIONS PASSED"

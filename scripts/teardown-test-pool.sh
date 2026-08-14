@@ -19,11 +19,33 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=testpool-lib.sh
 . "$SCRIPT_DIR/testpool-lib.sh"
 
-if ! tp_zpool list "$TP_POOL" >/dev/null 2>&1; then
-    echo "Pool '$TP_POOL' not found — nothing to remove."
-    echo "(If the image file '$TP_IMG' is left over, check it and remove it manually.)"
-    exit 0
-fi
+# Tri-state, and each state licenses a DIFFERENT action, which is why they must not blur:
+#   unknown → BLOCKED. The enumeration failed, so neither «destroy» nor «clean noop» is proved
+#             safe; nothing is touched.
+#   absent  → a clean noop ONLY when no artifact remains. A leftover directory, image, manifest
+#             or mountpoint with no pool to verify against is exactly the state where deleting
+#             by path is deleting on faith — BLOCKED, everything left in place.
+#   present → the full identity proof below, then destroy, then verified closure.
+case "$(tp_pool_presence "$TP_POOL")" in
+    unknown)
+        echo "BLOCKED: the pool enumeration failed or was ambiguous — cannot decide between" >&2
+        echo "         destroy and noop for '$TP_POOL', so NOTHING is removed." >&2
+        exit 1 ;;
+    absent)
+        if [ ! -e "$TP_DIR" ] && [ ! -L "$TP_DIR" ]; then
+            echo "Pool '$TP_POOL' is absent and no artifact remains — nothing to do."
+            exit 0
+        fi
+        echo "BLOCKED: pool '$TP_POOL' is absent but artifacts remain — with no pool to verify" >&2
+        echo "         them against, nothing is removed. Present right now:" >&2
+        for leftover in "$TP_DIR" "$TP_IMG" "$(tp_manifest_path)" "$TP_MNT"; do
+            if [ -e "$leftover" ] || [ -L "$leftover" ]; then
+                printf '           %s\n' "$leftover" >&2
+            fi
+        done
+        exit 1 ;;   # residue with no pool to verify against stays untouched
+    present) ;;
+esac
 
 # (1) directory chain and (2) image — a regular file, not a symlink — BEFORE destroy.
 if ! tp_contained "$TP_DIR"; then
@@ -67,20 +89,45 @@ if ! tp_manifest_verify; then
     exit 1
 fi
 
+# The mountpoint list is read from the just-verified manifest BEFORE anything is removed:
+# after the destroy these directories should be empty shells, and they are removed by `rmdir`,
+# deepest first — never by `rm -rf`, which would also flatten whatever a broken unmount left
+# mounted or written there.
+MOUNTS_TO_REMOVE="$(tp_manifest_field dataset | cut -f2 | LC_ALL=C sort -r)"
+
 if ! tp_zpool destroy "$TP_POOL"; then
     echo "REFUSED: 'zpool destroy $TP_POOL' failed — image NOT removed." >&2
     exit 1
 fi
 echo "Pool '$TP_POOL' destroyed."
 
-# Removing the backing image: the image is already confirmed as a regular file, the chain is
-# verified and contained. A final no-follow recheck as protection against a race.
-if [ ! -L "$TP_IMG" ] && [ -f "$TP_IMG" ] && tp_contained "$TP_IMG"; then
-    rm -f -- "$TP_IMG" && echo "Image '$TP_IMG' removed."
-    rm -f -- "$(tp_manifest_path)" 2>/dev/null || true
-    rmdir -- "$TP_MNT" 2>/dev/null || true
-    rmdir -- "$TP_DIR" 2>/dev/null && echo "Directory '$TP_DIR' removed." || true
-else
-    echo "Warning: '$TP_IMG' is no longer a contained regular file — NOT removing." >&2
+# Verified closure. Every removal below is checked; nothing is `|| true`d away, and any
+# survivor turns the teardown non-zero with the residue listed. Leaving a leftover behind
+# REPORTED is recoverable; reporting «Done» over one is how the next run inherits a lie.
+leftover_report() {
+    echo "BLOCKED: teardown is incomplete — residue under '$TP_DIR':" >&2
+    find "$TP_DIR" -mindepth 0 2>/dev/null | sed 's/^/           /' >&2
+    exit 1   # an unremoved artifact is a hard failure, never a warning
+}
+
+tp_remove_file "$TP_IMG" || leftover_report
+echo "Image '$TP_IMG' removed."
+tp_remove_file "$(tp_manifest_path)" || leftover_report
+
+while IFS= read -r mp; do
+    [ -n "$mp" ] || continue
+    tp_contained "$mp" || leftover_report
+    if [ -L "$mp" ]; then leftover_report; fi
+    if [ -e "$mp" ]; then
+        rmdir -- "$mp" 2>/dev/null || leftover_report
+    fi
+done <<< "$MOUNTS_TO_REMOVE"
+
+if [ -e "$TP_DIR" ] || [ -L "$TP_DIR" ]; then
+    rmdir -- "$TP_DIR" 2>/dev/null || leftover_report
 fi
+if [ -e "$TP_DIR" ] || [ -L "$TP_DIR" ]; then
+    leftover_report
+fi
+echo "Directory '$TP_DIR' fully removed."
 echo "Done."

@@ -58,14 +58,34 @@ STUBBODY
 make_stub zpool '
 case "$1" in
   list)
+    shift
     for a in "$@"; do case "$a" in -*v*) exec printf "%b" "${STUB_VDEV:-}";; esac; done
-    exit "${STUB_POOL_PRESENT:-1}" ;;
-  get)     printf "%s\n" "${STUB_GUID-7777777777777777777}"; exit 0 ;;
+    [ "${STUB_ENUM_RC:-0}" = "0" ] || exit "${STUB_ENUM_RC}"
+    if [ "$#" -eq 1 ] && [ "${1#-}" = "$1" ]; then
+      # Single-pool query, the pre-tristate form: succeed only when the name is enumerated.
+      printf "%b" "${STUB_POOLNAMES:-}" | grep -qxF -- "$1"
+      exit $?
+    fi
+    printf "%b" "${STUB_POOLNAMES:-}"
+    exit 0 ;;
+  get)     [ "${STUB_GUID_RC:-0}" = "0" ] || exit "${STUB_GUID_RC}"
+           printf "%s\n" "${STUB_GUID-7777777777777777777}"; exit 0 ;;
   create)  exit 0 ;;
-  destroy) exit 0 ;;
+  destroy) exit "${STUB_DESTROY_RC:-0}" ;;
   sync)    exit 0 ;;
 esac
 exit 0'
+
+# rm passthrough stub: fails exactly one marked path, so a removal error is injectable
+# without touching permissions or capabilities.
+make_stub rm '
+for a in "$@"; do
+  if [ -n "${STUB_RM_FAIL_PATH:-}" ] && [ "$a" = "$STUB_RM_FAIL_PATH" ]; then
+    echo "stub rm: refusing $a" >&2
+    exit 1
+  fi
+done
+exec /bin/rm "$@"'
 
 make_stub zfs '
 case "$1" in
@@ -228,7 +248,6 @@ else
   env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" \
       DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID=0 \
       DEDCOM_TESTPOOL_NAME="$POOL" DEDCOM_TESTPOOL_SIZE=1M \
-      STUB_POOL_PRESENT=1 \
       STUB_VDEV="$POOL\n\t$PDIR/pool.img\n" \
       STUB_DS="$(printf '%s\t%s\n%s/ds_a\t%s/ds_a\n%s/ds_b\t%s/ds_b\n' \
                  "$POOL" "$PDIR/mount" "$POOL" "$PDIR/mount" "$POOL" "$PDIR/mount")" \
@@ -392,6 +411,151 @@ hits="$(sed 's/[[:space:]]*#.*$//' "$HERE/e2e-dir-completeness.sh" | grep -F 'pw
 [ -n "$hits" ] && ok "the unprivileged identity is derived from DEDCOM_E2E_OWNER_UID" \
               || bad "the unprivileged identity is derived from DEDCOM_E2E_OWNER_UID"
 
+echo "== 7d. tri-state existence, verified closure, tmux isolation (FIX2B) =="
+
+# --- make: a failed enumeration permits nothing --------------------------------------------
+if [ "$UID_NOW" = "0" ]; then
+  ts_pool="ts-make-$$"
+  : > "$CMDLOG"
+  env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" STUB_ENUM_RC=2 \
+      DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID=0 DEDCOM_TESTPOOL_NAME="$ts_pool" \
+      bash "$HERE/make-test-pool.sh" >/dev/null 2>&1
+  ts_rc=$?
+  created="$(grep -c '^zpool create' "$CMDLOG" || true)"
+  if [ "$ts_rc" != 0 ] && [ "$created" = 0 ] && [ ! -e "$E2E/pools/$ts_pool" ]; then
+    ok "make: enumeration error -> non-zero, zero creates, no directory provisioned"
+  else
+    bad "make: enumeration error -> non-zero, zero creates, no directory provisioned" \
+        "rc=$ts_rc creates=$created dir=$( [ -e "$E2E/pools/$ts_pool" ] && echo exists || echo absent )"
+  fi
+else
+  bad "make: enumeration error -> non-zero, zero creates, no directory provisioned" "needs uid 0"
+fi
+
+# --- teardown: the same error is unknown, and unknown licenses nothing ---------------------
+td_pool="ts-td-$$"; td_dir="$E2E/pools/$td_pool"
+mkdir -p "$td_dir/mount"; chmod 0700 "$td_dir" "$td_dir/mount" 2>/dev/null || true
+printf 'payload' > "$td_dir/pool.img"
+td_sum_before="$(cksum < "$td_dir/pool.img")"
+: > "$CMDLOG"
+env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" STUB_ENUM_RC=2 \
+    DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME="$td_pool" \
+    bash "$HERE/teardown-test-pool.sh" >/dev/null 2>&1
+td_rc=$?
+td_destroys="$(grep -c '^zpool destroy' "$CMDLOG" || true)"
+td_sum_after="$(cksum < "$td_dir/pool.img" 2>/dev/null || echo GONE)"
+if [ "$td_rc" != 0 ] && [ "$td_destroys" = 0 ] && [ "$td_sum_after" = "$td_sum_before" ]; then
+  ok "teardown: enumeration error -> non-zero, zero destroys, artifacts byte-unchanged"
+else
+  bad "teardown: enumeration error -> non-zero, zero destroys, artifacts byte-unchanged" \
+      "rc=$td_rc destroys=$td_destroys"
+fi
+
+# The same error with NO artifacts present must still refuse: unknown is not absent, and the
+# clean noop is licensed only by a proved absence.
+env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" STUB_ENUM_RC=2 \
+    DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME="ts-none-$$" \
+    bash "$HERE/teardown-test-pool.sh" >/dev/null 2>&1 \
+  && bad "teardown: enumeration error with no artifacts -> still non-zero" \
+  || ok "teardown: enumeration error with no artifacts -> still non-zero"
+
+# --- absent: clean noop only when NOTHING remains ------------------------------------------
+env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" \
+    DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME="ts-clean-$$" \
+    bash "$HERE/teardown-test-pool.sh" >/dev/null 2>&1 \
+  && ok "teardown: proved absent + no artifacts -> clean noop 0" \
+  || bad "teardown: proved absent + no artifacts -> clean noop 0"
+
+: > "$CMDLOG"
+env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" \
+    DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME="$td_pool" \
+    bash "$HERE/teardown-test-pool.sh" >/dev/null 2>&1
+ab_rc=$?
+ab_destroys="$(grep -c '^zpool destroy' "$CMDLOG" || true)"
+ab_sum_after="$(cksum < "$td_dir/pool.img" 2>/dev/null || echo GONE)"
+if [ "$ab_rc" != 0 ] && [ "$ab_destroys" = 0 ] && [ "$ab_sum_after" = "$td_sum_before" ]; then
+  ok "teardown: absent + residue -> non-zero, artifacts byte-unchanged"
+else
+  bad "teardown: absent + residue -> non-zero, artifacts byte-unchanged" \
+      "rc=$ab_rc destroys=$ab_destroys"
+fi
+
+# --- present: a removal error turns the whole teardown non-zero ----------------------------
+cl_pool="ts-close-$$"; cl_dir="$E2E/pools/$cl_pool"
+mkdir -p "$cl_dir/mount"; chmod 0700 "$cl_dir" "$cl_dir/mount" 2>/dev/null || true
+: > "$cl_dir/pool.img"; cl_canon="$(readlink -f "$cl_dir/pool.img")"
+{
+  printf 'root\t%s\n'  "$E2E"
+  printf 'pool\t%s\n'  "$cl_pool"
+  printf 'guid\t%s\n'  7777777777777777777
+  printf 'image\t%s\n' "$cl_canon"
+  printf 'mount\t%s\n' "$cl_dir/mount"
+  printf 'vdev\t%s\n'  "$cl_canon"
+  printf 'dataset\t%s\t%s\n' "$cl_pool" "$cl_dir/mount"
+} > "$cl_dir/manifest.txt"
+: > "$CMDLOG"
+env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" \
+    STUB_POOLNAMES="$cl_pool\n" STUB_VDEV="$cl_pool\n\t$cl_canon\n" \
+    STUB_DS="$(printf '%s\t%s\n' "$cl_pool" "$cl_dir/mount")" \
+    STUB_RM_FAIL_PATH="$cl_dir/pool.img" \
+    DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME="$cl_pool" \
+    bash "$HERE/teardown-test-pool.sh" >/dev/null 2>&1
+cl_rc=$?
+if [ "$cl_rc" != 0 ] && [ -e "$cl_dir/pool.img" ]; then
+  ok "teardown: a failed artifact removal -> non-zero, never a green Done"
+else
+  bad "teardown: a failed artifact removal -> non-zero, never a green Done" "rc=$cl_rc"
+fi
+
+# The same pool with a working rm: destroy succeeds and the WHOLE directory must be gone.
+{
+  printf 'root\t%s\n'  "$E2E"
+  printf 'pool\t%s\n'  "$cl_pool"
+  printf 'guid\t%s\n'  7777777777777777777
+  printf 'image\t%s\n' "$cl_canon"
+  printf 'mount\t%s\n' "$cl_dir/mount"
+  printf 'vdev\t%s\n'  "$cl_canon"
+  printf 'dataset\t%s\t%s\n' "$cl_pool" "$cl_dir/mount"
+} > "$cl_dir/manifest.txt"
+env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" \
+    STUB_POOLNAMES="$cl_pool\n" STUB_VDEV="$cl_pool\n\t$cl_canon\n" \
+    STUB_DS="$(printf '%s\t%s\n' "$cl_pool" "$cl_dir/mount")" \
+    DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME="$cl_pool" \
+    bash "$HERE/teardown-test-pool.sh" >/dev/null 2>&1
+cl2_rc=$?
+if [ "$cl2_rc" = 0 ] && [ ! -e "$cl_dir" ] && [ ! -L "$cl_dir" ]; then
+  ok "teardown: successful destroy -> the pool directory is gone entirely"
+else
+  bad "teardown: successful destroy -> the pool directory is gone entirely" \
+      "rc=$cl2_rc dir=$( [ -e "$cl_dir" ] && echo exists || echo absent )"
+fi
+
+# --- tmux: private socket only, no default server, no global kill --------------------------
+audit_tmux_private() {  # dir -> 0 = every tmux invocation is private and no global kill exists
+  local dir="$1" src hits
+  src="$(sed 's/[[:space:]]*#.*$//' "$dir/e2e-dir-completeness.sh")"
+  # Invocation-position tmux calls that do NOT carry the private socket.
+  hits="$(printf '%s\n' "$src" \
+          | grep -E '(^[[:space:]]*|[;&|(][[:space:]]*|\{[[:space:]]+)tmux[[:space:]]' \
+          | grep -Fv -- '-S "$TMUX_SOCKET"' || true)"
+  [ -n "$hits" ] && return 1
+  # The global form must not exist at all, socketed or bare spelling aside.
+  hits="$(printf '%s\n' "$src" | grep -E '(^|[^-A-Za-z0-9_])tmux[[:space:]]+kill-server' \
+          | grep -Fv -- '-S "$TMUX_SOCKET"' || true)"
+  [ -n "$hits" ] && return 1
+  return 0
+}
+audit_tmux_socket_contained() {  # dir -> 0 = the socket path is declared under DIRTMP
+  grep -q 'TMUX_SOCKET="${DIRTMP}/' "$1/e2e-dir-completeness.sh"
+}
+audit_tmux_private "$HERE" && ok "every tmux call is addressed to the private socket" \
+                          || bad "every tmux call is addressed to the private socket"
+audit_tmux_socket_contained "$HERE" && ok "the tmux socket lives inside DIRTMP" \
+                                    || bad "the tmux socket lives inside DIRTMP"
+hits="$(sed 's/[[:space:]]*#.*$//' "$HERE/e2e-dir-completeness.sh" | grep -F 'command -v tmux' || true)"
+[ -n "$hits" ] && ok "tmux availability is a preflight check" \
+              || bad "tmux availability is a preflight check"
+
 echo "== 7c. root-guard walks through the shared guard =="
 
 # The guard must fire BEFORE the fixture exists. The banner «========== fixture» prints only
@@ -454,6 +618,11 @@ mutate() {  # label file from to check-fn
   if ! literal_sub "$dir/$file" "$from" "$to"; then
     bad "mutation '$label' changed nothing — the target text is no longer present in $file"; return
   fi
+  # A mutant that does not parse proves nothing about the contract — it must be a valid
+  # program that the checks then reject for its BEHAVIOUR.
+  if ! bash -n "$dir/$file" 2>/dev/null; then
+    bad "mutation '$label' does not parse — the substitution broke the syntax"; return
+  fi
   if "$fn" "$dir"; then
     bad "mutation '$label' SURVIVED — the contract does not catch it"
   else
@@ -473,7 +642,7 @@ chk_create_opts() {  # 0 = zpool create still carries -m under the root and cach
   local pdir="$E2E/pools/$pool"
   env PATH="$BIN:$PATH" STUB_CMDLOG="$log" \
       DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID=0 \
-      DEDCOM_TESTPOOL_NAME="$pool" DEDCOM_TESTPOOL_SIZE=1M STUB_POOL_PRESENT=1 \
+      DEDCOM_TESTPOOL_NAME="$pool" DEDCOM_TESTPOOL_SIZE=1M \
       STUB_VDEV="$pool\n\t$pdir/pool.img\n" \
       STUB_DS="$(printf '%s\t%s\n' "$pool" "$pdir/mount")" \
       bash "$dir/make-test-pool.sh" >/dev/null 2>&1
@@ -719,6 +888,131 @@ setvar M_TO <<'EOT'
 EOT
 mutate "12. manual destroy advice restored" e2e-g5.sh \
   "$M_FROM" "$M_TO" chk_no_advice
+
+# ---- FIX2B mutations: tri-state, verified closure, tmux isolation ----
+
+chk_unknown_not_absent() {  # 0 = an enumeration error still refuses the clean noop
+  local dir="$1"
+  if env PATH="$BIN:$PATH" STUB_CMDLOG="$WORK/mut.log" STUB_ENUM_RC=2 \
+       DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME="mu-none-$$" \
+       bash "$dir/teardown-test-pool.sh" >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+chk_make_enum_gate() {  # 0 = make still refuses to create after an enumeration error
+  local dir="$1"
+  [ "$UID_NOW" = "0" ] || return 1
+  local pool="mu-mk-$$-$RANDOM" log="$WORK/mut.log"; : > "$log"
+  env PATH="$BIN:$PATH" STUB_CMDLOG="$log" STUB_ENUM_RC=2 \
+      DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID=0 DEDCOM_TESTPOOL_NAME="$pool" \
+      bash "$dir/make-test-pool.sh" >/dev/null 2>&1
+  local rc=$?
+  local created; created="$(grep -c '^zpool create' "$log" || true)"
+  local dirstate=absent; [ -e "$E2E/pools/$pool" ] && dirstate=exists
+  rm -rf "$E2E/pools/$pool" 2>/dev/null
+  [ "$rc" != 0 ] && [ "$created" = 0 ] && [ "$dirstate" = absent ] && return 0
+  return 1
+}
+
+chk_residue_blocked() {  # 0 = absent + residue still refuses with exit non-zero
+  local dir="$1"
+  local pool="mu-res-$$-$RANDOM"
+  local pdir="$E2E/pools/$pool"
+  mkdir -p "$pdir"; : > "$pdir/pool.img"
+  local rc=0
+  env PATH="$BIN:$PATH" STUB_CMDLOG="$WORK/mut.log" \
+      DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME="$pool" \
+      bash "$dir/teardown-test-pool.sh" >/dev/null 2>&1 || rc=$?
+  rm -rf "$pdir" 2>/dev/null
+  [ "$rc" != 0 ] && return 0
+  return 1
+}
+
+chk_removal_verified() {  # 0 = a failed artifact removal still turns teardown non-zero
+  local dir="$1"
+  local pool="mu-cl-$$-$RANDOM"
+  local pdir="$E2E/pools/$pool"
+  mkdir -p "$pdir/mount"; chmod 0700 "$pdir" "$pdir/mount" 2>/dev/null || true
+  : > "$pdir/pool.img"
+  local canon; canon="$(readlink -f "$pdir/pool.img")"
+  {
+    printf 'root\t%s\n'  "$E2E"
+    printf 'pool\t%s\n'  "$pool"
+    printf 'guid\t%s\n'  7777777777777777777
+    printf 'image\t%s\n' "$canon"
+    printf 'mount\t%s\n' "$pdir/mount"
+    printf 'vdev\t%s\n'  "$canon"
+    printf 'dataset\t%s\t%s\n' "$pool" "$pdir/mount"
+  } > "$pdir/manifest.txt"
+  local rc=0
+  env PATH="$BIN:$PATH" STUB_CMDLOG="$WORK/mut.log" \
+      STUB_POOLNAMES="$pool\n" STUB_VDEV="$pool\n\t$canon\n" \
+      STUB_DS="$(printf '%s\t%s\n' "$pool" "$pdir/mount")" \
+      STUB_RM_FAIL_PATH="$pdir/pool.img" \
+      DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME="$pool" \
+      bash "$dir/teardown-test-pool.sh" >/dev/null 2>&1 || rc=$?
+  rm -rf "$pdir" 2>/dev/null
+  [ "$rc" != 0 ] && return 0
+  return 1
+}
+
+chk_tmux_private() { audit_tmux_private "$1"; }
+
+setvar M_FROM <<'EOT'
+        printf 'unknown\n'; return 0
+EOT
+setvar M_TO <<'EOT'
+        printf 'absent\n'; return 0
+EOT
+mutate "13. a failed enumeration reported as absent" testpool-lib.sh \
+  "$M_FROM" "$M_TO" chk_unknown_not_absent
+
+setvar M_FROM <<'EOT'
+        exit 1 ;;   # an unproved absence creates nothing
+EOT
+setvar M_TO <<'EOT'
+        ;;   # mutant: carry on after a failed enumeration
+EOT
+mutate "14. make continues past an enumeration error" make-test-pool.sh \
+  "$M_FROM" "$M_TO" chk_make_enum_gate
+
+setvar M_FROM <<'EOT'
+        exit 1 ;;   # residue with no pool to verify against stays untouched
+EOT
+setvar M_TO <<'EOT'
+        exit 0 ;;   # mutant: residue waved through
+EOT
+mutate "15. absent-plus-residue returns success" teardown-test-pool.sh \
+  "$M_FROM" "$M_TO" chk_residue_blocked
+
+setvar M_FROM <<'EOT'
+    exit 1   # an unremoved artifact is a hard failure, never a warning
+EOT
+setvar M_TO <<'EOT'
+    return 0   # mutant: residue reported but ignored
+EOT
+mutate "16. removal errors ignored by the closure" teardown-test-pool.sh \
+  "$M_FROM" "$M_TO" chk_removal_verified
+
+setvar M_FROM <<'EOT'
+ptmux() { tmux -S "$TMUX_SOCKET" "$@"; }
+EOT
+setvar M_TO <<'EOT'
+ptmux() { tmux "$@"; }
+EOT
+mutate "17. a tmux call loses the private socket" e2e-dir-completeness.sh \
+  "$M_FROM" "$M_TO" chk_tmux_private
+
+setvar M_FROM <<'EOT'
+        ptmux kill-server 2>/dev/null \
+EOT
+setvar M_TO <<'EOT'
+        tmux kill-server 2>/dev/null \
+EOT
+mutate "18. the global tmux kill-server returns" e2e-dir-completeness.sh \
+  "$M_FROM" "$M_TO" chk_tmux_private
 
 echo "== result: PASS=$PASS FAIL=$FAIL SKIP=$SKIP =="
 [ "$FAIL" -eq 0 ]

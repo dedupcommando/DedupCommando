@@ -312,8 +312,23 @@ assert_no_leftovers() {
             && { fail "backing file $POOLDIR/pool.img is still present after teardown"; rc=1; }
         return $rc
     fi
+    # The whole owned contour, named piece by piece — not just the image. A teardown that
+    # left the directory, the manifest or a mountpoint shell behind has not finished, and a
+    # symlink standing where the directory was is worse than a directory.
     if [ -e "$POOLDIR/pool.img" ]; then
         fail "backing file $POOLDIR/pool.img is still present after teardown"
+        rc=1
+    fi
+    if [ -e "$POOLDIR/manifest.txt" ]; then
+        fail "manifest $POOLDIR/manifest.txt is still present after teardown"
+        rc=1
+    fi
+    if [ -e "$PMNT" ] || [ -L "$PMNT" ]; then
+        fail "mountpoint tree $PMNT is still present after teardown"
+        rc=1
+    fi
+    if [ -e "$POOLDIR" ] || [ -L "$POOLDIR" ]; then
+        fail "pool directory $POOLDIR is still present after teardown"
         rc=1
     fi
     return $rc

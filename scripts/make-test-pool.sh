@@ -18,10 +18,19 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-if tp_zpool list "$TP_POOL" >/dev/null 2>&1; then
-    echo "Pool '$TP_POOL' already exists — run teardown-test-pool.sh first" >&2
-    exit 1
-fi
+# Tri-state, and only a PROVED absence permits creation. This check runs before tp_secure_dir,
+# before the image and before `zpool create` on purpose: a failed enumeration must not leave a
+# half-provisioned directory behind, and «the query broke» is not «the pool is gone».
+case "$(tp_pool_presence "$TP_POOL")" in
+    present)
+        echo "Pool '$TP_POOL' already exists — run teardown-test-pool.sh first" >&2
+        exit 1 ;;
+    unknown)
+        echo "BLOCKED: the pool enumeration failed or was ambiguous — cannot prove '$TP_POOL'" >&2
+        echo "         absent, so nothing is created: no directory, no image, no pool." >&2
+        exit 1 ;;   # an unproved absence creates nothing
+    absent) ;;
+esac
 
 # Secure directory (0700, ours, not a symlink, inside the root) + image does not yet exist.
 tp_secure_dir || exit 1

@@ -266,6 +266,42 @@ tp_require_real_image() {
 # tp_require_real_image, so the symlink case is already excluded.
 tp_expected_vdevs() { readlink -f -- "$TP_IMG"; }
 
+# --------------------------------------------------------------- pool existence, tri-state
+# present | absent | unknown — and `unknown` is a verdict, not a shrug. The ONLY source is a
+# SUCCESSFUL full enumeration (`zpool list -H -o name`); the name is compared whole-string,
+# never as a prefix or pattern. A failed query, or a listing in which the name somehow appears
+# more than once, is `unknown` — never `absent`, because "the query broke" and "the pool is
+# gone" license opposite actions: the first stops everything, the second permits create or a
+# clean noop. Callers case on all three; treating unknown like absent is the fail-open this
+# function exists to remove.
+tp_pool_presence() {  # pool -> prints present|absent|unknown; always returns 0
+    local pool="$1" raw line hits=0
+    if ! raw="$(tp_zpool list -H -o name 2>/dev/null)"; then
+        printf 'unknown\n'; return 0
+    fi
+    while IFS= read -r line; do
+        [ "$line" = "$pool" ] && hits=$((hits + 1))
+    done <<< "$raw"
+    case "$hits" in
+        0) printf 'absent\n' ;;
+        1) printf 'present\n' ;;
+        *) printf 'unknown\n' ;;   # one name twice is not a state this harness understands
+    esac
+    return 0
+}
+
+# Remove ONE exact file artifact and prove it gone. rm's exit status alone is not the proof —
+# the proof is the absence. Fail-closed: any survival returns non-zero.
+tp_remove_file() {  # path -> 0 only when the path is proved absent afterwards
+    local path="$1"
+    tp_contained "$path" || return 1
+    rm -f -- "$path" 2>/dev/null || true
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        tp_die "'$path' is still present after removal"; return 1
+    fi
+    return 0
+}
+
 # --------------------------------------------------------------- pool identity
 # The actual leaf-vdevs of the pool (canonical paths, one per line).
 # Returns != 0 on ANY zpool error OR an unexpected structure (fail-closed).
