@@ -26,6 +26,10 @@ set -uo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LIB="$HERE/testpool-lib.sh"
 
+# The static scanners are scoped to the six harness scripts: the test files themselves carry
+# the very strings under audit inside their heredocs and must not be read as violations.
+HARNESS_FILES="testpool-lib.sh make-test-pool.sh teardown-test-pool.sh e2e-g5.sh e2e-root-guard.sh e2e-dir-completeness.sh"
+
 PASS=0; FAIL=0; SKIP=0
 ok()   { PASS=$((PASS+1)); printf 'PASS  %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf 'FAIL  %s\n' "$1"; [ -n "${2:-}" ] && printf '%s\n' "$2" | sed 's/^/        /'; }
@@ -131,26 +135,42 @@ lib_env DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
 
 echo "== 2. ownership and symlink escape =="
 
-if [ "$UID_NOW" = "0" ]; then
-  foreign="$E2E/foreign"; mkdir -p "$foreign"
-  if chown 12345:12345 "$foreign" 2>/dev/null; then
-    if lib_env DEDCOM_E2E_ROOT="$foreign" DEDCOM_E2E_OWNER_UID="$UID_NOW"; then
-      bad "a component owned by a third uid -> refuse"
-    else
-      ok "a component owned by a third uid -> refuse"
-    fi
-    if lib_env DEDCOM_E2E_ROOT="$foreign" DEDCOM_E2E_OWNER_UID=12345; then
-      ok "the declared owner uid is accepted"
-    else
-      bad "the declared owner uid is accepted"
-    fi
-  else
-    skip "a component owned by a third uid -> refuse" "chown unavailable"
-    skip "the declared owner uid is accepted" "chown unavailable"
+# The ownership contract is proved WITHOUT chown, so it can never be skipped for a missing
+# CAP_CHOWN: a stat stub reports a chosen owner for exactly one marked node, and tp_check_node
+# is called against that node directly. Three assertions, three verdicts, no capability needed.
+make_stub stat '
+if [ -n "${STAT_FAKE_PATH:-}" ]; then
+  for last; do :; done
+  if [ "$last" = "$STAT_FAKE_PATH" ]; then
+    case "$*" in
+      *%u*) printf "%s\n" "${STAT_FAKE_UID:-0}"; exit 0 ;;
+      *%a*) printf "%s\n" "${STAT_FAKE_MODE:-700}"; exit 0 ;;
+    esac
   fi
+fi
+exec /usr/bin/stat "$@"'
+
+own_probe="$E2E/ownprobe"; mkdir -p "$own_probe"; chmod 0700 "$own_probe" 2>/dev/null || true
+owner_case() {  # fake-owner declared-uid -> exit status of tp_check_node
+  env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" \
+      STAT_FAKE_PATH="$own_probe" STAT_FAKE_UID="$1" \
+      DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
+      bash -c '. "$1" && tp_check_node "$2" "$3"' _ "$LIB" "$own_probe" "$2" >/dev/null 2>&1
+}
+if owner_case 0 1234; then
+  ok "owner root(0) is accepted for a chain node"
 else
-  skip "a component owned by a third uid -> refuse" "not root"
-  skip "the declared owner uid is accepted" "not root"
+  bad "owner root(0) is accepted for a chain node"
+fi
+if owner_case 1234 1234; then
+  ok "the exact declared owner uid is accepted for a chain node"
+else
+  bad "the exact declared owner uid is accepted for a chain node"
+fi
+if owner_case 4242 1234; then
+  bad "a third uid owning a chain node -> refuse"
+else
+  ok "a third uid owning a chain node -> refuse"
 fi
 
 ww="$E2E/worldwritable"; mkdir -p "$ww"; chmod 0777 "$ww" 2>/dev/null || true
@@ -328,6 +348,89 @@ else
   ok "--force appears in no harness script"
 fi
 
+echo "== 7b. execution-gap audits (FIX2A) =="
+
+# Reused verbatim by the mutation kills below, so the live audit and the kill are one check.
+audit_bare_zdb() {  # dir -> 0 = no executable bare `zdb`; the absolute path is the only form
+  local dir="$1" hits
+  hits="$(sed 's/[[:space:]]*#.*$//' "$dir/e2e-g5.sh" | sed 's|/usr/sbin/zdb||g' \
+          | grep -E '(^|[^A-Za-z0-9_./-])zdb([^A-Za-z0-9_.-]|$)' || true)"
+  [ -n "$hits" ] && return 1
+  return 0
+}
+audit_no_nobody() {  # dir -> 0 = no harness script runs anything as `nobody`
+  local dir="$1" f hits
+  for f in $HARNESS_FILES; do
+    hits="$(sed 's/[[:space:]]*#.*$//' "$dir/$f" | grep -F 'runuser -u nobody' || true)"
+    [ -n "$hits" ] && return 1
+  done
+  return 0
+}
+audit_no_destroy_advice() {  # dir -> 0 = e2e-g5.sh neither runs nor prints `zpool destroy`
+  local dir="$1" hits
+  hits="$(sed 's/[[:space:]]*#.*$//' "$dir/e2e-g5.sh" | grep -F 'zpool destroy' || true)"
+  [ -n "$hits" ] && return 1
+  return 0
+}
+audit_rootguard_shared() {  # dir -> 0 = root-guard sources the shared guard, no private copy
+  local dir="$1"
+  grep -q 'testpool-lib\.sh' "$dir/e2e-root-guard.sh" || return 1
+  grep -q 'is a system directory' "$dir/e2e-root-guard.sh" && return 1
+  return 0
+}
+
+audit_bare_zdb "$HERE"          && ok "zdb is invoked only as /usr/sbin/zdb" \
+                                || bad "zdb is invoked only as /usr/sbin/zdb"
+audit_no_nobody "$HERE"         && ok "no harness script runs as nobody" \
+                                || bad "no harness script runs as nobody"
+audit_no_destroy_advice "$HERE" && ok "e2e-g5.sh prints no manual zpool-destroy bypass" \
+                                || bad "e2e-g5.sh prints no manual zpool-destroy bypass"
+audit_rootguard_shared "$HERE"  && ok "e2e-root-guard.sh uses the shared containment guard" \
+                                || bad "e2e-root-guard.sh uses the shared containment guard"
+
+hits="$(sed 's/[[:space:]]*#.*$//' "$HERE/e2e-dir-completeness.sh" | grep -F 'pwd.getpwuid' || true)"
+[ -n "$hits" ] && ok "the unprivileged identity is derived from DEDCOM_E2E_OWNER_UID" \
+              || bad "the unprivileged identity is derived from DEDCOM_E2E_OWNER_UID"
+
+echo "== 7c. root-guard walks through the shared guard =="
+
+# The guard must fire BEFORE the fixture exists. The banner «========== fixture» prints only
+# after mktemp, so its absence plus a REFUSED line is «refused before mktemp/mount», and its
+# presence is «containment accepted» — /bin/true stands in for the binary, which is never
+# reached before the fixture stage.
+rg_run() { env "$@" DEDCOM=/bin/true bash "$HERE/e2e-root-guard.sh" 2>&1 || true; }
+
+mkdir -p "$WORK/rg-real/sub"; chmod 0700 "$WORK/rg-real/sub" 2>/dev/null || true
+if ln -s "$WORK/rg-real" "$WORK/rg-link" 2>/dev/null && [ -L "$WORK/rg-link" ]; then
+  out="$(rg_run DEDCOM_E2E_ROOT="$WORK/rg-link/sub" DEDCOM_E2E_OWNER_UID="$UID_NOW")"
+  if printf '%s' "$out" | grep -q '========== fixture'; then
+    bad "root-guard: a symlink parent in the root -> refused before any fixture" "$out"
+  elif printf '%s' "$out" | grep -Eq 'REFUSED|containment guard refused'; then
+    ok "root-guard: a symlink parent in the root -> refused before any fixture"
+  else
+    bad "root-guard: a symlink parent in the root -> refused before any fixture" "$out"
+  fi
+else
+  bad "root-guard: a symlink parent in the root -> refused before any fixture" "ln -s unavailable"
+fi
+
+out="$(rg_run PATH="$BIN:$PATH" STAT_FAKE_PATH="$E2E" STAT_FAKE_UID=4242 \
+              DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW")"
+if printf '%s' "$out" | grep -q '========== fixture'; then
+  bad "root-guard: a foreign-owned chain component -> refused before any fixture" "$out"
+elif printf '%s' "$out" | grep -Eq 'REFUSED|containment guard refused'; then
+  ok "root-guard: a foreign-owned chain component -> refused before any fixture"
+else
+  bad "root-guard: a foreign-owned chain component -> refused before any fixture" "$out"
+fi
+
+out="$(rg_run DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW")"
+if printf '%s' "$out" | grep -q '========== fixture'; then
+  ok "root-guard: a valid root passes the shared guard and reaches the fixture stage"
+else
+  bad "root-guard: a valid root passes the shared guard and reaches the fixture stage" "$out"
+fi
+
 echo "== 8. mutations must be caught =="
 
 # Each mutation is applied to a private copy of the scripts and the named check is re-run there.
@@ -361,9 +464,7 @@ MUTN=0
 
 # Every chk_* is THE CONTRACT CHECK for its guard, phrased positively: it returns 0 when the
 # guard holds and non-zero when it does not. On a mutant the check must fail — that is the
-# kill. The static checks are scoped to the six harness scripts: the test files themselves
-# carry these very strings inside their heredocs and must not be read as violations.
-HARNESS_FILES="testpool-lib.sh make-test-pool.sh teardown-test-pool.sh e2e-g5.sh e2e-root-guard.sh e2e-dir-completeness.sh"
+# kill.
 
 chk_create_opts() {  # 0 = zpool create still carries -m under the root and cachefile=none
   local dir="$1" line
@@ -565,6 +666,59 @@ setvar M_TO <<'EOT'
 EOT
 mutate "8. GUID query fails open" testpool-lib.sh \
   "$M_FROM" "$M_TO" chk_guid_failopen
+
+# ---- FIX2A mutations: each check above must also be a kill ----
+
+chk_owner_comparison() {  # 0 = a third uid owning a chain node still refuses
+  local dir="$1"
+  if env PATH="$BIN:$PATH" STUB_CMDLOG="$WORK/mut.log" \
+       STAT_FAKE_PATH="$own_probe" STAT_FAKE_UID=4242 \
+       DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
+       bash -c '. "$1" && tp_check_node "$2" 1234' _ "$dir/testpool-lib.sh" "$own_probe" \
+       >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+chk_bare_zdb()   { audit_bare_zdb "$1"; }
+chk_no_nobody()  { audit_no_nobody "$1"; }
+chk_no_advice()  { audit_no_destroy_advice "$1"; }
+
+setvar M_FROM <<'EOT'
+    if [ "$owner" != "0" ] && [ "$owner" != "$uid" ]; then
+EOT
+setvar M_TO <<'EOT'
+    if false; then
+EOT
+mutate "9. owner comparison removed from tp_check_node" testpool-lib.sh \
+  "$M_FROM" "$M_TO" chk_owner_comparison
+
+setvar M_FROM <<'EOT'
+    "$G5_ZDB" -dddd "$ds" "$obj" 2>/dev/null \
+EOT
+setvar M_TO <<'EOT'
+    zdb -dddd "$ds" "$obj" 2>/dev/null \
+EOT
+mutate "10. bare zdb restored" e2e-g5.sh \
+  "$M_FROM" "$M_TO" chk_bare_zdb
+
+setvar M_FROM <<'EOT'
+runuser -u "$OWNER_USER" -- "$DEDCOM" --state-dir "$STATE_FAIL" --scan "$FAILROOT" --no-resume
+EOT
+setvar M_TO <<'EOT'
+runuser -u nobody -- "$DEDCOM" --state-dir "$STATE_FAIL" --scan "$FAILROOT" --no-resume
+EOT
+mutate "11. runuser nobody restored" e2e-dir-completeness.sh \
+  "$M_FROM" "$M_TO" chk_no_nobody
+
+setvar M_FROM <<'EOT'
+    printf '       BLOCKED: pool %s is left in place, untouched.\n' "$POOL" >&2
+EOT
+setvar M_TO <<'EOT'
+    printf '       recover manually: sudo zpool destroy %s && sudo rm -f %s/pool.img\n' "$POOL" "$POOLDIR" >&2
+EOT
+mutate "12. manual destroy advice restored" e2e-g5.sh \
+  "$M_FROM" "$M_TO" chk_no_advice
 
 echo "== result: PASS=$PASS FAIL=$FAIL SKIP=$SKIP =="
 [ "$FAIL" -eq 0 ]

@@ -2,8 +2,12 @@
 # E2E test: directory-completeness invariant on a disposable loopback-ZFS pool.
 # Exercises the false-twin suppression case end-to-end.
 #
-# Run as ROOT on a ZFS host: root steps run directly; the unprivileged hash-failure case uses
-# `runuser -u nobody` (no sudo required).
+# Run as ROOT on a ZFS host: root steps run directly; the unprivileged cases run as the OWNER
+# of the containment root — the user DEDCOM_E2E_OWNER_UID names — via `runuser` (no sudo
+# required). `nobody` is deliberately NOT used: on the accepted host the chain to the root
+# passes through a 0700 home directory that only root and the owner can traverse, and the
+# product's own path check accepts only root or the effective uid as component owners, so a
+# `nobody` scan is unreachable there by construction.
 #
 # SHARED-HOST CONTAINMENT: operates ONLY on one disposable pool whose name is unique to this run
 # (dedcomdir-<ts>), whose backing file and mountpoints live under $DEDCOM_E2E_ROOT, and whose
@@ -25,11 +29,25 @@ banner "preconditions"
     || { echo "DEDCOM_E2E_ROOT is not set — this harness creates nothing outside a declared root" >&2; exit 1; }
 [ -n "${DEDCOM_E2E_OWNER_UID:-}" ] \
     || { echo "DEDCOM_E2E_OWNER_UID is not set — refusing to guess who may own the tree" >&2; exit 1; }
+[ "$DEDCOM_E2E_OWNER_UID" != "0" ] \
+    || { echo "DEDCOM_E2E_OWNER_UID=0 cannot prove the unprivileged scenarios: root reads everything" >&2; exit 1; }
 test -x "$DEDCOM"
 test -x "$HARNESS/make-test-pool.sh"
 test -x "$HARNESS/teardown-test-pool.sh"
 "$DEDCOM" -V
 python3 -c 'import sqlite3; print("python sqlite3", sqlite3.sqlite_version)'
+
+# The unprivileged identity is DERIVED from the owner uid, never guessed and never `nobody`.
+# pwd.getpwuid is the same host python this script already requires; the round-trip through
+# `id -u` proves the name still maps back to exactly the declared uid before it is trusted.
+OWNER_USER="$(python3 -c 'import pwd, sys; print(pwd.getpwuid(int(sys.argv[1])).pw_name)' \
+              "$DEDCOM_E2E_OWNER_UID")" \
+    || { echo "uid $DEDCOM_E2E_OWNER_UID has no passwd entry on this host — cannot run the unprivileged cases" >&2; exit 1; }
+[ -n "$OWNER_USER" ] \
+    || { echo "uid $DEDCOM_E2E_OWNER_UID resolved to an empty user name" >&2; exit 1; }
+[ "$(id -u -- "$OWNER_USER")" = "$DEDCOM_E2E_OWNER_UID" ] \
+    || { echo "user '$OWNER_USER' does not map back to uid $DEDCOM_E2E_OWNER_UID" >&2; exit 1; }
+echo "unprivileged identity: $OWNER_USER (uid $DEDCOM_E2E_OWNER_UID)"
 
 banner "1. create disposable pool + fixtures"
 # A unique name per run: `dedcomdirtest` was a fixed name, and a fixed name on a shared host is
@@ -45,10 +63,12 @@ tp_make_dir "$DIRTMP"
 cd "$DIRTMP"
 "$HARNESS/make-test-pool.sh"
 
-# Two scenarios scan as `nobody`, which needs TRAVERSE (x) through the chain down to the
-# fixture and the state directory. 0711 keeps every write bit closed — tp_check_node and the
-# product's own chain check accept it (both test the 022 write bits, never x) — while letting
-# an unprivileged uid pass through. Nothing becomes listable or writable to others.
+# Three scenarios scan as the owner user, which needs TRAVERSE (x) through the ROOT-created
+# components down to the fixture and the state directory (owner-created components are already
+# theirs). 0711 keeps every write bit closed — tp_check_node and the product's own chain check
+# accept it (both test the 022 write bits, never x) — while letting the owner uid pass through.
+# Nothing becomes listable or writable to others, and no human-owned directory outside the
+# containment root is touched.
 chmod 0711 "$DEDCOM_E2E_ROOT" "$DEDCOM_E2E_ROOT/pools" "$DEDCOM_E2E_ROOT/state" \
            "$STATEBASE" "$TP_DIR" "$TP_MNT"
 
@@ -133,7 +153,7 @@ if normalized["Old"] != normalized["Merkle"]:
 print("Old/Merkle memberships match")
 PY
 
-banner "4. hash-failure suppression (scan as nobody)"
+banner "4. hash-failure suppression (scan as $OWNER_USER)"
 export FAILROOT="$TP_MNT/ds_a/dir-completeness-hashfail"
 rm -rf "$FAILROOT"
 mkdir -p "$FAILROOT/A" "$FAILROOT/B"
@@ -144,11 +164,13 @@ chmod 000 "$FAILROOT/A/secret.bin"
 
 export STATE_FAIL=${STATEBASE}/fail-state
 rm -rf "$STATE_FAIL"
-# Created by root INSIDE the contained state base, then handed to nobody: the base is not
-# world-writable (unlike the old /tmp), so nobody cannot create the directory itself.
+# Created by root INSIDE the contained state base, then handed to the owner user: the base is
+# not world-writable (unlike the old /tmp), so the unprivileged uid cannot create it itself.
+# The fixture stays root-owned: secret.bin at mode 000 is unreadable to the owner user, which
+# is the hash failure this scenario exists to produce.
 install -d -m 700 "$STATE_FAIL"
-chown nobody "$STATE_FAIL"
-runuser -u nobody -- "$DEDCOM" --state-dir "$STATE_FAIL" --scan "$FAILROOT" --no-resume
+chown -- "$OWNER_USER" "$STATE_FAIL"
+runuser -u "$OWNER_USER" -- "$DEDCOM" --state-dir "$STATE_FAIL" --scan "$FAILROOT" --no-resume
 
 python3 - <<'PY'
 import os, sqlite3
@@ -207,7 +229,7 @@ if status != "complete":
 print(f"[ledger] one registered root gen>0; one real omission row; status={status}")
 PY
 
-banner "6. walk-error suppression + CompleteWithWarnings (scan as nobody)"
+banner "6. walk-error suppression + CompleteWithWarnings (scan as $OWNER_USER)"
 export ERRROOT="$TP_MNT/ds_a/dir-completeness-walkerr"
 rm -rf "$ERRROOT"
 mkdir -p "$ERRROOT/E" "$ERRROOT/F" "$ERRROOT/E/locked"
@@ -220,8 +242,8 @@ chown root:root "$ERRROOT/E/locked"
 export STATE_ERR=${STATEBASE}/err-state
 rm -rf "$STATE_ERR"
 install -d -m 700 "$STATE_ERR"
-chown nobody "$STATE_ERR"
-runuser -u nobody -- "$DEDCOM" --state-dir "$STATE_ERR" --scan "$ERRROOT" --no-resume | tee ${DIRTMP}/err-scan.out
+chown -- "$OWNER_USER" "$STATE_ERR"
+runuser -u "$OWNER_USER" -- "$DEDCOM" --state-dir "$STATE_ERR" --scan "$ERRROOT" --no-resume | tee ${DIRTMP}/err-scan.out
 grep -q "Scan left gaps:" ${DIRTMP}/err-scan.out || {
     echo "the aggregate omission notice is missing"; exit 1; }
 grep -q "^Omissions:" ${DIRTMP}/err-scan.out || {
@@ -376,8 +398,8 @@ banner "9. Old/Merkle parity holds for the walk-error fixture too"
 export STATE_ERR_MERKLE=${STATEBASE}/err-merkle-state
 rm -rf "$STATE_ERR_MERKLE"
 install -d -m 700 "$STATE_ERR_MERKLE"
-chown nobody "$STATE_ERR_MERKLE"
-runuser -u nobody -- "$DEDCOM" --state-dir "$STATE_ERR_MERKLE" --scan "$ERRROOT" --no-resume --merkle-dirs
+chown -- "$OWNER_USER" "$STATE_ERR_MERKLE"
+runuser -u "$OWNER_USER" -- "$DEDCOM" --state-dir "$STATE_ERR_MERKLE" --scan "$ERRROOT" --no-resume --merkle-dirs
 python3 - <<'PY'
 import os, sqlite3
 def memberships(state):

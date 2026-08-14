@@ -25,7 +25,7 @@
 #   sudo DEDCOM_G5_E2E=1 DEDCOM=/path/to/dedcom scripts/e2e-g5.sh [scenario]
 #     scenarios: hardlink reflink two-alias preflight script-preflight delete-restore
 #                revalidate snapshot interrupt dir-dedup all   (default: all)
-#   sudo DEDCOM_G5_E2E=1 scripts/e2e-g5.sh clean-stale   # tear down leftover dedcom-g5-* pools
+#   sudo DEDCOM_G5_E2E=1 scripts/e2e-g5.sh clean-stale <pool>   # tear down ONE leftover pool, by exact name
 #
 # Offline modes — no pool, no root, no ZFS, and NOT runtime evidence. They render or exercise the
 # same pause definitions, formatter and verdict functions the real run uses, so they prove what
@@ -62,6 +62,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS="${HARNESS:-$SCRIPT_DIR}"
 # No default under /tmp: on a shared host a guessed binary path is a guessed target.
 DEDCOM="${DEDCOM:-}"
+# The one path zdb is ever called by. Bare `zdb` is forbidden in an executable line: it is not
+# on the unprivileged PATH of the accepted host, and a PATH-resolved binary is not the frozen one.
+G5_ZDB=/usr/sbin/zdb
 
 if [ "$G5_OFFLINE" -eq 0 ]; then
     [ "${DEDCOM_G5_E2E:-}" = "1" ] \
@@ -118,6 +121,11 @@ case "$POOL" in dedcom-g5-*) ;; *) g5_die "pool name '$POOL' is not dedcom-g5-* 
 # Every path this run writes is derived from the containment root, never from /tmp, /var/lib or
 # the filesystem root. Offline modes create nothing and render a parameterized sample instead.
 if [ "$G5_OFFLINE" -eq 0 ]; then
+    # zdb is NOT on the unprivileged PATH of the accepted host; the frozen constraint is the
+    # absolute path, with no PATH resolution and no fallback. Proved here — after clean-stale,
+    # which never touches zdb, and before any scenario — so a missing binary blocks the run
+    # instead of surfacing inside the reflink evidence with G0–G3 already spent.
+    [ -x "$G5_ZDB" ] || g5_die "'$G5_ZDB' is missing or not executable — the reflink DVA proof needs it."
     [ -n "${DEDCOM_E2E_ROOT:-}" ] \
         || g5_die "DEDCOM_E2E_ROOT is not set — this harness creates nothing outside a declared root."
     [ -n "${DEDCOM_E2E_OWNER_UID:-}" ] \
@@ -273,8 +281,14 @@ teardown_pool() {
         return 0
     fi
     fail "teardown of $POOL reported an error"
-    printf '       recover manually: sudo zpool destroy %s && sudo rm -f %s/pool.img && sudo rmdir %s\n' \
-           "$POOL" "$POOLDIR" "$POOLDIR" >&2
+    # No manual destroy command is printed here, on purpose. The teardown refused because the
+    # pool's identity could not be proved against this run's manifest — handing the operator a
+    # copy-paste destroy at exactly that moment would bypass the one guard that just fired, on
+    # a host where a wrong pool name is someone else's data.
+    printf '       BLOCKED: pool %s is left in place, untouched.\n' "$POOL" >&2
+    printf '       Identity was not proved for destroy. Read %s/manifest.txt and compare the\n' "$POOLDIR" >&2
+    printf '       recorded name, GUID, leaf-vdevs and dataset mountpoints against the live pool\n' >&2
+    printf '       before deciding anything by hand.\n' >&2
     return 1
 }
 
@@ -979,7 +993,7 @@ dvas_of() {  # dataset abspath -> "vdev:offset:size" per line
     local ds="$1" path="$2" obj
     obj="$(stat -c '%i' -- "$path")" || return 1
     sync; zpool sync "$POOL" 2>/dev/null || true
-    zdb -dddd "$ds" "$obj" 2>/dev/null \
+    "$G5_ZDB" -dddd "$ds" "$obj" 2>/dev/null \
         | grep -oE 'DVA\[0\]=<[0-9]+:[0-9a-fA-F]+:[0-9a-fA-F]+>' \
         | sed 's/DVA\[0\]=<//; s/>//' | sort -u
 }
@@ -1060,7 +1074,7 @@ scenario_reflink() {
     keeper_dvas="$(dvas_of "$POOL/ds_a" "$d/keeper.bin")"
     dup_dvas="$(dvas_of "$POOL/ds_a" "$d/dup.bin")"
     if [ -z "$keeper_dvas" ] || [ -z "$dup_dvas" ]; then
-        fail "zdb produced no DVAs — block sharing is UNPROVEN (do not call this scenario green)"
+        fail "/usr/sbin/zdb produced no DVAs — block sharing is UNPROVEN (do not call this scenario green)"
     else
         shared="$(comm -12 <(printf '%s\n' "$keeper_dvas") <(printf '%s\n' "$dup_dvas") | wc -l)"
         [ "$shared" -gt 0 ] && ok "published clone shares $shared block address(es) with the keeper" \

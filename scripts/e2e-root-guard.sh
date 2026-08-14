@@ -16,7 +16,8 @@
 # Without that capability the two mount scenarios report SKIP; the path-only scenarios and the
 # positive control still run and still have to pass.
 #
-# Override DEDCOM to point at the binary (default ./target/release/dedcom).
+# Override DEDCOM to point at the binary (default ./target/release/dedcom). DEDCOM_E2E_ROOT and
+# DEDCOM_E2E_OWNER_UID are mandatory — the shared guard in testpool-lib.sh refuses without them.
 set -euo pipefail
 
 DEDCOM="${DEDCOM:-./target/release/dedcom}"
@@ -31,29 +32,21 @@ fail() {
 
 test -x "$DEDCOM" || fail "no dedcom binary at $DEDCOM (set DEDCOM=/path/to/dedcom)"
 
-# SHARED-HOST CONTAINMENT: the fixture is created inside the caller's declared root, never in a
-# world-writable spool. A missing root refuses — this script binds and unmounts, and a bind
-# whose target was chosen by a default is a bind aimed at somebody else's machine.
-E2E_ROOT="${DEDCOM_E2E_ROOT:-}"
-[ -n "$E2E_ROOT" ] || fail "DEDCOM_E2E_ROOT is not set — refusing to place a mount fixture by default"
-case "$E2E_ROOT" in
-/*) ;;
-*) fail "DEDCOM_E2E_ROOT='$E2E_ROOT' is not absolute" ;;
-esac
-[ -d "$E2E_ROOT" ] || fail "DEDCOM_E2E_ROOT='$E2E_ROOT' does not exist"
-[ ! -L "$E2E_ROOT" ] || fail "DEDCOM_E2E_ROOT='$E2E_ROOT' is a symbolic link"
-E2E_ROOT="$(realpath "$E2E_ROOT")"
-case "$E2E_ROOT" in
-/ | /home | /tmp | /var/tmp | /var/lib | /root | /run) fail "DEDCOM_E2E_ROOT='$E2E_ROOT' is a system directory" ;;
-esac
+# SHARED-HOST CONTAINMENT: the same guard as every other harness script, not a private copy of
+# it. testpool-lib.sh refuses to be sourced without DEDCOM_E2E_ROOT *and* DEDCOM_E2E_OWNER_UID,
+# verifies owner and mode over the whole parent chain, requires the spelling to equal the
+# canonical path (so a symlink in ANY component refuses, not just the leaf), and rejects system
+# roots. A local re-implementation had none of the first three — which is exactly why it is
+# gone: this script binds and unmounts, and a fixture whose root was accepted by a weaker check
+# is a bind aimed at somebody else's machine.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=testpool-lib.sh
+. "$SCRIPT_DIR/testpool-lib.sh" || fail "the shared containment guard refused this environment"
 
-mkdir -p -m 0700 "$E2E_ROOT/tmp"
-FIXTURE="$(mktemp -d "$E2E_ROOT/tmp/dedcom-rootguard-XXXXXX")"
-FIXTURE="$(realpath "$FIXTURE")"
-case "$FIXTURE" in
-"$E2E_ROOT"/*) ;;
-*) fail "the fixture must live inside $E2E_ROOT, got $FIXTURE" ;;
-esac
+TMPBASE="$(tp_tmp_dir rootguard)"
+tp_make_dir "$TMPBASE" || fail "could not create the contained tmp base $TMPBASE"
+FIXTURE="$(mktemp -d "$TMPBASE/dedcom-rootguard-XXXXXX")"
+tp_contained "$FIXTURE" || fail "the fixture must live inside $TP_ROOT, got $FIXTURE"
 
 MOUNTS=()
 
@@ -107,8 +100,8 @@ cleanup() {
 	# The error path obeys the same containment rule as the happy one: a fixture that is not
 	# inside the declared root is left alone and reported, never removed on a guess.
 	case "$FIXTURE" in
-	"$E2E_ROOT"/*) rm -rf "$FIXTURE" ;;
-	*) printf 'warning: not removing %s (outside %s)\n' "$FIXTURE" "$E2E_ROOT" >&2 ;;
+	"$TP_ROOT"/*) rm -rf "$FIXTURE" ;;
+	*) printf 'warning: not removing %s (outside %s)\n' "$FIXTURE" "$TP_ROOT" >&2 ;;
 	esac
 }
 trap cleanup EXIT
