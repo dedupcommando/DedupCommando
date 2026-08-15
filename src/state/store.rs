@@ -4533,6 +4533,34 @@ fn authority_cell(value: &Value) -> String {
     }
 }
 
+/// How a damaged group-summary cell is named in a refusal.
+///
+/// Numbers print as themselves — including a `reclaim_state` that is an integer but not one of
+/// the states, where the number IS the diagnosis. A damaged `hash` is the one cell whose stored
+/// text must not be echoed: it is attacker-shaped free text from a corrupt row. Its length is
+/// reported instead — that is what separates a truncated digest from a mistyped one — together
+/// with what is actually wrong with it, because a length alone leaves an operator staring at a
+/// 64-character value with no idea why the build rejected it.
+fn summary_cell(cell: &str, value: &Value) -> String {
+    match (cell, value) {
+        ("hash", Value::Text(text)) => format!(
+            "text of length {} that is not canonical lower-case hex",
+            text.chars().count()
+        ),
+        _ => authority_cell(value),
+    }
+}
+
+/// Where the operator will find the row. A rank is a group's address — but only while it is a
+/// rank; when the rank is itself the damaged cell there is nothing to look up by, so the row is
+/// named by the rowid instead.
+fn group_locator(rank: &Value, rowid: i64) -> String {
+    match rank {
+        Value::Integer(value) if *value >= 0 => format!("group rank {value}"),
+        _ => format!("group rowid {rowid}"),
+    }
+}
+
 /// Decodes one `scan_membership` row that is REQUIRED to be well-formed: mode 1/2 and a
 /// positive integer generation. Anything else is corruption, typed by the caller.
 fn decode_authority(
@@ -4597,6 +4625,8 @@ fn validate_authority(
     mode: MembershipMode,
     generation: i64,
 ) -> std::result::Result<AuthorityIntegrity, MembershipMiss> {
+    use rusqlite::OptionalExtension;
+
     if mode == MembershipMode::Unknown {
         // Nothing is trusted, so there is nothing to validate: the candidate view derives raw
         // digests and hands back no identity at all.
@@ -4610,29 +4640,68 @@ fn validate_authority(
     //    is an enum, so `99` is not «large», it is not a state at all; and `hash` is
     //    canonical lower-case BLAKE3 hex, which is what `GroupWitness.digest` is specified to
     //    carry — an identity whose digest no consumer can decode is not a trusted identity.
-    let bad_summary: i64 = tx.query_row(
-        &format!(
-            "SELECT COUNT(*) FROM file_group
-              WHERE scan_id = ?1
-                AND (typeof(rank) <> 'integer' OR rank < 0
-                  OR typeof(hash) <> 'text'
-                  OR length(hash) <> 64 OR hash GLOB '*[^0-9a-f]*'
-                  OR typeof(file_count) <> 'integer' OR file_count < 0
-                  OR typeof(size) <> 'integer' OR size < 0
-                  OR typeof(reclaim) <> 'integer' OR reclaim < 0
-                  OR typeof(object_count) <> 'integer' OR object_count < 0
-                  OR typeof(reclaim_state) <> 'integer'
-                  OR reclaim_state NOT IN ({states}))",
-            states = persisted_reclaim_states()
-        ),
-        params![scan_id],
-        |row| row.get(0),
-    )?;
-    if bad_summary != 0 {
+    //    Counting the damage was not enough: the operator was told that something in the scan is
+    //    out of domain, never which cell to look at. The same predicates now also name the
+    //    offending column, carry its stored value and locate its row.
+    //
+    //    The row is chosen deterministically. `ORDER BY rank` alone is undefined precisely when
+    //    `rank` is the damaged cell, so valid ranks sort first (the leading boolean), ties break
+    //    on `rowid`, and `file_group` is a rowid table — the schema declares no WITHOUT ROWID.
+    let offender: Option<(String, Value, Value, i64)> = tx
+        .query_row(
+            &format!(
+                "SELECT CASE
+                          WHEN typeof(rank) <> 'integer' OR rank < 0 THEN 'rank'
+                          WHEN typeof(hash) <> 'text'
+                            OR length(hash) <> 64 OR hash GLOB '*[^0-9a-f]*' THEN 'hash'
+                          WHEN typeof(file_count) <> 'integer' OR file_count < 0
+                            THEN 'file_count'
+                          WHEN typeof(size) <> 'integer' OR size < 0 THEN 'size'
+                          WHEN typeof(reclaim) <> 'integer' OR reclaim < 0 THEN 'reclaim'
+                          WHEN typeof(object_count) <> 'integer' OR object_count < 0
+                            THEN 'object_count'
+                          ELSE 'reclaim_state'
+                        END,
+                        CASE
+                          WHEN typeof(rank) <> 'integer' OR rank < 0 THEN rank
+                          WHEN typeof(hash) <> 'text'
+                            OR length(hash) <> 64 OR hash GLOB '*[^0-9a-f]*' THEN hash
+                          WHEN typeof(file_count) <> 'integer' OR file_count < 0
+                            THEN file_count
+                          WHEN typeof(size) <> 'integer' OR size < 0 THEN size
+                          WHEN typeof(reclaim) <> 'integer' OR reclaim < 0 THEN reclaim
+                          WHEN typeof(object_count) <> 'integer' OR object_count < 0
+                            THEN object_count
+                          ELSE reclaim_state
+                        END,
+                        rank,
+                        rowid
+                   FROM file_group
+                  WHERE scan_id = ?1
+                    AND (typeof(rank) <> 'integer' OR rank < 0
+                      OR typeof(hash) <> 'text'
+                      OR length(hash) <> 64 OR hash GLOB '*[^0-9a-f]*'
+                      OR typeof(file_count) <> 'integer' OR file_count < 0
+                      OR typeof(size) <> 'integer' OR size < 0
+                      OR typeof(reclaim) <> 'integer' OR reclaim < 0
+                      OR typeof(object_count) <> 'integer' OR object_count < 0
+                      OR typeof(reclaim_state) <> 'integer'
+                      OR reclaim_state NOT IN ({states}))
+                  ORDER BY (typeof(rank) <> 'integer' OR rank < 0), rank, rowid
+                  LIMIT 1",
+                states = persisted_reclaim_states()
+            ),
+            params![scan_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    if let Some((cell, value, rank, rowid)) = offender {
         return Err(MembershipMiss::Inconsistent {
             detail: format!(
-                "scan {scan_id} holds {bad_summary} group summary row(s) whose stored values are \
-                 not in the domain this build can read"
+                "file_group.{cell} holds {} for {} — not in the domain this build can read. \
+                 Nothing was written.",
+                summary_cell(&cell, &value),
+                group_locator(&rank, rowid)
             ),
         });
     }
@@ -16198,6 +16267,204 @@ mod membership_staging_tests {
             generation: ids[0].generation,
             groups,
         }
+    }
+
+    const OUT_OF_DOMAIN: &str =
+        "— not in the domain this build can read. Nothing was written.";
+
+    /// A real published scan of one group, damaged in exactly one summary cell, and the refusal
+    /// that damage produces. Real because the refusal has to be the one an export would hit.
+    fn refusal_for(tag: &str, damage: &str) -> String {
+        let dir = temp_dir(tag);
+        let digest = [7u8; 32];
+        let a = write(&dir, "a.bin", b"same");
+        let b = write(&dir, "b.bin", b"same");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &[(a, digest), (b, digest)]);
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        store.conn.execute_batch(damage).unwrap();
+
+        let miss = match store.membership_snapshot(scan_id) {
+            Ok(_) => panic!("a summary cell outside its domain must refuse"),
+            Err(miss) => miss,
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        match miss {
+            MembershipMiss::Inconsistent { detail } => detail,
+            other => panic!("the damage must be reported as inconsistent, not {other:?}"),
+        }
+    }
+
+    fn assert_names(detail: &str, head: &str) {
+        assert!(
+            detail.starts_with(head),
+            "the refusal must open with `{head}`, not `{detail}`"
+        );
+        assert!(
+            detail.ends_with(OUT_OF_DOMAIN),
+            "and close with the domain sentence: {detail}"
+        );
+    }
+
+    /// §8.3 C4a–C4g require the refusal to name the CELL. Seven columns are validated here, so
+    /// there are seven branches, and each one has to name itself — a single shared sentence that
+    /// merely counts damaged rows tells the operator nothing about what to repair.
+    #[test]
+    fn a_negative_rank_names_itself_and_locates_the_row_by_rowid() {
+        let detail = refusal_for("cell-rank-negative", "UPDATE file_group SET rank = -1");
+        assert_names(&detail, "file_group.rank holds -1 for group rowid ");
+    }
+
+    #[test]
+    fn a_hash_of_the_wrong_storage_class_names_the_hash() {
+        let detail = refusal_for("cell-hash-blob", "UPDATE file_group SET hash = X'0011'");
+        assert_names(&detail, "file_group.hash holds blob for group rank 0 ");
+    }
+
+    #[test]
+    fn a_short_hash_names_the_hash_by_length_and_never_echoes_it() {
+        let detail = refusal_for("cell-hash-short", "UPDATE file_group SET hash = 'abc'");
+        assert_names(
+            &detail,
+            "file_group.hash holds text of length 3 that is not canonical lower-case hex \
+             for group rank 0 ",
+        );
+        assert!(!detail.contains("abc"), "the stored text is not echoed: {detail}");
+    }
+
+    /// The length alone would say nothing here — the value is 64 characters, exactly as a digest
+    /// should be — so the refusal has to say what is wrong with it.
+    #[test]
+    fn a_hash_with_a_non_hex_character_names_the_hash() {
+        let detail = refusal_for(
+            "cell-hash-nonhex",
+            "UPDATE file_group SET hash = 'z' || substr(hash, 2)",
+        );
+        assert_names(
+            &detail,
+            "file_group.hash holds text of length 64 that is not canonical lower-case hex \
+             for group rank 0 ",
+        );
+    }
+
+    #[test]
+    fn a_negative_file_count_names_the_file_count() {
+        let detail = refusal_for("cell-file-count", "UPDATE file_group SET file_count = -1");
+        assert_names(&detail, "file_group.file_count holds -1 for group rank 0 ");
+    }
+
+    /// Each numeric branch fails two ways — a negative integer, and a cell that is not an integer
+    /// at all — and the `CASE` covers both. Only the negative half had a witness; a half-branch
+    /// with no test is the same gap that sent this commit back for correction.
+    #[test]
+    fn numeric_summary_cells_of_the_wrong_storage_class_name_themselves() {
+        for (tag, cell) in [
+            ("cell-file-count-text", "file_count"),
+            ("cell-size-text", "size"),
+            ("cell-reclaim-text", "reclaim"),
+            ("cell-object-count-text", "object_count"),
+        ] {
+            let detail = refusal_for(tag, &format!("UPDATE file_group SET {cell} = 'x'"));
+            assert_names(
+                &detail,
+                &format!("file_group.{cell} holds text for group rank 0 "),
+            );
+        }
+    }
+
+    /// C4a itself, at the layer that raises it.
+    #[test]
+    fn a_negative_size_names_the_size() {
+        let detail = refusal_for("cell-size", "UPDATE file_group SET size = -1");
+        assert_names(&detail, "file_group.size holds -1 for group rank 0 ");
+    }
+
+    #[test]
+    fn a_negative_reclaim_names_the_reclaim() {
+        let detail = refusal_for("cell-reclaim", "UPDATE file_group SET reclaim = -1");
+        assert_names(&detail, "file_group.reclaim holds -1 for group rank 0 ");
+    }
+
+    #[test]
+    fn a_negative_object_count_names_the_object_count() {
+        let detail = refusal_for("cell-object-count", "UPDATE file_group SET object_count = -1");
+        assert_names(&detail, "file_group.object_count holds -1 for group rank 0 ");
+    }
+
+    /// `reclaim_state` is an enum, so it fails in two different ways and both must name it: an
+    /// integer that is not a state prints the number, because the number IS the diagnosis.
+    #[test]
+    fn a_reclaim_state_outside_the_enum_names_the_value() {
+        let detail = refusal_for("cell-state-value", "UPDATE file_group SET reclaim_state = 99");
+        assert_names(&detail, "file_group.reclaim_state holds 99 for group rank 0 ");
+    }
+
+    #[test]
+    fn a_reclaim_state_of_the_wrong_storage_class_names_the_class() {
+        let detail = refusal_for("cell-state-text", "UPDATE file_group SET reclaim_state = 'x'");
+        assert_names(&detail, "file_group.reclaim_state holds text for group rank 0 ");
+    }
+
+    /// A rank that is not an integer is the case `ORDER BY rank` cannot answer and `row.get::<i64>`
+    /// would turn into a raw conversion error. Both storage classes are read as values, and the
+    /// row is located by rowid because there is no rank to look it up by.
+    #[test]
+    fn a_rank_of_a_foreign_storage_class_is_read_as_a_value() {
+        for (tag, damage, rendered) in [
+            ("cell-rank-text", "UPDATE file_group SET rank = 'abc'", "text"),
+            ("cell-rank-blob", "UPDATE file_group SET rank = X'0102'", "blob"),
+        ] {
+            let detail = refusal_for(tag, damage);
+            assert_names(
+                &detail,
+                &format!("file_group.rank holds {rendered} for group rowid "),
+            );
+        }
+    }
+
+    /// Two damaged rows must not produce a message that depends on the order SQLite happened to
+    /// return them in: the same row is named every time, and it is the one an operator can
+    /// address.
+    #[test]
+    fn two_damaged_summaries_always_name_the_same_row() {
+        let dir = temp_dir("cell-order");
+        let files = [
+            (write(&dir, "a.bin", b"one"), [1u8; 32]),
+            (write(&dir, "b.bin", b"one"), [1u8; 32]),
+            (write(&dir, "c.bin", b"two"), [2u8; 32]),
+            (write(&dir, "d.bin", b"two"), [2u8; 32]),
+        ];
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(&mut store, &dir, &files);
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        store
+            .conn
+            .execute_batch("UPDATE file_group SET size = -1")
+            .unwrap();
+
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..5 {
+            match store.membership_snapshot(scan_id) {
+                Ok(_) => panic!("two damaged summaries must refuse"),
+                Err(MembershipMiss::Inconsistent { detail }) => {
+                    seen.insert(detail);
+                }
+                Err(other) => panic!("expected an inconsistency, got {other:?}"),
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            seen.len(),
+            1,
+            "the same row must be named on every run: {seen:?}"
+        );
+        let detail = seen.into_iter().next().unwrap();
+        assert_names(&detail, "file_group.size holds -1 for group rank 0 ");
     }
 
     /// Matrix: an Unknown scan can yield only a candidate view. No `ResolvedGroup`, no

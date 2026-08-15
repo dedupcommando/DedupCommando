@@ -1927,6 +1927,57 @@ mod export_csv_tests {
             .collect()
     }
 
+    /// §8.3 C4a on the production route: `--export-csv` over a checkpoint whose group summary
+    /// carries a negative size. The store-level branches are covered in `state::store`; what this
+    /// test adds is that the refusal survives the whole route the runbook exercises — exit
+    /// non-zero, the cell named to the operator, nothing written anywhere.
+    #[test]
+    fn a_damaged_group_summary_refuses_the_export_naming_the_cell() {
+        let rig = Rig::new("c4a");
+        {
+            let mut store = rig.store();
+            complete_derived(
+                &mut store,
+                &[row("/tank/a.bin", 11, 100), row("/tank/b.bin", 12, 100)],
+                9,
+            );
+        }
+        {
+            let conn = rusqlite::Connection::open(rig.db()).unwrap();
+            conn.execute_batch("UPDATE file_group SET size = -1")
+                .unwrap();
+        }
+        let checkpoint = std::fs::read(rig.db()).unwrap();
+        let stamped = std::fs::metadata(rig.db()).unwrap().modified().unwrap();
+
+        let err = rig.run().expect_err("a damaged summary must refuse the export");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("file_group.size"),
+            "the refusal names the cell: {text}"
+        );
+        assert!(
+            text.contains("holds -1"),
+            "and the value it actually found: {text}"
+        );
+        assert!(
+            !rig.dest().exists(),
+            "a refused export creates no destination"
+        );
+        assert!(rig.residue().is_empty(), "and leaves no temporary artifact");
+        assert_eq!(
+            std::fs::read(rig.db()).unwrap(),
+            checkpoint,
+            "the checkpoint itself is untouched by the refusal"
+        );
+        assert_eq!(
+            std::fs::metadata(rig.db()).unwrap().modified().unwrap(),
+            stamped,
+            "and its mtime with it — identical bytes rewritten would still be a write"
+        );
+    }
+
     /// The destination's mtime, pinned so a refusal can be shown not to have touched it.
     fn modified(path: &Path) -> std::time::SystemTime {
         std::fs::metadata(path).unwrap().modified().unwrap()
