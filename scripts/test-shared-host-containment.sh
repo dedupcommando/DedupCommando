@@ -33,7 +33,14 @@ HARNESS_FILES="testpool-lib.sh make-test-pool.sh teardown-test-pool.sh e2e-g5.sh
 PASS=0; FAIL=0; SKIP=0
 ok()   { PASS=$((PASS+1)); printf 'PASS  %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf 'FAIL  %s\n' "$1"; [ -n "${2:-}" ] && printf '%s\n' "$2" | sed 's/^/        /'; }
-skip() { SKIP=$((SKIP+1)); printf 'SKIP  %s (%s)\n' "$1" "$2"; }
+# A skip is no longer a legal outcome. An assertion this suite cannot run is a failure, not a
+# silence: a guard nobody exercised is indistinguishable from a guard that is not there. The
+# helper is kept as a tripwire so a reintroduced skip is loud in BOTH counters rather than
+# undefined, and the closing gate refuses a run with either one non-zero.
+skip() {
+  FAIL=$((FAIL+1)); SKIP=$((SKIP+1))
+  printf 'FAIL  %s — cannot prove here (%s), and a skip is not a pass\n' "$1" "$2"
+}
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK" "${E2E:-}"' EXIT
 BIN="$WORK/bin"; mkdir -p "$BIN"
@@ -97,6 +104,18 @@ esac
 exit 0'
 
 make_stub seq 'printf "1\n2\n3\n"'   # keeps the fixture loop to three files
+
+# `id -u` stub, on exactly the same principle as the `stat` stub above: the contract under test
+# is what the scripts DO once their root gate is satisfied, and that must be provable without
+# actually being root — otherwise the assertion is skipped and the guard is never exercised.
+# Only the literal `id -u` is answered, and only when STUB_FAKE_UID is set, so every other
+# caller keeps the real uid. Ownership is a SEPARATE contract and still runs on the real uid:
+# these invocations pass DEDCOM_E2E_OWNER_UID="$UID_NOW", never 0.
+make_stub id '
+if [ -n "${STUB_FAKE_UID:-}" ] && [ "$*" = "-u" ]; then
+  printf "%s\n" "$STUB_FAKE_UID"; exit 0
+fi
+exec /usr/bin/id "$@"'
 
 export STUB_CMDLOG="$CMDLOG"
 
@@ -301,57 +320,55 @@ done <<< "$paths"
 
 echo "== 4. the exact zpool create command =="
 
-if [ "$UID_NOW" != "0" ]; then
-  skip "zpool create carries -m under the root and cachefile=none" "not root"
-  skip "the manifest records name, GUID, vdev and dataset mountpoints" "not root"
+# Runs under every uid. make-test-pool.sh gates on `id -u`, so the gate is satisfied by the
+# stub while OWNERSHIP stays on the real uid — the pool commands are what is under test here,
+# not the privilege. Every ZFS call is stubbed; nothing is created outside the root.
+POOL="ct-$$"
+PDIR="$E2E/pools/$POOL"
+: > "$CMDLOG"
+createlog="$WORK/create.out"
+env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" STUB_FAKE_UID=0 \
+    DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
+    DEDCOM_TESTPOOL_NAME="$POOL" DEDCOM_TESTPOOL_SIZE=1M \
+    STUB_VDEV="$POOL\n\t$PDIR/pool.img\n" \
+    STUB_DS="$(printf '%s\t%s\n%s/ds_a\t%s/ds_a\n%s/ds_b\t%s/ds_b\n' \
+               "$POOL" "$PDIR/mount" "$POOL" "$PDIR/mount" "$POOL" "$PDIR/mount")" \
+    bash "$HERE/make-test-pool.sh" > "$createlog" 2>&1
+mk_rc=$?
+
+create_line="$(grep -m1 '^zpool create ' "$CMDLOG" || true)"
+if [ -z "$create_line" ]; then
+  bad "zpool create carries -m under the root and cachefile=none" \
+      "no zpool create was issued (rc=$mk_rc)"$'\n'"$(tail -20 "$createlog")"
 else
-  POOL="ct-$$"
-  PDIR="$E2E/pools/$POOL"
-  : > "$CMDLOG"
-  createlog="$WORK/create.out"
-  env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" \
-      DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID=0 \
-      DEDCOM_TESTPOOL_NAME="$POOL" DEDCOM_TESTPOOL_SIZE=1M \
-      STUB_VDEV="$POOL\n\t$PDIR/pool.img\n" \
-      STUB_DS="$(printf '%s\t%s\n%s/ds_a\t%s/ds_a\n%s/ds_b\t%s/ds_b\n' \
-                 "$POOL" "$PDIR/mount" "$POOL" "$PDIR/mount" "$POOL" "$PDIR/mount")" \
-      bash "$HERE/make-test-pool.sh" > "$createlog" 2>&1
-  mk_rc=$?
-
-  create_line="$(grep -m1 '^zpool create ' "$CMDLOG" || true)"
-  if [ -z "$create_line" ]; then
-    bad "zpool create carries -m under the root and cachefile=none" \
-        "no zpool create was issued (rc=$mk_rc)"$'\n'"$(tail -20 "$createlog")"
+  err=""
+  case "$create_line" in *" -m $PDIR/mount "*) ;; *) err="$err no explicit -m under the root;";; esac
+  case "$create_line" in *" -o cachefile=none "*) ;; *) err="$err no cachefile=none;";; esac
+  case "$create_line" in *" /$POOL"*) err="$err mountpoint at the filesystem root;";; esac
+  if [ -z "$err" ]; then
+    ok "zpool create carries -m under the root and cachefile=none"
   else
-    err=""
-    case "$create_line" in *" -m $PDIR/mount "*) ;; *) err="$err no explicit -m under the root;";; esac
-    case "$create_line" in *" -o cachefile=none "*) ;; *) err="$err no cachefile=none;";; esac
-    case "$create_line" in *" /$POOL"*) err="$err mountpoint at the filesystem root;";; esac
-    if [ -z "$err" ]; then
-      ok "zpool create carries -m under the root and cachefile=none"
-    else
-      bad "zpool create carries -m under the root and cachefile=none" "$err"$'\n'"$create_line"
-    fi
+    bad "zpool create carries -m under the root and cachefile=none" "$err"$'\n'"$create_line"
   fi
-
-  man="$PDIR/manifest.txt"
-  if [ -r "$man" ] &&
-     grep -q "^pool	$POOL$" "$man" &&
-     grep -q '^guid	[0-9][0-9]*$' "$man" &&
-     grep -q "^vdev	$PDIR/pool.img$" "$man" &&
-     grep -q "^dataset	$POOL	$PDIR/mount$" "$man"; then
-    ok "the manifest records name, GUID, vdev and dataset mountpoints"
-  else
-    bad "the manifest records name, GUID, vdev and dataset mountpoints" \
-        "$( [ -r "$man" ] && cat "$man" || echo 'no manifest written')"
-  fi
-
-  # Everything the run created stays inside the root.
-  stray="$(grep -E '^(zpool|zfs) ' "$CMDLOG" | grep -oE ' /[A-Za-z0-9._/-]+' | tr -d ' ' \
-           | grep -v "^$E2E" | grep -v '^/dev/' || true)"
-  [ -z "$stray" ] && ok "no ZFS argument names a path outside the root" \
-                  || bad "no ZFS argument names a path outside the root" "$stray"
 fi
+
+man="$PDIR/manifest.txt"
+if [ -r "$man" ] &&
+   grep -q "^pool	$POOL$" "$man" &&
+   grep -q '^guid	[0-9][0-9]*$' "$man" &&
+   grep -q "^vdev	$PDIR/pool.img$" "$man" &&
+   grep -q "^dataset	$POOL	$PDIR/mount$" "$man"; then
+  ok "the manifest records name, GUID, vdev and dataset mountpoints"
+else
+  bad "the manifest records name, GUID, vdev and dataset mountpoints" \
+      "$( [ -r "$man" ] && cat "$man" || echo 'no manifest written')"
+fi
+
+# Everything the run created stays inside the root.
+stray="$(grep -E '^(zpool|zfs) ' "$CMDLOG" | grep -oE ' /[A-Za-z0-9._/-]+' | tr -d ' ' \
+         | grep -v "^$E2E" | grep -v '^/dev/' || true)"
+[ -z "$stray" ] && ok "no ZFS argument names a path outside the root" \
+                || bad "no ZFS argument names a path outside the root" "$stray"
 
 echo "== 5. a dataset mounted outside the root refuses =="
 
@@ -373,31 +390,25 @@ echo "== 6. clean-stale refuses prefix and listing forms =="
 # to the stubbed "pool not found" and exit 0.
 G5="$HERE/e2e-g5.sh"
 clean_stale() {  # args... -> exit status of clean-stale under gate envs and stubs
-  env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" DEDCOM_G5_E2E=1 \
+  env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" DEDCOM_G5_E2E=1 STUB_FAKE_UID=0 \
       DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
       DEDCOM="$BIN/zpool" \
       bash "$G5" clean-stale "$@" >/dev/null 2>&1
 }
-if [ "$UID_NOW" = "0" ]; then
-  if clean_stale; then
-    bad "clean-stale without an exact pool name -> refuse"
-  else
-    ok "clean-stale without an exact pool name -> refuse"
-  fi
-  if clean_stale 'dedcom-g5-*'; then
-    bad "clean-stale with a glob -> refuse"
-  else
-    ok "clean-stale with a glob -> refuse"
-  fi
-  if clean_stale 'rpool'; then
-    bad "clean-stale with a foreign pool name -> refuse"
-  else
-    ok "clean-stale with a foreign pool name -> refuse"
-  fi
+if clean_stale; then
+  bad "clean-stale without an exact pool name -> refuse"
 else
-  skip "clean-stale without an exact pool name -> refuse" "not root"
-  skip "clean-stale with a glob -> refuse" "not root"
-  skip "clean-stale with a foreign pool name -> refuse" "not root"
+  ok "clean-stale without an exact pool name -> refuse"
+fi
+if clean_stale 'dedcom-g5-*'; then
+  bad "clean-stale with a glob -> refuse"
+else
+  ok "clean-stale with a glob -> refuse"
+fi
+if clean_stale 'rpool'; then
+  bad "clean-stale with a foreign pool name -> refuse"
+else
+  ok "clean-stale with a foreign pool name -> refuse"
 fi
 # The old form iterated every imported pool and matched a prefix; its loop message is the
 # static fingerprint. The new form must refuse without a name and never print the old marker.
@@ -478,22 +489,18 @@ hits="$(sed 's/[[:space:]]*#.*$//' "$HERE/e2e-dir-completeness.sh" | grep -F 'pw
 echo "== 7d. tri-state existence, verified closure, tmux isolation (FIX2B) =="
 
 # --- make: a failed enumeration permits nothing --------------------------------------------
-if [ "$UID_NOW" = "0" ]; then
-  ts_pool="ts-make-$$"
-  : > "$CMDLOG"
-  env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" STUB_ENUM_RC=2 \
-      DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID=0 DEDCOM_TESTPOOL_NAME="$ts_pool" \
-      bash "$HERE/make-test-pool.sh" >/dev/null 2>&1
-  ts_rc=$?
-  created="$(grep -c '^zpool create' "$CMDLOG" || true)"
-  if [ "$ts_rc" != 0 ] && [ "$created" = 0 ] && [ ! -e "$E2E/pools/$ts_pool" ]; then
-    ok "make: enumeration error -> non-zero, zero creates, no directory provisioned"
-  else
-    bad "make: enumeration error -> non-zero, zero creates, no directory provisioned" \
-        "rc=$ts_rc creates=$created dir=$( [ -e "$E2E/pools/$ts_pool" ] && echo exists || echo absent )"
-  fi
+ts_pool="ts-make-$$"
+: > "$CMDLOG"
+env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" STUB_ENUM_RC=2 STUB_FAKE_UID=0 \
+    DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME="$ts_pool" \
+    bash "$HERE/make-test-pool.sh" >/dev/null 2>&1
+ts_rc=$?
+created="$(grep -c '^zpool create' "$CMDLOG" || true)"
+if [ "$ts_rc" != 0 ] && [ "$created" = 0 ] && [ ! -e "$E2E/pools/$ts_pool" ]; then
+  ok "make: enumeration error -> non-zero, zero creates, no directory provisioned"
 else
-  bad "make: enumeration error -> non-zero, zero creates, no directory provisioned" "needs uid 0"
+  bad "make: enumeration error -> non-zero, zero creates, no directory provisioned" \
+      "rc=$ts_rc creates=$created dir=$( [ -e "$E2E/pools/$ts_pool" ] && echo exists || echo absent )"
 fi
 
 # --- teardown: the same error is unknown, and unknown licenses nothing ---------------------
@@ -687,13 +694,21 @@ mutate() {  # label file from to check-fn
   if ! bash -n "$dir/$file" 2>/dev/null; then
     bad "mutation '$label' does not parse — the substitution broke the syntax"; return
   fi
-  if "$fn" "$dir"; then
-    bad "mutation '$label' SURVIVED — the contract does not catch it"
-  else
-    ok "mutation '$label' is caught"
-  fi
+  # Tri-state on purpose. 0 and 1 are verdicts the control reached by running; anything else
+  # means the control could not run at all, and a kill nobody executed is not a kill. Counting
+  # the controls that actually ran is what makes the closing census meaningful.
+  "$fn" "$dir"; local verdict=$?
+  case "$verdict" in
+    0) MUT_RUN=$((MUT_RUN+1))
+       bad "mutation '$label' SURVIVED — the contract does not catch it" ;;
+    1) MUT_RUN=$((MUT_RUN+1))
+       ok "mutation '$label' is caught" ;;
+    *) bad "mutation '$label' — its control never ran (status $verdict)" \
+           "a mutation whose control did not execute is not a proven kill" ;;
+  esac
 }
 MUTN=0
+MUT_RUN=0
 
 # Every chk_* is THE CONTRACT CHECK for its guard, phrased positively: it returns 0 when the
 # guard holds and non-zero when it does not. On a mutant the check must fail — that is the
@@ -701,11 +716,10 @@ MUTN=0
 
 chk_create_opts() {  # 0 = zpool create still carries -m under the root and cachefile=none
   local dir="$1" line
-  [ "$UID_NOW" = "0" ] || return 1     # make refuses as non-root: cannot prove, report caught
   local pool="mu-$$-$RANDOM" log="$dir/cmds.log"; : > "$log"
   local pdir="$E2E/pools/$pool"
-  env PATH="$BIN:$PATH" STUB_CMDLOG="$log" \
-      DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID=0 \
+  env PATH="$BIN:$PATH" STUB_CMDLOG="$log" STUB_FAKE_UID=0 \
+      DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
       DEDCOM_TESTPOOL_NAME="$pool" DEDCOM_TESTPOOL_SIZE=1M \
       STUB_VDEV="$pool\n\t$pdir/pool.img\n" \
       STUB_DS="$(printf '%s\t%s\n' "$pool" "$pdir/mount")" \
@@ -730,10 +744,16 @@ chk_no_root_mount() {  # 0 = no harness script places a pool at the filesystem r
   return 0
 }
 
-chk_no_tmp() {  # 0 = no executable harness line names /tmp or /var/lib
+chk_no_tmp() {  # 0 = no executable harness line names /tmp, /var/tmp or /var/lib
   local dir="$1" f hits
+  # The boundary is the whole point, and matches the live audit of section 7. Without it this
+  # control also matches CONTAINED paths that merely end in /tmp/ — "$TP_ROOT/tmp/…" and
+  # "$E2ESAMPLE/tmp/…" — so it answered "broken" on the pristine tree and reported mutations 3
+  # and 3b as caught whatever they did. A control that never answers "guard holds" kills
+  # nothing.
   for f in $HARNESS_FILES; do
-    hits="$(sed 's/[[:space:]]*#.*$//' "$dir/$f" | grep -E '(/tmp/|/var/lib/)' || true)"
+    hits="$(sed 's/[[:space:]]*#.*$//' "$dir/$f" \
+            | grep -E '(^|[^A-Za-z0-9_])(/tmp/|/var/tmp/|/var/lib/)' || true)"
     [ -n "$hits" ] && return 1
   done
   return 0
@@ -750,7 +770,9 @@ chk_uid_guard() {  # 0 = a non-numeric owner uid still refuses
 
 chk_symlink_guard() {  # 0 = a symlinked root still refuses
   local dir="$1"
-  [ -L "$WORK/rootlink" ] || return 1
+  # No symlink to probe with means the control cannot run. Status 2, never 1: reporting a kill
+  # here would credit this guard for a test that never happened.
+  [ -L "$WORK/rootlink" ] || return 2
   if env DEDCOM_E2E_ROOT="$WORK/rootlink" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
        bash -c '. "$1"' _ "$dir/testpool-lib.sh" >/dev/null 2>&1; then
     return 1
@@ -760,10 +782,9 @@ chk_symlink_guard() {  # 0 = a symlinked root still refuses
 
 chk_prefix_cleanup() {  # 0 = clean-stale without an exact name still refuses
   local dir="$1"
-  [ "$UID_NOW" = "0" ] || return 1     # the gate needs root; cannot prove here, report caught
-  # Every earlier gate is satisfied on purpose — env, root, stubs — so the only thing standing
-  # between a defaulted pool name and a "pool not found" exit 0 is the argument check itself.
-  if env PATH="$BIN:$PATH" STUB_CMDLOG="$WORK/mut.log" DEDCOM_G5_E2E=1 \
+  # Every earlier gate is satisfied on purpose — env, root, uid, stubs — so the only thing
+  # standing between a defaulted pool name and a "pool not found" exit 0 is the argument check.
+  if env PATH="$BIN:$PATH" STUB_CMDLOG="$WORK/mut.log" DEDCOM_G5_E2E=1 STUB_FAKE_UID=0 \
        DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
        DEDCOM="$BIN/zpool" \
        bash "$dir/e2e-g5.sh" clean-stale >/dev/null 2>&1; then
@@ -864,11 +885,15 @@ setvar M_TO2 <<'EOT'
 EOT
 if literal_sub "$mut5_dir/testpool-lib.sh" "$M_FROM" "$M_TO" &&
    literal_sub "$mut5_dir/testpool-lib.sh" "$M_FROM2" "$M_TO2"; then
-  if chk_symlink_guard "$mut5_dir"; then
-    bad "mutation '5. symlink guard removed (both layers)' SURVIVED — the contract does not catch it"
-  else
-    ok "mutation '5. symlink guard removed (both layers)' is caught"
-  fi
+  chk_symlink_guard "$mut5_dir"; mut5_verdict=$?
+  case "$mut5_verdict" in
+    0) MUT_RUN=$((MUT_RUN+1))
+       bad "mutation '5. symlink guard removed (both layers)' SURVIVED — the contract does not catch it" ;;
+    1) MUT_RUN=$((MUT_RUN+1))
+       ok "mutation '5. symlink guard removed (both layers)' is caught" ;;
+    *) bad "mutation '5. symlink guard removed (both layers)' — its control never ran (status $mut5_verdict)" \
+           "a mutation whose control did not execute is not a proven kill" ;;
+  esac
 else
   bad "mutation '5. symlink guard removed (both layers)' changed nothing — a target line is gone"
 fi
@@ -967,10 +992,9 @@ chk_unknown_not_absent() {  # 0 = an enumeration error still refuses the clean n
 
 chk_make_enum_gate() {  # 0 = make still refuses to create after an enumeration error
   local dir="$1"
-  [ "$UID_NOW" = "0" ] || return 1
   local pool="mu-mk-$$-$RANDOM" log="$WORK/mut.log"; : > "$log"
-  env PATH="$BIN:$PATH" STUB_CMDLOG="$log" STUB_ENUM_RC=2 \
-      DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID=0 DEDCOM_TESTPOOL_NAME="$pool" \
+  env PATH="$BIN:$PATH" STUB_CMDLOG="$log" STUB_ENUM_RC=2 STUB_FAKE_UID=0 \
+      DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME="$pool" \
       bash "$dir/make-test-pool.sh" >/dev/null 2>&1
   local rc=$?
   local created; created="$(grep -c '^zpool create' "$log" || true)"
@@ -1078,5 +1102,39 @@ EOT
 mutate "18. the global tmux kill-server returns" e2e-dir-completeness.sh \
   "$M_FROM" "$M_TO" chk_tmux_private
 
-echo "== result: PASS=$PASS FAIL=$FAIL SKIP=$SKIP =="
-[ "$FAIL" -eq 0 ]
+echo "== 9. every control must distinguish =="
+
+# A control that answers "the guard is broken" on the UNMUTATED tree reports every mutation as
+# caught without telling anything apart. That is a kill on paper only, and it is exactly how
+# chk_no_tmp passed unnoticed. Each control is therefore run once against a pristine copy —
+# built the way mutate() builds a mutant, minus the substitution — and must answer 0.
+pristine_dir="$WORK/pristine"; mkdir -p "$pristine_dir"; cp "$HERE"/*.sh "$pristine_dir/"
+vacuous=""
+for pristine_fn in chk_create_opts chk_prefix_cleanup chk_make_enum_gate chk_uid_guard \
+                   chk_symlink_guard chk_removal_verified chk_residue_blocked \
+                   chk_unknown_not_absent chk_dataset_mounts chk_guid_failopen \
+                   chk_owner_comparison chk_no_root_mount chk_no_tmp chk_bare_zdb \
+                   chk_no_nobody chk_no_advice chk_tmux_private; do
+  if ! "$pristine_fn" "$pristine_dir" >/dev/null 2>&1; then
+    vacuous="$vacuous $pristine_fn"
+  fi
+done
+if [ -z "$vacuous" ]; then
+  ok "every mutation control answers 'guard holds' on the unmutated tree"
+else
+  bad "every mutation control answers 'guard holds' on the unmutated tree" \
+      "vacuous, they report a kill whatever the mutation does:$vacuous"
+fi
+
+# Census. Every declared mutation must have had its control actually executed; a run where the
+# two numbers differ has reported verdicts it did not earn, and that is a failure of the suite
+# itself, not of the thing under test.
+if [ "$MUT_RUN" -eq "$MUTN" ]; then
+  ok "mutation census: all $MUTN declared mutations had their control executed"
+else
+  bad "mutation census: $MUT_RUN of $MUTN declared mutations had their control executed" \
+      "the difference was reported without being tested"
+fi
+
+echo "== result: PASS=$PASS FAIL=$FAIL SKIP=$SKIP MUTATIONS=$MUT_RUN/$MUTN =="
+[ "$FAIL" -eq 0 ] && [ "$SKIP" -eq 0 ] && [ "$MUT_RUN" -eq "$MUTN" ]
