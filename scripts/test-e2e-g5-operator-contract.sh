@@ -41,11 +41,23 @@ record() { awk -v idx="$1" '
         /^PAUSE [0-9][0-9] BEGIN /  { want = ($2 == idx) }
         want                        { print }
     ' "$DUMP"; }
-has()     { record "$1" | grep -qF -- "$2"; }
-hasre()   { record "$1" | grep -qE -- "$2"; }
+# Under `set -o pipefail` a reader that stops at its first match closes the pipe while the
+# writer is still writing; the writer takes SIGPIPE, exits 141, and pipefail hands 141 to the
+# check as its verdict. The input here is deterministic, so a check that answers differently
+# between runs is answering about the scheduler. Every decisive reader below therefore consumes
+# its whole input: `grep -c` counts to EOF and still exits non-zero when nothing matched, and
+# neither awk helper ever exits early.
+seen()    { grep -cF -- "$1" >/dev/null; }   # stdin, literal -> 0 when it occurs
+seen_re() { grep -cE -- "$1" >/dev/null; }   # stdin, ERE     -> 0 when it occurs
+# 1-based line of the first match; 0 when absent. Callers must treat 0 as "not found".
+first_line_of() { awk -v pat="$1" 'n == 0 && index($0, pat) { n = NR } END { print n + 0 }'; }
+first_line_in() { awk -v pat="$2" 'n == 0 && index($0, pat) { n = NR } END { print n + 0 }' "$1"; }
+first_match()   { grep -oE -- "$1" | awk 'n == 0 { n = 1; v = $0 } END { if (n) print v }'; }
+
+has()     { record "$1" | seen "$2"; }
+hasre()   { record "$1" | seen_re "$2"; }
 countre() { record "$1" | grep -cE -- "$2"; }
-# 1-based line of the first match inside a record; 0 when absent.
-line_of() { record "$1" | grep -nF -- "$2" | head -1 | cut -d: -f1 | grep . || echo 0; }
+line_of() { record "$1" | first_line_of "$2"; }
 
 ALL="01 02 03 04 05 06 07 08 09 10"
 # Every pause but 06 starts from a cold TUI; 06 continues the overlay 05 left open.
@@ -64,7 +76,7 @@ check "indices are exactly 01..10, once each, in order (saw: $indices)" "$?"
 
 printf '\n== 2. every record names the run it belongs to ==\n'
 for idx in $ALL; do
-    grep -E "^PAUSE $idx BEGIN " "$DUMP" | grep -qE 'pool=[^ ]+ state=[^ ]+ fixture=[^ ]+ scan=[0-9]+$'
+    grep -E "^PAUSE $idx BEGIN " "$DUMP" | seen_re 'pool=[^ ]+ state=[^ ]+ fixture=[^ ]+ scan=[0-9]+$'
     check "pause $idx marker carries pool/state/fixture/scan" "$?"
     has "$idx" "  binary  :" && has "$idx" "  state   :" \
         && has "$idx" "  pool    :" && has "$idx" "  fixture :" && has "$idx" "  scan id :"
@@ -111,12 +123,12 @@ for idx in $ROUTED; do
     [ "$a" -gt 0 ] && [ "$b" -gt 0 ] && [ "$a" -lt "$b" ]
     check "pause $idx: the dataset is reached before g5 is entered ($a < $b)" "$?"
 done
-! grep -qE '^ +Enter on «g5»' <(record 01 | head -20)
+! record 01 | awk 'NR <= 20' | seen_re '^ +Enter on «g5»'
 check "no record opens with «Enter on g5» straight after launch" "$?"
 
 printf '\n== 3c. the settlement line has to fit the terminal ==\n'
 for idx in $ALL; do
-    need="$(record "$idx" | grep -oE 'needs [0-9]+ columns' | head -1 | tr -dc '0-9')"
+    need="$(record "$idx" | first_match 'needs [0-9]+ columns' | tr -dc '0-9')"
     marks="$(countre "$idx" '«Mark saved: .* = ')"
     if [ "$marks" -eq 0 ]; then
         [ -z "$need" ]; check "pause $idx: no marks, so no width requirement" "$?"
@@ -334,13 +346,16 @@ grep -qF 'G5_FINAL_STATE=cleaning' "$G5"
 check "finalization has an explicit in-flight state" "$?"
 # `done` may only be published once the marker exists, and the commit point must mask signals.
 awk '/^emit_final\(\)/,/^}/' "$G5" >"$WORK/emit.txt"
-[ "$(grep -n "trap '' INT TERM" "$WORK/emit.txt" | head -1 | cut -d: -f1)" -lt \
-  "$(grep -n 'write_marker' "$WORK/emit.txt" | head -1 | cut -d: -f1)" ]
-check "signals are masked before any marker is attempted" "$?"
+# An absent needle answers 0, and 0 must never read as "comes first" — both lines have to be
+# found before their order means anything.
+mask_ln="$(first_line_in "$WORK/emit.txt" "trap '' INT TERM")"
+mark_ln="$(first_line_in "$WORK/emit.txt" 'write_marker')"
+done_ln="$(first_line_in "$WORK/emit.txt" 'G5_FINAL_STATE=done')"
+[ "$mask_ln" -gt 0 ] && [ "$mark_ln" -gt 0 ] && [ "$mask_ln" -lt "$mark_ln" ]
+check "signals are masked before any marker is attempted ($mask_ln < $mark_ln)" "$?"
 # Every publication of `done` must come after a write attempt whose result was inspected.
-[ "$(grep -n 'write_marker' "$WORK/emit.txt" | head -1 | cut -d: -f1)" -lt \
-  "$(grep -n 'G5_FINAL_STATE=done' "$WORK/emit.txt" | head -1 | cut -d: -f1)" ]
-check "«done» is never published before a marker was written" "$?"
+[ "$mark_ln" -gt 0 ] && [ "$done_ln" -gt 0 ] && [ "$mark_ln" -lt "$done_ln" ]
+check "«done» is never published before a marker was written ($mark_ln < $done_ln)" "$?"
 [ "$(grep -c 'G5_FINAL_STATE=done' "$WORK/emit.txt")" \
   -eq "$(grep -cE 'if write_marker|\|\| write_marker' "$WORK/emit.txt")" ]
 check "and each publication sits behind its own checked write" "$?"
@@ -422,15 +437,15 @@ grep -qE 'if write_marker PASS 1; then' "$WORK/emit2.txt"
 check "the PASS write's result is what decides the state" "$?"
 grep -qF 'G5_FINAL_STATE=output_failed' "$G5"
 check "there is an explicit terminal output-failure state" "$?"
-awk '/^on_exit\(\)/,/^}/' "$G5" | grep -qF 'done|output_failed'
+awk '/^on_exit\(\)/,/^}/' "$G5" | seen 'done|output_failed'
 check "and EXIT treats it as an ending, retrying neither cleanup nor the marker" "$?"
 
 printf '\n== 10a. the signal and trace seams are offline-only ==\n'
-awk '/^trace_output_failure\(\)/,/^}/' "$G5" | grep -qF 'G5_OFFLINE" -eq 1 ] || return 0'
+awk '/^trace_output_failure\(\)/,/^}/' "$G5" | seen 'G5_OFFLINE" -eq 1 ] || return 0'
 check "the output-failure trace is refused outside an offline mode" "$?"
-awk '/^maybe_signal\(\)/,/^}/' "$G5" | grep -qF 'G5_OFFLINE" -eq 1 ] || return 0'
+awk '/^maybe_signal\(\)/,/^}/' "$G5" | seen 'G5_OFFLINE" -eq 1 ] || return 0'
 check "the signal injection is refused outside an offline mode" "$?"
-awk '/^trace_step\(\)/,/^}/' "$G5" | grep -qF 'G5_OFFLINE" -eq 1 ] || return 0'
+awk '/^trace_step\(\)/,/^}/' "$G5" | seen 'G5_OFFLINE" -eq 1 ] || return 0'
 check "the cleanup trace is refused outside an offline mode" "$?"
 
 printf '\n== 10b. the dataset list of a real run comes from zfs, not the environment ==\n'
