@@ -101,18 +101,82 @@ make_stub seq 'printf "1\n2\n3\n"'   # keeps the fixture loop to three files
 export STUB_CMDLOG="$CMDLOG"
 
 # ---------------------------------------------------------------- containment root
-E2E=""
-for cand in /var/lib /run /root "$HOME"; do
-  [ -d "$cand" ] && [ -w "$cand" ] || continue
-  c="$(mktemp -d "$cand/dedcom-e2e-ct.XXXXXX" 2>/dev/null)" || continue
-  chmod 0700 "$c" 2>/dev/null || true
-  if DEDCOM_E2E_ROOT="$c" DEDCOM_E2E_OWNER_UID="$(id -u)" bash -c '. "$1"' _ "$LIB" >/dev/null 2>&1; then
-    E2E="$c"; break
-  fi
-  rmdir "$c" 2>/dev/null || rm -rf "$c"
+# The base is HANDED IN and never searched for. Probing system directories is how this suite
+# used to build its containment root in /var/lib — the first writable candidate won, and that
+# is outside <REMOTE_ROOT>, which the containment rules forbid. The caller names one base; the
+# private subdirectory created below is the only thing this run makes and the only thing the
+# exit trap removes. A base we cannot use is an abort with a reason, never a fallback.
+CT_BASE="${DEDCOM_E2E_CT_ROOT-}"
+if [ -z "$CT_BASE" ]; then
+  {
+    echo "ABORT: DEDCOM_E2E_CT_ROOT is not set — this suite never searches for a root."
+    echo "       Pass an absolute path inside the tree this run owns, for example:"
+    echo "         DEDCOM_E2E_CT_ROOT=<REMOTE_ROOT>/ct bash $0"
+  } >&2
+  exit 1
+fi
+case "$CT_BASE" in
+  /*) ;;
+  *) echo "ABORT: DEDCOM_E2E_CT_ROOT='$CT_BASE' is not absolute." >&2; exit 1;;
+esac
+if [ ! -d "$CT_BASE" ]; then
+  echo "ABORT: DEDCOM_E2E_CT_ROOT='$CT_BASE' does not exist or is not a directory." >&2
+  exit 1
+fi
+if ! CT_REAL="$(readlink -f -- "$CT_BASE" 2>/dev/null)"; then
+  echo "ABORT: canonicalization of DEDCOM_E2E_CT_ROOT='$CT_BASE' failed." >&2; exit 1
+fi
+if [ "$CT_REAL" != "$CT_BASE" ]; then
+  echo "ABORT: DEDCOM_E2E_CT_ROOT='$CT_BASE' canonicalizes to '$CT_REAL' — refusing an aliased base." >&2
+  exit 1
+fi
+
+# The shared guard refuses a system directory as a root, but only when it IS one: a base
+# UNDER /var/lib passes it, and that is exactly how the old search ended up there. Here the
+# whole ancestry is refused, and the list is read out of the library so there is one source of
+# truth. Failing to read it is an abort, never a silently empty list.
+ct_forbidden_roots() {
+  awk '/^tp_root_is_forbidden\(\)/,/^}/' "$LIB" \
+    | sed -n 's/^[[:space:]]*\(\/|[^)]*\))$/\1/p' | tr '|' ' '
+}
+FORBIDDEN_ROOTS="$(ct_forbidden_roots)"
+if [ -z "$FORBIDDEN_ROOTS" ]; then
+  echo "ABORT: cannot read the forbidden-root list out of '$LIB' — refusing to guess it." >&2
+  exit 1
+fi
+ct_refuse_base() {  # reason -> abort naming the base and why
+  echo "ABORT: DEDCOM_E2E_CT_ROOT='$CT_BASE' $1." >&2
+  exit 1
+}
+# The base itself is measured against the whole list, '/' included.
+for ct_bad_root in $FORBIDDEN_ROOTS; do
+  [ "$CT_BASE" = "$ct_bad_root" ] && ct_refuse_base "is the system directory '$ct_bad_root'"
 done
-[ -n "$E2E" ] || { echo "ABORT: no clean-chain containment root available here" >&2; exit 1; }
+[ -n "${HOME:-}" ] && [ "$CT_BASE" = "$HOME" ] && ct_refuse_base "is the user's home directory"
+# Its ancestry is measured against the same list MINUS '/', because every path lies under '/'
+# and refusing that would refuse every base there is.
+ct_probe_path="$(dirname "$CT_BASE")"
+while [ "$ct_probe_path" != "/" ]; do
+  for ct_bad_root in $FORBIDDEN_ROOTS; do
+    [ "$ct_bad_root" = "/" ] && continue
+    [ "$ct_probe_path" = "$ct_bad_root" ] \
+      && ct_refuse_base "lies under the system directory '$ct_bad_root'"
+  done
+  [ -n "${HOME:-}" ] && [ "$ct_probe_path" = "$HOME" ] \
+    && ct_refuse_base "lies under the user's home directory"
+  ct_probe_path="$(dirname "$ct_probe_path")"
+done
+
+E2E="$(mktemp -d "$CT_BASE/dedcom-e2e-ct.XXXXXX")" || {
+  echo "ABORT: cannot create a private containment root under '$CT_BASE'." >&2; exit 1; }
+chmod 0700 "$E2E" || { echo "ABORT: cannot set mode 0700 on '$E2E'." >&2; exit 1; }
 UID_NOW="$(id -u)"
+if ! ct_probe="$(DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
+                 bash -c '. "$1"' _ "$LIB" 2>&1)"; then
+  echo "ABORT: the guard refuses the handed-in containment root '$E2E':" >&2
+  printf '%s\n' "$ct_probe" | sed 's/^/       /' >&2
+  exit 1
+fi
 
 # Source the library in a subshell with a given environment; prints nothing, returns its status.
 lib_env() { env "$@" bash -c '. "$1"' _ "$LIB" >/dev/null 2>&1; }
