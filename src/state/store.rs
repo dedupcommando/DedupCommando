@@ -1075,6 +1075,10 @@ impl ScanStore {
         schema::enforce_foreign_keys(&conn)?;
         // Refuse a DB written by a newer build before touching it (no WAL flip, no migration).
         schema::ensure_version_supported(&conn)?;
+        // And refuse one that is not our checkpoint at all — also before the WAL flip below, so a
+        // database we do not own keeps its bytes, its mtime and its sidecar census. Reading
+        // `sqlite_master` and `PRAGMA table_info` writes nothing; the pragma on the next line does.
+        schema::ensure_recognisable_shape(&conn)?;
         // busy_timeout — the background move worker holds its own connection
         // in parallel with the main one; WAL + waiting on a lock instead of a «locked» error.
         conn.execute_batch(
@@ -11802,9 +11806,28 @@ mod tests {
             store.set_status(id, ScanStatus::Complete).unwrap();
             id
         };
-        // Simulate a pre-versioning (v0.9) DB: clear the stamp.
+        // A real pre-versioning (v0.9) checkpoint — the shape that build actually wrote, not
+        // today's shape with its stamp cleared. The v4 and v5 tables go, the v3 columns and
+        // indexes go, the v2 marker goes, and only then the stamp. Clearing the stamp alone would
+        // leave a database declaring v0 while carrying names that arrived at v4 and v5; that is
+        // incoherent rather than legacy, and the opener refuses it — see
+        // `a_current_shape_with_a_zeroed_stamp_is_refused` in main.rs.
         {
             let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "DROP TABLE file_group_member;
+                 DROP TABLE scan_membership;
+                 DROP TABLE dir_omission;
+                 DROP TABLE scan_root;
+                 DROP INDEX file_scan_identity;
+                 DROP INDEX file_hash_identity;
+                 ALTER TABLE file       DROP COLUMN nlink;
+                 ALTER TABLE file_group DROP COLUMN object_count;
+                 ALTER TABLE file_group DROP COLUMN reclaim_state;
+                 ALTER TABLE scan_stats DROP COLUMN reclaim_state;
+                 ALTER TABLE scan_stats DROP COLUMN results_materialized;",
+            )
+            .unwrap();
             conn.pragma_update(None, "user_version", 0i64).unwrap();
         }
         // Reopen with the new build: it must re-stamp and keep the scan.
@@ -11818,6 +11841,19 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, schema::SCHEMA_VERSION);
+        let restored: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE name IN ('scan_membership', 'file_group_member', 'scan_root',
+                                 'dir_omission', 'file_scan_identity', 'file_hash_identity')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            restored, 6,
+            "the migration rebuilt every object the rewind removed"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

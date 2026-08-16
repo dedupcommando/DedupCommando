@@ -3081,10 +3081,13 @@ mod boot_session_load_is_fail_closed_tests {
         db
     }
 
+    /// Exact bytes, mtime, `user_version` and the sibling census of one checkpoint.
+    type Census = (Vec<u8>, std::time::SystemTime, i64, Vec<String>);
+
     /// Exact bytes, mtime at the platform's full precision, `user_version` and the sibling
     /// census. Metadata is taken before the inspection connection and re-verified after it, so a
     /// census that disturbed the file cannot pass.
-    fn census(db: &std::path::Path) -> (Vec<u8>, std::time::SystemTime, i64, Vec<String>) {
+    fn census(db: &std::path::Path) -> Census {
         let bytes = std::fs::read(db).unwrap();
         let before = std::fs::metadata(db).unwrap().modified().unwrap();
 
@@ -3136,6 +3139,475 @@ mod boot_session_load_is_fail_closed_tests {
             before,
             "bytes, mtime, user_version and the sidecar census are untouched"
         );
+    }
+
+    const NOT_A_CHECKPOINT: &str = "dedcom.db is not a checkpoint this build can upgrade";
+
+    /// A checkpoint the product itself wrote, carrying one completed scan, rewound to the shape a
+    /// build of `version` would have left behind. Rewinding the real schema is how the migration
+    /// tests in `state::schema` build their legacy databases as well — hand-transcribed DDL in
+    /// this role is precisely what the G2 masters got wrong.
+    ///
+    /// The rollback journal is restored at the end: WAL is something an opener flips, not
+    /// something a resting checkpoint carries, and a fixture in WAL mode would blur the
+    /// no-sidecar assertions below.
+    fn genuine_checkpoint(dir: &std::path::Path, version: i64) -> std::path::PathBuf {
+        let db = dir.join("dedcom.db");
+        {
+            let mut store = ScanStore::open(&db).expect("the product creates its own checkpoint");
+            let scan = store
+                .begin_scan(&crate::model::scan::ScanConfig::new(vec![dir.to_path_buf()]))
+                .unwrap();
+            store
+                .set_status(scan, crate::model::scan::ScanStatus::Complete)
+                .unwrap();
+        }
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        if version < 5 {
+            conn.execute_batch("DROP TABLE file_group_member; DROP TABLE scan_membership;")
+                .unwrap();
+        }
+        if version < 4 {
+            conn.execute_batch("DROP TABLE dir_omission; DROP TABLE scan_root;")
+                .unwrap();
+        }
+        if version < 3 {
+            // The two v3 indexes go as well. They depend on no column dropped here, so they would
+            // survive the rewind — and a checkpoint declaring v0 while carrying a name that only
+            // arrived at v3 is exactly what the guard refuses. Dropping the v4/v5 TABLES above
+            // takes their indexes with them; these two have to be named.
+            conn.execute_batch(
+                "DROP INDEX file_scan_identity;
+                 DROP INDEX file_hash_identity;
+                 ALTER TABLE file       DROP COLUMN nlink;
+                 ALTER TABLE file_group DROP COLUMN object_count;
+                 ALTER TABLE file_group DROP COLUMN reclaim_state;
+                 ALTER TABLE scan_stats DROP COLUMN reclaim_state;",
+            )
+            .unwrap();
+        }
+        if version < 2 {
+            conn.execute_batch("ALTER TABLE scan_stats DROP COLUMN results_materialized;")
+                .unwrap();
+        }
+        conn.pragma_update(None, "user_version", version).unwrap();
+        let _: String = conn
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+        db
+    }
+
+    /// A database built by hand into a shape no release of this product ever wrote: `scan` with
+    /// `started_at` instead of the timestamps, and a table called `file_entry` where ours is
+    /// `file`. It exists here only as the foreign input that has to be refused.
+    fn foreign_shape(dir: &std::path::Path) -> std::path::PathBuf {
+        raw_db(
+            dir,
+            "CREATE TABLE scan (id INTEGER PRIMARY KEY, status TEXT NOT NULL,
+                                config_json TEXT NOT NULL, started_at INTEGER NOT NULL,
+                                trashed INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE file_entry (id INTEGER PRIMARY KEY, scan_id INTEGER NOT NULL,
+                                      path TEXT NOT NULL, size INTEGER NOT NULL,
+                                      hash TEXT NOT NULL);
+             CREATE TABLE scan_membership (scan_id INTEGER NOT NULL, file_id INTEGER NOT NULL,
+                                           mode, generation);
+             CREATE TABLE scan_stats (scan_id INTEGER PRIMARY KEY, files_scanned INTEGER NOT NULL,
+                                      bytes_hashed INTEGER NOT NULL, groups_found INTEGER NOT NULL,
+                                      results_materialized INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO scan (id, status, config_json, started_at, trashed)
+                  VALUES (1, 'complete', '{}', 1700000000, 0);",
+        )
+    }
+
+    fn raw_db(dir: &std::path::Path, ddl: &str) -> std::path::PathBuf {
+        let db = dir.join("dedcom.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(ddl).unwrap();
+        drop(conn);
+        db
+    }
+
+    /// Every refusal of a database we do not own says which object failed, never SQLite's own
+    /// «no such column», and leaves the file exactly as it found it.
+    fn assert_refused_untouched(db: &std::path::Path, before: &Census, names: &[&str]) {
+        let err = boot_session_load(db, false, false)
+            .expect_err("a database that is not our checkpoint must be refused");
+        let text = err.to_string();
+        assert!(
+            text.starts_with(NOT_A_CHECKPOINT),
+            "the refusal must be the shape guard's own: {text}"
+        );
+        assert!(
+            !text.contains("no such column"),
+            "a raw SQLite sentence must never reach the operator: {text}"
+        );
+        for name in names {
+            assert!(
+                text.contains(name),
+                "the refusal must name {name}, not just complain: {text}"
+            );
+        }
+        assert_eq!(
+            &census(db),
+            before,
+            "bytes, mtime, user_version and the sidecar census are untouched"
+        );
+    }
+
+    #[test]
+    fn a_genuine_unstamped_checkpoint_migrates() {
+        let _role = crate::state::store::role_guard();
+        let dir = scratch("floor-v0");
+        let db = genuine_checkpoint(dir.path(), 0);
+
+        let list = boot_session_load(&db, false, false)
+            .expect("a checkpoint of our own first shape upgrades");
+
+        assert_eq!(list.len(), 1, "its one completed session is listed");
+        let (_, _, version, _) = census(&db);
+        assert_eq!(version, 5, "and the upgrade is stamped");
+    }
+
+    #[test]
+    fn a_fresh_state_dir_still_creates_a_checkpoint() {
+        let _role = crate::state::store::role_guard();
+        let dir = scratch("fresh");
+        let db = dir.path().join("dedcom.db");
+
+        let list = boot_session_load(&db, false, false)
+            .expect("the first run creates the checkpoint it then reads");
+
+        assert!(list.is_empty(), "a brand new checkpoint holds no sessions");
+        let (_, _, version, _) = census(&db);
+        assert_eq!(version, 5);
+    }
+
+    #[test]
+    fn a_genuine_v3_checkpoint_migrates_to_v5() {
+        let _role = crate::state::store::role_guard();
+        let dir = scratch("floor-v3");
+        let db = genuine_checkpoint(dir.path(), 3);
+
+        let list = boot_session_load(&db, false, false).expect("an intermediate version upgrades");
+
+        assert_eq!(list.len(), 1);
+        let (_, _, version, _) = census(&db);
+        assert_eq!(version, 5);
+    }
+
+    #[test]
+    fn an_unrelated_table_and_its_rows_survive_the_migration() {
+        let _role = crate::state::store::role_guard();
+        let dir = scratch("extra-table");
+        let db = genuine_checkpoint(dir.path(), 3);
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+                 INSERT INTO notes (id, body) VALUES (1, 'kept'), (2, 'also kept');",
+            )
+            .unwrap();
+        }
+
+        boot_session_load(&db, false, false)
+            .expect("a table that is not ours is no reason to refuse a checkpoint that is");
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mut stmt = conn.prepare("SELECT id, body FROM notes ORDER BY id").unwrap();
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(1, "kept".to_string()), (2, "also kept".to_string())],
+            "the foreign table keeps every row, unchanged"
+        );
+    }
+
+    #[test]
+    fn a_foreign_shape_is_refused_without_touching_the_checkpoint() {
+        let _role = crate::state::store::role_guard();
+        let dir = scratch("foreign");
+        let db = foreign_shape(dir.path());
+        let before = census(&db);
+
+        assert_refused_untouched(&db, &before, &["scan", "created_at"]);
+    }
+
+    #[test]
+    fn a_lone_foreign_table_is_not_mistaken_for_a_fresh_database() {
+        let _role = crate::state::store::role_guard();
+        let dir = scratch("users-only");
+        let db = raw_db(
+            dir.path(),
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+        );
+        let before = census(&db);
+
+        assert_refused_untouched(&db, &before, &["scan"]);
+    }
+
+    #[test]
+    fn a_v5_stamp_missing_a_v5_table_is_refused() {
+        let _role = crate::state::store::role_guard();
+        let dir = scratch("half-v5");
+        let db = genuine_checkpoint(dir.path(), 5);
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch("DROP TABLE scan_membership;").unwrap();
+        }
+        let before = census(&db);
+
+        assert_refused_untouched(&db, &before, &["scan_membership"]);
+    }
+
+    #[test]
+    fn a_required_name_held_by_another_object_is_refused() {
+        let _role = crate::state::store::role_guard();
+        let dir = scratch("file-as-view");
+        let db = genuine_checkpoint(dir.path(), 5);
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "DROP TABLE file;
+                 CREATE VIEW file AS SELECT 1 AS scan_id, 'x' AS path;",
+            )
+            .unwrap();
+        }
+        let before = census(&db);
+
+        assert_refused_untouched(&db, &before, &["file", "view"]);
+    }
+
+    /// A genuine v5 checkpoint with one statement run over it. Every product-owned name is at or
+    /// below v5 here, so the version rule cannot fire first and each test below is left facing
+    /// exactly the axis it means to exercise.
+    fn v5_then(tag: &str, ddl: &str) -> (Scratch, std::path::PathBuf) {
+        let dir = scratch(tag);
+        let db = genuine_checkpoint(dir.path(), 5);
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(ddl).unwrap();
+        }
+        (dir, db)
+    }
+
+    fn assert_v5_refused(tag: &str, ddl: &str, names: &[&str]) {
+        let _role = crate::state::store::role_guard();
+        let (_dir, db) = v5_then(tag, ddl);
+        let before = census(&db);
+        assert_refused_untouched(&db, &before, names);
+    }
+
+    /// `LIKE` treats `_` as a wildcard, so `NOT LIKE 'sqlite_%'` also hides a foreign table called
+    /// `sqlitex` — and a database that reads as holding nothing is one the migration adopts.
+    #[test]
+    fn a_table_named_like_an_internal_one_is_not_mistaken_for_a_fresh_database() {
+        let _role = crate::state::store::role_guard();
+        let dir = scratch("sqlitex");
+        let db = raw_db(dir.path(), "CREATE TABLE sqlitex (id INTEGER PRIMARY KEY);");
+        let before = census(&db);
+
+        assert_refused_untouched(&db, &before, &["scan"]);
+    }
+
+    /// The version rule, on a table name: the object is exactly the shape v5 declares, and it is
+    /// still refused, because a checkpoint that says v0 cannot hold a name that arrived at v5.
+    #[test]
+    fn a_future_table_name_is_refused_whatever_its_shape() {
+        let _role = crate::state::store::role_guard();
+        let dir = scratch("future-table");
+        let db = genuine_checkpoint(dir.path(), 0);
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE scan_membership (
+                     scan_id    INTEGER PRIMARY KEY,
+                     mode       INTEGER NOT NULL,
+                     generation INTEGER NOT NULL);",
+            )
+            .unwrap();
+        }
+        let before = census(&db);
+
+        assert_refused_untouched(&db, &before, &["scan_membership", "v5", "v0"]);
+    }
+
+    /// The same rule on an index name. `file_scan_identity` is chosen because it can be built in
+    /// its exact v3 form on a v0 checkpoint — `file` is there from the start — so the refusal can
+    /// only be about the version the name belongs to.
+    #[test]
+    fn a_future_index_name_is_refused_whatever_its_shape() {
+        let _role = crate::state::store::role_guard();
+        let dir = scratch("future-index");
+        let db = genuine_checkpoint(dir.path(), 0);
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE INDEX file_scan_identity ON file(scan_id, device, inode);",
+            )
+            .unwrap();
+        }
+        let before = census(&db);
+
+        assert_refused_untouched(&db, &before, &["file_scan_identity", "v3", "v0"]);
+    }
+
+    /// The consequential one: our UNIQUE index name taken by an index over someone else's table.
+    /// The fixture first shows what that costs — membership loses its uniqueness entirely.
+    #[test]
+    fn a_product_index_on_a_foreign_table_is_refused() {
+        let _role = crate::state::store::role_guard();
+        let (_dir, db) = v5_then(
+            "index-foreign-owner",
+            "DROP INDEX file_group_member_by_path;
+             CREATE TABLE notes (scan_id INTEGER, path TEXT);
+             CREATE UNIQUE INDEX file_group_member_by_path ON notes(scan_id, path);",
+        );
+        {
+            // The primary key is (scan_id, group_rank, path), so it already forbids the same row
+            // twice. What `file_group_member_by_path` alone forbids is one path in TWO groups of
+            // one scan — the membership invariant — and with the index gone that goes straight in.
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "INSERT INTO file_group
+                        (scan_id, rank, hash, file_count, size, reclaim,
+                         object_count, reclaim_state)
+                      VALUES (1, 0, lower(hex(zeroblob(32))), 2, 10, 10, 0, 0),
+                             (1, 1, replace(lower(hex(zeroblob(32))), '0', '1'), 2, 10, 10, 0, 0);
+                 INSERT INTO file_group_member (scan_id, group_rank, path, generation)
+                      VALUES (1, 0, '/x/a', 1), (1, 1, '/x/a', 1);",
+            )
+            .expect("with the real index gone, one path lands in two groups — that is the damage");
+        }
+        let before = census(&db);
+
+        assert_refused_untouched(&db, &before, &["file_group_member_by_path", "notes"]);
+    }
+
+    #[test]
+    fn a_product_index_without_its_uniqueness_is_refused() {
+        assert_v5_refused(
+            "index-not-unique",
+            "DROP INDEX file_group_member_by_path;
+             CREATE INDEX file_group_member_by_path ON file_group_member(scan_id, path);",
+            &["file_group_member_by_path", "not unique"],
+        );
+    }
+
+    #[test]
+    fn a_partial_product_index_is_refused() {
+        assert_v5_refused(
+            "index-partial",
+            "DROP INDEX file_group_member_by_path;
+             CREATE UNIQUE INDEX file_group_member_by_path
+                 ON file_group_member(scan_id, path) WHERE scan_id > 0;",
+            &["file_group_member_by_path", "partial"],
+        );
+    }
+
+    #[test]
+    fn a_product_index_with_a_foreign_collation_is_refused() {
+        assert_v5_refused(
+            "index-nocase",
+            "DROP INDEX file_group_member_by_path;
+             CREATE UNIQUE INDEX file_group_member_by_path
+                 ON file_group_member(scan_id, path COLLATE NOCASE);",
+            &["file_group_member_by_path", "NOCASE"],
+        );
+    }
+
+    #[test]
+    fn a_product_index_sorted_descending_is_refused() {
+        assert_v5_refused(
+            "index-desc",
+            "DROP INDEX file_group_member_by_path;
+             CREATE UNIQUE INDEX file_group_member_by_path
+                 ON file_group_member(scan_id, path DESC);",
+            &["file_group_member_by_path", "descending"],
+        );
+    }
+
+    #[test]
+    fn a_product_index_over_the_wrong_columns_is_refused() {
+        assert_v5_refused(
+            "index-columns",
+            "DROP INDEX file_group_hash;
+             CREATE INDEX file_group_hash ON file_group(scan_id);",
+            &["file_group_hash", "covers"],
+        );
+    }
+
+    #[test]
+    fn a_product_index_over_an_expression_is_refused() {
+        assert_v5_refused(
+            "index-expression",
+            "DROP INDEX file_group_hash;
+             CREATE INDEX file_group_hash ON file_group(lower(hash));",
+            &["file_group_hash", "expression"],
+        );
+    }
+
+    #[test]
+    fn a_product_index_name_held_by_a_table_is_refused() {
+        assert_v5_refused(
+            "index-name-is-a-table",
+            "DROP INDEX file_group_hash;
+             CREATE TABLE file_group_hash (id INTEGER PRIMARY KEY);",
+            &["file_group_hash", "table"],
+        );
+    }
+
+    /// Today's shape declaring v0 is not a legacy checkpoint, it is an incoherent one: no build
+    /// ever wrote `scan_root` at v0, so the stamp and the contents contradict each other. A
+    /// `.dump` and reload produces exactly this, and the answer is a refusal that says so rather
+    /// than a silent re-stamp — the opener cannot tell a lost stamp from a forged one, and
+    /// adopting the file is the branch that has no way back.
+    #[test]
+    fn a_current_shape_with_a_zeroed_stamp_is_refused() {
+        let _role = crate::state::store::role_guard();
+        let dir = scratch("stamp-zeroed");
+        let db = genuine_checkpoint(dir.path(), 5);
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.pragma_update(None, "user_version", 0i64).unwrap();
+        }
+        let before = census(&db);
+
+        assert_refused_untouched(&db, &before, &["scan_root", "v4", "v0"]);
+    }
+
+    /// The other side of the policy: a name that is not ours is not our business. An unrelated
+    /// index on an unrelated table passes, and both are still there afterwards.
+    #[test]
+    fn an_unrelated_index_and_its_table_survive_the_migration() {
+        let _role = crate::state::store::role_guard();
+        let (_dir, db) = v5_then(
+            "index-unrelated",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+             CREATE INDEX notes_by_body ON notes(body);
+             INSERT INTO notes (id, body) VALUES (1, 'kept');",
+        );
+
+        boot_session_load(&db, false, false)
+            .expect("an index that is not ours is no reason to refuse a checkpoint that is");
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'notes_by_body'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the foreign index is still there");
+        assert!(sql.contains("notes(body)"), "and unchanged: {sql}");
+        let body: String = conn
+            .query_row("SELECT body FROM notes WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(body, "kept", "with its row intact");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-use rusqlite::Connection;
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{AppError, Result};
 
@@ -374,6 +374,442 @@ pub fn ensure_version_exact(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// One table of a floor: its name and the columns a checkpoint of that version must carry.
+type TableFloor = (&'static str, &'static [&'static str]);
+
+const NOT_A_CHECKPOINT: &str = "dedcom.db is not a checkpoint this build can upgrade";
+const NOTHING_CHANGED: &str =
+    "Nothing was changed. Move it aside, or point --state-dir at the right directory.";
+
+/// The floor of v0 and v1 — what the first public build actually wrote.
+///
+/// A version's real shape is the `CREATE` payload of the commit that introduced it PLUS the
+/// `add_column_if_missing` ladder that build already carried: at the first public commit the
+/// ladder alone contributes `scan.trashed`, `scan_stats.hash_failures` and the four `cand_*`
+/// columns, none of which are in that commit's payload. Reading the payload alone would accept
+/// shapes no release ever wrote.
+///
+/// `scan` comes first so a database that is not ours at all is refused by the table an operator
+/// recognises rather than by an alphabetically earlier one.
+const FLOOR_V0: &[TableFloor] = &[
+    (
+        "scan",
+        &["id", "created_at", "updated_at", "status", "config_json", "trashed"],
+    ),
+    (
+        "file",
+        &[
+            "scan_id",
+            "path",
+            "size",
+            "mtime",
+            "mtime_nsec",
+            "ctime_sec",
+            "ctime_nsec",
+            "identity_version",
+            "device",
+            "inode",
+            "hash",
+        ],
+    ),
+    (
+        "file_group",
+        &["scan_id", "rank", "hash", "file_count", "size", "reclaim"],
+    ),
+    (
+        "scan_stats",
+        &[
+            "scan_id",
+            "elapsed_seconds",
+            "storage_type",
+            "pool_layout",
+            "zfs_version",
+            "files_scanned",
+            "bytes_hashed",
+            "groups_found",
+            "reclaimable_bytes",
+            "hash_failures",
+            "cand_files_total",
+            "cand_bytes_total",
+            "cand_files_hashed",
+            "cand_bytes_hashed",
+        ],
+    ),
+    ("file_mark", &["scan_id", "path", "is_keeper", "action"]),
+    (
+        "dir_dedup",
+        &["scan_id", "signature", "path", "file_count", "size_per_dir"],
+    ),
+    (
+        "file_dedup",
+        &["scan_id", "hash", "path", "size", "mtime", "device", "inode"],
+    ),
+    (
+        "hash_cache",
+        &["device", "inode", "size", "mtime", "hash", "updated_at"],
+    ),
+    (
+        "move_event",
+        &[
+            "id",
+            "created_at",
+            "scan_id",
+            "source_path",
+            "target_path",
+            "hash",
+            "duplicate",
+        ],
+    ),
+];
+
+/// Per-version additions. A floor is frozen by the version bump that introduced it: a new
+/// `add_column_if_missing` belongs in a NEW row here behind a NEW `SCHEMA_VERSION`, never
+/// appended to a floor already published — that would retroactively reject databases the old
+/// build wrote correctly.
+const FLOOR_V2_COLUMNS: &[(&str, &str)] = &[("scan_stats", "results_materialized")];
+const FLOOR_V3_COLUMNS: &[(&str, &str)] = &[
+    ("file", "nlink"),
+    ("file_group", "object_count"),
+    ("file_group", "reclaim_state"),
+    ("scan_stats", "reclaim_state"),
+];
+const FLOOR_V4_TABLES: &[TableFloor] = &[
+    (
+        "dir_omission",
+        &[
+            "scan_id",
+            "root_key",
+            "dir_key",
+            "reason",
+            "event_count",
+            "generation",
+        ],
+    ),
+    ("scan_root", &["scan_id", "root_key", "generation"]),
+];
+const FLOOR_V5_TABLES: &[TableFloor] = &[
+    (
+        "file_group_member",
+        &["scan_id", "group_rank", "path", "generation"],
+    ),
+    ("scan_membership", &["scan_id", "mode", "generation"]),
+];
+
+fn floor_for(version: i64) -> Vec<(&'static str, Vec<&'static str>)> {
+    let mut floor: Vec<(&'static str, Vec<&'static str>)> = FLOOR_V0
+        .iter()
+        .map(|(table, columns)| (*table, columns.to_vec()))
+        .collect();
+    let mut add_columns = |adds: &[(&'static str, &'static str)]| {
+        for (table, column) in adds {
+            if let Some(entry) = floor.iter_mut().find(|(name, _)| name == table) {
+                entry.1.push(column);
+            }
+        }
+    };
+    if version >= 2 {
+        add_columns(FLOOR_V2_COLUMNS);
+    }
+    if version >= 3 {
+        add_columns(FLOOR_V3_COLUMNS);
+    }
+    if version >= 4 {
+        floor.extend(
+            FLOOR_V4_TABLES
+                .iter()
+                .map(|(table, columns)| (*table, columns.to_vec())),
+        );
+    }
+    if version >= 5 {
+        floor.extend(
+            FLOOR_V5_TABLES
+                .iter()
+                .map(|(table, columns)| (*table, columns.to_vec())),
+        );
+    }
+    floor
+}
+
+/// Every name this build's migration creates with `IF NOT EXISTS`, and the schema version at
+/// which the name first existed. Both halves matter: the migration always runs the WHOLE current
+/// `SCHEMA`, so it will create all of these whatever version the database claims, and a name that
+/// did not exist at the claimed version cannot legitimately be in a checkpoint of that version.
+///
+/// Provenance was read out of this repository's own history, one bump commit at a time, not
+/// transcribed from memory: v0 `0fbbb5e`, v1 `27f698f`, v2 `6c1ecd6`, v3 `75f8370`, v4 `eee4a94`,
+/// v5 `0a0df8d`.
+const PRODUCT_TABLES: &[(&str, i64)] = &[
+    ("scan", 0),
+    ("file", 0),
+    ("file_group", 0),
+    ("scan_stats", 0),
+    ("file_mark", 0),
+    ("dir_dedup", 0),
+    ("file_dedup", 0),
+    ("hash_cache", 0),
+    ("move_event", 0),
+    ("scan_root", 4),
+    ("dir_omission", 4),
+    ("scan_membership", 5),
+    ("file_group_member", 5),
+];
+
+/// Name, the version it arrived at, its table, whether it is UNIQUE, and its key columns in
+/// order. Every one of them is non-partial, BINARY and ascending, over plain columns — that is
+/// asserted rather than stored, because a squatter is free to differ in exactly those ways.
+type IndexSpec = (&'static str, i64, &'static str, bool, &'static [&'static str]);
+
+const PRODUCT_INDEXES: &[IndexSpec] = &[
+    ("file_size", 0, "file", false, &["scan_id", "size"]),
+    ("file_hash", 0, "file", false, &["scan_id", "hash"]),
+    ("file_content", 0, "file", false, &["device", "inode", "size", "mtime"]),
+    ("file_path_content", 0, "file", false, &["path", "size", "mtime"]),
+    ("file_hash_path", 0, "file", false, &["scan_id", "hash", "path"]),
+    (
+        "file_reuse_identity",
+        0,
+        "file",
+        false,
+        &[
+            "path",
+            "size",
+            "mtime",
+            "mtime_nsec",
+            "ctime_sec",
+            "ctime_nsec",
+            "identity_version",
+        ],
+    ),
+    (
+        "dir_dedup_by_scan_sig",
+        0,
+        "dir_dedup",
+        false,
+        &["scan_id", "signature"],
+    ),
+    ("file_group_hash", 0, "file_group", false, &["scan_id", "hash"]),
+    (
+        "file_dedup_by_scan_hash",
+        0,
+        "file_dedup",
+        false,
+        &["scan_id", "hash"],
+    ),
+    (
+        "file_scan_identity",
+        3,
+        "file",
+        false,
+        &["scan_id", "device", "inode"],
+    ),
+    (
+        "file_hash_identity",
+        3,
+        "file",
+        false,
+        &["scan_id", "hash", "device", "inode"],
+    ),
+    (
+        "dir_omission_by_root",
+        4,
+        "dir_omission",
+        false,
+        &["scan_id", "root_key", "dir_key"],
+    ),
+    (
+        "file_group_member_by_path",
+        5,
+        "file_group_member",
+        true,
+        &["scan_id", "path"],
+    ),
+];
+
+fn object_kind(conn: &Connection, name: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn not_ours(detail: String) -> AppError {
+    AppError::msg(format!("{NOT_A_CHECKPOINT}: {detail}. {NOTHING_CHANGED}"))
+}
+
+/// Refuses a database in which one of our names is taken by something that is not ours.
+///
+/// Every name here is created with `IF NOT EXISTS`, which is silent when the name is already
+/// occupied. That silence is the danger: the object we meant to create never appears, the
+/// migration reports success, and the stamp at the end says v5. For
+/// `file_group_member_by_path` — the one UNIQUE index in the schema — that means a checkpoint
+/// declared v5 with no uniqueness behind membership at all.
+///
+/// A name introduced later than the claimed version is refused WITHOUT looking at its shape. A
+/// genuine v0 checkpoint cannot carry a name that only came into existence at v5; the fact that
+/// it does is the answer, and a well-formed impostor is no better than a malformed one.
+fn ensure_no_squatted_name(conn: &Connection, version: i64) -> Result<()> {
+    for (table, since) in PRODUCT_TABLES {
+        let Some(kind) = object_kind(conn, table)? else {
+            continue;
+        };
+        if *since > version {
+            return Err(not_ours(format!(
+                "`{table}` belongs to schema v{since}, but this checkpoint declares v{version}"
+            )));
+        }
+        if kind != "table" {
+            return Err(not_ours(format!("`{table}` is a {kind}, not a table")));
+        }
+    }
+
+    for (name, since, owner, unique, columns) in PRODUCT_INDEXES {
+        let Some(kind) = object_kind(conn, name)? else {
+            continue;
+        };
+        if *since > version {
+            return Err(not_ours(format!(
+                "`{name}` belongs to schema v{since}, but this checkpoint declares v{version}"
+            )));
+        }
+        if kind != "index" {
+            return Err(not_ours(format!("`{name}` is a {kind}, not an index")));
+        }
+        let indexed: String = conn.query_row(
+            "SELECT tbl_name FROM sqlite_master WHERE name = ?1",
+            [name],
+            |row| row.get(0),
+        )?;
+        if indexed != *owner {
+            return Err(not_ours(format!(
+                "`{name}` indexes `{indexed}`, not `{owner}`"
+            )));
+        }
+        // `unique` and `partial` live only on the owner's index list; the key columns, their
+        // collation and their direction only on index_xinfo. Neither is visible to index_info,
+        // which is why checking the column names alone would pass a partial NOCASE index.
+        let (is_unique, is_partial): (i64, i64) = conn.query_row(
+            "SELECT \"unique\", partial FROM pragma_index_list(?1) WHERE name = ?2",
+            params![owner, name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if (is_unique != 0) != *unique {
+            let expected = if *unique { "is not unique" } else { "is unique" };
+            return Err(not_ours(format!("index `{name}` {expected}")));
+        }
+        if is_partial != 0 {
+            return Err(not_ours(format!("index `{name}` is partial")));
+        }
+        let mut stmt = conn.prepare(
+            "SELECT name, coll, \"desc\" FROM pragma_index_xinfo(?1) WHERE key = 1 ORDER BY seqno",
+        )?;
+        let keys: Vec<(Option<String>, String, i64)> = stmt
+            .query_map([name], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut found: Vec<String> = Vec::with_capacity(keys.len());
+        for (column, coll, desc) in keys {
+            // A key column with no name is an expression, and there is nothing to compare it to.
+            let Some(column) = column else {
+                return Err(not_ours(format!(
+                    "index `{name}` is built over an expression"
+                )));
+            };
+            if !coll.eq_ignore_ascii_case("BINARY") {
+                return Err(not_ours(format!(
+                    "index `{name}` collates `{column}` as {coll}, not BINARY"
+                )));
+            }
+            if desc != 0 {
+                return Err(not_ours(format!(
+                    "index `{name}` sorts `{column}` descending"
+                )));
+            }
+            found.push(column);
+        }
+        if found.iter().map(String::as_str).ne(columns.iter().copied()) {
+            return Err(not_ours(format!(
+                "index `{name}` covers ({}), not ({})",
+                found.join(", "),
+                columns.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a database that is not a checkpoint of the version it claims — BEFORE anything is
+/// written to it.
+///
+/// The migration below is additive: it creates missing tables and adds missing later columns. On
+/// a file that was never one of our checkpoints that is not a repair, it is adoption — the batch
+/// would write our tables into someone else's database and the stamp at the end would declare it
+/// v5. So the shape is judged first, and a database that fails keeps its bytes, its mtime and its
+/// sidecar census exactly as they were.
+///
+/// Three rules, in order:
+///
+///   * a database with no user objects at all is a first run and passes — anything else in an
+///     otherwise empty file means it is not ours;
+///   * every table of the claimed version's floor must exist AND be a table: `PRAGMA table_info`
+///     answers for a view as well, so the storage class is read from `sqlite_master` instead.
+///     Names share one namespace in SQLite, so an index or trigger squatting a required name is
+///     caught by the same test;
+///   * every floor column must be present. Types and constraints are NOT checked: a declared type
+///     is an affinity, and judging by it would refuse live databases over nothing;
+///   * finally `ensure_no_squatted_name`: none of the 26 names the migration will create with
+///     `IF NOT EXISTS` may be held by something that is not ours, and none of them may be present
+///     at all if it was introduced after the version this checkpoint declares.
+///
+/// This is not proof of provenance. It proves only a minimally recognisable checkpoint shape.
+/// Foreign objects whose names do not collide are left exactly as they are — an extra table is
+/// not evidence that the database is someone else's, and refusing it would break real extended
+/// databases for no gain.
+pub fn ensure_recognisable_shape(conn: &Connection) -> Result<()> {
+    // `sqlite_` is SQLite's own reserved prefix — sqlite_sequence, sqlite_stat1 and friends are
+    // the engine's bookkeeping, not a user object. The comparison is on the literal seven
+    // characters, NOT `LIKE 'sqlite_%'`: in LIKE the underscore matches any single character, so
+    // that pattern also swallows a foreign table called `sqlitex` and would read a database
+    // holding one as empty — and an empty database is one this function lets the migration adopt.
+    let user_objects: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE substr(name, 1, 7) <> 'sqlite_'",
+        [],
+        |row| row.get(0),
+    )?;
+    if user_objects == 0 {
+        return Ok(());
+    }
+
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    // The floor first: it answers «is this one of ours at all», and its diagnosis is the more
+    // useful one when the answer is no. Only then the squatted-name pass, which answers the
+    // narrower question of whether something else holds a name the migration is about to create.
+    for (table, columns) in floor_for(version) {
+        let kind: Option<String> = object_kind(conn, table)?;
+        match kind.as_deref() {
+            Some("table") => {}
+            Some(other) => return Err(not_ours(format!("`{table}` is a {other}, not a table"))),
+            None => return Err(not_ours(format!("table `{table}` is missing"))),
+        }
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let present: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for column in columns {
+            if !present.iter().any(|name| name == column) {
+                return Err(not_ours(format!(
+                    "table `{table}` has no column `{column}`"
+                )));
+            }
+        }
+    }
+    ensure_no_squatted_name(conn, version)
+}
+
+/// Upgrades a checkpoint to the current schema. Runs only after `ensure_recognisable_shape` has
+/// established that the database is one of ours — on its own this function would adopt a foreign
+/// file and stamp it.
 pub fn migrate(conn: &Connection) -> Result<()> {
     // The migration is transactional and idempotent — either it all applies,
     // or the DB stays in its previous state (no half-added columns).
