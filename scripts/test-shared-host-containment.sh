@@ -759,13 +759,22 @@ chk_no_tmp() {  # 0 = no executable harness line names /tmp, /var/tmp or /var/li
   return 0
 }
 
-chk_uid_guard() {  # 0 = a non-numeric owner uid still refuses
-  local dir="$1"
-  if env DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="nobody" \
-       bash -c '. "$1"' _ "$dir/testpool-lib.sh" >/dev/null 2>&1; then
+chk_uid_guard() {  # 0 = a non-numeric owner uid is refused BY THIS GUARD, named in the refusal
+  local dir="$1" out
+  # A bare non-zero proved nothing here, and the reason is measurable. Unprivileged, a mutant
+  # that drops this guard is still refused further down: tp_verify_chain freezes TP_OWNER_UID
+  # to the string it was handed and then compares a numeric owner against it, which never
+  # matches. That is somebody else's defence. As root the same comparison accepts owner 0, the
+  # mutant sails through, and the bare-status check flipped its answer with the uid it ran
+  # under. So the refusal must name this guard, or it does not count as this guard holding.
+  if out="$(env DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="nobody" \
+                bash -c '. "$1"' _ "$dir/testpool-lib.sh" 2>&1)"; then
     return 1
   fi
-  return 0
+  case "$out" in
+    *"is not a decimal uid"*) return 0 ;;
+  esac
+  return 1
 }
 
 chk_symlink_guard() {  # 0 = a symlinked root still refuses
@@ -1034,16 +1043,25 @@ chk_removal_verified() {  # 0 = a failed artifact removal still turns teardown n
     printf 'vdev\t%s\n'  "$canon"
     printf 'dataset\t%s\t%s\n' "$pool" "$pdir/mount"
   } > "$pdir/manifest.txt"
-  local rc=0
-  env PATH="$BIN:$PATH" STUB_CMDLOG="$WORK/mut.log" \
+  local rc=0 out
+  out="$(env PATH="$BIN:$PATH" STUB_CMDLOG="$WORK/mut.log" \
       STUB_POOLNAMES="$pool\n" STUB_VDEV="$pool\n\t$canon\n" \
       STUB_DS="$(printf '%s\t%s\n' "$pool" "$pdir/mount")" \
       STUB_RM_FAIL_PATH="$pdir/pool.img" \
       DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME="$pool" \
-      bash "$dir/teardown-test-pool.sh" >/dev/null 2>&1 || rc=$?
+      bash "$dir/teardown-test-pool.sh" 2>&1)" || rc=$?
   rm -rf "$pdir" 2>/dev/null
-  [ "$rc" != 0 ] && return 0
-  return 1
+  # A bare non-zero was not proof. The mutant here reports the residue and then CARRIES ON,
+  # claiming the image was removed and printing Done; whether the run ends non-zero after that
+  # depends on which later step happens to fail, which is why this read as caught here and as
+  # survived on the shared host. What actually separates the two is that the contract STOPS at
+  # the residue report, so that is what is asserted: non-zero, the guard's own message, and no
+  # later claim of success.
+  [ "$rc" != 0 ] || return 1
+  case "$out" in *"BLOCKED: teardown is incomplete"*) ;; *) return 1;; esac
+  case "$out" in *"$pdir/pool.img' removed."*) return 1;; esac
+  case "$out" in *"Done."*) return 1;; esac
+  return 0
 }
 
 chk_tmux_private() { audit_tmux_private "$1"; }
