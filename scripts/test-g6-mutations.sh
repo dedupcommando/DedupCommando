@@ -953,9 +953,12 @@ mutate_row "plan/inode-total" g6-controller.sh \
   '    have="$(total_inodes "$inside_dir")"' \
   '    have="$need"'
 
+# The anchor here went stale TWICE unseen: C2-3 moved the measurement to the sanctioned root
+# and C2-4 gave check_capacity its modes, and this row silently stopped mutating anything until
+# a filtered run tripped over it. The route-side check is the one this scenario starves.
 mutate_row "plan/capacity-before-create" g6-controller.sh \
-  '  check_capacity "$(dirname "$G6_IMAGE")" \
-    || terminalize BLOCKED "capacity before the image was created"' \
+  '  check_capacity full "$G6_REMOTE_ROOT" \
+                          || prestart_refusal "capacity before the image was created"' \
   '  :'
 
 # --- lifecycle, part two
