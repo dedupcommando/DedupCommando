@@ -491,23 +491,74 @@ g6s_cal_no_sanction() {  # delivery
 # The manifest's own numbers, put back through the frozen formula by this suite rather than
 # compared against the formula string the manifest prints about itself.
 g6s_cal_formula() {  # delivery
-  local d="$1" m t1 t2 g1 g2 w1 w2
+  local d="$1" m ts t1 t2 gs g1 g2 wsn w1 w2
   g6s_sealed_world "$d"
   m="$G6T_W/cal-formula.txt"
   G6T_FAKE_ELAPSED="0:05.00" bash "$d/g6-controller.sh" calibrate --mode rehearsal "$m" \
     >/dev/null 2>&1 || { printf 'cal-formula -> the calibration route did not complete\n'; return 1; }
+  ts="$(awk -F'\t' '$1 == "elapsed-SCAN" { print $2 }' "$m")"
   t1="$(awk -F'\t' '$1 == "elapsed-S1" { print $2 }' "$m")"
   t2="$(awk -F'\t' '$1 == "elapsed-S2" { print $2 }' "$m")"
+  gs="$(awk -F'\t' '$1 == "guard-SCAN" { print $2 }' "$m")"
   g1="$(awk -F'\t' '$1 == "guard-S1" { print $2 }' "$m")"
   g2="$(awk -F'\t' '$1 == "guard-S2" { print $2 }' "$m")"
-  case "$t1$t2$g1$g2" in ''|*[!0-9]*) printf 'cal-formula -> the manifest carries no numbers\n'
-                                      return 1 ;; esac
+  case "$ts$t1$t2$gs$g1$g2" in ''|*[!0-9]*) printf 'cal-formula -> the manifest carries no numbers\n'
+                                            return 1 ;; esac
+  wsn=$(( 4 * 100 * ts )); [ "$wsn" -lt 900 ] && wsn=900
   w1=$(( 4 * 100 * t1 )); [ "$w1" -lt 900 ] && w1=900
   w2=$(( 4 * 100 * t2 )); [ "$w2" -lt 900 ] && w2=900
+  [ "$gs" = "$wsn" ] || { printf 'cal-formula -> guard-SCAN is %s, the formula over t=%s gives %s\n' \
+                            "$gs" "$ts" "$wsn"; return 1; }
   [ "$g1" = "$w1" ] || { printf 'cal-formula -> guard-S1 is %s, the formula over t=%s gives %s\n' \
                            "$g1" "$t1" "$w1"; return 1; }
   [ "$g2" = "$w2" ] || { printf 'cal-formula -> guard-S2 is %s, the formula over t=%s gives %s\n' \
                            "$g2" "$t2" "$w2"; return 1; }
+  return 0
+}
+
+# The bootstrap limit is the environment's pin on the calibration itself, and its firing is the
+# environment's answer: BLOCKED and no manifest — never a verdict about the candidate. The
+# stand-in takes three seconds over the scan and the pin allows one.
+g6s_cal_bootstrap_blocked() {  # delivery
+  local d="$1" rc=0 out
+  g6s_world
+  g6s_slow_candidate "$G6T_W/slow" 3
+  g6s_seal "$d" "$G6T_W/slow"
+  out="$(G6_CAL_BOOTSTRAP_GUARD=1 G6_GRACE=1 bash "$d/g6-controller.sh" calibrate \
+          --mode rehearsal "$G6T_W/cal-b.txt" 2>&1)" || rc=$?
+  [ "$rc" = 2 ] \
+    || { printf 'cal-bootstrap -> the starved calibration exited %s, not BLOCKED\n' "$rc"; return 1; }
+  g6_has "$out" 'the calibration scan did not complete (CANDIDATE_TIMEOUT)' \
+    || { printf 'cal-bootstrap -> the calibration stopped for another reason: %s\n' \
+           "$(printf '%s' "$out" | tail -1)"; return 1; }
+  [ ! -e "$G6T_W/cal-b.txt" ] \
+    || { printf 'cal-bootstrap -> a manifest exists for a calibration that never measured\n'
+         return 1; }
+  return 0
+}
+
+# The scan guard the route applies is the one the calibration sealed, not a constant anywhere
+# in the delivery. The manifest here carries a SCAN measurement of 3 seconds, so the sealed
+# guard is 1200 — a number no leftover constant equals — and the guard the route's own meta
+# records for SCAN has to be exactly that number.
+g6s_route_scan_guard_used() {  # delivery
+  local d="$1" rc=0 want got bsha
+  g6s_world
+  CAL="$G6T_W/cal.txt"; SANC="$G6T_W/sanc.txt"; PLAN="$G6T_W/plan.txt"
+  g6t_write_calibration rehearsal "$CAL" 1 1 3
+  g6t_write_plan "$PLAN"
+  bsha="$(bash "$d/g6-controller.sh" bundle | awk -F'\t' '$1 == "bundle-sha256" { print $2 }')"
+  g6t_write_sanction rehearsal "$SANC" "$CAL" "$DEDCOM" "$bsha" "$PLAN"
+  export G6_CALIBRATION="$CAL" G6_SANCTION="$SANC" G6_RESOURCE_PLAN="$PLAN"
+  export G6_BIN="$DEDCOM" G6_NOW=5000 G6_CONTOUR=local
+  g6s_route "$d" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 0 ] \
+    || { printf 'route-scan-guard -> the route did not pass (rc=%s)\n' "$rc"; return 1; }
+  want="$(awk -F'\t' '$1 == "guard-SCAN" { print $2 }' "$CAL")"
+  got="$(awk -F'\t' '$1 == "guard" { print $2 }' "$G6_WORK/scenarios/SCAN.meta" 2>/dev/null)"
+  { [ -n "$want" ] && [ "$got" = "$want" ]; } \
+    || { printf 'route-scan-guard -> the route applied guard %s, the manifest sealed %s\n' \
+           "${got:-none}" "${want:-none}"; return 1; }
   return 0
 }
 
@@ -1490,6 +1541,7 @@ pub/reentry-2	g6s_pub_reentry_blocked	hold	reentry-2 ->	-	-
 s3/partial-destination	g6s_s3_partial_destination	hold	s3-partial ->	-	-
 cal/no-sanction	g6s_cal_no_sanction	hold	cal-no-sanction ->	-	-
 cal/formula	g6s_cal_formula	hold	cal-formula ->	-	-
+cal/bootstrap-blocked	g6s_cal_bootstrap_blocked	hold	cal-bootstrap ->	-	-
 lc/loop-partition	g6s_lc_loop_partition	refuse	is not an exact /dev/loopN name	-	-
 lc/uuid-shape	g6s_lc_uuid_shape	refuse	is not a uuid	-	-
 lc/image-devino	g6s_lc_image_devino	refuse	the image's dev:ino is	-	-
@@ -1515,6 +1567,7 @@ pub/physical-no-overwrite	g6s_pub_physical_no_overwrite	reclass	is already publi
 pub/terminal-unsealed	g6s_pub_terminal_unsealed	hold	terminal-unsealed ->	-	-
 route/signal	g6s_route_signal	hold	route-signal ->	-	-
 route/signal-reap	g6s_route_signal	hold	route-signal ->	-	-
+route/scan-guard-used	g6s_route_scan_guard_used	hold	route-scan-guard ->	-	-
 route/contour-first	g6s_route_contour_first	hold	route-contour-first ->	-	-
 cal/candidate-pin	g6s_cal_candidate_pin	hold	cal-candidate-pin ->	-	-
 cal/kit-separate	g6s_cal_kit_separate	refuse	the calibration and the run share	-	-

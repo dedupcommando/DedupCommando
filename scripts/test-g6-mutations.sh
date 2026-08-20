@@ -1071,9 +1071,21 @@ mutate_row "cal/own-numbers" g6-controller.sh \
   '  :'
 
 mutate_row "cal/guarded-scan" g6-controller.sh \
-  '  guarded_run "$G6_SCAN_GUARD" CALSCAN "$outdir" -- \
+  '  guarded_run "$G6_CAL_BOOTSTRAP_GUARD" CALSCAN "$outdir" -- \
     "$G6_BIN" --state-dir "$cal_mnt/state" --scan "$cal_mnt/data" --no-resume \' \
   '  "$G6_BIN" --state-dir "$cal_mnt/state" --scan "$cal_mnt/data" --no-resume >/dev/null 2>&1 \'
+
+# The bootstrap pin ignored: a hardwired hour in its place lets a starved calibration run to
+# completion, and the scenario that pins the limit to one second has to see that.
+mutate_row "cal/bootstrap-blocked" g6-controller.sh \
+  '  guarded_run "$G6_CAL_BOOTSTRAP_GUARD" CALSCAN "$outdir" -- \' \
+  '  guarded_run 3600 CALSCAN "$outdir" -- \'
+
+# The sealed scan guard replaced by the old constant: the route still runs, but the guard its
+# own meta records is 600 and not the number the manifest sealed.
+mutate_row "route/scan-guard-used" g6-controller.sh \
+  '  guarded_run "$(calibration_field guard-SCAN)" SCAN "$outdir" -- \' \
+  '  guarded_run 600 SCAN "$outdir" -- \'
 
 mutate_row "cal/capacity-hook" g6-controller.sh \
       '      G6_BATCH="$G6_BATCH" G6_CAPACITY_HOOK="$cal_hook" \' \

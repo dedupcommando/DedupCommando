@@ -308,14 +308,17 @@ g6t_write_sanction() {  # mode sanction-path calibration-path candidate bundle-s
 # A calibration manifest that survives being recomputed: the guards here are what the frozen
 # formula gives for the measurements here. A manifest with four arbitrary positive numbers is
 # refused now, which is the point of the recomputation.
-g6t_write_calibration() {  # scale path [t1] [t2]
-  local t1="${3:-1}" t2="${4:-1}" g1 g2
+g6t_write_calibration() {  # scale path [t1] [t2] [tS]
+  local t1="${3:-1}" t2="${4:-1}" ts="${5:-1}" g1 g2 gs
   g1=$(( 4 * 100 * t1 )); [ "$g1" -lt 900 ] && g1=900
   g2=$(( 4 * 100 * t2 )); [ "$g2" -lt 900 ] && g2=900
+  gs=$(( 4 * 100 * ts )); [ "$gs" -lt 900 ] && gs=900
   { printf 'scale\t%s\n' "$1"
     printf 'calibration-divisor\t100\n'
+    printf 'elapsed-SCAN\t%s\n' "$ts"
     printf 'elapsed-S1\t%s\n' "$t1"; printf 'elapsed-S2\t%s\n' "$t2"
     printf 'formula\tmax(4 * 100 * t, 900)\n'
+    printf 'guard-SCAN\t%s\n' "$gs"
     printf 'guard-S1\t%s\n' "$g1"; printf 'guard-S2\t%s\n' "$g2"
     printf 'guard-S3\t%s\n' "$g2"; printf 'guard-S4\t%s\n' "$g1"
   } > "$2"

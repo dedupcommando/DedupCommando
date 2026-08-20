@@ -108,7 +108,13 @@ G6_REAP_LIMIT="${G6_REAP_LIMIT:-10}"
 # not on the candidate — the candidate's guards are measured, this one merely has to outlast a
 # fork and a file write on a loaded host.
 G6_READY_GUARD="${G6_READY_GUARD:-15}"
-G6_SCAN_GUARD="${G6_SCAN_GUARD:-600}"
+# The calibration's own runs happen before any measured guard can exist: somebody has to time
+# the first scan. That bootstrap limit is an ENVIRONMENT pin — declared here, tunable only by
+# the environment, and when it fires the verdict is BLOCKED: the environment allowed the
+# calibration too little, which says nothing about the candidate. The run's SCAN guard is a
+# different thing entirely — measured by the calibration and sealed in its manifest, like
+# every other guard.
+G6_CAL_BOOTSTRAP_GUARD="${G6_CAL_BOOTSTRAP_GUARD:-600}"
 G6_NOW="${G6_NOW:-}"
 
 LIVE_G=645000; LIVE_M=2; LIVE_U=910000; LIVE_B=4096; LIVE_SEED="g6-fixture-v1"
@@ -362,26 +368,29 @@ verify_calibration() {
     || { refused "a '$scale' calibration is not a '$MODE' one — guard values measured at another \
 scale are not guard values for this one"; return 1; }
   local s g
-  for s in S1 S2 S3 S4; do
+  for s in SCAN S1 S2 S3 S4; do
     g="$(calibration_field "guard-$s")"
     case "$g" in ''|*[!0-9]*) refused "no numeric guard for $s"; return 1 ;; esac
     [ "$g" -gt 0 ] || { refused "guard-$s is not positive"; return 1; }
   done
 
-  # The guards are RECOMPUTED here from the manifest's own measurements. Accepting four positive
-  # numbers is accepting whatever produced them; the formula is the frozen part, and a guard that
-  # does not follow from the measurement next to it is not a guard, it is a number.
-  local t1 t2 div w1 w2
+  # The guards are RECOMPUTED here from the manifest's own measurements — the scan's included.
+  # Accepting five positive numbers is accepting whatever produced them; the formula is the
+  # frozen part, and a guard that does not follow from the measurement next to it is not a
+  # guard, it is a number.
+  local ts t1 t2 div ws w1 w2
+  ts="$(calibration_field elapsed-SCAN)"
   t1="$(calibration_field elapsed-S1)"; t2="$(calibration_field elapsed-S2)"
   div="$(calibration_field calibration-divisor)"
-  case "$t1$t2$div" in ''|*[!0-9]*) refused "the calibration carries no measurement to \
+  case "$ts$t1$t2$div" in ''|*[!0-9]*) refused "the calibration carries no measurement to \
 recompute its guards from"; return 1 ;; esac
   [ "$div" = "$CAL_DIVISOR" ] \
     || { refused "the calibration was measured at 1/$div, the frozen divisor is 1/$CAL_DIVISOR"
          return 1; }
+  ws=$(( 4 * CAL_DIVISOR * ts )); [ "$ws" -lt 900 ] && ws=900
   w1=$(( 4 * CAL_DIVISOR * t1 )); [ "$w1" -lt 900 ] && w1=900
   w2=$(( 4 * CAL_DIVISOR * t2 )); [ "$w2" -lt 900 ] && w2=900
-  for s in "S1:$w1" "S2:$w2" "S3:$w2" "S4:$w1"; do
+  for s in "SCAN:$ws" "S1:$w1" "S2:$w2" "S3:$w2" "S4:$w1"; do
     g="$(calibration_field "guard-${s%%:*}")"
     [ "$g" = "${s#*:}" ] \
       || { refused "guard-${s%%:*} is $g; max(4 * $CAL_DIVISOR * t, 900) over this manifest's \
@@ -797,6 +806,7 @@ identity, never by a number"
   {
     printf 'label\t%s\n' "$label";     printf 'class\t%s\n' "$G6_LAST_CLASS"
     printf 'raw-exit\t%s\n' "$raw";    printf 'signal\t%s\n' "${G6_LAST_SIGNAL:-none}"
+    printf 'guard\t%s\n' "$timeout"
     printf 'pid\t%s\n' "$G6_LAST_PID"; printf 'pgid\t%s\n' "$G6_LAST_PGID"
     printf 'starttime\t%s\n' "$G6_LAST_STARTTIME"
     printf 'supervisor-note\t%s\n' "${note:-none}"
@@ -971,10 +981,13 @@ nothing was created and no device was touched"; return 1; }
       bash "$G6_MAKE_FIXTURE" --mode rehearsal --root "$cal_mnt" >/dev/null 2>&1 \
     || { blocked "the calibration fixture did not build"; return 2; }
 
-  # The calibration scan runs under the SAME kill guard as the run's, and leaves the same raw
-  # evidence. An unguarded scan here is an unbounded scan on the machine the run is about to use.
+  # The calibration scan runs under the same KIND of kill guard as the run's, and leaves the
+  # same raw evidence — but its limit is the bootstrap pin, because the measured guard is what
+  # this very scan is about to produce. An unguarded scan here is an unbounded scan on the
+  # machine the run is about to use; a bootstrap limit that fires is the environment refusing
+  # the calibration, and it is BLOCKED, never a verdict about the candidate.
   mkdir -p "$cal_mnt/state" "$cal_mnt/out"
-  guarded_run "$G6_SCAN_GUARD" CALSCAN "$outdir" -- \
+  guarded_run "$G6_CAL_BOOTSTRAP_GUARD" CALSCAN "$outdir" -- \
     "$G6_BIN" --state-dir "$cal_mnt/state" --scan "$cal_mnt/data" --no-resume \
     || { blocked "the calibration scan did not complete ($G6_LAST_CLASS)"; return 2; }
 
@@ -987,17 +1000,23 @@ nothing was created and no device was touched"; return 1; }
     || { cat "$outdir/verify.out" >&2
          blocked "the calibration fixture does not match its own parameters"; return 2; }
 
-  guarded_run 600 CAL1 "$outdir" -- "$G6_BIN" --state-dir "$cal_mnt/state" --stats \
+  guarded_run "$G6_CAL_BOOTSTRAP_GUARD" CAL1 "$outdir" -- \
+      "$G6_BIN" --state-dir "$cal_mnt/state" --stats \
     || { blocked "calibration S1 did not complete"; return 2; }
-  guarded_run 600 CAL2 "$outdir" -- "$G6_BIN" --state-dir "$cal_mnt/state" \
-      --export-csv "$cal_mnt/out/cal.csv" \
+  guarded_run "$G6_CAL_BOOTSTRAP_GUARD" CAL2 "$outdir" -- \
+      "$G6_BIN" --state-dir "$cal_mnt/state" --export-csv "$cal_mnt/out/cal.csv" \
     || { blocked "calibration S2 did not complete"; return 2; }
 
-  local t1 t2 g1 g2
+  # The SCAN guard is measured here like every other one — from the calibration's own timed
+  # scan, through the frozen formula. A constant in its place was the one guard nobody had
+  # measured, on the one workload that dominates the run.
+  local ts t1 t2 gs g1 g2
+  ts="$(elapsed_seconds "$outdir/CALSCAN.time")"
   t1="$(elapsed_seconds "$outdir/CAL1.time")"
   t2="$(elapsed_seconds "$outdir/CAL2.time")"
-  { [ "$t1" -ge 1 ] && [ "$t2" -ge 1 ]; } \
+  { [ "$ts" -ge 1 ] && [ "$t1" -ge 1 ] && [ "$t2" -ge 1 ]; } \
     || { blocked "the time report carries no elapsed line — the guards cannot be derived"; return 2; }
+  gs=$(( 4 * CAL_DIVISOR * ts )); [ "$gs" -lt 900 ] && gs=900
   g1=$(( 4 * CAL_DIVISOR * t1 )); [ "$g1" -lt 900 ] && g1=900
   g2=$(( 4 * CAL_DIVISOR * t2 )); [ "$g2" -lt 900 ] && g2=900
 
@@ -1014,14 +1033,16 @@ nothing was created and no device was touched"; return 1; }
     printf 'calibration-divisor\t%s\n' "$CAL_DIVISOR"
     printf 'calibration-fixture\tG=%s M=%s U=%s B=%s\n' "$g" "$m" "$u" "$LIVE_B"
     printf 'calibration-image\t%s\n' "$cal_img"
+    printf 'elapsed-SCAN\t%s\n' "$ts"
     printf 'elapsed-S1\t%s\n' "$t1"; printf 'elapsed-S2\t%s\n' "$t2"
     printf 'formula\tmax(4 * %s * t, 900)\n' "$CAL_DIVISOR"
     printf 'calibration-image-removed\tproved\n'
+    printf 'guard-SCAN\t%s\n' "$gs"
     printf 'guard-S1\t%s\n' "$g1"; printf 'guard-S2\t%s\n' "$g2"
     printf 'guard-S3\t%s\n' "$g2"; printf 'guard-S4\t%s\n' "$g1"
   } | "$G6_PUBLISH" --dir "$(dirname "$out")" --name "$(basename "$out")" >/dev/null 2>&1 \
     || { blocked "the calibration manifest could not be published"; return 2; }
-  say "calibration published to $out (scale $MODE, t1=${t1}s t2=${t2}s)"
+  say "calibration published to $out (scale $MODE, tS=${ts}s t1=${t1}s t2=${t2}s)"
 }
 
 # ------------------------------------------------------------------ scenarios
@@ -1588,7 +1609,9 @@ code $qcode, record ${qrec:-none})"
   G6_STOPPED_AT=INVOCATION
   publish_invocation || terminalize BLOCKED "provenance: the invocation could not be recorded"
   G6_STOPPED_AT=SCAN
-  guarded_run "$G6_SCAN_GUARD" SCAN "$outdir" -- \
+  # The scan's guard comes from the sealed calibration like every other guard: measured on this
+  # machine, derived by the frozen formula, recomputed at verify. It was the one constant left.
+  guarded_run "$(calibration_field guard-SCAN)" SCAN "$outdir" -- \
     "$G6_BIN" --state-dir "$G6_FIXTURE_ROOT/state" --scan "$G6_FIXTURE_ROOT/data" --no-resume
   case "$G6_LAST_CLASS" in
     OK) say "production scan complete" ;;
