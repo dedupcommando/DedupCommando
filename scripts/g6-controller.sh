@@ -502,33 +502,58 @@ avail_bytes()  { "$G6_DF" -P -B1 "$1" 2>/dev/null | awk 'NR == 2 { print $4 }'; 
 avail_inodes() { "$G6_DF" -P -i  "$1" 2>/dev/null | awk 'NR == 2 { print $4 }'; }
 total_inodes() { "$G6_DF" -P -i  "$1" 2>/dev/null | awk 'NR == 2 { print $2 }'; }
 
-# Need AND reserve, never one of them: the reserve exists so the run is not the thing that fills
-# the filesystem, and a check against the reserve alone would pass a filesystem that cannot hold
-# the fixture at all.
+# Two modes, because the question changes as the fixture grows.
+#
+#   full     everything the whole fixture will need, plus the reserve. Asked once before
+#            generation, of the inode TOTAL as well: mkfs cannot be asked afterwards to add
+#            inodes, so a filesystem formatted too small is BLOCKED before a single file exists.
+#   reserve  the margin, and only the margin. Between batches and after the last one, what has
+#            to be true is that the reserve is still there.
+#
+# The reserve mode MEASURES; it does not predict. A batch spends more than its files: every
+# directory it creates is an inode too, and the bytes are not files x block either. Anything the
+# harness works out about what the next batch will cost is a forecast, and a forecast that is
+# wrong in the safe direction still refuses a run that would have fitted, while one wrong in the
+# other direction passes a run that will not. P0 §4.2 and §6.3 ask for the margin to be measured
+# again between batches, which is what this does.
+#
+# And asking for `need + reserve` again after 2 200 000 files already exist asks the filesystem
+# to hold the fixture twice: the full-scale run would refuse itself at the last batch boundary,
+# every time, on arithmetic rather than on the machine.
 check_capacity() {
-  local outside_dir="$1" inside_dir="${2:-}"
-  local have need
+  local mode="$1" outside_dir="$2" inside_dir="${3:-}"
+  local have inode_need byte_need
+  case "$mode" in full|reserve) ;;
+    *) blocked "unknown capacity mode '$mode'"; return 2 ;;
+  esac
   have="$(avail_bytes "$outside_dir")"
   case "$have" in ''|*[!0-9]*) blocked "cannot measure free bytes on '$outside_dir'"; return 2 ;; esac
   [ "$have" -ge "$G6_EXTERNAL_REQUIREMENT" ] \
     || { blocked "external requirement: $have bytes free under '$outside_dir', need $G6_EXTERNAL_REQUIREMENT"; return 2; }
   if [ -n "$inside_dir" ]; then
-    need=$(( G6_INODE_NEED + G6_INODE_RESERVE ))
-    have="$(total_inodes "$inside_dir")"
-    case "$have" in ''|*[!0-9]*) blocked "cannot measure the inode total in '$inside_dir'"; return 2 ;; esac
-    [ "$have" -ge "$need" ] \
-      || { blocked "internal inode total: $have in '$inside_dir', need $need — a filesystem that was formatted too small never grows one"; return 2; }
+    if [ "$mode" = full ]; then
+      inode_need=$(( G6_INODE_NEED + G6_INODE_RESERVE ))
+      byte_need=$(( G6_INTERNAL_BYTE_NEED + G6_INTERNAL_BYTE_RESERVE ))
+      # The total is a property of the geometry mkfs already chose, so it is asked once, here,
+      # and never again: it does not shrink and it cannot grow.
+      have="$(total_inodes "$inside_dir")"
+      case "$have" in ''|*[!0-9]*) blocked "cannot measure the inode total in '$inside_dir'"; return 2 ;; esac
+      [ "$have" -ge "$inode_need" ] \
+        || { blocked "internal inode total: $have in '$inside_dir', need $inode_need — a filesystem that was formatted too small never grows one"; return 2; }
+    else
+      inode_need=$G6_INODE_RESERVE
+      byte_need=$G6_INTERNAL_BYTE_RESERVE
+    fi
     have="$(avail_inodes "$inside_dir")"
     case "$have" in ''|*[!0-9]*) blocked "cannot measure free inodes in '$inside_dir'"; return 2 ;; esac
-    [ "$have" -ge "$need" ] \
-      || { blocked "internal inode margin: $have free in '$inside_dir', need $need"; return 2; }
-    need=$(( G6_INTERNAL_BYTE_NEED + G6_INTERNAL_BYTE_RESERVE ))
+    [ "$have" -ge "$inode_need" ] \
+      || { blocked "internal inode margin: $have free in '$inside_dir', need $inode_need"; return 2; }
     have="$(avail_bytes "$inside_dir")"
     case "$have" in ''|*[!0-9]*) blocked "cannot measure free bytes in '$inside_dir'"; return 2 ;; esac
-    [ "$have" -ge "$need" ] \
-      || { blocked "internal byte margin: $have free in '$inside_dir', need $need"; return 2; }
+    [ "$have" -ge "$byte_need" ] \
+      || { blocked "internal byte margin: $have free in '$inside_dir', need $byte_need"; return 2; }
   fi
-  say "capacity ok (outside '$outside_dir'${inside_dir:+, inside '$inside_dir'})"
+  say "capacity ok, $mode (outside '$outside_dir'${inside_dir:+, inside '$inside_dir'})"
 }
 
 # ------------------------------------------------------------------ kill guard
@@ -749,7 +774,7 @@ nothing was created and no device was touched"; return 1; }
 # on a path that is not there measures nothing, which this function then reports as BLOCKED. The
 # image lands on the root's filesystem anyway, so the root is both the measurable answer and the
 # correct one. The stub bench used to create g6-image up front, which is why no scenario saw it.
-  check_capacity "$G6_REMOTE_ROOT" \
+  check_capacity full "$G6_REMOTE_ROOT" \
     || { blocked "capacity before the calibration image was created"; return 2; }
 
   cal_lib prepare >/dev/null 2>&1 || { blocked "calibration lifecycle: prepare"; return 2; }
@@ -757,7 +782,7 @@ nothing was created and no device was touched"; return 1; }
   cal_lib format  >/dev/null 2>&1 || { blocked "calibration lifecycle: format"; return 2; }
   cal_lib mount   >/dev/null 2>&1 || { blocked "calibration lifecycle: mount"; return 2; }
 
-  check_capacity "$G6_REMOTE_ROOT" "$cal_mnt" \
+  check_capacity full "$G6_REMOTE_ROOT" "$cal_mnt" \
     || { blocked "capacity after the calibration mkfs"; return 2; }
 
   # The generator gets a hook here too, so the calibration is measured between batches and after
@@ -1334,7 +1359,7 @@ code $qcode, record ${qrec:-none})"
 # on a path that is not there measures nothing, which this function then reports as BLOCKED. The
 # image lands on the root's filesystem anyway, so the root is both the measurable answer and the
 # correct one. The stub bench used to create g6-image up front, which is why no scenario saw it.
-  check_capacity "$G6_REMOTE_ROOT" \
+  check_capacity full "$G6_REMOTE_ROOT" \
     || terminalize BLOCKED "capacity before the image was created"
 
   # What the filesystem must be able to hold, handed to the steps that format it. mkfs cannot be
@@ -1365,11 +1390,8 @@ code $qcode, record ${qrec:-none})"
 
   # And again the moment the filesystem exists, because what mkfs actually produced — not what it
   # was asked for — is the first time the inode total is a fact.
-  check_capacity "$G6_REMOTE_ROOT" "$G6_FIXTURE_ROOT" \
-    || terminalize BLOCKED "capacity after mkfs"
-
-  check_capacity "$G6_REMOTE_ROOT" "$G6_FIXTURE_ROOT" \
-    || terminalize BLOCKED "capacity before generation"
+  check_capacity full "$G6_REMOTE_ROOT" "$G6_FIXTURE_ROOT" \
+    || terminalize BLOCKED "capacity after mkfs, before generation"
 
   # The hook is a generated executable carrying the exact paths, so the generator invokes ONE
   # program with no arguments and there is no word splitting anywhere in the chain.
@@ -1464,7 +1486,8 @@ case "$cmd" in
   check-sanctions) parse_mode "$@" || exit $RC_BLOCKED
                    verify_contour && verify_sanction && verify_calibration && verify_candidate \
                      && verify_bundle && verify_resource_plan ;;
-  capacity-hook)   check_capacity "${1:?outside dir}" "${2:-}" ;;
+  capacity-hook)   check_capacity reserve "${1:?outside dir}" "${2:-}" ;;
+  capacity-full)   check_capacity full "${1:?outside dir}" "${2:-}" ;;
   dry-route)       parse_mode "$@" || exit $RC_BLOCKED
                    verify_sanction >/dev/null && verify_calibration >/dev/null \
                      || { refused "the dry route is not printed before the sanctions verify"; exit $RC_BLOCKED; }

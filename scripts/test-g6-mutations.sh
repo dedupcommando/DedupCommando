@@ -135,15 +135,35 @@ sc_plan_incomplete() { sealed_world "$1"
                        bash "$1/g6-controller.sh" check-sanctions --mode rehearsal 2>&1; }
 sc_plan_seal()       { sealed_world "$1"; printf 'note\tedited\n' >> "$PLAN"
                        bash "$1/g6-controller.sh" check-sanctions --mode rehearsal 2>&1; }
-sc_internal_bytes()  { sealed_world "$1"
+# The inside axis is the mounted image, so the mountpoint exists whenever it is measured —
+# the lifecycle creates it in mount. These scenarios call the hook directly, without a
+# lifecycle, so they have to make it themselves: df cannot measure what is not there, and a
+# refusal about a missing path is a foreign cause, not this guard.
+sc_internal_bytes()  { sealed_world "$1"; mkdir -p "$G6_FIXTURE_ROOT"
                        G6T_DF_INSIDE_BYTES=5 bash "$1/g6-controller.sh" capacity-hook \
-                         "$(dirname "$G6_IMAGE")" "$G6_FIXTURE_ROOT" 2>&1; }
-sc_internal_inodes() { sealed_world "$1"
+                         "$G6_REMOTE_ROOT" "$G6_FIXTURE_ROOT" 2>&1; }
+sc_internal_inodes() { sealed_world "$1"; mkdir -p "$G6_FIXTURE_ROOT"
                        G6T_DF_INSIDE_INODES=5 bash "$1/g6-controller.sh" capacity-hook \
-                         "$(dirname "$G6_IMAGE")" "$G6_FIXTURE_ROOT" 2>&1; }
-sc_external_bytes()  { sealed_world "$1"
+                         "$G6_REMOTE_ROOT" "$G6_FIXTURE_ROOT" 2>&1; }
+sc_external_bytes()  { sealed_world "$1"; mkdir -p "$G6_FIXTURE_ROOT"
                        G6T_DF_OUTSIDE_BYTES=1000 bash "$1/g6-controller.sh" capacity-hook \
-                         "$(dirname "$G6_IMAGE")" "$G6_FIXTURE_ROOT" 2>&1; }
+                         "$G6_REMOTE_ROOT" "$G6_FIXTURE_ROOT" 2>&1; }
+
+# Five files at two per batch is three batches, so the hook is asked four times: once before each
+# batch and once after the last. This hook allows the first three and refuses the fourth, so the
+# only thing that can fail is the check that happens AFTER the fixture is complete — the one the
+# run consumed the most to reach and the only one a missing final call would skip.
+sc_final_capacity()  { local d="$1" root="$WORK/fin$RANDOM" h="$WORK/fh$RANDOM" c="$WORK/fc$RANDOM"
+                       mkdir -p "$root"; : > "$c"
+                       { printf '#!/usr/bin/env bash\n'
+                         printf 'echo x >> %q\n' "$c"
+                         printf 'n=$(wc -l < %q)\n' "$c"
+                         printf '[ "$n" -ge 4 ] && exit 1\n'
+                         printf 'exit 0\n'; } > "$h"
+                       chmod +x "$h"
+                       env G6_G=2 G6_M=2 G6_U=1 G6_B=4096 G6_SEED=fin G6_BATCH=2 \
+                           G6_CAPACITY_HOOK="$h" \
+                         bash "$d/g6-make-fixture.sh" --mode rehearsal --root "$root" 2>&1; }
 
 # --- generator and helper scenarios
 sc_tiny_b()      { env G6_G=2 G6_M=2 G6_U=2 G6_B=512 G6_SEED=x \
@@ -464,14 +484,24 @@ mutate "ctl/plan-seal" g6-controller.sh \
   sc_plan_seal "resource plan is not the sealed one"
 
 mutate "ctl/internal-byte-margin" g6-controller.sh \
-  '    need=$(( G6_INTERNAL_BYTE_NEED + G6_INTERNAL_BYTE_RESERVE ))' \
-  '    need=0' \
+  '      byte_need=$G6_INTERNAL_BYTE_RESERVE' \
+  '      byte_need=0' \
   sc_internal_bytes "internal byte margin"
 
 mutate "ctl/internal-inode-margin" g6-controller.sh \
   '    have="$(avail_inodes "$inside_dir")"' \
-  '    have="$need"' \
+  '    have="$inode_need"' \
   sc_internal_inodes "internal inode margin"
+
+mutate "gen/final-capacity-check" g6-make-fixture.sh \
+  'if [ -n "$G6_CAPACITY_HOOK" ]; then
+  if ! "$G6_CAPACITY_HOOK"; then
+    blocked "capacity hook refused after the final batch — the fixture is complete but the \
+margin it left behind is not the one that was sanctioned"
+  fi
+fi' \
+  ':' \
+  sc_final_capacity "refused after the final batch"
 
 mutate "ctl/external-margin" g6-controller.sh \
   '  [ "$have" -ge "$G6_EXTERNAL_REQUIREMENT" ] \' \
