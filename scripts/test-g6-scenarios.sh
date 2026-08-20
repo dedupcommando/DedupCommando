@@ -682,6 +682,150 @@ g6s_route_verifier_preflight() {  # delivery
   return 0
 }
 
+# ------------------------------------------------------------------ the kill guard, in rows
+#
+# The supervisor's critical branches, each pinned by a scenario the matrix can hold a mutant
+# against: the identity captured before READY, the deadline, the TERM-before-KILL escalation,
+# the survivor sweep, and the controller-side identity discipline. test-g6-watchdog.sh proves
+# the same machinery interactively; these rows are what lets a REMOVED branch show up as a
+# killed mutant rather than as a green suite over a hollow guard.
+
+# READY carries the leader's start time, read from /proc BEFORE the identity is announced. A
+# guard that announces an identity it never read has nothing to verify later kills against —
+# and misreads a healthy leader as done.
+g6s_wd_identity_ready() {  # delivery
+  local d="$1" rc=0 st cls
+  g6s_world
+  bash "$d/g6-controller.sh" guarded 30 WDI "$G6T_W/wd-i" -- sleep 3 >/dev/null 2>&1 || rc=$?
+  st="$(awk -F'\t' '$1 == "starttime" { print $2 }' "$G6T_W/wd-i/WDI.ready" 2>/dev/null)"
+  case "$st" in ''|*[!0-9]*)
+    printf 'wd-identity -> READY carries starttime %s\n' "${st:-none}"; return 1 ;; esac
+  cls="$(awk -F'\t' '$1 == "class" { print $2 }' "$G6T_W/wd-i/WDI.meta" 2>/dev/null)"
+  { [ "$rc" = 0 ] && [ "$cls" = OK ]; } \
+    || { printf 'wd-identity -> a three second sleep under a thirty second guard ended %s rc=%s\n' \
+           "${cls:-none}" "$rc"; return 1; }
+  return 0
+}
+
+# The deadline belongs to the supervisor. A TERM-proof workload under a two second guard is
+# gone — pid and group — well inside fifteen, and the status says the deadline fired. With the
+# firing branch gone the workload knows no deadline at all, and this scenario has to shoot it.
+g6s_wd_deadline() {  # delivery
+  local d="$1" child=0 n=0 fired ctl
+  g6s_world
+  { printf '#!/usr/bin/env bash\n'
+    printf 'trap "" TERM INT HUP\n'
+    printf 'echo "$$" > %q\n' "$G6T_W/wd-d.pid"
+    printf 'sleep 3600\n'
+  } > "$G6T_W/stubborn"
+  chmod +x "$G6T_W/stubborn"
+  G6_GRACE=1 bash "$d/g6-controller.sh" guarded 2 WDD "$G6T_W/wd-d" -- "$G6T_W/stubborn" \
+    >/dev/null 2>&1 &
+  ctl=$!
+  while [ "$n" -lt 10 ]; do
+    child="$(cat "$G6T_W/wd-d.pid" 2>/dev/null || echo 0)"
+    [ "$child" != 0 ] && break
+    sleep 1; n=$(( n + 1 ))
+  done
+  [ "$child" != 0 ] \
+    || { kill -KILL "$ctl" 2>/dev/null; wait "$ctl" 2>/dev/null
+         printf 'wd-deadline -> the workload never started\n'; return 1; }
+  n=0
+  while { kill -0 "$child" 2>/dev/null || kill -0 -- "-$child" 2>/dev/null; } \
+        && [ "$n" -lt 15 ]; do
+    sleep 1; n=$(( n + 1 ))
+  done
+  if kill -0 "$child" 2>/dev/null || kill -0 -- "-$child" 2>/dev/null; then
+    kill -KILL -- "-$child" 2>/dev/null; kill -KILL "$child" "$ctl" 2>/dev/null
+    wait "$ctl" 2>/dev/null
+    printf 'wd-deadline -> the workload outlived its deadline\n'; return 1
+  fi
+  wait "$ctl" 2>/dev/null
+  fired="$(awk -F'\t' '$1 == "fired" { print $2 }' "$G6T_W/wd-d/WDD.status" 2>/dev/null)"
+  [ "$fired" = 1 ] \
+    || { printf 'wd-deadline -> the status does not say the deadline fired (%s)\n' \
+           "${fired:-none}"; return 1; }
+  return 0
+}
+
+# Escalation starts with TERM. A workload that exits cleanly on it leaves its farewell on disk
+# and is never KILLed; with the TERM half gone, the same workload dies silently of KILL and
+# the farewell is missing.
+g6s_wd_term_first() {  # delivery
+  local d="$1" rc=0
+  g6s_world
+  { printf '#!/usr/bin/env bash\n'
+    printf 'trap ": > %q; exit 0" TERM\n' "$G6T_W/got-term"
+    printf 'sleep 3600 & wait $!\n'
+  } > "$G6T_W/polite"
+  chmod +x "$G6T_W/polite"
+  G6_GRACE=3 bash "$d/g6-controller.sh" guarded 2 WDT "$G6T_W/wd-t" -- "$G6T_W/polite" \
+    >/dev/null 2>&1 || rc=$?
+  [ -e "$G6T_W/got-term" ] \
+    || { printf 'wd-term -> the workload never saw a TERM before dying\n'; return 1; }
+  return 0
+}
+
+# The leader is not the group. A workload that leaves a same-group straggler behind and exits
+# cleanly must still end with the group swept and the status saying cleared — a supervisor
+# that only watches the leader reports a clean run over a survivor.
+g6s_wd_sweep() {  # delivery
+  local d="$1" rc=0 sp group n=0
+  g6s_world
+  { printf '#!/usr/bin/env bash\n'
+    printf 'sleep 3600 &\n'
+    printf 'echo $! > %q\n' "$G6T_W/straggler.pid"
+    printf 'exit 0\n'
+  } > "$G6T_W/leaver"
+  chmod +x "$G6T_W/leaver"
+  bash "$d/g6-controller.sh" guarded 30 WDS "$G6T_W/wd-s" -- "$G6T_W/leaver" \
+    >/dev/null 2>&1 || rc=$?
+  sp="$(cat "$G6T_W/straggler.pid" 2>/dev/null || echo 0)"
+  [ "$sp" != 0 ] || { printf 'wd-sweep -> the straggler never started\n'; return 1; }
+  while kill -0 "$sp" 2>/dev/null && [ "$n" -lt 15 ]; do sleep 1; n=$(( n + 1 )); done
+  if kill -0 "$sp" 2>/dev/null; then
+    kill -KILL "$sp" 2>/dev/null
+    printf 'wd-sweep -> the straggler outlived the run\n'; return 1
+  fi
+  group="$(awk -F'\t' '$1 == "group" { print $2 }' "$G6T_W/wd-s/WDS.status" 2>/dev/null)"
+  [ "$group" = cleared ] \
+    || { printf 'wd-sweep -> the status reports group %s\n' "${group:-none}"; return 1; }
+  return 0
+}
+
+# The controller's fallback may only shoot what the recorded identity still verifies. A live
+# decoy whose recorded start time is forged — exactly what a recycled pid looks like — is
+# refused the signal and survives, and the refusal is on the record. Two rows hold mutants
+# against this one scenario: the starttime comparison, and the refusal branch itself.
+g6s_wd_identity_refused() {  # delivery
+  local d="$1" rc=0 out decoy dstart alive n=0
+  g6s_world
+  setsid bash -c 'echo "$$" > "$1"; exec sleep 300' _ "$G6T_W/decoy.pid" &
+  while [ ! -s "$G6T_W/decoy.pid" ] && [ "$n" -lt 5 ]; do sleep 1; n=$(( n + 1 )); done
+  decoy="$(cat "$G6T_W/decoy.pid" 2>/dev/null || echo 0)"
+  [ "$decoy" != 0 ] || { printf 'wd-recheck -> no decoy could be started\n'; return 1; }
+  dstart="$(sed 's/.*) //' "/proc/$decoy/stat" | awk '{ print $20 }')"
+  { printf '#!/usr/bin/env bash\n'
+    printf 'outdir="$5"; label="$6"\n'
+    printf '{ printf "pid\\t%s\\n"; printf "pgid\\t%s\\n"\n' "$decoy" "$decoy"
+    printf '  printf "starttime\\t%s\\n"; printf "supervisor\\t$$\\n"\n' "$(( dstart + 100000 ))"
+    printf '} > "$outdir/$label.ready"\n'
+    printf 'exit 0\n'
+  } > "$G6T_W/forging"
+  chmod +x "$G6T_W/forging"
+  out="$(G6_SUPERVISOR="$G6T_W/forging" G6_GRACE=1 bash "$d/g6-controller.sh" guarded 30 WDR \
+          "$G6T_W/wd-r" -- /bin/true 2>&1)" || rc=$?
+  kill -0 "$decoy" 2>/dev/null; alive=$?
+  kill -KILL "$decoy" 2>/dev/null; wait "$decoy" 2>/dev/null
+  [ "$rc" = 2 ] || { printf 'wd-recheck -> exited %s, not BLOCKED\n' "$rc"; return 1; }
+  [ "$alive" = 0 ] \
+    || { printf 'wd-recheck -> the decoy wearing the number was shot\n'; return 1; }
+  printf '%s' "$out" | grep -q 'refusing to signal' \
+    || { printf 'wd-recheck -> no refusal was recorded: %s\n' \
+           "$(printf '%s' "$out" | tail -1)"; return 1; }
+  return 0
+}
+
 # ------------------------------------------------------------------ lifecycle
 
 g6s_lc_loop_partition() {  # delivery
@@ -1700,6 +1844,12 @@ route/signal-reap	g6s_route_signal	hold	route-signal ->	-	-
 route/scan-guard-used	g6s_route_scan_guard_used	hold	route-scan-guard ->	-	-
 route/verifier-preflight	g6s_route_verifier_preflight	hold	route-verifier-pf ->	-	-
 route/contour-first	g6s_route_contour_first	hold	route-contour-first ->	-	-
+wd/identity-before-ready	g6s_wd_identity_ready	hold	wd-identity ->	-	-
+wd/deadline	g6s_wd_deadline	hold	wd-deadline ->	-	-
+wd/term-before-kill	g6s_wd_term_first	hold	wd-term ->	-	-
+wd/sweep	g6s_wd_sweep	hold	wd-sweep ->	-	-
+wd/starttime-recheck	g6s_wd_identity_refused	hold	wd-recheck ->	-	-
+wd/fallback-refusal	g6s_wd_identity_refused	hold	wd-recheck ->	-	-
 cal/candidate-pin	g6s_cal_candidate_pin	hold	cal-candidate-pin ->	-	-
 cal/kit-separate	g6s_cal_kit_separate	refuse	the calibration and the run share	-	-
 cal/manifest-sealed	g6s_cal_manifest_sealed	refuse	the calibration manifest could not be published	-	-

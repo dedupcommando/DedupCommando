@@ -1128,6 +1128,49 @@ mutate_row "route/verifier-preflight" g6-controller.sh \
   '  for t in "$G6_SUPERVISOR" "$G6_PUBLISH" "$G6_VERIFY_COUNTS"; do' \
   '  for t in "$G6_SUPERVISOR" "$G6_PUBLISH"; do'
 
+# --- the supervisor's critical branches
+
+# The start time never read: READY announces an identity nobody captured, and everything
+# downstream that verifies kills against it has nothing to verify.
+mutate_row "wd/identity-before-ready" g6-supervisor.sh \
+  'starttime="$(tail_field "$line" 20)"' \
+  'starttime=""'
+
+# The deadline never fires: the watch loop waits on the leader alone, and a TERM-proof
+# workload knows no limit at all.
+mutate_row "wd/deadline" g6-supervisor.sh \
+  '  if [ "$waited" -ge "$deadline" ]; then fired=1; break; fi' \
+  '  :'
+
+# The escalation loses its first step: nothing polite is ever asked to leave, everything
+# is KILLed outright.
+mutate_row "wd/term-before-kill" g6-supervisor.sh \
+  '  signal_guarded TERM' \
+  '  :'
+
+# The sweep looks and sees nothing: the leader's clean exit is reported as a cleared group
+# over a living survivor.
+mutate_row "wd/sweep" g6-supervisor.sh \
+  '  survivors="$(group_survivors)"' \
+  '  survivors=""'
+
+# The start time dropped from the controller's identity check: a recycled number verifies by
+# group alone, and the fallback shoots the decoy wearing it.
+mutate_row "wd/starttime-recheck" g6-controller.sh \
+  '  [ "$(tail_field "$l" 3)" = "$G6_LAST_PGID" ] && \
+    [ "$(tail_field "$l" 20)" = "$G6_LAST_STARTTIME" ]' \
+  '  [ "$(tail_field "$l" 3)" = "$G6_LAST_PGID" ]'
+
+# The refusal branch removed outright: the fallback no longer declines an unverified identity,
+# it signals it.
+mutate_row "wd/fallback-refusal" g6-controller.sh \
+  '  if ! guard_identity_holds; then
+    [ -d "/proc/$G6_LAST_PID" ] && \
+      say "pid $G6_LAST_PID no longer matches the recorded identity — refusing to signal it"
+    return 0
+  fi' \
+  '  :'
+
 mutate_row "cal/capacity-hook" g6-controller.sh \
       '      G6_BATCH="$G6_BATCH" G6_CAPACITY_HOOK="$cal_hook" \' \
       '      G6_BATCH="$G6_BATCH" \'
