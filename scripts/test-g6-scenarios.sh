@@ -1869,14 +1869,14 @@ lc/detach-ineffective	g6s_lc_detach_ineffective	reclass	still reports a backing 
 prov/invocation-record	g6s_prov_invocation_record	hold	prov-invocation ->	-	-
 prov/read-after-verify	g6s_prov_read_after_verify	hold	prov-read-after-verify ->	-	-
 prov/structural-v5	g6s_prov_structural_v5	reclass	indexes missing	does not belong to	1/1
-prov/col-scan-trashed	g6s_prov_column_scan_trashed	reclass	scan is missing columns: trashed	indexes missing	1/1
-prov/col-hash-failures	g6s_prov_column_hash_failures	reclass	scan_stats is missing columns: hash_failures	indexes missing	1/1
-prov/col-materialized	g6s_prov_column_materialized	reclass	scan_stats is missing columns: results_materialized	indexes missing	1/1
-prov/col-cand-files-total	g6s_prov_column_cand_files_total	reclass	scan_stats is missing columns: cand_files_total	indexes missing	1/1
-prov/col-cand-bytes-total	g6s_prov_column_cand_bytes_total	reclass	scan_stats is missing columns: cand_bytes_total	indexes missing	1/1
-prov/col-cand-files-hashed	g6s_prov_column_cand_files_hashed	reclass	scan_stats is missing columns: cand_files_hashed	indexes missing	1/1
-prov/col-cand-bytes-hashed	g6s_prov_column_cand_bytes_hashed	reclass	scan_stats is missing columns: cand_bytes_hashed	indexes missing	1/1
-prov/idx-reuse-identity	g6s_prov_index_reuse_identity	reclass	indexes missing: file_reuse_identity	does not belong to	1/1
+prov/col-scan-trashed	g6s_prov_column_scan_trashed	reclass	scan is missing columns: trashed	scan is missing columns: zz_mutant	1/1
+prov/col-hash-failures	g6s_prov_column_hash_failures	reclass	scan_stats is missing columns: hash_failures	scan_stats is missing columns: zz_mutant	1/1
+prov/col-materialized	g6s_prov_column_materialized	reclass	scan_stats is missing columns: results_materialized	scan_stats is missing columns: zz_mutant	1/1
+prov/col-cand-files-total	g6s_prov_column_cand_files_total	reclass	scan_stats is missing columns: cand_files_total	scan_stats is missing columns: zz_mutant	1/1
+prov/col-cand-bytes-total	g6s_prov_column_cand_bytes_total	reclass	scan_stats is missing columns: cand_bytes_total	scan_stats is missing columns: zz_mutant	1/1
+prov/col-cand-files-hashed	g6s_prov_column_cand_files_hashed	reclass	scan_stats is missing columns: cand_files_hashed	scan_stats is missing columns: zz_mutant	1/1
+prov/col-cand-bytes-hashed	g6s_prov_column_cand_bytes_hashed	reclass	scan_stats is missing columns: cand_bytes_hashed	scan_stats is missing columns: zz_mutant	1/1
+prov/idx-reuse-identity	g6s_prov_index_reuse_identity	reclass	indexes missing: file_reuse_identity	indexes missing: zz_mutant_identity	1/1
 prov/receipt-in-verifier	g6s_prov_receipt_in_verifier	reclass	the receipt is about	BAD files	1/1
 prov/sqlite-blocked	g6s_prov_sqlite_blocked	reclass	BLOCKED: the schema of	Traceback	2/1
 ROWS

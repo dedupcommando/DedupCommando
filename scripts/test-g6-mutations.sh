@@ -561,15 +561,18 @@ sc_route_twice()  { local d="$1"; sealed_world "$d"
 # state is recorded either way; what the downgrade decides is whether the VERDICT is allowed to
 # stand as it was. So the assertion is on the reason the record carries, not on the presence of
 # the zero-write line — which is there in both copies and proves nothing about the downgrade.
-sc_zero_write()   { local d="$1"; sealed_world "$d"
+sc_zero_write()   { local d="$1" out; sealed_world "$d"
+                    # C2-2 moved every read-only refusal BEFORE BEGIN, so a refusal over a
+                    # leftover no longer writes a terminal record at all — it reports the
+                    # violation in the prestart refusal itself. The claim this row now pins is
+                    # the same one at its new address: a refusal over a dirty machine must SAY
+                    # the machine is dirty, never "proved".
                     : > "$G6_STATE_DIR/PREPARED"
                     sed -i 's/^window-close\t9999999999/window-close\t4000/' "$SANC"
-                    bash "$d/g6-controller.sh" route --mode rehearsal >/dev/null 2>&1
-                    grep -q '^zero-write	VIOLATED' "$G6_WORK/TERMINAL" 2>/dev/null \
-                      || { printf 'zero-write-downgrade -> nothing was left behind to downgrade\n'
-                           return 1; }
-                    grep -q '^reason	.*zero-write violated' "$G6_WORK/TERMINAL" 2>/dev/null \
-                      || { printf 'zero-write-downgrade -> the outcome was not downgraded for it\n'
+                    out="$(bash "$d/g6-controller.sh" route --mode rehearsal 2>&1)" || true
+                    printf '%s' "$out" | grep -q 'nothing was touched (VIOLATED: PREPARED)' \
+                      || { printf 'zero-write-downgrade -> the refusal did not name what was left: %s\n' \
+                             "$(printf '%s' "$out" | tail -1)"
                            return 1; }
                     return 0; }
 sc_pin_mountpoint() { local d="$1"; sealed_world "$d"
@@ -612,12 +615,13 @@ mutate_reclass "corr/rerun-gate" g6-controller.sh \
   '  if false; then' \
   sc_route_twice "already carries a finished run" "the run could not announce itself" 2/2
 
+# The terminalize-side downgrade branch this row used to mutate is still in the delivery, but
+# after C2-2 it is reachable only in the two-line window between BEGIN and the first mutation —
+# no deterministic oracle can drive a run into it. What IS provable is the same claim at the
+# prestart address: the refusal's zero-write report must come from looking, not from optimism.
 mutate_detect "corr/zero-write-downgrade" g6-controller.sh \
-  '    VIOLATED:*)
-      # A run that refused early and still left something behind cannot report a clean outcome.
-      verdict=BLOCKED
-      reason="$reason; zero-write violated ($zw)" ;;' \
-  '    VIOLATED:*) ;;' \
+  '  [ -z "$leftovers" ] && printf '"'"'proved'"'"' || printf '"'"'VIOLATED:%s'"'"' "$leftovers"' \
+  '  printf '"'"'proved'"'"'' \
   sc_zero_write "zero-write-downgrade ->"
 
 mutate_reclass "corr/full-resource-pins" g6-controller.sh \
@@ -643,8 +647,20 @@ mutate_detect "corr/calibration-formula" g6-controller.sh \
   "    printf 'formula\\tguessed\\n'" \
   sc_cal_formula "cal-formula-manifest ->"
 
-sc_verifier_rc() { local d="$1"; sealed_world "$d"
-                   G6_VERIFY_COUNTS=/nonexistent/verify \
+# A verifier that was NEVER there is caught by the preflight now, before BEGIN, in both copies
+# — which is exactly why this row makes it vanish AFTER the run began: the candidate stand-in
+# deletes a COPY of the verifier during the scan, so the VERIFY-step guard is the only thing
+# left between the run and a 127 read as "the counts disagreed".
+sc_verifier_rc() { local d="$1"; g6s_world
+                   cp "$d/g6-verify-counts.py" "$G6T_W/verify-copy.py"
+                   { printf '#!/usr/bin/env bash\n'
+                     printf 'for a in "$@"; do [ "$a" = --scan ] && rm -f %q; done\n' \
+                       "$G6T_W/verify-copy.py"
+                     printf 'exec %q "$@"\n' "$DEDCOM"
+                   } > "$G6T_W/vergone"
+                   chmod +x "$G6T_W/vergone"
+                   g6s_seal "$d" "$G6T_W/vergone"
+                   G6_VERIFY_COUNTS="$G6T_W/verify-copy.py" \
                      bash "$d/g6-controller.sh" route --mode rehearsal 2>&1; }
 sc_failfast()    { local d="$1" got
                    g6s_world
@@ -904,9 +920,11 @@ mutate_row "route/signal-reap" g6-controller.sh \
   "  trap 'G6_RAW_SIGNAL=TERM; guard_interrupt_now; terminalize BLOCKED \"the run was interrupted by SIGTERM\"' TERM" \
   "  trap 'G6_RAW_SIGNAL=TERM; terminalize BLOCKED \"the run was interrupted by SIGTERM\"' TERM"
 
+# The anchor once carried the "# fresh | resume" signature comment; C2-6 removed resume and the
+# comment with it, and the row was INVALID from that commit to the first full matrix.
 mutate_row "route/contour-first" g6-controller.sh \
-  'route_common() {  # fresh | resume' \
-  'route_common() {  # mutant: a directory created before the contour was judged
+  'route_common() {' \
+  'route_common() {
   mkdir -p "$G6_WORK" 2>/dev/null'
 
 # --- calibration, part two
@@ -1049,10 +1067,13 @@ mutate_row "route/begin-durable" g6-controller.sh \
   '    "$G6_PUBLISH" --begin --state-file "$G6_WORK/PUBSTATE" > "$G6_WORK/begin.out" 2>&1 \' \
   '    true \'
 
+# Same story as route/contour-first: C2-2 rerouted the refusal through prestart_refusal and the
+# old printf anchor stopped matching anything.
 mutate_row "route/prestart-leaves-nothing" g6-controller.sh \
-  '  verify_contour || { printf '"'"'REFUSED: the contour was refused; nothing was touched\n'"'"' >&2' \
-  '  verify_contour || { "$G6_PUBLISH" --begin --state-file "$G6_WORK/PUBSTATE" >/dev/null 2>&1
-    printf '"'"'REFUSED: nothing was touched\n'"'"' >&2'
+  '  verify_contour          || prestart_refusal "the contour was refused"' \
+  '  verify_contour          || { mkdir -p "$G6_WORK" 2>/dev/null
+    "$G6_PUBLISH" --begin --state-file "$G6_WORK/PUBSTATE" >/dev/null 2>&1
+    prestart_refusal "the contour was refused"; }'
 
 mutate_row "lc/interrupted-blocked" g6-controller.sh \
   '      [ "$qstate" != RUNNING ] \' \
@@ -1204,6 +1225,45 @@ mutate_row "prov/index-shape" g6-verify-counts.py \
 mutate_row "prov/all-columns" g6-verify-counts.py \
   '    "hash_cache": ("device", "inode", "size", "mtime", "hash", "updated_at"),' \
   '    "hash_cache": (),'
+
+# The C2-9 elements, one mutant per name — declared in C2-9's registry rows and never wired to
+# a mutation until the first full matrix demanded them. Each mutant RENAMES the expected element
+# instead of dropping it: dropping would let the run continue past the verifier onto a
+# candidate-dependent path with an unpredictable exit, while a rename keeps the refusal on the
+# same deterministic line — and still proves the NAME in the contract is the one that catches
+# the defect: the pristine copy names the dropped element, the mutant names its stand-in and
+# misses the drop.
+mutate_row "prov/col-scan-trashed" g6-verify-counts.py \
+  '    "scan": ("id", "created_at", "updated_at", "status", "config_json", "trashed"),' \
+  '    "scan": ("id", "created_at", "updated_at", "status", "config_json", "zz_mutant"),'
+
+mutate_row "prov/col-hash-failures" g6-verify-counts.py \
+  '                   "reclaim_state", "hash_failures", "results_materialized",' \
+  '                   "reclaim_state", "zz_mutant", "results_materialized",'
+
+mutate_row "prov/col-materialized" g6-verify-counts.py \
+  '                   "reclaim_state", "hash_failures", "results_materialized",' \
+  '                   "reclaim_state", "hash_failures", "zz_mutant",'
+
+mutate_row "prov/col-cand-files-total" g6-verify-counts.py \
+  '                   "cand_files_total", "cand_bytes_total",' \
+  '                   "zz_mutant", "cand_bytes_total",'
+
+mutate_row "prov/col-cand-bytes-total" g6-verify-counts.py \
+  '                   "cand_files_total", "cand_bytes_total",' \
+  '                   "cand_files_total", "zz_mutant",'
+
+mutate_row "prov/col-cand-files-hashed" g6-verify-counts.py \
+  '                   "cand_files_hashed", "cand_bytes_hashed"),' \
+  '                   "zz_mutant", "cand_bytes_hashed"),'
+
+mutate_row "prov/col-cand-bytes-hashed" g6-verify-counts.py \
+  '                   "cand_files_hashed", "cand_bytes_hashed"),' \
+  '                   "cand_files_hashed", "zz_mutant"),'
+
+mutate_row "prov/idx-reuse-identity" g6-verify-counts.py \
+  '    "file_reuse_identity": ("file", 0, (("path", 0, "BINARY"), ("size", 0, "BINARY"),' \
+  '    "zz_mutant_identity": ("file", 0, (("path", 0, "BINARY"), ("size", 0, "BINARY"),'
 
 echo
 echo "== census =="
