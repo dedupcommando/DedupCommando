@@ -20,8 +20,9 @@
 # The boundary is `begin_run`. Before it, refusals; after it, verdicts.
 #
 # A run killed between BEGIN and the terminal record leaves RUNNING behind on purpose. `route`
-# refuses to start over one of those — it is not a fresh directory — and `recover` is the command
-# that continues it, from the durable lifecycle chain rather than from the beginning.
+# refuses to start over one of those — it is not a fresh directory — and it stops with the
+# inventory instead. What happens next is a human decision: there is no subcommand that starts
+# the candidate again over the evidence of a run that did not finish.
 #
 # Order, and it is fail-fast at every step:
 #
@@ -90,6 +91,9 @@ G6_HOST_ID="${G6_HOST_ID:-}"
 
 G6_DF="${G6_DF:-df}"
 G6_TIME="${G6_TIME:-/usr/bin/time}"
+# The watchdog is detached with this, so its absence is a preflight question like any
+# other tool the delivery depends on — not something discovered when a guard is needed.
+G6_SETSID="${G6_SETSID:-setsid}"
 G6_LOSETUP="${G6_LOSETUP:-losetup}"
 G6_MKFS="${G6_MKFS:-mkfs.ext4}"
 G6_MOUNT="${G6_MOUNT:-mount}"
@@ -187,7 +191,29 @@ terminalize() {  # verdict reason
 
   [ "$verdict" = PASS ] || printf '%s: %s\n' "$verdict" "$reason" >&2
   printf 'VERDICT\t%s\n' "$verdict"
+
+  # A run cut short by a signal proved nothing about the candidate, so the VERDICT is BLOCKED and
+  # the record says so. The exit STATUS is a different question: whatever sent the signal reads
+  # the wait status, and §5 of the runbook puts TERM=143 and INT=130 first in its exit precedence.
+  # Reporting 2 there would make the harness disagree with its own document about what happened,
+  # and would hide a signal behind the code that means "environment". The record is written
+  # first; only then does this process die of the signal it was sent.
+  if [ -n "${G6_RAW_SIGNAL:-}" ]; then
+    trap - "$G6_RAW_SIGNAL"
+    kill -"$G6_RAW_SIGNAL" $$
+  fi
   exit "$code"
+}
+
+# A refusal taken before the run announces itself. It never publishes, because there is nothing
+# to publish about: no record, no state, no evidence directory. The zero-write check is quoted
+# here rather than asserted in prose — a refusal that says "nothing was touched" while something
+# was is worse than no refusal at all.
+prestart_refusal() {  # reason
+  local zw; zw="$(zero_write_state)"
+  printf 'REFUSED: %s; nothing was touched (%s)\n' "$1" "$zw" >&2
+  printf 'VERDICT\tBLOCKED\n'
+  exit $RC_BLOCKED
 }
 
 # Outside the route these two just report; inside, everything funnels into terminalize.
@@ -559,6 +585,7 @@ check_capacity() {
 # ------------------------------------------------------------------ kill guard
 
 G6_LAST_CLASS=""; G6_LAST_RAW=""; G6_LAST_SIGNAL=""; G6_LAST_PID=""; G6_LAST_PGID=""
+G6_LAST_WATCHDOG=""
 
 guarded_run() {  # timeout label outdir -- command...
   local timeout="$1" label="$2" outdir="$3"; shift 3; [ "$1" = "--" ] && shift
@@ -589,6 +616,40 @@ guarded_run() {  # timeout label outdir -- command...
   fi
   G6_LAST_PID="$child"; G6_LAST_PGID="$pgid"
 
+  # THE WATCHDOG IS ITS OWN PROCESS, IN ITS OWN SESSION.
+  #
+  # A guard that is a loop inside this shell is only a guard while this shell is alive. SIGKILL
+  # the controller — the one signal nothing can trap — and the loop is gone while the candidate
+  # keeps running: on the full-scale fixture that is an unbounded scan on somebody else's
+  # production host, with nobody left to stop it and no record that it is still there. The same
+  # hole opens more quietly if the controller is killed as part of a process group.
+  #
+  # So the deadline is enforced from outside: setsid detaches the watchdog into a session of its
+  # own, where neither the controller's death nor a signal aimed at the controller's group can
+  # reach it. It watches the child's group, not the controller, and it exits by itself the moment
+  # that group is gone. The in-shell loop below stays, because it is what MEASURES and classifies
+  # the outcome — but it is no longer what enforces it.
+  local wd="$outdir/$label.watchdog"
+  { printf '#!/usr/bin/env bash\n'
+    printf 'pgid=%q; deadline=%q; grace=%q\n' "$pgid" "$timeout" "$G6_GRACE"
+    printf 'waited=0\n'
+    printf 'while kill -0 -- "-$pgid" 2>/dev/null; do\n'
+    printf '  [ "$waited" -ge "$deadline" ] && break\n'
+    printf '  sleep 1; waited=$(( waited + 1 ))\n'
+    printf 'done\n'
+    printf 'kill -0 -- "-$pgid" 2>/dev/null || exit 0\n'
+    printf 'printf "watchdog: the guarded group %%s outlived its %%s second deadline\\n" "$pgid" "$deadline" >&2\n'
+    printf 'kill -TERM -- "-$pgid" 2>/dev/null\n'
+    printf 'g=0\n'
+    printf 'while kill -0 -- "-$pgid" 2>/dev/null && [ "$g" -lt "$grace" ]; do sleep 1; g=$(( g + 1 )); done\n'
+    printf 'kill -KILL -- "-$pgid" 2>/dev/null\n'
+    printf 'exit 0\n'
+  } > "$wd"
+  chmod 0700 "$wd"
+  "$G6_SETSID" "$wd" >"$outdir/$label.watchdog.out" 2>&1 &
+  local watcher=$!
+  G6_LAST_WATCHDOG="$watcher"
+
   local waited=0 fired=0
   while kill -0 "$child" 2>/dev/null; do
     [ "$waited" -ge "$timeout" ] && { fired=1; break; }
@@ -600,6 +661,12 @@ guarded_run() {  # timeout label outdir -- command...
     while kill -0 "$child" 2>/dev/null && [ "$g" -lt "$G6_GRACE" ]; do sleep 1; g=$(( g + 1 )); done
     kill -KILL -- "-$pgid" 2>/dev/null
   fi
+
+  # The child is done one way or the other, so the deadline no longer has anything to enforce.
+  # Reaped here rather than left to exit on its own, because a watchdog still sleeping on a dead
+  # group is a process nobody accounted for.
+  kill -TERM "$watcher" 2>/dev/null
+  wait "$watcher" 2>/dev/null
 
   wait "$child"; local raw=$?
   G6_LAST_RAW="$raw"
@@ -1238,12 +1305,10 @@ PY
 
 # Where the lifecycle actually stands, and what is left to do about it.
 #
-# The chain is durable, so "start at prepare" is a guess, not a fact. A run that was killed after
-# ATTACHED comes back to a device that is already attached: prepare would refuse (the image
-# exists), and the whole recovery would be a human reading four refusals to work out which step
-# to run by hand. So the controller asks the library where the chain got to and continues from
-# exactly there — or, when the chain no longer describes the machine, stops with the inventory
-# that tells a human what is actually on it.
+# The chain is durable, so "start at prepare" is a guess, not a fact. The library reports where
+# the chain got to, and a human uses that to continue or to tear down. The controller does not
+# resume a run on its own: the lifecycle steps and teardown remain available, the automatic
+# re-entry does not.
 G6_LIFECYCLE_WHY=""
 
 lifecycle_to_mounted() {
@@ -1274,21 +1339,32 @@ lifecycle_to_mounted() {
 
 # ------------------------------------------------------------------ the route
 
-route()   { route_common fresh; }
-recover() { route_common resume; }
+route() { route_common; }
 
-route_common() {  # fresh | resume
-  local entry="$1"
+route_common() {
   # PRESTART. The contour is settled BEFORE anything at all — before a directory is created,
   # before a stream is redirected into one, before the lifecycle is touched and before the
   # candidate is invoked. A contour check that runs after the first mkdir has already acted in
   # the contour it was about to reject. These exits are refusals, not verdicts: there is no run
   # yet to write a terminal record about.
-  verify_contour || { printf 'REFUSED: the contour was refused; nothing was touched\n' >&2
-                      printf 'VERDICT\tBLOCKED\n'; exit $RC_BLOCKED; }
+  # PRESTART. Every read-only check happens here, and NOTHING in this phase creates anything:
+  # no evidence directory, no state file, no terminal record, no image, no mountpoint, and the
+  # candidate is not invoked once. That is not tidiness. A refusal routed through terminalize
+  # would CREATE the very state it claims was never made — it writes RUNNING and then TERMINAL —
+  # so the harness would contradict its own contract in the act of reporting it. There is no run
+  # yet for a verdict to be about; these exits are refusals.
+  verify_contour          || prestart_refusal "the contour was refused"
+  [ -n "$G6_WORK" ]       || prestart_refusal "G6_WORK is not set"
+  preflight_tools         || prestart_refusal "tool preflight refused"
+  verify_sanction         || prestart_refusal "sanction refused"
+  verify_calibration      || prestart_refusal "calibration refused"
+  verify_candidate        || prestart_refusal "candidate refused"
+  verify_bundle           || prestart_refusal "bundle refused"
+  verify_resource_plan    || prestart_refusal "resource plan refused"
+  assert_calibration_gone || prestart_refusal "calibration resources are still present"
+  check_capacity full "$G6_REMOTE_ROOT" \
+                          || prestart_refusal "capacity before the image was created"
 
-  [ -n "$G6_WORK" ] || { printf 'REFUSED: G6_WORK is not set\n' >&2; exit $RC_BLOCKED; }
-  mkdir -p "$G6_WORK" || { printf 'REFUSED: cannot create G6_WORK\n' >&2; exit $RC_BLOCKED; }
   local outdir="$G6_WORK/scenarios"
 
   # A finished run is finished. The terminal state is consulted here — before the first
@@ -1301,29 +1377,36 @@ route_common() {  # fresh | resume
   # saying PUBLISHED; replacing the record with a properly sealed one of somebody else's leaves
   # a state file whose recorded digest no longer matches. Either half alone would let one of the
   # two through, and both refusals name which half was wrong.
-  local qrc=0 qstate qcode qrec
-  "$G6_PUBLISH" --query-state --state-file "$G6_WORK/PUBSTATE" --dir "$G6_WORK" \
-    > "$G6_WORK/state.out" 2>&1 || qrc=$?
-  qstate="$(awk -F'\t' '$1 == "STATE" { print $2 }' "$G6_WORK/state.out")"
-  qcode="$(awk -F'\t' '$1 == "STATE" { print $3 }' "$G6_WORK/state.out")"
-  qrec="$(awk -F'\t' '$1 == "RECORD" { print $2 }' "$G6_WORK/state.out")"
+  # Read into a variable, not into a file under the evidence directory: a query that has to
+  # create the directory in order to report that nothing is in it has already answered its own
+  # question wrongly. g6-publish-record.py makes no directories, so this is a pure read.
+  local qrc=0 qout qstate qcode qrec
+  qout="$("$G6_PUBLISH" --query-state --state-file "$G6_WORK/PUBSTATE" --dir "$G6_WORK" 2>&1)" \
+    || qrc=$?
+  qstate="$(printf '%s\n' "$qout" | awk -F'\t' '$1 == "STATE" { print $2 }')"
+  qcode="$(printf '%s\n' "$qout" | awk -F'\t' '$1 == "STATE" { print $3 }')"
+  qrec="$(printf '%s\n' "$qout" | awk -F'\t' '$1 == "RECORD" { print $2 }')"
   refuse_reentry() {  # reason
-    [ -s "$G6_WORK/state.out" ] && cat "$G6_WORK/state.out" >&2
+    [ -n "$qout" ] && printf '%s\n' "$qout" >&2
+    # The inventory is part of the refusal, not a follow-up somebody has to ask for: a human
+    # deciding what to do with an interrupted run needs to see what is on the machine.
+    [ -n "${G6_IMAGE_LIB:-}" ] && bash "$G6_IMAGE_LIB" inventory >&2 2>/dev/null
     printf 'BLOCKED: %s; nothing was touched\n' "$1" >&2
     printf 'VERDICT\tBLOCKED\n'
     exit $RC_BLOCKED
   }
-  if [ "$entry" = resume ]; then
-    # Recovery is for a run that ANNOUNCED itself and did not finish. Anything else is not a
-    # recovery: NOT_STARTED has nothing to continue, PUBLISHED is finished.
-    [ "$qstate" = RUNNING ] \
-      || refuse_reentry "recover continues a run that started and did not finish; this evidence \
-directory reports $qstate"
-  else
+  if true; then
     if [ "$qstate" != NOT_STARTED ] || [ "$qrc" != 0 ] || [ -e "$G6_WORK/TERMINAL" ]; then
+      # An unfinished run is BLOCKED with an inventory, and the candidate is NOT started again.
+      # There was a controller-level `recover` here; it resumed on RUNNING without checking
+      # whether a TERMINAL record already existed, so a run whose record was published and whose
+      # state update then failed could be re-entered and the candidate invoked a second time over
+      # the evidence of the first. Continuing an interrupted run is a decision for a human
+      # holding the inventory, not a subcommand.
       [ "$qstate" != RUNNING ] \
-        || refuse_reentry "this evidence directory carries a run that started and did not finish \
-— it is not a fresh start, and 'recover' is what continues it"
+        || refuse_reentry "this evidence directory carries a run that started and did not \
+finish — what happens next is decided by a human reading the inventory below, not by starting \
+the candidate again"
       { [ "$qstate" != NOT_STARTED ] || [ "$qrc" != 0 ]; } \
         || refuse_reentry "a terminal record is present while the state file reports NOT_STARTED \
 — one of the two was removed"
@@ -1342,26 +1425,6 @@ code $qcode, record ${qrec:-none})"
     fi
   fi
 
-  preflight_tools     || terminalize BLOCKED "tool preflight refused"
-  verify_sanction     || terminalize BLOCKED "sanction refused"
-  verify_calibration  || terminalize BLOCKED "calibration refused"
-  verify_candidate    || terminalize BLOCKED "candidate refused"
-  verify_bundle       || terminalize BLOCKED "bundle refused"
-  verify_resource_plan|| terminalize BLOCKED "resource plan refused"
-
-  # Nothing of the calibration may still be on the machine when the run it calibrated begins.
-  assert_calibration_gone || terminalize BLOCKED "calibration resources are still present"
-
-  # Capacity BEFORE anything is created. Finding out that the image does not fit after writing
-  # sixteen gigabytes of it is finding out too late.
-# The margin is measured on the sanctioned root, not on the image directory: that directory does
-# not exist yet — `prepare` creates it (g6-image-lib.sh mkdir before the image is made) — and df
-# on a path that is not there measures nothing, which this function then reports as BLOCKED. The
-# image lands on the root's filesystem anyway, so the root is both the measurable answer and the
-# correct one. The stub bench used to create g6-image up front, which is why no scenario saw it.
-  check_capacity full "$G6_REMOTE_ROOT" \
-    || terminalize BLOCKED "capacity before the image was created"
-
   # What the filesystem must be able to hold, handed to the steps that format it. mkfs cannot be
   # asked afterwards to add inodes.
   export G6_MIN_INODES=$(( G6_INODE_NEED + G6_INODE_RESERVE ))
@@ -1371,7 +1434,8 @@ code $qcode, record ${qrec:-none})"
   # killed at any point after this line leaves a directory that says a run started and did not
   # finish — instead of one that looks untouched. On a fresh entry this is also the last moment
   # at which nothing has been changed.
-  if [ "$entry" = fresh ]; then
+  mkdir -p "$G6_WORK" || prestart_refusal "cannot create the evidence directory"
+  if true; then
     "$G6_PUBLISH" --begin --state-file "$G6_WORK/PUBSTATE" > "$G6_WORK/begin.out" 2>&1 \
       || { cat "$G6_WORK/begin.out" >&2
            printf 'BLOCKED: the run could not announce itself; nothing was touched\n' >&2
@@ -1381,9 +1445,9 @@ code $qcode, record ${qrec:-none})"
   # A signal is an outcome too, and from the boundary onwards it is a VERDICT rather than a
   # refusal. Without this the shell dies where it stands and the evidence directory is left
   # saying RUNNING for ever, which is the one state nobody can classify later.
-  trap 'terminalize BLOCKED "the run was interrupted by SIGINT"'  INT
-  trap 'terminalize BLOCKED "the run was interrupted by SIGTERM"' TERM
-  trap 'terminalize BLOCKED "the run was interrupted by SIGHUP"'  HUP
+  trap 'G6_RAW_SIGNAL=INT  terminalize BLOCKED "the run was interrupted by SIGINT"'  INT
+  trap 'G6_RAW_SIGNAL=TERM terminalize BLOCKED "the run was interrupted by SIGTERM"' TERM
+  trap 'G6_RAW_SIGNAL=HUP  terminalize BLOCKED "the run was interrupted by SIGHUP"'  HUP
 
   G6_MUTATED=1
   lifecycle_to_mounted || terminalize BLOCKED "lifecycle: $G6_LIFECYCLE_WHY"
@@ -1496,10 +1560,9 @@ case "$cmd" in
   guarded)         guarded_run "$@" ;;
   classify)        class_verdict "${1:-}" ;;
   route)           parse_mode "$@" || exit $RC_BLOCKED; route ;;
-  recover)         parse_mode "$@" || exit $RC_BLOCKED; recover ;;
   teardown)        parse_mode "$@" || exit $RC_BLOCKED
                    say "teardown is a separate decision, taken after the result was read"
                    bash "$G6_IMAGE_LIB" teardown ;;
-  *) printf 'usage: %s bundle|preflight|contour|check-sanctions|capacity-hook|dry-route|calibrate|guarded|classify|route|recover|teardown [--mode live|rehearsal]\n' "$0" >&2
+  *) printf 'usage: %s bundle|preflight|contour|check-sanctions|capacity-hook|dry-route|calibrate|guarded|classify|route|teardown [--mode live|rehearsal]\n' "$0" >&2
      exit $RC_BLOCKED ;;
 esac

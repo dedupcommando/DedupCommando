@@ -894,7 +894,7 @@ mutate_row "pub/terminal-unsealed" g6-publish-record.py \
 
 # --- the route as a whole
 mutate_row "route/signal" g6-controller.sh \
-  "  trap 'terminalize BLOCKED \"the run was interrupted by SIGTERM\"' TERM" \
+  "  trap 'G6_RAW_SIGNAL=TERM terminalize BLOCKED \"the run was interrupted by SIGTERM\"' TERM" \
   '  :'
 
 mutate_row "route/contour-first" g6-controller.sh \
@@ -1044,9 +1044,9 @@ mutate_row "route/prestart-leaves-nothing" g6-controller.sh \
   '  verify_contour || { "$G6_PUBLISH" --begin --state-file "$G6_WORK/PUBSTATE" >/dev/null 2>&1
     printf '"'"'REFUSED: nothing was touched\n'"'"' >&2'
 
-mutate_row "lc/controller-resume" g6-controller.sh \
-  '      [ "$step" = "$next" ] || continue' \
-  '      [ "$step" = prepare ] || continue'
+mutate_row "lc/interrupted-blocked" g6-controller.sh \
+  '      [ "$qstate" != RUNNING ] \' \
+  '      [ 1 = 1 ] \'
 
 # --- S3
 mutate_row "s3/ready-after-sample" g6-observe-destination.py \

@@ -156,16 +156,21 @@ g6_has "$out" '--mode is required' \
 
 setup
 printf 'note\ttampered\n' >> "$CAL"
-exits_as "a calibration edited after sealing" BLOCKED 2 -- route rehearsal
+# These ten refusals moved from a verdict to a refusal in C2-2, and the assertion moved with
+# them. Each is a read-only check — sanction, calibration, candidate, bundle, plan, margin — and
+# all of them now happen before BEGIN, so there is no run for a record to be about. Asserting a
+# TERMINAL record here would be asserting that the harness wrote the very state its own refusal
+# says it never made.
+refuses_prestart "a calibration edited after sealing" 2 -- route rehearsal
 setup
 sed -i 's/^window-close\t9999999999/window-close\t4000/' "$SANC"
-exits_as "a closed load window" BLOCKED 2 -- route rehearsal
+refuses_prestart "a closed load window" 2 -- route rehearsal
 setup
 sed -i "s/^candidate-sha256\t.*/candidate-sha256\t$(printf '0%.0s' $(seq 64))/" "$SANC"
-exits_as "a candidate that is not the pinned one" BLOCKED 2 -- route rehearsal
+refuses_prestart "a candidate that is not the pinned one" 2 -- route rehearsal
 setup
 sed -i "s/^bundle-sha256\t.*/bundle-sha256\t$(printf '1%.0s' $(seq 64))/" "$SANC"
-exits_as "a bundle that is not the pinned one" BLOCKED 2 -- route rehearsal
+refuses_prestart "a bundle that is not the pinned one" 2 -- route rehearsal
 
 # ---------------------------------------------------------------- 4. the frozen resource plan
 
@@ -173,20 +178,20 @@ echo
 echo "== 4. the resource plan is complete, frozen and agreed =="
 setup
 grep -v '^work-dir	' "$PLAN" > "$PLAN.n" && mv "$PLAN.n" "$PLAN"; reseal
-exits_as "a plan missing a resource" BLOCKED 2 -- route rehearsal
+refuses_prestart "a plan missing a resource" 2 -- route rehearsal
 setup
 printf 'note\tedited\n' >> "$PLAN"
-exits_as "a plan edited after sealing" BLOCKED 2 -- route rehearsal
+refuses_prestart "a plan edited after sealing" 2 -- route rehearsal
 setup
 sed -i "s|^uuid\t.*|uuid\t00000000-0000-0000-0000-000000000000|" "$PLAN"; reseal
-exits_as "a plan that disagrees with the sanction" BLOCKED 2 -- route rehearsal
+refuses_prestart "a plan that disagrees with the sanction" 2 -- route rehearsal
 
 # ---------------------------------------------------------------- 5. capacity
 
 echo
 echo "== 5. both margins, at every check =="
 setup
-exits_as "a starved external margin" BLOCKED 2 -- \
+refuses_prestart "a starved external margin" 2 -- \
   env G6T_DF_OUTSIDE_BYTES=1000 bash "$CTL" route --mode rehearsal
 setup
 exits_as "a starved internal inode margin" BLOCKED 2 -- \
@@ -301,10 +306,18 @@ echo
 echo "== 10. zero-write on an early refusal =="
 setup
 sed -i 's/^window-close\t9999999999/window-close\t4000/' "$SANC"
-route rehearsal >/dev/null 2>&1
-grep -q '^zero-write	proved' "$G6_WORK/TERMINAL" 2>/dev/null \
-  && ok "an early refusal proves it wrote nothing" \
-  || bad "an early refusal proves it wrote nothing" "$(grep '^zero-write' "$G6_WORK/TERMINAL" 2>/dev/null)"
+# The proof used to be read out of the TERMINAL record. After C2-2 there is no record here, and
+# that is the point: an early refusal writes nothing, so it cannot leave a note certifying that
+# it wrote nothing. The claim travels in the refusal itself, and the absence is then checked
+# against the filesystem rather than against the harness's own account of it.
+out="$(route rehearsal 2>&1)" || true
+problems=""
+g6_has "$out" 'nothing was touched (proved)' || problems="$problems no-zero-write-claim"
+[ ! -e "$G6_WORK/TERMINAL" ] || problems="$problems terminal-record-left"
+[ ! -e "$G6_WORK/PUBSTATE" ] || problems="$problems state-file-left"
+[ ! -e "$G6_IMAGE" ]         || problems="$problems image-left"
+[ -z "$problems" ] && ok "an early refusal proves it wrote nothing" \
+                   || bad "an early refusal proves it wrote nothing" "$problems"
 [ ! -e "$G6_IMAGE" ] && [ ! -e "$G6_STATE_DIR/PREPARED" ] \
   && ok "and no image or lifecycle record exists" || bad "and no image or record exists"
 
@@ -361,10 +374,10 @@ echo
 echo "== 15. every resource is pinned in the sanction =="
 setup
 grep -v '^mountpoint	' "$SANC" > "$SANC.n" && mv "$SANC.n" "$SANC"
-exits_as "a sanction that pins no mountpoint" BLOCKED 2 -- route rehearsal
+refuses_prestart "a sanction that pins no mountpoint" 2 -- route rehearsal
 setup
 sed -i "s|^state-dir\t.*|state-dir\t/elsewhere|" "$SANC"
-exits_as "a sanction whose state-dir disagrees with the plan" BLOCKED 2 -- route rehearsal
+refuses_prestart "a sanction whose state-dir disagrees with the plan" 2 -- route rehearsal
 
 echo
 echo "== 16. the lifecycle chain is cross-linked and resumable =="

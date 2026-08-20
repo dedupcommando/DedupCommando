@@ -413,7 +413,11 @@ g6s_reentry() {  # delivery break-how tag want-code
   g6s_logging_candidate "$G6T_W/candidate" "$clog" "$inner"
   g6s_seal "$d" "$G6T_W/candidate"
   case "$how" in
-    blocked) sed -i 's/^window-close\t9999999999/window-close\t4000/' "$SANC" ;;
+    # A BLOCKED that leaves a record has to happen AFTER the run announces itself. Closing the
+    # sanction window used to do it, but that is a read-only check and since C2-2 it refuses
+    # before BEGIN, writing nothing — there would be no first run to re-enter. Starving the
+    # filesystem inside the image blocks between batches, which is post-BEGIN and terminalizes.
+    blocked) export G6T_DF_STARVE_AFTER=0 ;;
   esac
   g6s_route "$d" >/dev/null 2>&1 || true
   code="$(g6s_terminal_field code)"
@@ -771,8 +775,13 @@ g6s_route_signal() {  # delivery
          return 1; }
   kill -TERM "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null || rc=$?
-  [ "$rc" = 2 ] || { printf 'route-signal -> the interrupted route exited %s, not 2\n' "$rc"
-                     return 1; }
+  # The status is the signal, not 2. A run cut short proved nothing about the candidate, so the
+  # VERDICT is BLOCKED and the record says so — but whatever sent the signal reads the wait
+  # status, and §5 of the runbook puts TERM=143 first in its exit precedence. Reporting 2 here
+  # would hide a signal behind the code that means "environment".
+  [ "$rc" = 143 ] || { printf 'route-signal -> the interrupted route exited %s, not 143
+' "$rc"
+                       return 1; }
   [ -f "$G6_WORK/TERMINAL" ] \
     || { printf 'route-signal -> the interrupted route left no terminal record\n'; return 1; }
   grep -q 'interrupted by SIG' "$G6_WORK/TERMINAL" \
@@ -1186,26 +1195,35 @@ g6s_route_prestart_leaves_nothing() {  # delivery
   return 0
 }
 
-# Recovery goes through the CONTROLLER: it reads the durable chain and continues the allowed
-# prefix. The test never runs the step it was told about — that would be the test doing the
-# recovering.
-g6s_lc_controller_resume() {  # delivery
-  local d="$1" rc=0 losetups
+# An interrupted run is an inspection, not a second attempt.
+#
+# There was a controller `recover` here that continued the durable chain by itself. It resumed on
+# a state of RUNNING without asking whether a TERMINAL record already existed, so a run whose
+# record was published and whose state update then failed could be entered again — and the
+# candidate invoked a second time, over the evidence of the first. What the run left behind is a
+# question for a human holding the inventory; the harness does not answer it by running the
+# workload again.
+g6s_lc_interrupted_blocked() {  # delivery
+  local d="$1" rc=0 losetups out
   g6s_sealed_world "$d"
-  g6s_lib "$d" prepare >/dev/null 2>&1 || { printf 'lc-resume -> prepare failed\n'; return 1; }
-  g6s_lib "$d" attach  >/dev/null 2>&1 || { printf 'lc-resume -> attach failed\n'; return 1; }
+  g6s_lib "$d" prepare >/dev/null 2>&1 || { printf 'lc-interrupted -> prepare failed\n'; return 1; }
+  g6s_lib "$d" attach  >/dev/null 2>&1 || { printf 'lc-interrupted -> attach failed\n'; return 1; }
   "$d/g6-publish-record.py" --begin --state-file "$G6_WORK/PUBSTATE" >/dev/null 2>&1 \
-    || { printf 'lc-resume -> the interrupted run could not be announced\n'; return 1; }
+    || { printf 'lc-interrupted -> the interrupted run could not be announced\n'; return 1; }
   losetups="$(g6s_attach_calls)"
-  bash "$d/g6-controller.sh" recover --mode rehearsal >"$G6T_W/recover.out" 2>&1 || rc=$?
-  [ "$rc" = 0 ] || { printf 'lc-resume -> recover exited %s\n%s\n' "$rc" \
-                       "$(tail -3 "$G6T_W/recover.out")"; return 1; }
-  grep -q "resuming the lifecycle at 'format'" "$G6T_W/recover.out" \
-    || { printf 'lc-resume -> recover did not continue from the durable chain\n'; return 1; }
+  out="$(bash "$d/g6-controller.sh" route --mode rehearsal 2>&1)" || rc=$?
+  [ "$rc" = 2 ] \
+    || { printf 'lc-interrupted -> re-entry exited %s, not BLOCKED\n%s\n' "$rc" \
+           "$(printf '%s' "$out" | tail -3)"; return 1; }
+  g6_has "$out" 'started and did not finish' \
+    || { printf 'lc-interrupted -> the refusal does not say what it found\n'; return 1; }
+  g6_has "$out" 'INVENTORY:' \
+    || { printf 'lc-interrupted -> the refusal carries no inventory for a human to read\n'
+         return 1; }
   [ "$(g6s_attach_calls)" = "$losetups" ] \
-    || { printf 'lc-resume -> recover attached the device again\n'; return 1; }
-  [ "$(g6s_terminal_field verdict)" = PASS ] \
-    || { printf 'lc-resume -> the recovered run ended %s\n' "$(g6s_terminal_field verdict)"
+    || { printf 'lc-interrupted -> re-entry touched the device\n'; return 1; }
+  [ ! -e "$G6_WORK/TERMINAL" ] \
+    || { printf 'lc-interrupted -> a refusal that touched nothing wrote a terminal record\n'
          return 1; }
   return 0
 }
@@ -1434,7 +1452,7 @@ pub/begin-concurrent	g6s_pub_begin_concurrent	hold	begin-concurrent ->	-	-
 pub/begin-create-only	g6s_pub_begin_create_only	hold	begin-claim ->	-	-
 route/begin-durable	g6s_route_begin_durable	hold	route-begin ->	-	-
 route/prestart-leaves-nothing	g6s_route_prestart_leaves_nothing	hold	route-prestart ->	-	-
-lc/controller-resume	g6s_lc_controller_resume	hold	lc-resume ->	-	-
+lc/interrupted-blocked	g6s_lc_interrupted_blocked	hold	lc-interrupted ->	-	-
 s3/ready-after-sample	g6s_s3_ready_after_sample	hold	s3-ready ->	-	-
 s3/hung-observer	g6s_s3_hung_observer	hold	s3-hung ->	-	-
 cal/own-numbers	g6s_cal_own_numbers	hold	cal-own ->	-	-
