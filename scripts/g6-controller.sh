@@ -46,9 +46,10 @@ G6_IMAGE_LIB="${G6_IMAGE_LIB:-$HERE/g6-image-lib.sh}"
 G6_MAKE_FIXTURE="${G6_MAKE_FIXTURE:-$HERE/g6-make-fixture.sh}"
 G6_VERIFY_COUNTS="${G6_VERIFY_COUNTS:-$HERE/g6-verify-counts.py}"
 G6_OBSERVE="${G6_OBSERVE:-$HERE/g6-observe-destination.py}"
+G6_SUPERVISOR="${G6_SUPERVISOR:-$HERE/g6-supervisor.sh}"
 
-BUNDLE_FILES="g6-controller.sh g6-image-lib.sh g6-make-fixture.sh g6-publish-record.py \
-g6-verify-counts.py g6-observe-destination.py"
+BUNDLE_FILES="g6-controller.sh g6-supervisor.sh g6-image-lib.sh g6-make-fixture.sh \
+g6-publish-record.py g6-verify-counts.py g6-observe-destination.py"
 
 G6_SANCTION="${G6_SANCTION:-}"
 G6_CALIBRATION="${G6_CALIBRATION:-}"
@@ -91,8 +92,9 @@ G6_HOST_ID="${G6_HOST_ID:-}"
 
 G6_DF="${G6_DF:-df}"
 G6_TIME="${G6_TIME:-/usr/bin/time}"
-# The watchdog is detached with this, so its absence is a preflight question like any
-# other tool the delivery depends on — not something discovered when a guard is needed.
+# The supervisor is detached with this, so its absence — or a version that does not actually
+# detach — is a preflight question like any other tool the delivery depends on, settled before
+# a run, not discovered with a candidate already launched.
 G6_SETSID="${G6_SETSID:-setsid}"
 G6_LOSETUP="${G6_LOSETUP:-losetup}"
 G6_MKFS="${G6_MKFS:-mkfs.ext4}"
@@ -102,6 +104,10 @@ G6_BLKID="${G6_BLKID:-blkid}"
 G6_DUMPE2FS="${G6_DUMPE2FS:-dumpe2fs}"
 G6_GRACE="${G6_GRACE:-3}"
 G6_REAP_LIMIT="${G6_REAP_LIMIT:-10}"
+# How long the supervisor gets to say WHOM it launched. A bound on the harness's own machinery,
+# not on the candidate — the candidate's guards are measured, this one merely has to outlast a
+# fork and a file write on a loaded host.
+G6_READY_GUARD="${G6_READY_GUARD:-15}"
 G6_SCAN_GUARD="${G6_SCAN_GUARD:-600}"
 G6_NOW="${G6_NOW:-}"
 
@@ -514,11 +520,27 @@ verify_resource_plan() {
 preflight_tools() {
   local t missing=""
   for t in "$G6_LOSETUP" "$G6_MKFS" "$G6_MOUNT" "$G6_UMOUNT" "$G6_BLKID" "$G6_DUMPE2FS" \
-           "$G6_TIME" "$G6_DF" python3 sha256sum; do
+           "$G6_TIME" "$G6_DF" "$G6_SETSID" python3 sha256sum; do
     command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
   done
   [ -z "$missing" ] || { blocked "tools unavailable:$missing — a preflight question, not \
 something to work around at run time"; return 2; }
+
+  # The kill guard is a delivery of its own and the run cannot exist without it, so its absence
+  # is settled here — not discovered with a candidate already launched.
+  [ -x "$G6_SUPERVISOR" ] \
+    || { blocked "the supervisor '$G6_SUPERVISOR' is not executable — no kill guard, no run"; return 2; }
+
+  # setsid that exists but does not detach is the same preflight question with a worse answer:
+  # a guard sharing the controller's session dies with the controller. Proved, not assumed —
+  # the probe's session id has to differ from ours.
+  local here_sid there_sid
+  read -r _ _ _ _ _ here_sid _ < "/proc/$$/stat"
+  there_sid="$("$G6_SETSID" bash -c \
+    'read -r _ _ _ _ _ s _ < /proc/self/stat; printf %s "$s"' 2>/dev/null)"
+  { [ -n "$there_sid" ] && [ "$there_sid" != "$here_sid" ]; } \
+    || { blocked "'$G6_SETSID' does not start a new session — the guard would die with the \
+controller it is meant to outlive"; return 2; }
   say "tool preflight ok"
 }
 
@@ -585,104 +607,188 @@ check_capacity() {
 # ------------------------------------------------------------------ kill guard
 
 G6_LAST_CLASS=""; G6_LAST_RAW=""; G6_LAST_SIGNAL=""; G6_LAST_PID=""; G6_LAST_PGID=""
-G6_LAST_WATCHDOG=""
+G6_LAST_STARTTIME=""; G6_LAST_SUPERVISOR=""
+
+# /proc/<pid>/stat past the command name, so the fields count from the state: $1 state, $3 pgrp,
+# $20 starttime. The comm field can contain spaces and parentheses, which is why the line is cut
+# at the LAST ')'.
+stat_tail()  { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null; }
+tail_field() { printf '%s' "$1" | awk -v n="$2" '{ print $n }'; }
+
+# The licence every controller-side signal is checked against: the recorded pid exists, sits in
+# the recorded group, and carries the recorded start time. A bare number is never a licence —
+# on a host that recycles pids, a number alone can come to mean somebody else's work.
+guard_identity_holds() {
+  local l; l="$(stat_tail "$G6_LAST_PID")"
+  [ -n "$l" ] || return 1
+  [ "$(tail_field "$l" 3)" = "$G6_LAST_PGID" ] && \
+    [ "$(tail_field "$l" 20)" = "$G6_LAST_STARTTIME" ]
+}
+
+# The controller's last resort, for a run its supervisor did not close: TERM, grace, KILL —
+# every signal only while the identity above still verifies. A pid that is gone needs nothing.
+# A pid that answers with a different group or start time is a stranger wearing a recycled
+# number, and it is refused a signal, not sent one on suspicion. Survivors beyond the leader
+# are the supervisor's to sweep (it owns them); without it there is no identity to check them
+# against, so they are reported, never shot blind. Returns 1 if the leader would not die.
+guarded_fallback_reap() {
+  { [ -n "$G6_LAST_PID" ] && [ -n "$G6_LAST_STARTTIME" ]; } || return 0
+  if ! guard_identity_holds; then
+    [ -d "/proc/$G6_LAST_PID" ] && \
+      say "pid $G6_LAST_PID no longer matches the recorded identity — refusing to signal it"
+    return 0
+  fi
+  kill -TERM -- "-$G6_LAST_PGID" 2>/dev/null
+  local n=0
+  while guard_identity_holds && [ "$n" -lt "$G6_GRACE" ]; do sleep 1; n=$(( n + 1 )); done
+  guard_identity_holds && kill -KILL -- "-$G6_LAST_PGID" 2>/dev/null
+  n=0
+  while guard_identity_holds && [ "$n" -lt "$G6_REAP_LIMIT" ]; do sleep 1; n=$(( n + 1 )); done
+  ! guard_identity_holds
+}
+
+# What a signal to the CONTROLLER does about the run in flight, and it does it BEFORE the
+# terminal record is published: §5 — terminate and reap only known children, then publish, then
+# leave with the raw signal. The known child is the supervisor, so the signal is handed to it —
+# it owns the group and closes it bounded — and the identity-checked fallback above is what
+# remains if the supervisor is already gone. Leaving the group to the distant scan deadline
+# instead would publish a record about a workload still running.
+guard_interrupt_now() {
+  local sup="${G6_LAST_SUPERVISOR:-}" n=0 bound=$(( G6_GRACE + G6_REAP_LIMIT + 5 ))
+  if [ -n "$sup" ] && kill -0 "$sup" 2>/dev/null; then
+    kill -TERM "$sup" 2>/dev/null
+    while kill -0 "$sup" 2>/dev/null && [ "$n" -lt "$bound" ]; do sleep 1; n=$(( n + 1 )); done
+    kill -KILL "$sup" 2>/dev/null
+    wait "$sup" 2>/dev/null
+    G6_LAST_SUPERVISOR=""
+  fi
+  guarded_fallback_reap \
+    || say "the guarded leader survived the interrupt reap — the record will say so"
+}
 
 guarded_run() {  # timeout label outdir -- command...
   local timeout="$1" label="$2" outdir="$3"; shift 3; [ "$1" = "--" ] && shift
   G6_LAST_CLASS=""; G6_LAST_RAW=""; G6_LAST_SIGNAL=""; G6_LAST_PID=""; G6_LAST_PGID=""
+  G6_LAST_STARTTIME=""; G6_LAST_SUPERVISOR=""
   mkdir -p "$outdir" || { blocked "cannot create '$outdir'"; return 2; }
 
-  # The argv that actually ran, recorded here rather than re-typed later: a receipt quoting a
-  # command line somebody printed separately is a receipt for a command nobody watched.
+  # THE GUARD STARTS FIRST, AND THE GUARD IS WHAT STARTS THE CANDIDATE.
+  #
+  # A watchdog attached after the launch leaves a window: kill the controller between the two —
+  # SIGKILL, the one signal nothing can trap — and the candidate runs with no deadline at all.
+  # So the supervisor is detached first, into a session of its own where neither the
+  # controller's death nor a signal aimed at its group can reach it, and the candidate does not
+  # exist until the supervisor launches it. No supervisor, no candidate; there is nothing to
+  # guard in the gap because nothing has been released into it. As the candidate's parent it
+  # owns the group it kills — see g6-supervisor.sh for the identity rules — and this loop here
+  # only WAITS for its answer and classifies it.
+  if [ ! -x "$G6_SUPERVISOR" ]; then
+    G6_LAST_CLASS="TOOLING_FAILURE"
+    blocked "the supervisor '$G6_SUPERVISOR' is not executable — nothing was launched"
+    return 2
+  fi
+  rm -f "$outdir/$label.ready" "$outdir/$label.status" "$outdir/$label.argv"
+  "$G6_SETSID" "$G6_SUPERVISOR" "$timeout" "$G6_GRACE" "$G6_REAP_LIMIT" "$G6_TIME" \
+    "$outdir" "$label" -- "$@" > "$outdir/$label.supervisor.out" 2>&1 &
+  G6_LAST_SUPERVISOR=$!
+  local sup="$G6_LAST_SUPERVISOR"
+
+  # READY carries the identity of the launched candidate, and the wait for it is bounded. No
+  # READY means the guard never came up — and because the guard is the only thing that
+  # launches, it also means no candidate is out there running unguarded.
+  local waited=0
+  while [ ! -s "$outdir/$label.ready" ]; do
+    kill -0 "$sup" 2>/dev/null || break
+    [ "$waited" -ge "$G6_READY_GUARD" ] && break
+    sleep 1; waited=$(( waited + 1 ))
+  done
+  if [ ! -s "$outdir/$label.ready" ]; then
+    kill -TERM "$sup" 2>/dev/null
+    waited=0
+    while kill -0 "$sup" 2>/dev/null && [ "$waited" -lt $(( G6_GRACE + 2 )) ]; do
+      sleep 1; waited=$(( waited + 1 ))
+    done
+    kill -KILL "$sup" 2>/dev/null
+    wait "$sup" 2>/dev/null
+    G6_LAST_SUPERVISOR=""
+    local why=""
+    [ -s "$outdir/$label.status" ] && \
+      why="$(awk -F'\t' '$1 == "note" { print $2 }' "$outdir/$label.status")"
+    G6_LAST_CLASS="TOOLING_FAILURE"
+    blocked "the supervisor announced no identity for '$label' within ${G6_READY_GUARD}s\
+${why:+ (}${why}${why:+)} — no candidate was released without a guard"
+    return 2
+  fi
+
+  G6_LAST_PID="$(awk -F'\t' '$1 == "pid" { print $2 }' "$outdir/$label.ready")"
+  G6_LAST_PGID="$(awk -F'\t' '$1 == "pgid" { print $2 }' "$outdir/$label.ready")"
+  G6_LAST_STARTTIME="$(awk -F'\t' '$1 == "starttime" { print $2 }' "$outdir/$label.ready")"
+
+  # The argv that actually ran, recorded rather than re-typed later: a receipt quoting a command
+  # line somebody printed separately is a receipt for a command nobody watched. Written after
+  # READY on purpose — anything watching for it may now signal this controller and find a guard
+  # that already knows whom it guards.
   local argv_q="" a
   for a in "$@"; do argv_q="$argv_q $(printf '%q' "$a")"; done
   printf '%s\n' "${argv_q# }" > "$outdir/$label.argv"
 
-  set -m
-  "$G6_TIME" -v -o "$outdir/$label.time" "$@" \
-    >"$outdir/$label.out" 2>"$outdir/$label.err" &
-  local child=$!
-  set +m
-
-  local pgid=""
-  [ -r "/proc/$child/stat" ] && \
-    pgid="$(sed 's/.*) //' "/proc/$child/stat" 2>/dev/null | awk '{print $3}')"
-  [ -n "$pgid" ] || pgid="$child"
-  if [ "$pgid" != "$child" ]; then
-    kill -KILL "$child" 2>/dev/null; wait "$child" 2>/dev/null
-    G6_LAST_CLASS="TOOLING_FAILURE"
-    blocked "the guarded child is in group $pgid, not its own"
-    return 2
-  fi
-  G6_LAST_PID="$child"; G6_LAST_PGID="$pgid"
-
-  # THE WATCHDOG IS ITS OWN PROCESS, IN ITS OWN SESSION.
-  #
-  # A guard that is a loop inside this shell is only a guard while this shell is alive. SIGKILL
-  # the controller — the one signal nothing can trap — and the loop is gone while the candidate
-  # keeps running: on the full-scale fixture that is an unbounded scan on somebody else's
-  # production host, with nobody left to stop it and no record that it is still there. The same
-  # hole opens more quietly if the controller is killed as part of a process group.
-  #
-  # So the deadline is enforced from outside: setsid detaches the watchdog into a session of its
-  # own, where neither the controller's death nor a signal aimed at the controller's group can
-  # reach it. It watches the child's group, not the controller, and it exits by itself the moment
-  # that group is gone. The in-shell loop below stays, because it is what MEASURES and classifies
-  # the outcome — but it is no longer what enforces it.
-  local wd="$outdir/$label.watchdog"
-  { printf '#!/usr/bin/env bash\n'
-    printf 'pgid=%q; deadline=%q; grace=%q\n' "$pgid" "$timeout" "$G6_GRACE"
-    printf 'waited=0\n'
-    printf 'while kill -0 -- "-$pgid" 2>/dev/null; do\n'
-    printf '  [ "$waited" -ge "$deadline" ] && break\n'
-    printf '  sleep 1; waited=$(( waited + 1 ))\n'
-    printf 'done\n'
-    printf 'kill -0 -- "-$pgid" 2>/dev/null || exit 0\n'
-    printf 'printf "watchdog: the guarded group %%s outlived its %%s second deadline\\n" "$pgid" "$deadline" >&2\n'
-    printf 'kill -TERM -- "-$pgid" 2>/dev/null\n'
-    printf 'g=0\n'
-    printf 'while kill -0 -- "-$pgid" 2>/dev/null && [ "$g" -lt "$grace" ]; do sleep 1; g=$(( g + 1 )); done\n'
-    printf 'kill -KILL -- "-$pgid" 2>/dev/null\n'
-    printf 'exit 0\n'
-  } > "$wd"
-  chmod 0700 "$wd"
-  "$G6_SETSID" "$wd" >"$outdir/$label.watchdog.out" 2>&1 &
-  local watcher=$!
-  G6_LAST_WATCHDOG="$watcher"
-
-  local waited=0 fired=0
-  while kill -0 "$child" 2>/dev/null; do
-    [ "$waited" -ge "$timeout" ] && { fired=1; break; }
+  # The deadline is the supervisor's to enforce. This wait allows for everything the supervisor
+  # is itself allowed to spend — deadline, grace, two bounded reap loops — plus slack, because
+  # two clocks never agree to the second. Outliving even that is tooling trouble, not evidence
+  # about the candidate.
+  local outer=$(( timeout + G6_GRACE + 2 * G6_REAP_LIMIT + G6_READY_GUARD + 10 ))
+  waited=0
+  while [ ! -s "$outdir/$label.status" ]; do
+    kill -0 "$sup" 2>/dev/null || break
+    [ "$waited" -ge "$outer" ] && break
     sleep 1; waited=$(( waited + 1 ))
   done
-  if [ "$fired" = 1 ]; then
-    kill -TERM -- "-$pgid" 2>/dev/null
-    local g=0
-    while kill -0 "$child" 2>/dev/null && [ "$g" -lt "$G6_GRACE" ]; do sleep 1; g=$(( g + 1 )); done
-    kill -KILL -- "-$pgid" 2>/dev/null
+
+  if [ ! -s "$outdir/$label.status" ]; then
+    # A wedged supervisor is shut down; one that died without its record needs no shutting
+    # down. Either way the candidate is closed by verified identity, never by a number, and
+    # the run is BLOCKED: nobody measured how this workload ended.
+    kill -TERM "$sup" 2>/dev/null
+    waited=0
+    while kill -0 "$sup" 2>/dev/null && [ "$waited" -lt $(( G6_GRACE + 2 )) ]; do
+      sleep 1; waited=$(( waited + 1 ))
+    done
+    kill -KILL "$sup" 2>/dev/null
+    wait "$sup" 2>/dev/null
+    G6_LAST_SUPERVISOR=""
+    G6_LAST_CLASS="TOOLING_FAILURE"
+    if guarded_fallback_reap; then
+      blocked "the supervisor left no status for '$label'; the guarded run was settled by \
+identity, never by a number"
+    else
+      blocked "the supervisor left no status for '$label' and the guarded leader would not die"
+    fi
+    return 2
   fi
 
-  # The child is done one way or the other, so the deadline no longer has anything to enforce.
-  # Reaped here rather than left to exit on its own, because a watchdog still sleeping on a dead
-  # group is a process nobody accounted for.
-  kill -TERM "$watcher" 2>/dev/null
-  wait "$watcher" 2>/dev/null
+  wait "$sup" 2>/dev/null
+  G6_LAST_SUPERVISOR=""
 
-  wait "$child"; local raw=$?
+  local raw fired group note
+  raw="$(awk -F'\t' '$1 == "raw" { print $2 }' "$outdir/$label.status")"
+  fired="$(awk -F'\t' '$1 == "fired" { print $2 }' "$outdir/$label.status")"
+  group="$(awk -F'\t' '$1 == "group" { print $2 }' "$outdir/$label.status")"
+  note="$(awk -F'\t' '$1 == "note" { print $2 }' "$outdir/$label.status")"
+
+  case "$raw" in
+    ''|*[!0-9]*)
+      G6_LAST_CLASS="TOOLING_FAILURE"
+      blocked "the supervisor's status for '$label' carries no raw exit (${note:-no note})"
+      return 2 ;;
+  esac
+  if [ "$group" != cleared ]; then
+    G6_LAST_CLASS="TOOLING_FAILURE"
+    blocked "the guarded group for '$label' did not close: ${group:-unreported}"
+    return 2
+  fi
+
   G6_LAST_RAW="$raw"
   [ "$raw" -gt 128 ] && G6_LAST_SIGNAL=$(( raw - 128 ))
-
-  local attempt=0
-  while kill -0 -- "-$pgid" 2>/dev/null; do
-    if [ "$attempt" -ge "$G6_REAP_LIMIT" ]; then
-      G6_LAST_CLASS="TOOLING_FAILURE"
-      blocked "process group $pgid survived $G6_REAP_LIMIT kill attempts"
-      return 2
-    fi
-    kill -KILL -- "-$pgid" 2>/dev/null
-    attempt=$(( attempt + 1 )); sleep 1
-  done
-
   if [ "$fired" = 1 ]; then G6_LAST_CLASS="CANDIDATE_TIMEOUT"
   elif [ -n "$G6_LAST_SIGNAL" ]; then G6_LAST_CLASS="EXTERNAL_INTERRUPT"
   elif [ "$raw" = 0 ]; then G6_LAST_CLASS="OK"
@@ -691,13 +797,15 @@ guarded_run() {  # timeout label outdir -- command...
   {
     printf 'label\t%s\n' "$label";     printf 'class\t%s\n' "$G6_LAST_CLASS"
     printf 'raw-exit\t%s\n' "$raw";    printf 'signal\t%s\n' "${G6_LAST_SIGNAL:-none}"
-    printf 'pid\t%s\n' "$child";       printf 'pgid\t%s\n' "$pgid"
+    printf 'pid\t%s\n' "$G6_LAST_PID"; printf 'pgid\t%s\n' "$G6_LAST_PGID"
+    printf 'starttime\t%s\n' "$G6_LAST_STARTTIME"
+    printf 'supervisor-note\t%s\n' "${note:-none}"
     printf 'stdout\t%s\n' "$outdir/$label.out"
     printf 'stderr\t%s\n' "$outdir/$label.err"
     printf 'time\t%s\n' "$outdir/$label.time"
     printf 'argv\t%s\n' "$(cat "$outdir/$label.argv")"
   } > "$outdir/$label.meta"
-  say "$label: class=$G6_LAST_CLASS raw=$raw pid=$child pgid=$pgid"
+  say "$label: class=$G6_LAST_CLASS raw=$raw pid=$G6_LAST_PID pgid=$G6_LAST_PGID"
   [ "$G6_LAST_CLASS" = "OK" ]
 }
 
@@ -1444,10 +1552,13 @@ code $qcode, record ${qrec:-none})"
 
   # A signal is an outcome too, and from the boundary onwards it is a VERDICT rather than a
   # refusal. Without this the shell dies where it stands and the evidence directory is left
-  # saying RUNNING for ever, which is the one state nobody can classify later.
-  trap 'G6_RAW_SIGNAL=INT  terminalize BLOCKED "the run was interrupted by SIGINT"'  INT
-  trap 'G6_RAW_SIGNAL=TERM terminalize BLOCKED "the run was interrupted by SIGTERM"' TERM
-  trap 'G6_RAW_SIGNAL=HUP  terminalize BLOCKED "the run was interrupted by SIGHUP"'  HUP
+  # saying RUNNING for ever, which is the one state nobody can classify later. The order inside
+  # the trap is §5's: terminate and reap the known child FIRST, bounded — a guarded workload
+  # must not outlive the record that claims the run is over — then publish, then leave with the
+  # raw signal.
+  trap 'G6_RAW_SIGNAL=INT;  guard_interrupt_now; terminalize BLOCKED "the run was interrupted by SIGINT"'  INT
+  trap 'G6_RAW_SIGNAL=TERM; guard_interrupt_now; terminalize BLOCKED "the run was interrupted by SIGTERM"' TERM
+  trap 'G6_RAW_SIGNAL=HUP;  guard_interrupt_now; terminalize BLOCKED "the run was interrupted by SIGHUP"'  HUP
 
   G6_MUTATED=1
   lifecycle_to_mounted || terminalize BLOCKED "lifecycle: $G6_LIFECYCLE_WHY"

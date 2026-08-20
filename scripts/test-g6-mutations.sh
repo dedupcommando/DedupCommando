@@ -21,8 +21,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/test-g6-stubs.sh"
 
-DELIVERY="g6-controller.sh g6-image-lib.sh g6-make-fixture.sh g6-publish-record.py \
-g6-verify-counts.py g6-observe-destination.py"
+DELIVERY="g6-controller.sh g6-supervisor.sh g6-image-lib.sh g6-make-fixture.sh \
+g6-publish-record.py g6-verify-counts.py g6-observe-destination.py"
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 g6t_install_stubs "$WORK/bin"
@@ -894,8 +894,15 @@ mutate_row "pub/terminal-unsealed" g6-publish-record.py \
 
 # --- the route as a whole
 mutate_row "route/signal" g6-controller.sh \
-  "  trap 'G6_RAW_SIGNAL=TERM terminalize BLOCKED \"the run was interrupted by SIGTERM\"' TERM" \
+  "  trap 'G6_RAW_SIGNAL=TERM; guard_interrupt_now; terminalize BLOCKED \"the run was interrupted by SIGTERM\"' TERM" \
   '  :'
+
+# The reap half alone: the record is still published and the exit is still 143, but the guarded
+# workload is left to the distant scan deadline — the pre-§5 behaviour, and the scenario now
+# has to notice the scan outliving the terminal record.
+mutate_row "route/signal-reap" g6-controller.sh \
+  "  trap 'G6_RAW_SIGNAL=TERM; guard_interrupt_now; terminalize BLOCKED \"the run was interrupted by SIGTERM\"' TERM" \
+  "  trap 'G6_RAW_SIGNAL=TERM; terminalize BLOCKED \"the run was interrupted by SIGTERM\"' TERM"
 
 mutate_row "route/contour-first" g6-controller.sh \
   'route_common() {  # fresh | resume' \

@@ -787,6 +787,19 @@ g6s_route_signal() {  # delivery
   grep -q 'interrupted by SIG' "$G6_WORK/TERMINAL" \
     || { printf 'route-signal -> the terminal record does not name the signal: %s\n' \
            "$(g6s_terminal_field reason)"; return 1; }
+  # §5: the known child is terminated and reaped BEFORE the record is published, not left to
+  # the scan guard's distant deadline. The identity the guard recorded is the proof: the route
+  # has exited, so that pid must be gone or must no longer carry the recorded start time.
+  local spid sstart sline
+  spid="$(awk -F'\t' '$1 == "pid" { print $2 }' "$G6_WORK/scenarios/SCAN.ready" 2>/dev/null)"
+  sstart="$(awk -F'\t' '$1 == "starttime" { print $2 }' "$G6_WORK/scenarios/SCAN.ready" 2>/dev/null)"
+  [ -n "$spid" ] \
+    || { printf 'route-signal -> the guard recorded no identity for the scan\n'; return 1; }
+  sline="$(sed 's/.*) //' "/proc/$spid/stat" 2>/dev/null)"
+  if [ -n "$sline" ] && [ "$(printf '%s' "$sline" | awk '{ print $1 }')" != Z ] \
+     && [ "$(printf '%s' "$sline" | awk '{ print $20 }')" = "$sstart" ]; then
+    printf 'route-signal -> the guarded scan outlived the terminal record\n'; return 1
+  fi
   return 0
 }
 
@@ -1501,6 +1514,7 @@ verdict/multiline	g6s_verdict_multiline	hold	verdict-multiline ->	-	-
 pub/physical-no-overwrite	g6s_pub_physical_no_overwrite	reclass	is already published	appeared while it was being written	2/2
 pub/terminal-unsealed	g6s_pub_terminal_unsealed	hold	terminal-unsealed ->	-	-
 route/signal	g6s_route_signal	hold	route-signal ->	-	-
+route/signal-reap	g6s_route_signal	hold	route-signal ->	-	-
 route/contour-first	g6s_route_contour_first	hold	route-contour-first ->	-	-
 cal/candidate-pin	g6s_cal_candidate_pin	hold	cal-candidate-pin ->	-	-
 cal/kit-separate	g6s_cal_kit_separate	refuse	the calibration and the run share	-	-
