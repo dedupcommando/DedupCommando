@@ -218,5 +218,23 @@ grep -qE 'block/[^/]*/loop/backing_(ino|dev)|SYSFS[^ ]*backing_(ino|dev)' <<<"$L
   || ok "no executable line reads an invented sysfs field"
 
 echo
+echo "== 6. the margin is measured on a directory that exists =="
+# The first capacity check happens before anything is created, so the directory the image will
+# live in is not there yet — the library creates it in prepare. Measuring THAT directory measures
+# nothing: df fails, the reading comes back empty, and the run blocks on its own arithmetic
+# instead of on the machine. The bench no longer creates it either, so this is the real state a
+# run starts from.
+setup
+IMG_DIR="$(dirname "$G6_IMAGE")"
+[ ! -e "$IMG_DIR" ] && ok "the image directory does not exist before prepare" \
+                    || bad "the image directory does not exist before prepare"
+bash "$HERE/g6-controller.sh" capacity-hook "$G6_REMOTE_ROOT" >/dev/null 2>&1 \
+  && ok "the sanctioned root can be measured" || bad "the sanctioned root can be measured"
+out="$(bash "$HERE/g6-controller.sh" capacity-hook "$IMG_DIR" 2>&1)"
+g6_has "$out" 'cannot measure free bytes' \
+  && ok "measuring the absent image directory refuses, and says so" \
+  || bad "measuring the absent image directory refuses, and says so"
+
+echo
 echo "== result: PASS=$PASS FAIL=$FAIL =="
 [ "$FAIL" -eq 0 ]

@@ -744,7 +744,12 @@ nothing was created and no device was touched"; return 1; }
   local g m u
   g=$(( LIVE_G / CAL_DIVISOR )); m=$LIVE_M; u=$(( LIVE_U / CAL_DIVISOR ))
 
-  check_capacity "$(dirname "$cal_img")" \
+# The margin is measured on the sanctioned root, not on the image directory: that directory does
+# not exist yet — `prepare` creates it (g6-image-lib.sh mkdir before the image is made) — and df
+# on a path that is not there measures nothing, which this function then reports as BLOCKED. The
+# image lands on the root's filesystem anyway, so the root is both the measurable answer and the
+# correct one. The stub bench used to create g6-image up front, which is why no scenario saw it.
+  check_capacity "$G6_REMOTE_ROOT" \
     || { blocked "capacity before the calibration image was created"; return 2; }
 
   cal_lib prepare >/dev/null 2>&1 || { blocked "calibration lifecycle: prepare"; return 2; }
@@ -752,13 +757,13 @@ nothing was created and no device was touched"; return 1; }
   cal_lib format  >/dev/null 2>&1 || { blocked "calibration lifecycle: format"; return 2; }
   cal_lib mount   >/dev/null 2>&1 || { blocked "calibration lifecycle: mount"; return 2; }
 
-  check_capacity "$(dirname "$cal_img")" "$cal_mnt" \
+  check_capacity "$G6_REMOTE_ROOT" "$cal_mnt" \
     || { blocked "capacity after the calibration mkfs"; return 2; }
 
   # The generator gets a hook here too, so the calibration is measured between batches and after
   # the last one exactly as the run is. A contour that skips it is not the same contour.
   local cal_hook="$outdir/capacity-hook"
-  write_capacity_hook "$cal_hook" "$(dirname "$cal_img")" "$cal_mnt" \
+  write_capacity_hook "$cal_hook" "$G6_REMOTE_ROOT" "$cal_mnt" \
     || { blocked "cannot prepare the calibration capacity hook"; return 2; }
 
   env G6_G="$g" G6_M="$m" G6_U="$u" G6_B="$LIVE_B" G6_SEED="calibration-$LIVE_SEED" \
@@ -1324,7 +1329,12 @@ code $qcode, record ${qrec:-none})"
 
   # Capacity BEFORE anything is created. Finding out that the image does not fit after writing
   # sixteen gigabytes of it is finding out too late.
-  check_capacity "$(dirname "$G6_IMAGE")" \
+# The margin is measured on the sanctioned root, not on the image directory: that directory does
+# not exist yet — `prepare` creates it (g6-image-lib.sh mkdir before the image is made) — and df
+# on a path that is not there measures nothing, which this function then reports as BLOCKED. The
+# image lands on the root's filesystem anyway, so the root is both the measurable answer and the
+# correct one. The stub bench used to create g6-image up front, which is why no scenario saw it.
+  check_capacity "$G6_REMOTE_ROOT" \
     || terminalize BLOCKED "capacity before the image was created"
 
   # What the filesystem must be able to hold, handed to the steps that format it. mkfs cannot be
@@ -1355,16 +1365,16 @@ code $qcode, record ${qrec:-none})"
 
   # And again the moment the filesystem exists, because what mkfs actually produced — not what it
   # was asked for — is the first time the inode total is a fact.
-  check_capacity "$(dirname "$G6_IMAGE")" "$G6_FIXTURE_ROOT" \
+  check_capacity "$G6_REMOTE_ROOT" "$G6_FIXTURE_ROOT" \
     || terminalize BLOCKED "capacity after mkfs"
 
-  check_capacity "$(dirname "$G6_IMAGE")" "$G6_FIXTURE_ROOT" \
+  check_capacity "$G6_REMOTE_ROOT" "$G6_FIXTURE_ROOT" \
     || terminalize BLOCKED "capacity before generation"
 
   # The hook is a generated executable carrying the exact paths, so the generator invokes ONE
   # program with no arguments and there is no word splitting anywhere in the chain.
   local hook="$G6_WORK/capacity-hook"
-  write_capacity_hook "$hook" "$(dirname "$G6_IMAGE")" "$G6_FIXTURE_ROOT" \
+  write_capacity_hook "$hook" "$G6_REMOTE_ROOT" "$G6_FIXTURE_ROOT" \
     || terminalize BLOCKED "cannot prepare the capacity hook"
 
   local g m u b seed

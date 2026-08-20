@@ -126,6 +126,14 @@ exit 0'
   g6t_make_stub df '
 inodes=0; for a in "$@"; do [ "$a" = "-i" ] && inodes=1; done
 target=""; for a in "$@"; do case "$a" in -*) ;; *) target="$a" ;; esac; done
+# Real df cannot measure a path that is not there, and neither may this. A stub that answers for
+# any string lets the delivery measure a directory it has not created yet and look healthy doing
+# it — which is exactly how "the margin is taken on dirname(image), before prepare makes it"
+# survived a green suite.
+if [ -n "$target" ] && [ ! -e "$target" ]; then
+  printf "df: %s: No such file or directory\n" "$target" >&2
+  exit 1
+fi
 inside=0
 case "$target" in ${G6T_INSIDE:-__none__}*) inside=1 ;; esac
 if [ "$inodes" = 1 ]; then
@@ -173,7 +181,10 @@ g6t_new_world() {  # base-dir
   G6T_W="$1/w$RANDOM$RANDOM"
   # The state and the work directory live UNDER the sanctioned root, because that is what the
   # plan pins and what containment requires: they are written on every step.
-  mkdir -p "$G6T_W/sys" "$G6T_W/uuids" "$G6T_W/remote/g6-image" \
+  # g6-image is deliberately NOT created here. The delivery creates it in prepare, and a bench
+  # that makes it first turns "the run measures a directory that does not exist yet" into a
+  # scenario nobody can write.
+  mkdir -p "$G6T_W/sys" "$G6T_W/uuids" \
            "$G6T_W/remote/g6-state" "$G6T_W/remote/g6-work"
   : > "$G6T_W/mountinfo"; : > "$G6T_W/log"
   export G6T_W
