@@ -457,6 +457,36 @@ g6s_s3_partial_destination() {  # delivery
   return 0
 }
 
+# S4's last postcondition is that the refusal left the checkpoint openable, and the probe that
+# checks it is read-only and independent — no extra candidate run. The stand-in IS the real
+# candidate, so the refusal is genuine; it then corrupts the checkpoint on its way out, which
+# is exactly the damage the probe exists to catch. FAIL, and the reason says the checkpoint
+# stopped opening: the candidate broke its own database, not the environment.
+g6s_s4_still_opens() {  # delivery
+  local d="$1" out rc=0
+  g6s_world
+  { printf '#!/usr/bin/env bash\n'
+    printf 'rc=0; %q "$@" || rc=$?\n' "$DEDCOM"
+    printf 'prev=""\n'
+    printf 'for a in "$@"; do\n'
+    printf '  if [ "$prev" = --export-csv ] && [ "${a##*/}" = dedcom.db ]; then\n'
+    printf '    printf junk > "$a"\n'
+    printf '  fi\n'
+    printf '  prev="$a"\n'
+    printf 'done\n'
+    printf 'exit $rc\n'
+  } > "$G6T_W/corrupting"
+  chmod +x "$G6T_W/corrupting"
+  g6s_seal "$d" "$G6T_W/corrupting"
+  out="$(g6s_route "$d" 2>&1)" || rc=$?
+  [ "$rc" = 1 ] || { printf 's4-still-opens -> a broken checkpoint ended %s, not FAIL\n' "$rc"
+                     return 1; }
+  g6_has "$out" 'no longer opens' \
+    || { printf 's4-still-opens -> the failure does not say the checkpoint stopped opening\n'
+         return 1; }
+  return 0
+}
+
 # ------------------------------------------------------------------ calibration
 
 # Without a sanction the calibration must do NOTHING — not a device, not a directory. The proof
@@ -1539,6 +1569,7 @@ pub/reentry-0	g6s_pub_reentry_pass	hold	reentry-0 ->	-	-
 pub/reentry-1	g6s_pub_reentry_fail	hold	reentry-1 ->	-	-
 pub/reentry-2	g6s_pub_reentry_blocked	hold	reentry-2 ->	-	-
 s3/partial-destination	g6s_s3_partial_destination	hold	s3-partial ->	-	-
+s4/still-opens	g6s_s4_still_opens	hold	s4-still-opens ->	-	-
 cal/no-sanction	g6s_cal_no_sanction	hold	cal-no-sanction ->	-	-
 cal/formula	g6s_cal_formula	hold	cal-formula ->	-	-
 cal/bootstrap-blocked	g6s_cal_bootstrap_blocked	hold	cal-bootstrap ->	-	-

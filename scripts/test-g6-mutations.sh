@@ -1087,6 +1087,12 @@ mutate_row "route/scan-guard-used" g6-controller.sh \
   '  guarded_run "$(calibration_field guard-SCAN)" SCAN "$outdir" -- \' \
   '  guarded_run 600 SCAN "$outdir" -- \'
 
+# The read-only probe removed: a candidate that corrupts its checkpoint after the S4 refusal
+# sails through, and the scenario that breaks the checkpoint on purpose has to notice.
+mutate_row "s4/still-opens" g6-controller.sh \
+  '  checkpoint_opens_ro "$st/dedcom.db" || {' \
+  '  true || {'
+
 mutate_row "cal/capacity-hook" g6-controller.sh \
       '      G6_BATCH="$G6_BATCH" G6_CAPACITY_HOOK="$cal_hook" \' \
       '      G6_BATCH="$G6_BATCH" \'

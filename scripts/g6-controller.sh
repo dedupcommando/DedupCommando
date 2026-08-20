@@ -1057,7 +1057,7 @@ S2-post	exit 0; row count equals header + sum of members exactly; mode 0600; no 
 S3	$G6_BIN --state-dir $st --export-csv $out/full.csv
 S3-post	exit 0; atomic replacement — a NEW inode, identical bytes, no temporary left behind
 S4	$G6_BIN --state-dir $st --export-csv $st/dedcom.db
-S4-post	non-zero; refused as a protected name; the checkpoint still opens afterwards
+S4-post	non-zero; refused as a protected name; the checkpoint still opens, proved read-only
 EOF
 }
 
@@ -1068,6 +1068,19 @@ c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
 one = lambda s: c.execute(s).fetchone()[0]
 print(one("SELECT COUNT(*) FROM file"), one("SELECT COUNT(*) FROM file_group"),
       one("SELECT COALESCE(SUM(file_count),0) FROM file_group"))
+PY
+}
+
+# Read-only, independent proof that a checkpoint still opens: the same way the verifier reads
+# it, never one more run of the candidate. The census of candidate invocations stays exactly
+# the guarded, receipted set — a probe that ran the candidate outside every guard, census and
+# receipt was an invocation nobody sanctioned and nobody measured.
+checkpoint_opens_ro() {  # db
+  python3 - "$1" <<'PY' >/dev/null 2>&1
+import sqlite3, sys
+c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+c.execute("SELECT COUNT(*) FROM file").fetchone()
+c.close()
 PY
 }
 
@@ -1272,7 +1285,7 @@ run_scenarios() {  # outdir
   grep -q "is dedcom's own dedcom.db" "$outdir/S4.err" || {
     printf 'S4-post: the refusal does not name the protected checkpoint\n' >&2
     sc_end FAIL "S4-post: the refusal does not name the protected checkpoint"; return; }
-  "$G6_BIN" --state-dir "$st" --stats >/dev/null 2>&1 || {
+  checkpoint_opens_ro "$st/dedcom.db" || {
     printf 'S4-post: the checkpoint no longer opens\n' >&2
     sc_end FAIL "S4-post: the checkpoint no longer opens after the refusal"; return; }
   sc_met "S4-refused S4-names-the-checkpoint S4-checkpoint-still-opens"
