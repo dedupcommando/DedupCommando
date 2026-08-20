@@ -55,7 +55,7 @@ for line in "${ROWS[@]}"; do
     refuse)
       if [ "$rc" = 0 ]; then
         bad "[$name] refuse — it was accepted" "$tail"
-      elif printf '%s' "$out" | grep -qF -- "$cause"; then
+      elif g6_has "$out" "$cause"; then
         ok "[$name] refused, naming '$cause'"
       else
         bad "[$name] refused without naming '$cause'" "$tail"
@@ -76,9 +76,9 @@ for line in "${ROWS[@]}"; do
         bad "[$name] reclass — the pristine copy did not refuse at all" "$tail"
       elif [ "$rc" != "${rcpair%%/*}" ]; then
         bad "[$name] refused with $rc, the registry declares ${rcpair%%/*}" "$tail"
-      elif ! printf '%s' "$out" | grep -qF -- "$cause"; then
+      elif ! g6_has "$out" "$cause"; then
         bad "[$name] refused without naming '$cause'" "$tail"
-      elif [ -n "${alt:-}" ] && [ "$alt" != "-" ] && printf '%s' "$out" | grep -qF -- "$alt"; then
+      elif [ -n "${alt:-}" ] && [ "$alt" != "-" ] && g6_has "$out" "$alt"; then
         bad "[$name] the pristine copy already names the mutant's cause '$alt'" "$tail"
       else
         ok "[$name] names '$cause', and not '$alt'"

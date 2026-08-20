@@ -54,7 +54,7 @@ exits_as() {  # label verdict code -- command...
   out="$("$@" 2>&1)" || rc=$?
   local problems=""
   [ "$rc" = "$code" ] || problems="$problems exit=$rc(want $code)"
-  printf '%s' "$out" | grep -q "^VERDICT	$verdict" || problems="$problems no-VERDICT-$verdict"
+  g6_has_line "$out" "VERDICT	$verdict" || problems="$problems no-VERDICT-$verdict"
   [ -f "$G6_WORK/TERMINAL" ] || problems="$problems no-terminal-record"
   if [ -f "$G6_WORK/TERMINAL" ]; then
     "$PUB" --verify --dir "$G6_WORK" --name TERMINAL >/dev/null 2>&1 \
@@ -76,7 +76,7 @@ refuses_prestart() {  # label code -- command...
   out="$("$@" 2>&1)" || rc=$?
   local problems=""
   [ "$rc" = "$code" ] || problems="$problems exit=$rc(want $code)"
-  printf '%s' "$out" | grep -q "^VERDICT	BLOCKED" || problems="$problems no-VERDICT-BLOCKED"
+  g6_has_line "$out" "VERDICT	BLOCKED" || problems="$problems no-VERDICT-BLOCKED"
   [ ! -e "$G6_WORK/TERMINAL" ] || problems="$problems terminal-record-left"
   [ ! -e "$G6_WORK/PUBSTATE" ] || problems="$problems state-file-left"
   [ ! -e "$G6_IMAGE" ]        || problems="$problems image-left"
@@ -151,7 +151,7 @@ setup
 # of a pipe decides the pipeline, so `refuses | grep -q` reads as a failure however well the
 # message matched.
 out="$(bash "$CTL" route 2>&1)" || true
-printf '%s' "$out" | grep -q -- '--mode is required' \
+g6_has "$out" '--mode is required' \
   && ok "the route refuses without a mode" || bad "the route refuses without a mode" "$out"
 
 setup
@@ -205,7 +205,7 @@ env G6_G=5 G6_M=2 G6_U=5 G6_CAPACITY_HOOK="$hookdir/h" \
   || bad "a capacity hook whose path contains a space is invoked exactly"
 out="$(env G6_G=5 G6_M=2 G6_U=5 G6_CAPACITY_HOOK="$hookdir/h --extra" \
          bash "$HERE/g6-make-fixture.sh" --mode rehearsal --root "$G6T_W/spaced2" 2>&1)" || true
-printf '%s' "$out" | grep -q 'never a command line' \
+g6_has "$out" 'never a command line' \
   && ok "a hook carrying arguments in a string is refused" \
   || bad "a hook carrying arguments in a string is refused" "$out"
 
@@ -274,7 +274,7 @@ setup
 # check is right not to recognise it.
 mkdir -p "$G6_WORK"; printf 'half a record\n' > "$G6_WORK/.TERMINAL.999999.tmp"
 out="$(route rehearsal 2>&1)"; rc=$?
-if [ "$rc" = 2 ] && printf '%s' "$out" | grep -q 'a PASS nobody recorded is BLOCKED'; then
+if [ "$rc" = 2 ] && g6_has "$out" 'a PASS nobody recorded is BLOCKED'; then
   ok "an unpublishable PASS becomes BLOCKED with code 2"
 else bad "an unpublishable PASS becomes BLOCKED with code 2" "$(printf '%s' "$out" | tail -5)"; fi
 
@@ -286,14 +286,14 @@ setup
 route rehearsal >/dev/null 2>&1
 before="$(sha256sum < "$G6_WORK/TERMINAL")"
 out="$(route rehearsal 2>&1)"; rc=$?
-if [ "$rc" = 2 ] && printf '%s' "$out" | grep -q 'already carries a finished run'; then
+if [ "$rc" = 2 ] && g6_has "$out" 'already carries a finished run'; then
   ok "a second run is refused before it touches anything"
 else bad "a second run is refused before it touches anything" "$(printf '%s' "$out" | tail -4)"; fi
 [ "$(sha256sum < "$G6_WORK/TERMINAL")" = "$before" ] \
   && ok "and the first run's terminal record is untouched" || bad "the record is untouched"
 printf 'PUBLISHED 0\nstate-sha256\tdeadbeef\n' > "$G6_WORK/PUBSTATE"
 out="$("$PUB" --query-state --state-file "$G6_WORK/PUBSTATE" 2>&1)" || true
-printf '%s' "$out" | grep -q 'FAILED' \
+g6_has "$out" 'FAILED' \
   && ok "a tampered state reads as FAILED, never as a fresh start" \
   || bad "a tampered state reads as FAILED" "$out"
 
@@ -370,7 +370,8 @@ echo
 echo "== 16. the lifecycle chain is cross-linked and resumable =="
 setup
 bash "$HERE/g6-image-lib.sh" prepare >/dev/null 2>&1
-bash "$HERE/g6-image-lib.sh" resume 2>&1 | grep -q 'next=attach' \
+out="$(bash "$HERE/g6-image-lib.sh" resume 2>&1)"
+g6_has "$out" 'next=attach' \
   && ok "resume reads the next step out of durable state" || bad "resume reads the next step"
 bash "$HERE/g6-image-lib.sh" attach >/dev/null 2>&1
 grep -qE '^prev-sha256	[0-9a-f]{64}' "$G6_STATE_DIR/ATTACHED" \
@@ -384,7 +385,7 @@ printf 'image\tx\ndevino\t1:1\nsize\t1\nloop_dev\t/dev/loop7\nremote_root\tx\npr
 rm -f "$G6_STATE_DIR/PREPARED"
 "$PUB" --dir "$G6_STATE_DIR" --name PREPARED < "$WORK/foreign-body" >/dev/null 2>&1
 out="$(bash "$HERE/g6-image-lib.sh" verify 2>&1)"; rc=$?
-if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'links back to PREPARED'; then
+if [ "$rc" != 0 ] && g6_has "$out" 'links back to PREPARED'; then
   ok "a swapped predecessor breaks the cross-link"
 else bad "a swapped predecessor breaks the cross-link" "$(printf '%s' "$out" | tail -3)"; fi
 

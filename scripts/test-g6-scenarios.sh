@@ -409,7 +409,7 @@ g6s_s3_partial_destination() {  # delivery
   out="$(g6s_route "$d" 2>&1)" || rc=$?
   [ "$rc" = 1 ] || { printf 's3-partial -> a half-written destination ended %s, not FAIL\n' "$rc"
                      return 1; }
-  printf '%s' "$out" | grep -q 'half-written state' \
+  g6_has "$out" 'half-written state' \
     || { printf 's3-partial -> the failure does not name the half-written destination\n'
          return 1; }
   return 0
@@ -430,7 +430,7 @@ g6s_cal_no_sanction() {  # delivery
   # And it refused BECAUSE there is no sanction. Something further in would refuse an empty
   # sanction too, and a run that stops for the second reason has not shown that the first gate
   # is there at all.
-  printf '%s' "$out" | grep -q 'refuses without a sanction' \
+  g6_has "$out" 'refuses without a sanction' \
     || { printf 'cal-no-sanction -> it refused for another reason: %s\n' \
            "$(printf '%s' "$out" | tail -1)"; return 1; }
   local t n
@@ -543,9 +543,10 @@ g6s_resume_at() {  # delivery tag steps... -- next
     g6s_lib "$d" "$s" >/dev/null 2>&1 \
       || { printf '%s -> the chain could not be built as far as %s\n' "$tag" "$s"; return 1; }
   done
-  g6s_lib "$d" resume 2>&1 | grep -q "next=$next" \
+  local rout; rout="$(g6s_lib "$d" resume 2>&1)"
+  g6_has "$rout" "next=$next" \
     || { printf '%s -> resume does not name %s as the next step: %s\n' \
-           "$tag" "$next" "$(g6s_lib "$d" resume 2>&1 | tail -1)"; return 1; }
+           "$tag" "$next" "$(printf '%s' "$rout" | tail -1)"; return 1; }
   g6s_lib "$d" "$next" >/dev/null 2>&1 \
     || { printf '%s -> the step resume named did not complete\n' "$tag"; return 1; }
   return 0
@@ -601,7 +602,7 @@ g6s_prov_pre_existing_state() {  # delivery
   out="$(g6s_route "$d" 2>&1)" || rc=$?
   [ "$rc" = 2 ] || { printf 'prov-pre-existing -> a checkpoint that predates the run ended %s\n' \
                        "$rc"; return 1; }
-  printf '%s' "$out" | grep -q 'a checkpoint already exists' \
+  g6_has "$out" 'a checkpoint already exists' \
     || { printf 'prov-pre-existing -> the refusal does not name the earlier checkpoint\n'
          return 1; }
   [ ! -e "$G6_WORK/scenarios/SCAN.meta" ] \
@@ -752,7 +753,7 @@ g6s_route_contour_first() {  # delivery
   [ ! -d "$G6_WORK" ] \
     || { printf 'route-contour-first -> the work directory was created in a refused contour\n'
          return 1; }
-  printf '%s' "$out" | grep -q 'REFUSED' \
+  g6_has "$out" 'REFUSED' \
     || { printf 'route-contour-first -> the contour was not refused at all\n'; return 1; }
   return 0
 }
@@ -861,7 +862,7 @@ g6s_plan_inode_total() {  # delivery
     || rc=$?
   [ "$rc" = 2 ] || { printf 'plan-inode-total -> a filesystem too small for the run ended %s\n' \
                        "$rc"; return 1; }
-  printf '%s' "$out" | grep -q 'internal inode total' \
+  g6_has "$out" 'internal inode total' \
     || { printf 'plan-inode-total -> the refusal does not name the inode total\n'; return 1; }
   return 0
 }
@@ -990,7 +991,7 @@ g6s_prov_sqlite_blocked() {  # delivery
   out="$("$d/g6-verify-counts.py" --db "$G6T_W/not-a-db" --groups 1 --members-per-group 2 \
            --singletons 1 2>&1)" || rc=$?
   printf '%s\n' "$out"
-  printf '%s' "$out" | grep -q Traceback && printf 'prov-sqlite -> it printed a traceback\n'
+  g6_has "$out" Traceback && printf 'prov-sqlite -> it printed a traceback\n'
   # The verifier's own status is the answer, and it is passed through rather than swallowed: this
   # scenario is about WHICH refusal a broken database gets, and a scenario that always exits 0
   # cannot tell one refusal from another.
@@ -1100,7 +1101,7 @@ g6s_route_begin_durable() {  # delivery
   out="$(bash "$d/g6-controller.sh" route --mode rehearsal 2>&1)" || rc=$?
   [ "$rc" = 2 ] || { printf 'route-begin -> a fresh route over an unfinished run exited %s\n' "$rc"
                      return 1; }
-  printf '%s' "$out" | grep -q 'started and did not finish' \
+  g6_has "$out" 'started and did not finish' \
     || { printf 'route-begin -> the refusal does not name the unfinished run\n'; return 1; }
   return 0
 }
@@ -1238,7 +1239,7 @@ g6s_cal_capacity_hook() {  # delivery
            "$G6T_W/cal-h.txt" 2>&1)" \
     && { printf 'cal-hook -> the calibration finished with no capacity between batches\n'
          return 1; }
-  printf '%s' "$out" | grep -q 'fixture did not build' \
+  g6_has "$out" 'fixture did not build' \
     || { printf 'cal-hook -> the calibration stopped for another reason: %s\n' \
            "$(printf '%s' "$out" | tail -1)"; return 1; }
   return 0

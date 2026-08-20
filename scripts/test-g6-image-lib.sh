@@ -126,8 +126,8 @@ echo "== 4. teardown removes nothing it cannot confirm =="
 world; lib prepare >/dev/null
 "$G6_LOSETUP" "$G6_LOOP_DEV" "$G6_IMAGE" >/dev/null 2>&1
 out="$(lib teardown 2>&1)"; rc=$?
-if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'ATTACHED was never published' \
-   && printf '%s' "$out" | grep -q 'INVENTORY:'; then
+if [ "$rc" != 0 ] && g6_has "$out" 'ATTACHED was never published' \
+   && g6_has "$out" 'INVENTORY:'; then
   ok "an unpublished attach is BLOCKED with an inventory"
 else bad "an unpublished attach is BLOCKED with an inventory" "$(printf '%s' "$out" | tail -6)"; fi
 [ -e "$G6_IMAGE" ] && ok "and the image is untouched" || bad "and the image is untouched"
@@ -137,7 +137,7 @@ grep -q '^losetup -d' "$G6T_W/log" && bad "and nothing was detached" || ok "and 
 world; lib prepare >/dev/null; lib attach >/dev/null; lib format >/dev/null
 mkdir -p "$G6_MOUNTPOINT"; "$G6_MOUNT" "$G6_LOOP_DEV" "$G6_MOUNTPOINT" >/dev/null 2>&1
 out="$(lib teardown 2>&1)"; rc=$?
-if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'MOUNTED was never published'; then
+if [ "$rc" != 0 ] && g6_has "$out" 'MOUNTED was never published'; then
   ok "an unpublished mount is BLOCKED with an inventory"
 else bad "an unpublished mount is BLOCKED with an inventory" "$(printf '%s' "$out" | tail -6)"; fi
 grep -q '^umount' "$G6T_W/log" && bad "and nothing was unmounted" || ok "and nothing was unmounted"
@@ -162,7 +162,7 @@ grep -q '/dev/sda1' "$G6T_MI" && ok "the foreign mount survives" || bad "the for
 world; chain >/dev/null
 printf 'deadbeef-0000-0000-0000-000000000000\n' > "$G6T_UUIDS/loop7"
 out="$(lib teardown 2>&1)"; rc=$?
-if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'does not match the machine'; then
+if [ "$rc" != 0 ] && g6_has "$out" 'does not match the machine'; then
   ok "a chain that no longer matches blocks before any removal"
 else bad "a chain that no longer matches blocks before any removal" "$(printf '%s' "$out" | tail -5)"; fi
 [ -e "$G6_IMAGE" ] && ok "and the image is still there" || bad "and the image is still there"
@@ -178,7 +178,7 @@ grep -q '^losetup -d' "$G6T_W/log" && bad "and nothing below it ran" || ok "and 
 # must refuse, and it must refuse BEFORE unlinking the image out from under a live device.
 world; chain >/dev/null
 out="$(G6T_KEEP_BACKING=1 bash "$LIB" teardown 2>&1)"; rc=$?
-if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'still reports a backing file after detach'; then
+if [ "$rc" != 0 ] && g6_has "$out" 'still reports a backing file after detach'; then
   ok "a detach that did not take effect is BLOCKED"
 else bad "a detach that did not take effect is BLOCKED" "$(printf '%s' "$out" | tail -5)"; fi
 [ -e "$G6_IMAGE" ] && ok "and the image was not unlinked under a live device" \
@@ -187,7 +187,7 @@ else bad "a detach that did not take effect is BLOCKED" "$(printf '%s' "$out" | 
 # the clean case, for contrast
 world; chain >/dev/null
 out="$(bash "$LIB" teardown 2>&1)"
-printf '%s' "$out" | grep -q 'teardown complete' && ok "a clean teardown says complete" \
+g6_has "$out" 'teardown complete' && ok "a clean teardown says complete" \
                                                  || bad "a clean teardown says complete" "$out"
 
 # the happy path, and a second run is a clean no-op
@@ -200,16 +200,20 @@ lib teardown >/dev/null 2>&1 && ok "a second teardown is a clean no-op" \
 echo
 echo "== 5. the forbidden discovery forms are absent from the library =="
 scan_lib() { sed 's/[[:space:]]*#.*$//' "$LIB"; }
+# Read once into memory, then match with a here-string. `scan_lib | grep -q` lets grep
+# exit at the first hit, kills sed with SIGPIPE and reports 141 under pipefail — a hit
+# read as a miss. These are real regular expressions, so grep stays; only the pipe goes.
+LIB_SRC="$(scan_lib)"
 for pat in 'losetup --find' 'losetup -f' 'losetup -a'; do
-  scan_lib | grep -qE -- "$pat" && bad "no executable line uses '$pat'" \
+  grep -qE -- "$pat" <<<"$LIB_SRC" && bad "no executable line uses '$pat'" \
                                 || ok "no executable line uses '$pat'"
 done
-scan_lib | grep -qE '/dev/loop\*|\bls .*loop' \
+grep -qE '/dev/loop\*|ls .*loop' <<<"$LIB_SRC" \
   && bad "no executable line globs over loop devices" || ok "no executable line globs over loop devices"
 # The invented fields were SYSFS files. The record still has backing_ino and backing_dev keys —
 # it has to, they are the facts — so what must be absent is any line that reads them from
 # /sys/block/<dev>/loop/, which is where the earlier draft imagined them.
-scan_lib | grep -qE 'block/[^/]*/loop/backing_(ino|dev)|SYSFS[^ ]*backing_(ino|dev)' \
+grep -qE 'block/[^/]*/loop/backing_(ino|dev)|SYSFS[^ ]*backing_(ino|dev)' <<<"$LIB_SRC" \
   && bad "no executable line reads an invented sysfs field" \
   || ok "no executable line reads an invented sysfs field"
 

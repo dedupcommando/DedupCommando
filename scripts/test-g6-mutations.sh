@@ -202,7 +202,7 @@ mutate() {  # label file FROM TO scenario cause
     INVALID=$((INVALID+1))
     bad "[$label] INVALID — the pristine copy did not exit, it stopped (rc=$prc)"; return
   fi
-  if [ "$prc" = 0 ] || ! printf '%s' "$pout" | grep -qF -- "$cause"; then
+  if [ "$prc" = 0 ] || ! g6_has "$pout" "$cause"; then
     INVALID=$((INVALID+1))
     bad "[$label] INVALID — the scenario does not exercise this guard on the pristine copy" \
         "$(printf '%s' "$pout" | tail -3)"
@@ -215,7 +215,7 @@ mutate() {  # label file FROM TO scenario cause
     INVALID=$((INVALID+1))
     bad "[$label] INVALID — the mutant did not exit, it stopped (rc=$mrc)"; return
   fi
-  if printf '%s' "$mout" | grep -qF -- "$cause"; then
+  if g6_has "$mout" "$cause"; then
     SURVIVED=$((SURVIVED+1)); bad "[$label] SURVIVED — the same cause still refuses"; return
   fi
   if [ "$mrc" != 0 ]; then
@@ -265,7 +265,7 @@ mutate_detect() {  # label file FROM TO scenario cause
   if [ "$mrc" = 0 ]; then
     SURVIVED=$((SURVIVED+1)); bad "[$label] SURVIVED — the mutant passes just as well"; return
   fi
-  if printf '%s' "$mout" | grep -qF -- "$cause"; then
+  if g6_has "$mout" "$cause"; then
     KILLED=$((KILLED+1)); ok "[$label] killed — removing it breaks exactly this detection"
   else
     INVALID=$((INVALID+1))
@@ -344,12 +344,12 @@ mutate_reclass() {  # label file FROM TO scenario cause alternative pristine-rc/
         "$(printf '%s' "$pout" | tail -3)"
     return
   fi
-  if ! printf '%s' "$pout" | grep -qF -- "$cause"; then
+  if ! g6_has "$pout" "$cause"; then
     INVALID=$((INVALID+1))
     bad "[$label] INVALID — the pristine copy does not name this cause" "$(printf '%s' "$pout" | tail -3)"
     return
   fi
-  if printf '%s' "$pout" | grep -qF -- "$alt"; then
+  if g6_has "$pout" "$alt"; then
     INVALID=$((INVALID+1))
     bad "[$label] INVALID — the pristine copy already names the fallback cause" \
         "$(printf '%s' "$pout" | tail -3)"
@@ -359,7 +359,7 @@ mutate_reclass() {  # label file FROM TO scenario cause alternative pristine-rc/
   # The mutant: it must still refuse, with the declared status, it must lose this cause, and it
   # must fail for the declared alternative reason rather than for any reason at all.
   local mout mrc=0; mout="$("$scenario" "$dir" 2>&1)" || mrc=$?
-  if printf '%s' "$mout" | grep -qF -- "$cause"; then
+  if g6_has "$mout" "$cause"; then
     SURVIVED=$((SURVIVED+1)); bad "[$label] SURVIVED — the mutant still names it"; return
   fi
   if [ "$mrc" != "$want_mrc" ]; then
@@ -368,7 +368,7 @@ mutate_reclass() {  # label file FROM TO scenario cause alternative pristine-rc/
 reclassification the row is about" "$(printf '%s' "$mout" | tail -3)"
     return
   fi
-  if ! printf '%s' "$mout" | grep -qF -- "$alt"; then
+  if ! g6_has "$mout" "$alt"; then
     INVALID=$((INVALID+1))
     bad "[$label] INVALID — the mutant failed for a foreign reason, not '$alt'" \
         "$(printf '%s' "$mout" | tail -3)"

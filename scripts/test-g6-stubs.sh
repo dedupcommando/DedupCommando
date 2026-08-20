@@ -309,3 +309,23 @@ g6t_write_calibration() {  # scale path [t1] [t2]
     printf 'guard-S3\t%s\n' "$g2"; printf 'guard-S4\t%s\n' "$g1"
   } > "$2"
 }
+
+# ---------------------------------------------------------------- matching, without a pipe
+#
+# `producer | grep -q needle` is a RACE, not a test. grep exits at the first match, the
+# producer takes SIGPIPE, and under `set -o pipefail` the pipeline reports 141 — a match read
+# as a miss. It is the same class that was removed from the G4/G5 harness, and it must never
+# come back through the oracle that judges everything else: a flaky matcher turns a surviving
+# mutant into a killed one at random.
+#
+# Both helpers work on a string already in memory and start no subprocess at all.
+
+g6_has() {  # haystack needle — literal substring
+  case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac
+}
+
+g6_has_line() {  # haystack line — one WHOLE line, literally
+  local nl='
+'
+  case "$nl$1$nl" in *"$nl$2$nl"*) return 0 ;; *) return 1 ;; esac
+}
