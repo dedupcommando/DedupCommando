@@ -331,9 +331,22 @@ g6s_world
 g6s_row_deleter "$G6T_W/deleter"
 g6s_seal "$HERE" "$G6T_W/deleter"
 exits_as "counts that contradict the formulas are FAIL" FAIL 1 -- route rehearsal
+# The two halves of the same question. A verifier that was NEVER there is a preflight matter:
+# the refusal comes before BEGIN and leaves nothing. One that vanished AFTER the run began is
+# the VERIFY step's own guard: the run is accountable by then, so the refusal is a terminal
+# record, not an absence.
 setup
-exits_as "a verifier that cannot be executed is BLOCKED" BLOCKED 2 -- \
+refuses_prestart "a verifier that was never there refuses before BEGIN" 2 -- \
   env G6_VERIFY_COUNTS=/nonexistent/verify bash "$CTL" route --mode rehearsal
+cp "$HERE/g6-verify-counts.py" "$WORK/verify-copy.py"
+{ printf '#!/usr/bin/env bash\n'
+  printf 'for a in "$@"; do [ "$a" = --scan ] && rm -f %q; done\n' "$WORK/verify-copy.py"
+  printf 'exec %q "$@"\n' "$DEDCOM"
+} > "$WORK/vergone"
+chmod +x "$WORK/vergone"
+setup rehearsal "$WORK/vergone"
+exits_as "a verifier that vanished mid-run is BLOCKED at the verify step" BLOCKED 2 -- \
+  env G6_VERIFY_COUNTS="$WORK/verify-copy.py" bash "$CTL" route --mode rehearsal
 
 echo
 echo "== 12. fail-fast records where it stopped =="

@@ -567,6 +567,56 @@ g6s_cal_bootstrap_blocked() {  # delivery
   return 0
 }
 
+# One broken tool, zero footprint. With any of the delivery's own parts missing or lying, the
+# calibration refuses before its first mkdir: no privileged call, no directory, no manifest —
+# and no candidate, which is a fact on disk here rather than an absence of evidence, because
+# the sealed candidate is a stand-in that marks a file the moment it runs. The magic value
+# @samesid builds a setsid that exists, executes, and does not detach — the case the file test
+# cannot see and the probe exists for.
+g6s_cal_tool_refused() {  # delivery tag var value
+  local d="$1" tag="$2" var="$3" val="$4" out rc=0 t n p
+  g6s_world
+  if [ "$val" = @samesid ]; then
+    printf '#!/usr/bin/env bash\nexec "$@"\n' > "$G6T_W/samesid"
+    chmod +x "$G6T_W/samesid"
+    val="$G6T_W/samesid"
+  fi
+  { printf '#!/usr/bin/env bash\n'
+    printf ': > %q\n' "$G6T_W/candidate-ran"
+    printf 'exec %q "$@"\n' "$DEDCOM"
+  } > "$G6T_W/marking"
+  chmod +x "$G6T_W/marking"
+  g6s_seal "$d" "$G6T_W/marking"
+  out="$(env "$var=$val" bash "$d/g6-controller.sh" calibrate --mode rehearsal \
+          "$G6T_W/cal-t.txt" 2>&1)" || rc=$?
+  [ "$rc" != 0 ] \
+    || { printf '%s -> calibrate accepted a world missing %s\n' "$tag" "$var"; return 1; }
+  for t in losetup mkfs.ext4 mount; do
+    n="$(g6s_calls "$t")"
+    [ "${n:-0}" = 0 ] \
+      || { printf '%s -> %s ran %s time(s) under a refused preflight\n' "$tag" "$t" "$n"
+           return 1; }
+  done
+  [ ! -e "$G6T_W/candidate-ran" ] \
+    || { printf '%s -> the candidate ran under a refused preflight\n' "$tag"; return 1; }
+  for p in cal-image cal-mountpoint cal-state-dir; do
+    t="$(awk -F'\t' -v k="$p" '$1 == k { print $2 }' "$PLAN")"
+    if [ -n "$t" ] && [ -e "$t" ]; then
+      printf '%s -> %s exists under a refused preflight\n' "$tag" "$p"; return 1
+    fi
+  done
+  [ ! -e "$G6T_W/cal-t.txt" ] \
+    || { printf '%s -> a manifest exists for a calibration that never ran\n' "$tag"; return 1; }
+  [ ! -e "$G6_WORK/calibration" ] \
+    || { printf '%s -> the calibration evidence directory was created\n' "$tag"; return 1; }
+  return 0
+}
+
+g6s_cal_pf_setsid()     { g6s_cal_tool_refused "$1" cal-pf-setsid     G6_SETSID @samesid; }
+g6s_cal_pf_supervisor() { g6s_cal_tool_refused "$1" cal-pf-supervisor G6_SUPERVISOR /nonexistent-supervisor; }
+g6s_cal_pf_publisher()  { g6s_cal_tool_refused "$1" cal-pf-publisher  G6_PUBLISH /nonexistent-publisher; }
+g6s_cal_pf_verifier()   { g6s_cal_tool_refused "$1" cal-pf-verifier   G6_VERIFY_COUNTS /nonexistent-verifier; }
+
 # The scan guard the route applies is the one the calibration sealed, not a constant anywhere
 # in the delivery. The manifest here carries a SCAN measurement of 3 seconds, so the sealed
 # guard is 1200 — a number no leftover constant equals — and the guard the route's own meta
@@ -589,6 +639,46 @@ g6s_route_scan_guard_used() {  # delivery
   { [ -n "$want" ] && [ "$got" = "$want" ]; } \
     || { printf 'route-scan-guard -> the route applied guard %s, the manifest sealed %s\n' \
            "${got:-none}" "${want:-none}"; return 1; }
+  return 0
+}
+
+# A verifier that is not there is a PRESTART refusal, proved by absence: no BEGIN, no record,
+# no image, no lifecycle mark, no candidate — the tool preflight asks about every part of the
+# delivery before the run announces itself. The question used to wait at the VERIFY step, with
+# a produced checkpoint already on disk and a RUNNING record behind it.
+g6s_route_verifier_preflight() {  # delivery
+  local d="$1" out rc=0 r
+  g6s_world
+  { printf '#!/usr/bin/env bash\n'
+    printf ': > %q\n' "$G6T_W/candidate-ran"
+    printf 'exec %q "$@"\n' "$DEDCOM"
+  } > "$G6T_W/marking"
+  chmod +x "$G6T_W/marking"
+  g6s_seal "$d" "$G6T_W/marking"
+  out="$(G6_VERIFY_COUNTS=/nonexistent-verifier bash "$d/g6-controller.sh" route \
+          --mode rehearsal 2>&1)" || rc=$?
+  [ "$rc" = 2 ] \
+    || { printf 'route-verifier-pf -> exited %s, not BLOCKED\n' "$rc"; return 1; }
+  g6_has_line "$out" 'VERDICT	BLOCKED' \
+    || { printf 'route-verifier-pf -> no BLOCKED verdict line\n'; return 1; }
+  g6_has "$out" 'nothing was touched (proved)' \
+    || { printf 'route-verifier-pf -> the refusal does not prove zero-write: %s\n' \
+           "$(printf '%s' "$out" | tail -1)"; return 1; }
+  for r in PUBSTATE TERMINAL scenarios; do
+    [ ! -e "$G6_WORK/$r" ] \
+      || { printf 'route-verifier-pf -> %s exists, so the refusal was not before BEGIN\n' "$r"
+           return 1; }
+  done
+  [ ! -e "$G6_IMAGE" ] \
+    || { printf 'route-verifier-pf -> an image exists under a prestart refusal\n'; return 1; }
+  for r in PREPARED ATTACHED FORMATTED MOUNTED TORNDOWN; do
+    [ ! -e "$G6_STATE_DIR/$r" ] \
+      || { printf 'route-verifier-pf -> lifecycle record %s exists\n' "$r"; return 1; }
+  done
+  [ ! -e "$G6T_W/candidate-ran" ] \
+    || { printf 'route-verifier-pf -> the candidate ran under a prestart refusal\n'; return 1; }
+  [ "$(g6s_attach_calls)" = 0 ] \
+    || { printf 'route-verifier-pf -> a device was attached under a prestart refusal\n'; return 1; }
   return 0
 }
 
@@ -937,12 +1027,17 @@ g6s_cal_manifest_sealed() {  # delivery
   bash "$d/g6-controller.sh" calibrate --mode rehearsal "$G6T_W/cal-taken.txt" 2>&1
 }
 
-# The calibration fixture is checked by the independent verifier before anything is timed.
+# The calibration fixture is checked by the independent verifier before anything is timed. The
+# stand-in verifier exists and runs — the preflight passes — and rejects what it is shown: the
+# refusal this row pins is the check itself. A verifier that is not there at all is
+# cal/pf-verifier's question, and it is answered before anything exists to check.
 g6s_cal_fixture_verified() {  # delivery
   local d="$1"
   g6s_sealed_world "$d"
-  G6_VERIFY_COUNTS=/nonexistent/verify bash "$d/g6-controller.sh" calibrate --mode rehearsal \
-    "$G6T_W/cal-fx.txt" 2>&1
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$G6T_W/refusing-verify"
+  chmod +x "$G6T_W/refusing-verify"
+  G6_VERIFY_COUNTS="$G6T_W/refusing-verify" bash "$d/g6-controller.sh" calibrate \
+    --mode rehearsal "$G6T_W/cal-fx.txt" 2>&1
 }
 
 # A calibration path with a space in it. Nothing in the environment handed to the lifecycle may
@@ -1573,6 +1668,10 @@ s4/still-opens	g6s_s4_still_opens	hold	s4-still-opens ->	-	-
 cal/no-sanction	g6s_cal_no_sanction	hold	cal-no-sanction ->	-	-
 cal/formula	g6s_cal_formula	hold	cal-formula ->	-	-
 cal/bootstrap-blocked	g6s_cal_bootstrap_blocked	hold	cal-bootstrap ->	-	-
+cal/pf-setsid	g6s_cal_pf_setsid	hold	cal-pf-setsid ->	-	-
+cal/pf-supervisor	g6s_cal_pf_supervisor	hold	cal-pf-supervisor ->	-	-
+cal/pf-publisher	g6s_cal_pf_publisher	hold	cal-pf-publisher ->	-	-
+cal/pf-verifier	g6s_cal_pf_verifier	hold	cal-pf-verifier ->	-	-
 lc/loop-partition	g6s_lc_loop_partition	refuse	is not an exact /dev/loopN name	-	-
 lc/uuid-shape	g6s_lc_uuid_shape	refuse	is not a uuid	-	-
 lc/image-devino	g6s_lc_image_devino	refuse	the image's dev:ino is	-	-
@@ -1599,6 +1698,7 @@ pub/terminal-unsealed	g6s_pub_terminal_unsealed	hold	terminal-unsealed ->	-	-
 route/signal	g6s_route_signal	hold	route-signal ->	-	-
 route/signal-reap	g6s_route_signal	hold	route-signal ->	-	-
 route/scan-guard-used	g6s_route_scan_guard_used	hold	route-scan-guard ->	-	-
+route/verifier-preflight	g6s_route_verifier_preflight	hold	route-verifier-pf ->	-	-
 route/contour-first	g6s_route_contour_first	hold	route-contour-first ->	-	-
 cal/candidate-pin	g6s_cal_candidate_pin	hold	cal-candidate-pin ->	-	-
 cal/kit-separate	g6s_cal_kit_separate	refuse	the calibration and the run share	-	-

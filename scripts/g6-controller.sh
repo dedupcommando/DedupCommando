@@ -535,10 +535,15 @@ preflight_tools() {
   [ -z "$missing" ] || { blocked "tools unavailable:$missing — a preflight question, not \
 something to work around at run time"; return 2; }
 
-  # The kill guard is a delivery of its own and the run cannot exist without it, so its absence
-  # is settled here — not discovered with a candidate already launched.
-  [ -x "$G6_SUPERVISOR" ] \
-    || { blocked "the supervisor '$G6_SUPERVISOR' is not executable — no kill guard, no run"; return 2; }
+  # The delivery's own parts, checked like the system tools: the kill guard, the publisher and
+  # the independent verifier are each load-bearing, and each would otherwise be discovered
+  # missing MID-run — the supervisor with a candidate to launch, the publisher with a record to
+  # write, the verifier with a checkpoint already produced. A refusal here is free; one there
+  # never is.
+  for t in "$G6_SUPERVISOR" "$G6_PUBLISH" "$G6_VERIFY_COUNTS"; do
+    [ -x "$t" ] \
+      || { blocked "'$t' is not executable — the delivery cannot run without its own parts"; return 2; }
+  done
 
   # setsid that exists but does not detach is the same preflight question with a worse answer:
   # a guard sharing the controller's session dies with the controller. Proved, not assumed —
@@ -928,6 +933,11 @@ calibrate() {  # out-manifest
   # manifest, which does not exist yet.
   verify_contour >/dev/null \
     || { refused "calibration refuses outside a verified contour"; return 1; }
+  # The same tool preflight the route runs, at the same point in the frozen order — contour,
+  # then tools — and before the first mkdir, the first lifecycle call and the candidate. A
+  # missing tool discovered mid-lifecycle has already left the machine dirty by the time it is
+  # reported; discovered here, the refusal costs nothing and touches nothing.
+  preflight_tools || return 2
   verify_sanction_core \
     || { refused "calibration refuses without a sanction for this contour, mode and root — \
 nothing was created and no device was touched"; return 1; }

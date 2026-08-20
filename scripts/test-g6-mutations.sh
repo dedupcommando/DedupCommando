@@ -1096,6 +1096,38 @@ mutate_row "s4/still-opens" g6-controller.sh \
   '  checkpoint_opens_ro "$st/dedcom.db" || {' \
   '  true || {'
 
+# --- preflight over the delivery's own parts
+
+# The calibrate-side preflight removed: every tool question then waits until the tool is
+# needed, which is after the lifecycle has already run and the candidate has already scanned.
+mutate_row "cal/pf-publisher" g6-controller.sh \
+  '  preflight_tools || return 2' \
+  '  :'
+
+# The supervisor dropped from the parts the preflight asks about. guarded_run still refuses on
+# its own — but only with the lifecycle already run, which is exactly what the scenario counts.
+mutate_row "cal/pf-supervisor" g6-controller.sh \
+  '  for t in "$G6_SUPERVISOR" "$G6_PUBLISH" "$G6_VERIFY_COUNTS"; do' \
+  '  for t in "$G6_PUBLISH" "$G6_VERIFY_COUNTS"; do'
+
+# The verifier dropped from the same list: the question waits for the verify call, behind a
+# built fixture and a completed calibration scan.
+mutate_row "cal/pf-verifier" g6-controller.sh \
+  '  for t in "$G6_SUPERVISOR" "$G6_PUBLISH" "$G6_VERIFY_COUNTS"; do' \
+  '  for t in "$G6_SUPERVISOR" "$G6_PUBLISH"; do'
+
+# The detachment probe removed: a setsid that exists but does not detach passes preflight, and
+# the whole calibration then completes on a guard that would die with its controller.
+mutate_row "cal/pf-setsid" g6-controller.sh \
+  '  { [ -n "$there_sid" ] && [ "$there_sid" != "$here_sid" ]; } \' \
+  '  { true; } \'
+
+# The route-side twin of cal/pf-verifier: without the preflight entry the missing verifier is
+# discovered at the VERIFY step, behind BEGIN, an image, a scan and a RUNNING record.
+mutate_row "route/verifier-preflight" g6-controller.sh \
+  '  for t in "$G6_SUPERVISOR" "$G6_PUBLISH" "$G6_VERIFY_COUNTS"; do' \
+  '  for t in "$G6_SUPERVISOR" "$G6_PUBLISH"; do'
+
 mutate_row "cal/capacity-hook" g6-controller.sh \
       '      G6_BATCH="$G6_BATCH" G6_CAPACITY_HOOK="$cal_hook" \' \
       '      G6_BATCH="$G6_BATCH" \'
