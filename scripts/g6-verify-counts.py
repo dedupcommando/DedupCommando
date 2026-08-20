@@ -48,12 +48,19 @@ V5_TABLES = (
 # Every table, not only the ones this program reads: a checkpoint missing a column of a table
 # nobody queries here is still not a checkpoint the product would have created.
 V5_COLUMNS = {
-    "scan": ("id", "created_at", "updated_at", "status", "config_json"),
+    # `trashed` is part of the v5 floor (schema.rs FLOOR_V0): a checkpoint without it is not
+    # one this product wrote, and leaving it out of the contract left a real column unguarded.
+    "scan": ("id", "created_at", "updated_at", "status", "config_json", "trashed"),
     "file": ("scan_id", "path", "size", "mtime", "mtime_nsec", "ctime_sec", "ctime_nsec",
              "identity_version", "device", "inode", "nlink", "hash"),
+    # The four `cand_*` columns and `hash_failures` arrive through the migration ladder
+    # (schema.rs, guarded ALTER ADD COLUMN), `results_materialized` through the v2 floor. They
+    # are columns of a table this program already reads, so their absence has to refuse.
     "scan_stats": ("scan_id", "elapsed_seconds", "storage_type", "pool_layout", "zfs_version",
                    "files_scanned", "bytes_hashed", "groups_found", "reclaimable_bytes",
-                   "reclaim_state"),
+                   "reclaim_state", "hash_failures", "results_materialized",
+                   "cand_files_total", "cand_bytes_total",
+                   "cand_files_hashed", "cand_bytes_hashed"),
     "file_mark": ("scan_id", "path", "is_keeper", "action"),
     "dir_dedup": ("scan_id", "signature", "path", "file_count", "size_per_dir"),
     "file_group": ("scan_id", "rank", "hash", "file_count", "size", "reclaim", "object_count",
@@ -85,6 +92,12 @@ V5_INDEXES = {
                                       ("mtime", 0, "BINARY")), 0),
     "file_hash_path": ("file", 0, (("scan_id", 0, "BINARY"), ("hash", 0, "BINARY"),
                                    ("path", 0, "BINARY")), 0),
+    # The reuse identity: seven columns in this exact order. A shorter index wearing this name
+    # would still let the hash cache answer for a file it never saw.
+    "file_reuse_identity": ("file", 0, (("path", 0, "BINARY"), ("size", 0, "BINARY"),
+                                        ("mtime", 0, "BINARY"), ("mtime_nsec", 0, "BINARY"),
+                                        ("ctime_sec", 0, "BINARY"), ("ctime_nsec", 0, "BINARY"),
+                                        ("identity_version", 0, "BINARY")), 0),
     "dir_dedup_by_scan_sig": ("dir_dedup", 0, (("scan_id", 0, "BINARY"),
                                                ("signature", 0, "BINARY")), 0),
     "file_group_hash": ("file_group", 0, (("scan_id", 0, "BINARY"), ("hash", 0, "BINARY")), 0),

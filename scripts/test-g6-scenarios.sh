@@ -184,6 +184,44 @@ g6s_slow_candidate() {  # out seconds
 
 # Scans correctly and then drops one INDEX. The stamp is intact, every table is present, every
 # column is where it should be — and the schema is still not the one the product creates.
+g6s_column_dropper() {  # out table column
+  # The same shape as the index dropper: the stand-in runs the real candidate and then removes
+  # ONE element of the schema, so the refusal that follows is about that element and nothing
+  # else. A guard nobody can take away is a guard nobody has proved.
+  local edit="$1.column.py"
+  { printf 'import sqlite3, sys
+'
+    printf 'c = sqlite3.connect(sys.argv[1])
+'
+    printf 'c.execute("ALTER TABLE %s DROP COLUMN %s")
+' "$2" "$3"
+    printf 'c.commit()
+'
+  } > "$edit"
+  { printf '#!/usr/bin/env bash
+'
+    printf 'sd=""; prev=""; scanning=0
+'
+    printf 'for a in "$@"; do
+'
+    printf '  [ "$prev" = --state-dir ] && sd="$a"
+'
+    printf '  [ "$a" = --scan ] && scanning=1
+'
+    printf '  prev="$a"
+'
+    printf 'done
+'
+    printf '%q "$@" || exit $?
+' "$DEDCOM"
+    printf '[ "$scanning" = 1 ] && python3 %q "$sd/dedcom.db"
+' "$edit"
+    printf 'exit 0
+'
+  } > "$1"
+  chmod +x "$1"
+}
+
 g6s_index_dropper() {  # out index
   local edit="$1.index.py"
   { printf 'import sqlite3, sys\n'
@@ -952,6 +990,33 @@ g6s_prov_invocation_record() {  # delivery
 
 # The stamp and the table names survive; one index does not. A contract that stops at four names
 # cannot see this, and the route must still refuse.
+# One witness per element of the v5 floor. Each takes exactly one thing away, so each refusal
+# names exactly one thing; a single scenario dropping several would prove only that SOMETHING
+# was noticed.
+g6s_prov_column_scan_trashed()      { g6s_prov_column_gone "$1" scan trashed; }
+g6s_prov_column_hash_failures()     { g6s_prov_column_gone "$1" scan_stats hash_failures; }
+g6s_prov_column_materialized()      { g6s_prov_column_gone "$1" scan_stats results_materialized; }
+g6s_prov_column_cand_files_total()  { g6s_prov_column_gone "$1" scan_stats cand_files_total; }
+g6s_prov_column_cand_bytes_total()  { g6s_prov_column_gone "$1" scan_stats cand_bytes_total; }
+g6s_prov_column_cand_files_hashed() { g6s_prov_column_gone "$1" scan_stats cand_files_hashed; }
+g6s_prov_column_cand_bytes_hashed() { g6s_prov_column_gone "$1" scan_stats cand_bytes_hashed; }
+
+g6s_prov_column_gone() {  # delivery table column
+  local d="$1"
+  g6s_world
+  g6s_column_dropper "$G6T_W/column-dropper" "$2" "$3"
+  g6s_seal "$d" "$G6T_W/column-dropper"
+  g6s_route "$d" 2>&1
+}
+
+g6s_prov_index_reuse_identity() {  # delivery
+  local d="$1"
+  g6s_world
+  g6s_index_dropper "$G6T_W/index-dropper" file_reuse_identity
+  g6s_seal "$d" "$G6T_W/index-dropper"
+  g6s_route "$d" 2>&1
+}
+
 g6s_prov_structural_v5() {  # delivery
   local d="$1"
   g6s_world
@@ -1438,6 +1503,14 @@ lc/detach-ineffective	g6s_lc_detach_ineffective	reclass	still reports a backing 
 prov/invocation-record	g6s_prov_invocation_record	hold	prov-invocation ->	-	-
 prov/read-after-verify	g6s_prov_read_after_verify	hold	prov-read-after-verify ->	-	-
 prov/structural-v5	g6s_prov_structural_v5	reclass	indexes missing	does not belong to	1/1
+prov/col-scan-trashed	g6s_prov_column_scan_trashed	reclass	scan is missing columns: trashed	indexes missing	1/1
+prov/col-hash-failures	g6s_prov_column_hash_failures	reclass	scan_stats is missing columns: hash_failures	indexes missing	1/1
+prov/col-materialized	g6s_prov_column_materialized	reclass	scan_stats is missing columns: results_materialized	indexes missing	1/1
+prov/col-cand-files-total	g6s_prov_column_cand_files_total	reclass	scan_stats is missing columns: cand_files_total	indexes missing	1/1
+prov/col-cand-bytes-total	g6s_prov_column_cand_bytes_total	reclass	scan_stats is missing columns: cand_bytes_total	indexes missing	1/1
+prov/col-cand-files-hashed	g6s_prov_column_cand_files_hashed	reclass	scan_stats is missing columns: cand_files_hashed	indexes missing	1/1
+prov/col-cand-bytes-hashed	g6s_prov_column_cand_bytes_hashed	reclass	scan_stats is missing columns: cand_bytes_hashed	indexes missing	1/1
+prov/idx-reuse-identity	g6s_prov_index_reuse_identity	reclass	indexes missing: file_reuse_identity	does not belong to	1/1
 prov/receipt-in-verifier	g6s_prov_receipt_in_verifier	reclass	the receipt is about	BAD files	1/1
 prov/sqlite-blocked	g6s_prov_sqlite_blocked	reclass	BLOCKED: the schema of	Traceback	2/1
 ROWS
