@@ -394,7 +394,14 @@ const NOTHING_CHANGED: &str =
 const FLOOR_V0: &[TableFloor] = &[
     (
         "scan",
-        &["id", "created_at", "updated_at", "status", "config_json", "trashed"],
+        &[
+            "id",
+            "created_at",
+            "updated_at",
+            "status",
+            "config_json",
+            "trashed",
+        ],
     ),
     (
         "file",
@@ -442,7 +449,9 @@ const FLOOR_V0: &[TableFloor] = &[
     ),
     (
         "file_dedup",
-        &["scan_id", "hash", "path", "size", "mtime", "device", "inode"],
+        &[
+            "scan_id", "hash", "path", "size", "mtime", "device", "inode",
+        ],
     ),
     (
         "hash_cache",
@@ -557,14 +566,38 @@ const PRODUCT_TABLES: &[(&str, i64)] = &[
 /// Name, the version it arrived at, its table, whether it is UNIQUE, and its key columns in
 /// order. Every one of them is non-partial, BINARY and ascending, over plain columns — that is
 /// asserted rather than stored, because a squatter is free to differ in exactly those ways.
-type IndexSpec = (&'static str, i64, &'static str, bool, &'static [&'static str]);
+type IndexSpec = (
+    &'static str,
+    i64,
+    &'static str,
+    bool,
+    &'static [&'static str],
+);
 
 const PRODUCT_INDEXES: &[IndexSpec] = &[
     ("file_size", 0, "file", false, &["scan_id", "size"]),
     ("file_hash", 0, "file", false, &["scan_id", "hash"]),
-    ("file_content", 0, "file", false, &["device", "inode", "size", "mtime"]),
-    ("file_path_content", 0, "file", false, &["path", "size", "mtime"]),
-    ("file_hash_path", 0, "file", false, &["scan_id", "hash", "path"]),
+    (
+        "file_content",
+        0,
+        "file",
+        false,
+        &["device", "inode", "size", "mtime"],
+    ),
+    (
+        "file_path_content",
+        0,
+        "file",
+        false,
+        &["path", "size", "mtime"],
+    ),
+    (
+        "file_hash_path",
+        0,
+        "file",
+        false,
+        &["scan_id", "hash", "path"],
+    ),
     (
         "file_reuse_identity",
         0,
@@ -587,7 +620,13 @@ const PRODUCT_INDEXES: &[IndexSpec] = &[
         false,
         &["scan_id", "signature"],
     ),
-    ("file_group_hash", 0, "file_group", false, &["scan_id", "hash"]),
+    (
+        "file_group_hash",
+        0,
+        "file_group",
+        false,
+        &["scan_id", "hash"],
+    ),
     (
         "file_dedup_by_scan_hash",
         0,
@@ -696,7 +735,11 @@ fn ensure_no_squatted_name(conn: &Connection, version: i64) -> Result<()> {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         if (is_unique != 0) != *unique {
-            let expected = if *unique { "is not unique" } else { "is unique" };
+            let expected = if *unique {
+                "is not unique"
+            } else {
+                "is unique"
+            };
             return Err(not_ours(format!("index `{name}` {expected}")));
         }
         if is_partial != 0 {

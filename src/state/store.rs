@@ -16269,8 +16269,7 @@ mod membership_staging_tests {
         }
     }
 
-    const OUT_OF_DOMAIN: &str =
-        "— not in the domain this build can read. Nothing was written.";
+    const OUT_OF_DOMAIN: &str = "— not in the domain this build can read. Nothing was written.";
 
     /// A real published scan of one group, damaged in exactly one summary cell, and the refusal
     /// that damage produces. Real because the refusal has to be the one an export would hit.
@@ -16331,7 +16330,10 @@ mod membership_staging_tests {
             "file_group.hash holds text of length 3 that is not canonical lower-case hex \
              for group rank 0 ",
         );
-        assert!(!detail.contains("abc"), "the stored text is not echoed: {detail}");
+        assert!(
+            !detail.contains("abc"),
+            "the stored text is not echoed: {detail}"
+        );
     }
 
     /// The length alone would say nothing here — the value is 64 characters, exactly as a digest
@@ -16389,22 +16391,40 @@ mod membership_staging_tests {
 
     #[test]
     fn a_negative_object_count_names_the_object_count() {
-        let detail = refusal_for("cell-object-count", "UPDATE file_group SET object_count = -1");
-        assert_names(&detail, "file_group.object_count holds -1 for group rank 0 ");
+        let detail = refusal_for(
+            "cell-object-count",
+            "UPDATE file_group SET object_count = -1",
+        );
+        assert_names(
+            &detail,
+            "file_group.object_count holds -1 for group rank 0 ",
+        );
     }
 
     /// `reclaim_state` is an enum, so it fails in two different ways and both must name it: an
     /// integer that is not a state prints the number, because the number IS the diagnosis.
     #[test]
     fn a_reclaim_state_outside_the_enum_names_the_value() {
-        let detail = refusal_for("cell-state-value", "UPDATE file_group SET reclaim_state = 99");
-        assert_names(&detail, "file_group.reclaim_state holds 99 for group rank 0 ");
+        let detail = refusal_for(
+            "cell-state-value",
+            "UPDATE file_group SET reclaim_state = 99",
+        );
+        assert_names(
+            &detail,
+            "file_group.reclaim_state holds 99 for group rank 0 ",
+        );
     }
 
     #[test]
     fn a_reclaim_state_of_the_wrong_storage_class_names_the_class() {
-        let detail = refusal_for("cell-state-text", "UPDATE file_group SET reclaim_state = 'x'");
-        assert_names(&detail, "file_group.reclaim_state holds text for group rank 0 ");
+        let detail = refusal_for(
+            "cell-state-text",
+            "UPDATE file_group SET reclaim_state = 'x'",
+        );
+        assert_names(
+            &detail,
+            "file_group.reclaim_state holds text for group rank 0 ",
+        );
     }
 
     /// A rank that is not an integer is the case `ORDER BY rank` cannot answer and `row.get::<i64>`
@@ -16413,8 +16433,16 @@ mod membership_staging_tests {
     #[test]
     fn a_rank_of_a_foreign_storage_class_is_read_as_a_value() {
         for (tag, damage, rendered) in [
-            ("cell-rank-text", "UPDATE file_group SET rank = 'abc'", "text"),
-            ("cell-rank-blob", "UPDATE file_group SET rank = X'0102'", "blob"),
+            (
+                "cell-rank-text",
+                "UPDATE file_group SET rank = 'abc'",
+                "text",
+            ),
+            (
+                "cell-rank-blob",
+                "UPDATE file_group SET rank = X'0102'",
+                "blob",
+            ),
         ] {
             let detail = refusal_for(tag, damage);
             assert_names(

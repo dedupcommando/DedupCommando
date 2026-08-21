@@ -1950,7 +1950,9 @@ mod export_csv_tests {
         let checkpoint = std::fs::read(rig.db()).unwrap();
         let stamped = std::fs::metadata(rig.db()).unwrap().modified().unwrap();
 
-        let err = rig.run().expect_err("a damaged summary must refuse the export");
+        let err = rig
+            .run()
+            .expect_err("a damaged summary must refuse the export");
 
         let text = err.to_string();
         assert!(
@@ -3207,7 +3209,9 @@ mod boot_session_load_is_fail_closed_tests {
         {
             let mut store = ScanStore::open(&db).expect("the product creates its own checkpoint");
             let scan = store
-                .begin_scan(&crate::model::scan::ScanConfig::new(vec![dir.to_path_buf()]))
+                .begin_scan(&crate::model::scan::ScanConfig::new(
+                    vec![dir.to_path_buf()],
+                ))
                 .unwrap();
             store
                 .set_status(scan, crate::model::scan::ScanStatus::Complete)
@@ -3365,7 +3369,9 @@ mod boot_session_load_is_fail_closed_tests {
             .expect("a table that is not ours is no reason to refuse a checkpoint that is");
 
         let conn = rusqlite::Connection::open(&db).unwrap();
-        let mut stmt = conn.prepare("SELECT id, body FROM notes ORDER BY id").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, body FROM notes ORDER BY id")
+            .unwrap();
         let rows: Vec<(i64, String)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
@@ -3497,10 +3503,8 @@ mod boot_session_load_is_fail_closed_tests {
         let db = genuine_checkpoint(dir.path(), 0);
         {
             let conn = rusqlite::Connection::open(&db).unwrap();
-            conn.execute_batch(
-                "CREATE INDEX file_scan_identity ON file(scan_id, device, inode);",
-            )
-            .unwrap();
+            conn.execute_batch("CREATE INDEX file_scan_identity ON file(scan_id, device, inode);")
+                .unwrap();
         }
         let before = census(&db);
 
