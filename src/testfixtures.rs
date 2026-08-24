@@ -536,6 +536,92 @@ impl Drop for PlanScenario {
     }
 }
 
+/// A scratch directory that removes itself when the test returns: a green test may not leave a
+/// persistent fixture behind merely because the cargo process eventually exits. The name carries
+/// the pid and a timestamp, so tests running in parallel never share one.
+pub struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    pub fn new(tag: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before the epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "dedcom_scratch_{tag}_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        Self(dir)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+/// A checkpoint the product itself wrote, carrying one completed scan, rewound to the shape a
+/// build of `version` would have left behind. Rewinding the real schema is how the migration tests
+/// build their legacy databases as well — hand-transcribed DDL in this role is precisely what the
+/// gate's own masters got wrong.
+///
+/// The rollback journal is restored at the end: WAL is something an opener flips, not something a
+/// resting checkpoint carries, and a fixture in WAL mode would blur the no-sidecar assertions its
+/// callers make.
+pub fn genuine_checkpoint(dir: &Path, version: i64) -> PathBuf {
+    let db = dir.join("dedcom.db");
+    {
+        let mut store =
+            crate::state::ScanStore::open(&db).expect("the product creates its own checkpoint");
+        let scan = store
+            .begin_scan(&ScanConfig::new(vec![dir.to_path_buf()]))
+            .unwrap();
+        store
+            .set_status(scan, crate::model::scan::ScanStatus::Complete)
+            .unwrap();
+    }
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    if version < 5 {
+        conn.execute_batch("DROP TABLE file_group_member; DROP TABLE scan_membership;")
+            .unwrap();
+    }
+    if version < 4 {
+        conn.execute_batch("DROP TABLE dir_omission; DROP TABLE scan_root;")
+            .unwrap();
+    }
+    if version < 3 {
+        // The two v3 indexes go as well. They depend on no column dropped here, so they would
+        // survive the rewind — and a checkpoint declaring v0 while carrying a name that only
+        // arrived at v3 is exactly what the guard refuses. Dropping the v4/v5 TABLES above takes
+        // their indexes with them; these two have to be named.
+        conn.execute_batch(
+            "DROP INDEX file_scan_identity;
+             DROP INDEX file_hash_identity;
+             ALTER TABLE file       DROP COLUMN nlink;
+             ALTER TABLE file_group DROP COLUMN object_count;
+             ALTER TABLE file_group DROP COLUMN reclaim_state;
+             ALTER TABLE scan_stats DROP COLUMN reclaim_state;",
+        )
+        .unwrap();
+    }
+    if version < 2 {
+        conn.execute_batch("ALTER TABLE scan_stats DROP COLUMN results_materialized;")
+            .unwrap();
+    }
+    conn.pragma_update(None, "user_version", version).unwrap();
+    let _: String = conn
+        .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+        .unwrap();
+    drop(conn);
+    db
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

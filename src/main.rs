@@ -23,6 +23,7 @@ mod paths;
 mod pipeline;
 mod scan;
 mod signals;
+mod startup;
 mod state;
 mod sysmon;
 /// Shared test fixtures (hardlink forest, content-read counting). Test builds only.
@@ -201,33 +202,8 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
     // anything else — even through a path that forgot to ask.
     state::set_observer_role(read_only);
 
-    // Deferred auto-VACUUM: operator only, at startup (no scan running yet),
-    // if config.json says it's time (default every 120 h, 0=off). In the background — a
-    // VACUUM of a 5+ GB DB is noticeable; busy_timeout keeps it clear of the background
-    // session load.
-    if !read_only && maint::should_auto_vacuum(&state_dir) {
-        let db_path = db_path.clone();
-        let state_dir = state_dir.clone();
-        std::thread::spawn(move || match maint::vacuum_only(&db_path, &state_dir) {
-            Ok(()) => tracing::info!("auto-VACUUM completed"),
-            Err(err) => tracing::warn!("auto-VACUUM not completed: {err}"),
-        });
-    }
-
-    // Results are prepared by the WRITER: the operator brings every completed scan that predates
-    // the marker up to date at startup, so an observer only ever reads. In the background —
-    // aggregating an old multi-million-row manifest is not instant.
-    if !read_only {
-        let db_path = db_path.clone();
-        std::thread::spawn(move || {
-            match ScanStore::open(&db_path).and_then(|mut store| store.prepare_completed_scans()) {
-                Ok(0) => {}
-                Ok(n) => tracing::info!("prepared results of {n} completed scan(s)"),
-                Err(err) => tracing::warn!("preparing completed scans failed: {err}"),
-            }
-        });
-    }
-
+    // The checkpoint itself is settled on the boot thread below, before anything else opens it —
+    // see `startup`. Nothing above this point has touched `dedcom.db`.
     let commander = wants_commander(cli);
 
     let (tx, rx) = tui::event::channel();
@@ -236,8 +212,8 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
     let mut guard = tui::TerminalGuard::enter()?;
     // Splash on screen immediately — even before the keyboard-support request.
     let mut tick: u64 = 0;
-    // A startup thread (auto-VACUUM, preparing results) may already have panicked: the hook has
-    // restored the terminal, so the splash must not paint over the message either.
+    // A background thread may already have panicked: the hook has restored the terminal, so the
+    // splash must not paint over the message either. The same check guards every later frame.
     if panics::tui_dead() {
         return Err(panic_shutdown_error());
     }
@@ -255,12 +231,23 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
     let (boot_tx, boot_rx) = crossbeam_channel::bounded(1);
     {
         let db_path = db_path.clone();
+        let state_dir = state_dir.clone();
         let no_resume = cli.no_resume;
         std::thread::spawn(move || {
+            // The checkpoint's whole startup work, in one order on one thread: settle it, vacuum
+            // it if that is due, prepare its completed scans. It happens here rather than on the
+            // main thread so the splash is already on screen while it runs, and nothing else in
+            // this process opens the checkpoint until it returns.
+            let settled = startup::settle_and_maintain(&db_path, &state_dir, read_only);
             let zfs = zfs::ZfsEnvironment::detect();
             // The host profile (CPU/RAM/disks/ZFS/inotify) — also here, in the background.
             let host = HostProfile::detect();
-            let sessions = boot_session_load(&db_path, commander, no_resume);
+            // `and_then`, so a checkpoint that would not settle becomes the run's error whatever
+            // the surface would have asked for. The commander and `--no-resume` skip the eager
+            // load, so without this the refusal that stopped the startup work would reach nobody.
+            let sessions = settled.and_then(|settled| {
+                settled.after(|| boot_session_load(&db_path, commander, no_resume))
+            });
             let _ = boot_tx.send((zfs, host, sessions));
         });
     }
@@ -399,8 +386,9 @@ fn panic_shutdown_error() -> AppError {
 #[cfg(test)]
 mod startup_order_tests {
     /// The hook is what tells the loop the screen is gone, so a thread started before it is
-    /// installed can panic outside its reach — auto-VACUUM and the results preparation both start
-    /// long before the terminal is entered. Only source order can hold this, hence the guard.
+    /// installed can panic outside its reach — and the boot thread carries the checkpoint's
+    /// settling, the auto-VACUUM and the results preparation. Only source order can hold this,
+    /// hence the guard.
     #[test]
     fn the_panic_hook_is_installed_before_the_first_background_thread() {
         let after_run_tui = include_str!("main.rs")
@@ -416,6 +404,65 @@ mod startup_order_tests {
         assert!(
             hook < spawn,
             "the panic hook must be installed before the first background thread"
+        );
+    }
+
+    /// The checkpoint is settled once, before anything else opens it. Which task may open it is
+    /// held by `startup::CheckpointSettled`; what a token cannot hold is a NEW opener written into
+    /// `run_tui` above the settling call, so source order guards that half.
+    #[test]
+    fn run_tui_opens_no_checkpoint_before_it_has_been_settled() {
+        let after_run_tui = include_str!("main.rs")
+            .split_once("fn run_tui")
+            .expect("run_tui must exist")
+            .1;
+        let settle = after_run_tui
+            .find("startup::settle_and_maintain")
+            .expect("run_tui must settle the checkpoint");
+        let load = after_run_tui
+            .find("boot_session_load")
+            .expect("run_tui must load the sessions");
+        assert!(
+            settle < load,
+            "the eager session load must come after the checkpoint is settled"
+        );
+        for opener in [
+            "ScanStore::open(",
+            "ScanStore::open_writable(",
+            "ScanStore::open_read_only(",
+        ] {
+            assert!(
+                !after_run_tui[..settle].contains(opener),
+                "nothing in run_tui may call {opener} before the checkpoint has been settled"
+            );
+        }
+    }
+
+    /// A checkpoint that would not settle has to become the run's error on every surface. The
+    /// commander and `--no-resume` never open it themselves, so the load must be CHAINED on the
+    /// settling result rather than run beside it — only source order can hold that.
+    ///
+    /// The needle is the statement itself, not the word `and_then`: an earlier version looked for
+    /// the word, the comment above the code already contains it, and replacing the chain with a
+    /// bare call left the guard green. A source guard that its own explanation satisfies is not a
+    /// guard.
+    #[test]
+    fn the_session_load_is_chained_on_the_settling_result() {
+        const CHAIN: &str = "let sessions = settled.and_then(|settled| {";
+        let after_run_tui = include_str!("main.rs")
+            .split_once("fn run_tui")
+            .expect("run_tui must exist")
+            .1;
+        let settle = after_run_tui
+            .find("startup::settle_and_maintain")
+            .expect("run_tui must settle the checkpoint");
+        let load = after_run_tui[settle..]
+            .find("boot_session_load")
+            .expect("run_tui must load the sessions");
+        assert!(
+            after_run_tui[settle..settle + load].contains(CHAIN),
+            "the session load must be chained on the settling result as `{CHAIN}`, \
+             not run beside it"
         );
     }
 }
@@ -3196,62 +3243,10 @@ mod boot_session_load_is_fail_closed_tests {
 
     const NOT_A_CHECKPOINT: &str = "dedcom.db is not a checkpoint this build can upgrade";
 
-    /// A checkpoint the product itself wrote, carrying one completed scan, rewound to the shape a
-    /// build of `version` would have left behind. Rewinding the real schema is how the migration
-    /// tests in `state::schema` build their legacy databases as well — hand-transcribed DDL in
-    /// this role is precisely what the G2 masters got wrong.
-    ///
-    /// The rollback journal is restored at the end: WAL is something an opener flips, not
-    /// something a resting checkpoint carries, and a fixture in WAL mode would blur the
-    /// no-sidecar assertions below.
-    fn genuine_checkpoint(dir: &std::path::Path, version: i64) -> std::path::PathBuf {
-        let db = dir.join("dedcom.db");
-        {
-            let mut store = ScanStore::open(&db).expect("the product creates its own checkpoint");
-            let scan = store
-                .begin_scan(&crate::model::scan::ScanConfig::new(
-                    vec![dir.to_path_buf()],
-                ))
-                .unwrap();
-            store
-                .set_status(scan, crate::model::scan::ScanStatus::Complete)
-                .unwrap();
-        }
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        if version < 5 {
-            conn.execute_batch("DROP TABLE file_group_member; DROP TABLE scan_membership;")
-                .unwrap();
-        }
-        if version < 4 {
-            conn.execute_batch("DROP TABLE dir_omission; DROP TABLE scan_root;")
-                .unwrap();
-        }
-        if version < 3 {
-            // The two v3 indexes go as well. They depend on no column dropped here, so they would
-            // survive the rewind — and a checkpoint declaring v0 while carrying a name that only
-            // arrived at v3 is exactly what the guard refuses. Dropping the v4/v5 TABLES above
-            // takes their indexes with them; these two have to be named.
-            conn.execute_batch(
-                "DROP INDEX file_scan_identity;
-                 DROP INDEX file_hash_identity;
-                 ALTER TABLE file       DROP COLUMN nlink;
-                 ALTER TABLE file_group DROP COLUMN object_count;
-                 ALTER TABLE file_group DROP COLUMN reclaim_state;
-                 ALTER TABLE scan_stats DROP COLUMN reclaim_state;",
-            )
-            .unwrap();
-        }
-        if version < 2 {
-            conn.execute_batch("ALTER TABLE scan_stats DROP COLUMN results_materialized;")
-                .unwrap();
-        }
-        conn.pragma_update(None, "user_version", version).unwrap();
-        let _: String = conn
-            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
-            .unwrap();
-        drop(conn);
-        db
-    }
+    // A checkpoint the product itself wrote, rewound to the shape a build of `version` would have
+    // left behind. It lives in `testfixtures` because the startup tests need the same legacy
+    // checkpoint, and two hand-kept copies of a fixture are two fixtures.
+    use crate::testfixtures::genuine_checkpoint;
 
     /// A database built by hand into a shape no release of this product ever wrote: `scan` with
     /// `started_at` instead of the timestamps, and a table called `file_entry` where ours is

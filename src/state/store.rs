@@ -289,6 +289,61 @@ pub(crate) fn role_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Test seam: every open of ONE checkpoint, in order, with the schema version its opener found.
+///
+/// It exists to state an ordering claim that a sleep could only make probabilistically — that
+/// nothing opened the checkpoint before the boot thread's migration had committed. Keyed by
+/// pathname, so a test never records another test's opens. Not compiled into a production build.
+#[cfg(test)]
+pub(crate) mod open_ledger {
+    use super::{Connection, Path, PathBuf};
+
+    static LEDGER: std::sync::Mutex<Option<(PathBuf, Vec<i64>)>> = std::sync::Mutex::new(None);
+
+    fn slot() -> std::sync::MutexGuard<'static, Option<(PathBuf, Vec<i64>)>> {
+        LEDGER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Arms the ledger for one database and disarms it on drop.
+    pub(crate) struct Recording;
+
+    impl Recording {
+        pub(crate) fn of(db_path: &Path) -> Self {
+            *slot() = Some((db_path.to_path_buf(), Vec::new()));
+            Recording
+        }
+
+        /// The schema version each opener found, in the order they opened.
+        pub(crate) fn versions(&self) -> Vec<i64> {
+            slot()
+                .as_ref()
+                .map(|(_, seen)| seen.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    impl Drop for Recording {
+        fn drop(&mut self) {
+            *slot() = None;
+        }
+    }
+
+    pub(super) fn record(db_path: &Path, conn: &Connection) {
+        let mut armed = slot();
+        let Some((path, seen)) = armed.as_mut() else {
+            return;
+        };
+        if path != db_path {
+            return;
+        }
+        if let Ok(version) = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)) {
+            seen.push(version);
+        }
+    }
+}
+
 /// The pathnames of `scan_id` still marked for an action, in path order.
 ///
 /// The plan itself is built from real files on disk, so a test about what SURVIVES in the database
@@ -1068,22 +1123,27 @@ impl ScanStore {
         // here must be refused before any of it can touch the replacement.
         #[cfg(test)]
         take_open_race_hook();
+        #[cfg(test)]
+        open_ledger::record(db_path, &conn);
         let identity = settled_identity(db_path, before)?;
         // First, and before the refusal below: the declared relationships are only worth what this
         // connection enforces, and the pragma is connection state — nothing is written, so a DB
         // from a newer build is still left exactly as it was.
         schema::enforce_foreign_keys(&conn)?;
+        // busy_timeout comes first now, and on its own: it is connection-local state that writes
+        // nothing, so it is safe ahead of the refusals below, and the shape guard holds a read
+        // transaction for the whole of its judgement — a concurrent writer has to be able to WAIT
+        // for that rather than be handed «database is locked» on the first attempt.
+        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
         // Refuse a DB written by a newer build before touching it (no WAL flip, no migration).
         schema::ensure_version_supported(&conn)?;
         // And refuse one that is not our checkpoint at all — also before the WAL flip below, so a
         // database we do not own keeps its bytes, its mtime and its sidecar census. Reading
-        // `sqlite_master` and `PRAGMA table_info` writes nothing; the pragma on the next line does.
+        // `sqlite_master` and `PRAGMA table_info` writes nothing; the WAL flip below does.
         schema::ensure_recognisable_shape(&conn)?;
-        // busy_timeout — the background move worker holds its own connection
-        // in parallel with the main one; WAL + waiting on a lock instead of a «locked» error.
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;\nPRAGMA synchronous=NORMAL;\nPRAGMA busy_timeout=5000;",
-        )?;
+        // WAL and synchronous for the run itself — the background move worker holds its own
+        // connection in parallel with the main one.
+        conn.execute_batch("PRAGMA journal_mode=WAL;\nPRAGMA synchronous=NORMAL;")?;
         schema::migrate(&conn)?;
         // 0600 on the DB file and WAL/SHM (created by enabling WAL above): the contents — the paths of all
         // pool files — are for the owner only (errors are propagated, not best-effort).

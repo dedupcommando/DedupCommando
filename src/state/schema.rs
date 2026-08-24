@@ -782,6 +782,49 @@ fn ensure_no_squatted_name(conn: &Connection, version: i64) -> Result<()> {
     Ok(())
 }
 
+// Test seam: fires once, after the shape guard has read `PRAGMA user_version` and before it has
+// looked up a single name. It exists so a test can commit a whole migration from a SECOND
+// connection at exactly the moment that used to matter, and prove deterministically — no sleeps,
+// no racing threads — that the guard judges one database snapshot from end to end. Not compiled
+// into a production build at all.
+#[cfg(test)]
+thread_local! {
+    static SHAPE_RACE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms the one-shot shape-guard seam for this thread and disarms it on drop.
+#[cfg(test)]
+pub(crate) struct ShapeGuardRace;
+
+#[cfg(test)]
+impl ShapeGuardRace {
+    pub(crate) fn armed(action: impl FnOnce() + 'static) -> Self {
+        SHAPE_RACE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(action)));
+        ShapeGuardRace
+    }
+
+    /// Whether the armed shot was consumed. A test whose seam was never reached proved nothing.
+    pub(crate) fn fired(&self) -> bool {
+        SHAPE_RACE_HOOK.with(|slot| slot.borrow().is_none())
+    }
+}
+
+#[cfg(test)]
+impl Drop for ShapeGuardRace {
+    fn drop(&mut self) {
+        SHAPE_RACE_HOOK.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn take_shape_race_hook() {
+    let action = SHAPE_RACE_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+    }
+}
+
 /// Refuses a database that is not a checkpoint of the version it claims — BEFORE anything is
 /// written to it.
 ///
@@ -809,7 +852,30 @@ fn ensure_no_squatted_name(conn: &Connection, version: i64) -> Result<()> {
 /// Foreign objects whose names do not collide are left exactly as they are — an extra table is
 /// not evidence that the database is someone else's, and refusing it would break real extended
 /// databases for no gain.
+///
+/// The whole judgement reads ONE snapshot. Every question below — how many user objects there
+/// are, what version the checkpoint declares, which tables and columns its floor requires and
+/// which of our names are already taken — used to be its own statement, and separate statements
+/// outside a transaction are separate snapshots. A migration committing between two of them
+/// showed this guard the stamp of the version it started at together with the names of the version
+/// it ended at: a combination no committed database ever held, refused with a sentence that named
+/// a real object and a real version and was still wrong. `ensure_version_exact` above already
+/// states the narrow half of this rule for two reads of the stamp; this is the same rule over the
+/// whole inspection.
 pub fn ensure_recognisable_shape(conn: &Connection) -> Result<()> {
+    // Deferred: the read lock is taken by the first statement and given back when the guard
+    // returns. Nothing here writes, so every path out rolls back — and the rollback's own failure
+    // must never mask a refusal.
+    let tx = conn.unchecked_transaction()?;
+    let verdict = judge_shape(&tx);
+    let ended = tx.rollback();
+    verdict?;
+    ended?;
+    Ok(())
+}
+
+/// The judgement itself, over whatever snapshot the caller has opened.
+fn judge_shape(conn: &Connection) -> Result<()> {
     // `sqlite_` is SQLite's own reserved prefix — sqlite_sequence, sqlite_stat1 and friends are
     // the engine's bookkeeping, not a user object. The comparison is on the literal seven
     // characters, NOT `LIKE 'sqlite_%'`: in LIKE the underscore matches any single character, so
@@ -825,6 +891,8 @@ pub fn ensure_recognisable_shape(conn: &Connection) -> Result<()> {
     }
 
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    #[cfg(test)]
+    take_shape_race_hook();
     // The floor first: it answers «is this one of ours at all», and its diagnosis is the more
     // useful one when the answer is no. Only then the squatted-name pass, which answers the
     // narrower question of whether something else holds a name the migration is about to create.
@@ -959,6 +1027,7 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testfixtures::{genuine_checkpoint, ScratchDir};
     use rusqlite::Connection;
 
     /// Column names of a table, in declaration order.
@@ -2492,5 +2561,85 @@ mod tests {
                 .unwrap();
             assert_eq!(version, seeded, "the refusal writes nothing");
         }
+    }
+
+    /// The incident the integration gate caught, reduced to two connections and a barrier.
+    ///
+    /// The guard reads the stamp; while it holds that answer a SECOND connection migrates the very
+    /// same file and commits. Before this was one snapshot, the guard then looked the names up in a
+    /// fresh one and refused a checkpoint that had never been anything but ours — naming
+    /// `file_scan_identity`, an index the migration had created microseconds earlier, against the
+    /// v0 the stamp had said. Deterministic by construction: the barrier is a seam, not a sleep.
+    #[test]
+    fn the_shape_guard_judges_one_snapshot_when_a_migration_commits_underneath_it() {
+        let _role = crate::state::store::role_guard();
+        crate::state::store::set_observer_role(false);
+        let dir = ScratchDir::new("schema-barrier");
+        let db = genuine_checkpoint(dir.path(), 0);
+        // WAL is the mode every opener flips the checkpoint to, and the mode the incident happened
+        // in: under WAL a writer does not wait for a reader, which is exactly how a migration got
+        // in between two of the guard's reads.
+        {
+            let conn = Connection::open(&db).unwrap();
+            let _: String = conn
+                .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+                .unwrap();
+        }
+
+        let checking = Connection::open(&db).unwrap();
+        checking.execute_batch("PRAGMA busy_timeout=5000;").unwrap();
+        let migrating = db.clone();
+        let race = ShapeGuardRace::armed(move || {
+            let conn = Connection::open(&migrating).unwrap();
+            conn.execute_batch("PRAGMA busy_timeout=5000;").unwrap();
+            migrate(&conn).expect("the second opener migrates the same checkpoint");
+        });
+
+        let verdict = ensure_recognisable_shape(&checking);
+
+        assert!(
+            race.fired(),
+            "the barrier was never reached — the test proved nothing"
+        );
+        verdict.expect(
+            "a checkpoint migrated underneath the guard is still ours: the guard must judge the \
+             snapshot it started on, not a sentence assembled out of two",
+        );
+
+        // The other half of «old or new, never a mixture»: the migration really did land, and the
+        // guard accepts that state too when it is the one it starts on.
+        let after = Connection::open(&db).unwrap();
+        assert_eq!(
+            user_version(&after),
+            SCHEMA_VERSION,
+            "the second opener's migration committed"
+        );
+        ensure_recognisable_shape(&after)
+            .expect("and the migrated checkpoint is recognisable in its own right");
+    }
+
+    /// The rule the barrier must not have loosened: a v0 checkpoint that really does carry a name
+    /// introduced at v3 is still refused, and still by that name.
+    #[test]
+    fn a_v3_name_in_a_resting_v0_checkpoint_is_still_refused() {
+        let _role = crate::state::store::role_guard();
+        crate::state::store::set_observer_role(false);
+        let dir = ScratchDir::new("schema-squat");
+        let db = genuine_checkpoint(dir.path(), 0);
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch("CREATE INDEX file_scan_identity ON file(scan_id, device, inode);")
+                .unwrap();
+        }
+
+        let conn = Connection::open(&db).unwrap();
+        let text = ensure_recognisable_shape(&conn)
+            .expect_err("a v0 checkpoint carrying a v3 name is not ours to adopt")
+            .to_string();
+
+        assert!(text.starts_with(NOT_A_CHECKPOINT), "{text}");
+        assert!(text.contains("file_scan_identity"), "{text}");
+        assert!(text.contains("v3"), "{text}");
+        assert!(text.contains("v0"), "{text}");
     }
 }
