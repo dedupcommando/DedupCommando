@@ -1,6 +1,6 @@
 # DedupCommando
 
-> **⚠️ Beta (v0.9.0-beta.1).** DedupCommando performs destructive operations (delete, hardlink, reflink)
+> **⚠️ Beta (v0.9.0-beta.3).** DedupCommando performs destructive operations (delete, hardlink, reflink)
 > on real files. Read **[docs/SAFETY.md](docs/SAFETY.md)** before applying any action, and keep backups.
 
 **DedupCommando** is a Linux terminal UI for finding and safely deduplicating byte-for-byte identical
