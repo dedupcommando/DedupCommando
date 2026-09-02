@@ -2690,37 +2690,107 @@ mod snapshot_tests {
 }
 
 /// Files of directory `dir` with a size of exactly `size` — a cheap duplicate pre-filter
-/// (metadata only, without reading the contents).
-fn same_size_files(dir: &Path, size: u64) -> Vec<PathBuf> {
+/// (metadata only, without reading the contents) — or the error that stopped the directory
+/// being read.
+///
+/// The `Result` is the point. The caller reads an empty answer as "nothing here duplicates it"
+/// and files the file under its own name; a directory that could not be read produces that same
+/// empty answer while establishing nothing. Swallowing the error therefore turned a transient
+/// failure on the destination — descriptors exhausted on a large batch, `EIO`, permissions
+/// changed underfoot — into a duplicate silently filed as a fresh file, with `duplicate = false`
+/// recorded for it in the `move_event` journal.
+///
+/// `NotFound` on one entry is deliberately NOT such a failure: an entry can be unlinked between
+/// `read_dir` and the stat, and something that is no longer there duplicates nothing — a complete
+/// answer rather than a missing one. Making that race fatal would fail a move for a file the batch
+/// never had to look at.
+///
+/// Symlinks never reach that arm. `DirEntry::metadata` does NOT follow them — it is the `lstat`
+/// form — so even a link with no target comes back `Ok` and is dropped by `is_file` below, and a
+/// link pointing AT an identical file is not a duplicate candidate either. That is the behaviour
+/// this function always had; it is written down because swapping to `fs::metadata(entry.path())`
+/// would silently turn every broken link in the destination into a `NotFound` this arm swallows.
+///
+/// The result is sorted by the raw bytes of the file name, like the walk and the merge. The
+/// caller stops at the first match, so which candidate it reads — and, when one of them cannot
+/// be read, which one it names in the log — would otherwise be `readdir`'s choice.
+///
+/// One failing entry costs every move into this directory, not only the files of its size: the
+/// size filter is applied AFTER the stat, so an entry that will not stat stops the listing before
+/// anything has been filtered. That is the intended trade — a directory only partly read cannot
+/// answer "nothing here duplicates it" for anyone — but the blast radius is the whole destination,
+/// and a batch will report one failure per file moved into it.
+///
+/// **Untested arm, stated rather than implied:** the non-`NotFound` stat failure has no test.
+/// The tests run as root in a container, where permissions refuse nothing, and the injection seam
+/// below produces `NotFound` because that is the arm worth exercising — the one that CONTINUES.
+/// Reaching the returning arm from a fixture would need a filesystem that can refuse a stat, and
+/// no such fixture exists here. What is covered is the `?` on `read_dir` itself, by
+/// `a_destination_that_will_not_open_is_an_error`, which uses real refusals and no seam.
+fn same_size_files(dir: &Path, size: u64) -> std::io::Result<Vec<PathBuf>> {
     use std::os::unix::fs::MetadataExt;
+    // Test-only: the `read_dir` failure a directory has no way to produce on demand. Absent from
+    // every non-test build.
+    #[cfg(test)]
+    if crate::testfixtures::take_walk_fault(dir) {
+        return Err(std::io::Error::other("injected read_dir fault"));
+    }
     let mut out = Vec::new();
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in read.flatten() {
-        if let Ok(meta) = entry.metadata() {
-            if meta.is_file() && meta.size() == size {
-                out.push(entry.path());
-            }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        // Test-only: the entry unlinked between `read_dir` and the stat — a race no fixture can
+        // stage. Absent from every non-test build.
+        #[cfg(test)]
+        let stat = if crate::testfixtures::take_metadata_fault(&entry.path()) {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        } else {
+            entry.metadata()
+        };
+        #[cfg(not(test))]
+        let stat = entry.metadata();
+        let meta = match stat {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        if meta.is_file() && meta.size() == size {
+            out.push(entry.path());
         }
     }
-    out
+    out.sort_by(|a, b| {
+        use std::os::unix::ffi::OsStrExt;
+        let key = |p: &Path| p.file_name().map_or(&[][..], |n| n.as_bytes()).to_vec();
+        key(a).cmp(&key(b))
+    });
+    Ok(out)
 }
 
 /// The first free name `{stem}.dup{N}{.ext}` in directory `dir` for the duplicate `src`.
+///
+/// Assembled from the name's raw bytes, never from a `String`. A Unix filename is arbitrary
+/// non-NUL bytes, and going through `to_string_lossy` would corrupt two ways at once: it renames
+/// the survivor, so `b"\x80.bin"` lands as `"\u{FFFD}.dup1.bin"` — bytes the operator never chose,
+/// with no way back to the original from the name alone — and it collapses distinct names onto one
+/// stem, so `b"\x80.bin"` and `b"\xff.bin"` moved into the same directory would queue up as
+/// `.dup1` and `.dup2` of a stem neither of them ever had.
 fn dup_dest(dir: &Path, src: &Path) -> PathBuf {
-    let stem = src
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let ext = src.extension().map(|e| e.to_string_lossy().into_owned());
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let stem = src.file_stem().map(OsStr::as_bytes).unwrap_or_default();
+    let ext = src.extension().map(OsStr::as_bytes);
     let mut n = 1u32;
     loop {
-        let name = match &ext {
-            Some(ext) => format!("{stem}.dup{n}.{ext}"),
-            None => format!("{stem}.dup{n}"),
-        };
-        let candidate = dir.join(name);
+        let marker = format!(".dup{n}");
+        let mut name =
+            Vec::with_capacity(stem.len() + marker.len() + ext.map_or(0, |ext| 1 + ext.len()));
+        name.extend_from_slice(stem);
+        name.extend_from_slice(marker.as_bytes());
+        if let Some(ext) = ext {
+            name.push(b'.');
+            name.extend_from_slice(ext);
+        }
+        let candidate = dir.join(OsString::from_vec(name));
         if !candidate.exists() {
             return candidate;
         }
@@ -4047,6 +4117,80 @@ mod triage_tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// A duplicate whose name is not valid UTF-8 keeps its own bytes. Assembled through
+    /// `to_string_lossy` the name came back with U+FFFD in place of every byte the decoder
+    /// refused, so the file landed under a name the operator never selected — and one nothing
+    /// can read back to the original.
+    #[test]
+    fn dup_dest_preserves_non_utf8_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = temp_dir("dup_bytes");
+
+        // An invalid stem, carrying a valid extension.
+        let src = PathBuf::from(OsStr::from_bytes(b"/somewhere/\x80.bin"));
+        assert_eq!(
+            dup_dest(&dir, &src),
+            dir.join(OsStr::from_bytes(b"\x80.dup1.bin"))
+        );
+
+        // An invalid extension survives just as literally.
+        let src = PathBuf::from(OsStr::from_bytes(b"/somewhere/photo.\xff"));
+        assert_eq!(
+            dup_dest(&dir, &src),
+            dir.join(OsStr::from_bytes(b"photo.dup1.\xff"))
+        );
+
+        // And an invalid name with no extension at all.
+        let src = PathBuf::from(OsStr::from_bytes(b"/somewhere/\x80"));
+        assert_eq!(
+            dup_dest(&dir, &src),
+            dir.join(OsStr::from_bytes(b"\x80.dup1"))
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two names that differ only outside UTF-8 keep their own slots. Lossy conversion mapped
+    /// `\x80` and `\xff` alike onto U+FFFD, so the second file was filed as `.dup2` of the first
+    /// one's stem: two unrelated files sharing a stem neither of them ever had. Within one source
+    /// directory stems are unique, so that collapse was in fact the main way `.dup2` was reached.
+    #[test]
+    fn dup_dest_does_not_collapse_distinct_non_utf8_names() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = temp_dir("dup_collapse");
+
+        // The premise first, so the test proves what it claims rather than assuming it: the two
+        // names differ as bytes, yet `to_string_lossy` maps them onto ONE string. Any name built
+        // through a `String` is therefore blind to the difference between them.
+        let a = OsStr::from_bytes(b"\x80.bin");
+        let b = OsStr::from_bytes(b"\xff.bin");
+        assert_ne!(a, b, "the two names are distinct on disk");
+        assert_eq!(
+            a.to_string_lossy(),
+            b.to_string_lossy(),
+            "but lossy conversion collapses them onto one string"
+        );
+
+        let first = dup_dest(&dir, Path::new(OsStr::from_bytes(b"/a/\x80.bin")));
+        assert_eq!(first, dir.join(OsStr::from_bytes(b"\x80.dup1.bin")));
+        fs::write(&first, b"x").unwrap();
+
+        // The second name is a stem of its own, so it takes its own `.dup1`.
+        let second = dup_dest(&dir, Path::new(OsStr::from_bytes(b"/a/\xff.bin")));
+        assert_eq!(second, dir.join(OsStr::from_bytes(b"\xff.dup1.bin")));
+        assert_ne!(first, second, "distinct names do not share a slot");
+        fs::write(&second, b"y").unwrap();
+
+        assert!(first.is_file(), "the first name is still its own file");
+        assert!(second.is_file(), "and the second landed beside it");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn same_size_files_filters_by_size() {
         let dir = temp_dir("size");
@@ -4054,10 +4198,41 @@ mod triage_tests {
         fs::write(dir.join("b.bin"), b"12345").unwrap(); // 5 bytes
         fs::write(dir.join("c.bin"), b"123").unwrap(); // 3 bytes
         fs::create_dir(dir.join("sub")).unwrap(); // directory — ignored
-        let mut got = same_size_files(&dir, 5);
-        got.sort();
-        assert_eq!(got, vec![dir.join("a.bin"), dir.join("b.bin")]);
-        assert!(same_size_files(&dir, 999).is_empty());
+        let got = same_size_files(&dir, 5).expect("the directory reads");
+        assert_eq!(
+            got,
+            vec![dir.join("a.bin"), dir.join("b.bin")],
+            "and comes back sorted by name, not in readdir order"
+        );
+        assert!(same_size_files(&dir, 999)
+            .expect("the directory reads")
+            .is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A directory that will not open is an error, not an empty answer.
+    ///
+    /// This is the `?` on `read_dir` itself, and it needs a test that does NOT go through the
+    /// injection seam: the seam returns before `read_dir` is ever called, so it proves how the
+    /// CALLER treats an error and nothing about where the error comes from. Both cases here are
+    /// real refusals from the filesystem — no fixture, no seam, nothing to keep in step.
+    #[test]
+    fn a_destination_that_will_not_open_is_an_error() {
+        let dir = temp_dir("unopenable");
+        let not_a_dir = dir.join("plain.bin");
+        fs::write(&not_a_dir, b"12345").unwrap();
+
+        let err = same_size_files(&not_a_dir, 5).expect_err("a regular file is not a directory");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "ENOTDIR, not a missing path: {err}"
+        );
+
+        let missing = dir.join("no_such_dir");
+        let err = same_size_files(&missing, 5).expect_err("a missing directory is an error too");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+
         fs::remove_dir_all(&dir).ok();
     }
 }

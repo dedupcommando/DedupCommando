@@ -2157,6 +2157,13 @@ impl ScanStore {
     }
 
     /// Writes a move event (the «trash bin» journal + the fact of a created duplicate).
+    ///
+    /// **Known limit: both pathnames go in lossy.** The names the move puts on disk are built
+    /// from raw bytes and keep them, but this journal stores TEXT, so two names differing only
+    /// outside UTF-8 land here as one `U+FFFD` string and stop being distinguishable. The move
+    /// itself is correct; the record of it is not, for such names. Closing this means storing the
+    /// paths as bytes, which is a schema change with a migration, so it is deliberately NOT done
+    /// here — and until it is, the write path is not byte-correct end to end.
     pub fn record_move_event(&mut self, event: &MoveEvent) -> Result<()> {
         let source = event.source_path.to_string_lossy();
         let target = event.target_path.to_string_lossy();

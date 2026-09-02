@@ -810,6 +810,14 @@ mod tests {
             let expected_reason = match kind {
                 WalkFault::Iterator => OmissionReason::WalkError,
                 WalkFault::Metadata => OmissionReason::MetadataError,
+                // A content-read fault belongs to the commander's duplicate check, not to the
+                // walk: this fixture arms none, and the walk has no branch that would fire one.
+                // Named rather than swept into a default so that a walk-side content fault, if
+                // one ever exists, has to come here and pick a reason.
+                WalkFault::Content => unreachable!(
+                    "the completeness fixture arms no content fault: {}",
+                    file.display()
+                ),
             };
             assert_eq!(
                 declared.get(&file).copied(),

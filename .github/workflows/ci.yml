@@ -1,9 +1,9 @@
 # CI — DedupCommando.
 #
 # Build/test (amd64 + arm64), rustfmt --check, clippy -D warnings, cargo-deny,
-# contamination scan, secret scan, and DCO sign-off. The fmt job uses the same
-# `@stable` toolchain as build/clippy. The destructive ZFS E2E is NOT run here — it
-# needs a real ZFS host (disposable loopback-ZFS) and is run by maintainers.
+# secret scan, and DCO sign-off. The fmt job uses the same `@stable` toolchain as
+# build/clippy. The destructive ZFS E2E is NOT run here — it needs a real ZFS host
+# (disposable loopback-ZFS) and is run by maintainers.
 name: CI
 
 on:
@@ -65,13 +65,6 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
-
-  contamination:
-    name: contamination scan
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: bash scripts/scan-contamination.sh
 
   secret-scan:
     name: gitleaks

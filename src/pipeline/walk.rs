@@ -405,8 +405,48 @@ fn root_keys(roots: &[PathBuf]) -> std::result::Result<Vec<PathKey>, AuthorityUn
     Ok(keys)
 }
 
+/// The order two sibling names are yielded in: raw bytes, ascending.
+///
+/// Bytes because that is the only total order a Linux filename has. Anything routed through
+/// `to_string_lossy` maps distinct byte names onto one `U+FFFD` string and then calls them equal,
+/// which hands their relative order straight back to `readdir` — the same collapse
+/// `walk_collecting` refuses to let near the manifest.
+///
+/// A free function rather than a closure so the order can be tested for what it is — a decision
+/// about bytes — without a filesystem, a fixture or a `readdir` anywhere in the test.
+fn by_name_bytes(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> std::cmp::Ordering {
+    use std::os::unix::ffi::OsStrExt;
+    a.as_bytes().cmp(b.as_bytes())
+}
+
 /// The shared builder settings. `standard_filters(false)` also turns off parent-ignore reading, so
 /// a per-root builder and the multi-root one behave identically apart from which paths they cover.
+///
+/// `sort_by_file_name` is what makes traversal order a property of this program instead of a
+/// property of the disk it is pointed at: within every directory, at every depth, siblings are
+/// yielded in byte order of their names. Without it the order is whatever `readdir` returns, which
+/// differs between filesystems — the same fixture that lists as expected under one `/tmp` lists
+/// shuffled under another. What gets persisted is keyed by path and so came out the same either
+/// way; what varied is the sequence the walk hands to its caller, and every reading of it that
+/// treats a sequence as one.
+/// Roots are NOT sorted: `ignore` drains the paths it was handed in the order they were added,
+/// which is the order the scan was configured with, and `walk_collecting` zips that order against
+/// the root keys.
+///
+/// The comparison itself is `by_name_bytes`, and dropping this line would leave that function with
+/// no caller outside the test module — a `dead_code` warning in the ordinary build, which this
+/// project gates on.
+///
+/// This is a mechanism of the SERIAL walker alone. `ignore` keeps no sorter on `WalkParallel`, so
+/// setting one and then calling `build_parallel()` compiles and silently does nothing; a parallel
+/// walk would have to re-establish the order itself, by a deterministic merge of the per-directory
+/// results.
+///
+/// The traversal-order tests are the tripwire for that on the ledgered branch, which builds one
+/// walker per root — and only there. The branch for roots that cannot be keyed builds a single
+/// multi-root walker, and its one test holds a single file, so switching THAT walker to
+/// `build_parallel()` would drop the sorter without failing anything. Both branches go through
+/// this function, so the mechanism is shared; the coverage is not.
 fn configure(
     builder: &mut WalkBuilder,
     config: &ScanConfig,
@@ -416,6 +456,7 @@ fn configure(
         .standard_filters(false)
         .hidden(false)
         .follow_links(config.follow_symlinks)
+        .sort_by_file_name(by_name_bytes)
         .overrides(overrides.clone());
 }
 
@@ -566,6 +607,18 @@ fn absorb(
 
 /// Walks all roots from `config` and returns the matching files, the non-UTF8 compatibility count,
 /// and — when the roots can carry one — an account of everything the walk left out.
+///
+/// **The order of the returned files is a guarantee, not an accident.** Roots are reported in the
+/// order they were configured, and within each root the tree is walked depth-first with every
+/// directory's entries taken in byte order of their names, so one tree yields the same file
+/// sequence on any machine.
+///
+/// The guarantee covers the files this returns and nothing else. Entries the walk could not read
+/// are not files it returns: `ignore` hands errors over before the sorted entries and treats two
+/// of them as equal, so the order of several errors inside one directory is still whatever
+/// `readdir` gave. That costs no determinism where it matters — an error is counted into a
+/// `BTreeMap` cell, never appended to a sequence — but the sequence of error EVENTS is not
+/// something to build on. See `configure` for the mechanism.
 ///
 /// Each keyable root is walked by its own `WalkBuilder`, in configured order. `ignore::Walk`
 /// already drains its paths one after another, so this changes no traversal order; what it changes
@@ -1953,6 +2006,255 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Traversal order.
+    // -----------------------------------------------------------------------------------------
+
+    /// One copy of the order fixture, in the sequence a byte-sorted depth-first walk must produce.
+    ///
+    /// Two properties are readable straight off it. It is BYTE order, not a natural or a
+    /// locale-aware one: `10.bin` precedes `2.bin`, and `Beta.bin` precedes `_tail.bin` precedes
+    /// `alpha.bin` (0x42 < 0x5F < 0x61). And the sorting happens DURING the walk rather than over
+    /// the finished vector: `sub/A.bin` comes before `sub.bin`, because the walk descends into
+    /// `sub` the moment it reaches it, while as flat strings `sub.bin` sorts first (`.` is 0x2E,
+    /// `/` is 0x2F). Sorting the result afterwards fails on that pair alone.
+    const ORDERED_WALK: [&str; 9] = [
+        "10.bin",
+        "2.bin",
+        "Beta.bin",
+        "_tail.bin",
+        "alpha.bin",
+        "sub/A.bin",
+        "sub/m.bin",
+        "sub/z.bin",
+        "sub.bin",
+    ];
+
+    /// The same nine pathnames in an order that is neither the walk order nor its reverse.
+    const CREATION_ORDER: [&str; 9] = [
+        "sub.bin",
+        "alpha.bin",
+        "sub/z.bin",
+        "Beta.bin",
+        "sub/A.bin",
+        "2.bin",
+        "sub/m.bin",
+        "_tail.bin",
+        "10.bin",
+    ];
+
+    /// `ORDERED_WALK` as owned strings. Nothing here sorts: the expectation is a literal.
+    fn ordered_walk() -> Vec<String> {
+        ORDERED_WALK.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// `ORDERED_WALK` under a directory name, as a multi-root walk reports it.
+    fn ordered_walk_under(dir: &str) -> Vec<String> {
+        ORDERED_WALK
+            .iter()
+            .map(|name| format!("{dir}/{name}"))
+            .collect()
+    }
+
+    /// Builds one copy of the order fixture. `reversed` flips the creation order of every entry in
+    /// both directories, `sub` included — it comes into being with whichever of its children is
+    /// created first. Where listing order follows the order entries were made, the two copies
+    /// enumerate in opposite directions and only a walk that imposes an order of its own can
+    /// report them alike. Which filesystems do that is deliberately not claimed here: it varies by
+    /// filesystem, by mount option and by kernel version, and no assertion depends on it — the
+    /// expectation the test compares against is a literal, which holds whatever the listing order
+    /// turns out to be.
+    fn build_order_tree(root: &Path, reversed: bool) {
+        fs::create_dir_all(root).unwrap();
+        let mut order: Vec<&str> = CREATION_ORDER.to_vec();
+        if reversed {
+            order.reverse();
+        }
+        for name in order {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().expect("a name under the root")).unwrap();
+            fs::write(&path, name.as_bytes()).unwrap();
+        }
+    }
+
+    /// The order the walk imposes is decided by `by_name_bytes`, so it can be tested for what it
+    /// is — a decision about bytes — with no filesystem, no fixture and no `readdir` involved.
+    /// Every assertion here holds identically on every machine.
+    #[test]
+    fn the_name_comparator_orders_raw_bytes() {
+        // Byte order, spelled out: digits before letters and "10" before "2", so not numeric;
+        // uppercase (0x42) before underscore (0x5F) before lowercase (0x61), so neither case
+        // folding nor a locale collation; and a prefix before the name that extends it.
+        let expected: Vec<&OsStr> = [
+            &b"10.bin"[..],
+            &b"2.bin"[..],
+            &b"Beta.bin"[..],
+            &b"_tail.bin"[..],
+            &b"alpha.bin"[..],
+            &b"sub"[..],
+            &b"sub.bin"[..],
+        ]
+        .into_iter()
+        .map(OsStr::from_bytes)
+        .collect();
+
+        let mut shuffled: Vec<&OsStr> = vec![
+            expected[4],
+            expected[6],
+            expected[0],
+            expected[5],
+            expected[2],
+            expected[1],
+            expected[3],
+        ];
+        assert!(
+            shuffled.iter().zip(expected.iter()).all(|(a, b)| a != b),
+            "the input must not already sit in the expected order at any position"
+        );
+
+        shuffled.sort_by(|a, b| by_name_bytes(a, b));
+        assert_eq!(
+            shuffled, expected,
+            "the comparator orders raw bytes, ascending"
+        );
+    }
+
+    /// Two names no `str` can hold are still ordered, and ordered APART.
+    ///
+    /// This is the whole reason the comparator reads bytes rather than text. The first assertion
+    /// establishes the premise — `to_string_lossy` genuinely cannot tell these two names apart —
+    /// and the rest show that the comparator can. A lossy comparator would call them equal, and
+    /// equal siblings keep whatever order `readdir` gave them, which is exactly the
+    /// filesystem-dependence the sorter exists to remove.
+    #[test]
+    fn two_distinct_non_utf8_names_are_ordered_apart() {
+        let lower = OsStr::from_bytes(b"bad\xfename.bin");
+        let upper = OsStr::from_bytes(b"bad\xffname.bin");
+
+        assert_eq!(
+            lower.to_string_lossy(),
+            upper.to_string_lossy(),
+            "the premise: lossy conversion cannot tell these two names apart"
+        );
+        assert_ne!(lower, upper, "but they are two different names");
+
+        assert_eq!(by_name_bytes(lower, upper), std::cmp::Ordering::Less);
+        assert_eq!(by_name_bytes(upper, lower), std::cmp::Ordering::Greater);
+        assert_eq!(by_name_bytes(lower, lower), std::cmp::Ordering::Equal);
+    }
+
+    /// Traversal order belongs to this program, not to `readdir`.
+    ///
+    /// Two copies of one logical tree, created in deliberately opposite orders, must walk in the
+    /// SAME sequence, and that sequence must be the byte-sorted depth-first one. Both assertions
+    /// hold on every filesystem once the walk sorts; neither asks the filesystem to behave in any
+    /// particular way, so this test is not the place a shuffling `readdir` shows up. What it does
+    /// catch, on any machine, is a walk whose order stops matching the one this program promises.
+    #[test]
+    fn the_walk_order_is_sorted_and_independent_of_creation_order() {
+        // The expectation is a traversal sequence, not a sorted list: `sub/A.bin` precedes
+        // `sub.bin` although as flat strings `sub.bin` sorts first. Sorting both sides of the
+        // comparisons below could therefore never turn this test green.
+        let mut flat = ordered_walk();
+        flat.sort();
+        assert_ne!(
+            flat,
+            ordered_walk(),
+            "ORDERED_WALK must stay a traversal sequence, never a sorted list of strings"
+        );
+
+        let holder = temp_dir("order");
+        let forward = holder.join("forward");
+        let backward = holder.join("backward");
+        build_order_tree(&forward, false);
+        build_order_tree(&backward, true);
+
+        let outcome = collect(&base_config(&forward));
+        let walked_forward = walked_names(finished(&outcome), &forward);
+        let walked_backward = walked_names(finished(&collect(&base_config(&backward))), &backward);
+
+        assert_eq!(
+            walked_forward, walked_backward,
+            "opposite creation orders must not produce different walks"
+        );
+        assert_eq!(
+            walked_forward,
+            ordered_walk(),
+            "and the shared sequence is the byte-sorted, depth-first one"
+        );
+
+        // Completeness, asserted APART from order: delete both assertions above and losing a file
+        // still fails here.
+        assert_eq!(walked_forward.len(), 9, "nine files: {walked_forward:?}");
+        assert_eq!(
+            walked_forward
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ordered_walk()
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "every pathname of the fixture reached the manifest"
+        );
+        assert_eq!(
+            cells(&outcome, &forward),
+            Vec::new(),
+            "and nothing was omitted on the way"
+        );
+
+        // Mutation control: one file taken out of the middle of the nested directory. Without it
+        // the completeness assertions above are untested claims.
+        fs::remove_file(backward.join("sub/m.bin")).unwrap();
+        let after = walked_names(finished(&collect(&base_config(&backward))), &backward);
+        assert_eq!(
+            after,
+            vec![
+                "10.bin".to_string(),
+                "2.bin".to_string(),
+                "Beta.bin".to_string(),
+                "_tail.bin".to_string(),
+                "alpha.bin".to_string(),
+                "sub/A.bin".to_string(),
+                "sub/z.bin".to_string(),
+                "sub.bin".to_string(),
+            ],
+            "one file removed, eight left, the order of the rest unchanged"
+        );
+
+        fs::remove_dir_all(&holder).ok();
+    }
+
+    /// Roots keep the order they were configured in; sorting happens INSIDE a root, never across
+    /// them. `the_manifest_membership_and_order_are_unchanged` also walks two roots, but its `one`
+    /// and `two` are alphabetical, so it cannot tell a preserved order from a sorted one. These are
+    /// deliberately anti-alphabetical.
+    ///
+    /// The order matters outside this file: `walk_collecting` zips `config.roots` against the keys
+    /// `root_keys` returns in the same order, and a stored checkpoint is matched to a scan by
+    /// comparing the two root vectors for equality — a sorted root list would silently stop
+    /// resuming.
+    #[test]
+    fn the_walk_keeps_the_roots_in_configured_order() {
+        let holder = temp_dir("order_roots");
+        let zz = holder.join("zz_first");
+        let aa = holder.join("aa_second");
+        build_order_tree(&zz, false);
+        build_order_tree(&aa, true);
+
+        let mut config = base_config(&zz);
+        config.roots = vec![zz.clone(), aa.clone()];
+        let outcome = collect(&config);
+
+        let mut expected = ordered_walk_under("zz_first");
+        expected.extend(ordered_walk_under("aa_second"));
+        assert_eq!(
+            walked_names(finished(&outcome), &holder),
+            expected,
+            "configured root order survives; only entries within a directory are sorted"
+        );
+
+        fs::remove_dir_all(&holder).ok();
     }
 
     // -----------------------------------------------------------------------------------------

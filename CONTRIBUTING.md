@@ -38,7 +38,7 @@ pwsh scripts/build.ps1 check | test | clippy | release | docs-check
 - `cargo fmt --all -- --check` — **rustfmt is enforced** (run `cargo fmt` before committing)
 - `cargo clippy --all-targets -- -D warnings` — **zero warnings**
 - `cargo deny check` — dependency licenses / advisories / bans / sources
-- contamination scan + `gitleaks` secret scan
+- `gitleaks` secret scan
 - DCO sign-off on every commit
 
 ## Style

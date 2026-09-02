@@ -311,13 +311,21 @@ pub fn note_content_read(path: &Path) {
     }
 }
 
-/// Which of the walk's two silently-skipping branches an injected fault stands in for.
+/// Which silently-skipping branch an injected fault stands in for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkFault {
-    /// The walk iterator yielded an error instead of an entry.
+    /// A directory iterator yielded an error instead of an entry — the walk's own, or the
+    /// `read_dir` the commander's merge reads a source directory with. Both discard the entry
+    /// without ever learning its pathname, which is what makes the fault worth injecting.
     Iterator,
     /// The entry arrived, but its metadata could not be read.
     Metadata,
+    /// The file is there and its metadata reads, but its CONTENT does not. The move's duplicate
+    /// check hashes both the file being moved and every same-size candidate, and either read can
+    /// fail on its own (`EACCES`, `EIO`) long after the directory listed cleanly. A separate kind
+    /// because `Metadata` is consumed while the destination is listed, before any hashing starts,
+    /// so one kind could not reach this branch at all.
+    Content,
 }
 
 thread_local! {
@@ -329,11 +337,12 @@ thread_local! {
 
 /// Arms walk faults for the current thread and disarms them on drop.
 ///
-/// Thread-local, and that is the whole point: `walk` iterates on the caller's thread, so a fault
-/// cannot leak into a test running in parallel and nothing has to be serialized. (`ReadLog` above has
-/// the opposite constraint — hashing happens on rayon workers, so it must be process-wide.) Each
-/// fault fires at most once, and both what fired and what did not are observable, so a test can
-/// prove a fault was consumed exactly once rather than merely that a file went missing.
+/// Thread-local, and that is the whole point: `walk` and the commander's `merge_dir` both iterate
+/// on the caller's thread, so a fault cannot leak into a test running in parallel and nothing has
+/// to be serialized. (`ReadLog` above has the opposite constraint — hashing happens on rayon
+/// workers, so it must be process-wide.) Each fault fires at most once, and both what fired and
+/// what did not are observable, so a test can prove a fault was consumed exactly once rather than
+/// merely that a file went missing.
 ///
 /// If `ignore` ever moved its iteration to another thread, the fault would simply never fire and the
 /// test would fail — never silently pass.
@@ -383,9 +392,15 @@ fn take_fault(path: &Path, kind: WalkFault) -> bool {
     }
 }
 
-/// Called by the walk where an iterator error would have skipped the entry.
+/// Called where a directory-iteration error would have skipped the entry: the walk's `absorb`, and
+/// the commander's `merge_dir`.
 pub(crate) fn take_walk_fault(path: &Path) -> bool {
     take_fault(path, WalkFault::Iterator)
+}
+
+/// Called where a file's content could not be read: the move's duplicate check.
+pub(crate) fn take_content_fault(path: &Path) -> bool {
+    take_fault(path, WalkFault::Content)
 }
 
 /// Called by the walk where a metadata error would have skipped the entry.

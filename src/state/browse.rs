@@ -5839,7 +5839,7 @@ mod tests {
 
     // ---- R4B-2b2a: one atomic ownership boundary ----------------------------------------------
 
-    /// The Codex interleaving, permanent. The actor is already dead, a typed mark send parks
+    /// The narrow interleaving, pinned permanently. The actor is already dead, a mark send parks
     /// between registration and the channel send WHILE OWNING THE GATE, and a terminal drain
     /// runs concurrently: it cannot pass the gate during the window, the dead receiver then
     /// rejects the enqueue, the sender receives its COMPLETE ticket — and the drain sees no

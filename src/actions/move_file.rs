@@ -53,12 +53,29 @@ pub fn move_to(src: &Path, dest: &Path) -> Result<PathBuf> {
 }
 
 /// Candidate name with a collision suffix: `n == 0` → `base`, otherwise `base.N`.
+///
+/// The suffix is appended to the name's raw bytes, never to a `String`. A Unix filename is
+/// arbitrary non-NUL bytes, and going through `to_string_lossy` would corrupt the survivor two
+/// ways at once: it renames the file, so `b"\x80.bin"` would land as `"\u{FFFD}.bin.1"` — bytes
+/// the operator never chose, with no way back to the original from the name alone — and it
+/// collapses distinct names onto one, so `b"\x80.bin"` and `b"\xff.bin"` colliding in the same
+/// directory would queue up as `.1` and `.2` of a name neither of them ever had.
 pub(crate) fn suffixed(base: &Path, n: u32) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
     if n == 0 {
         return base.to_path_buf();
     }
     match base.file_name() {
-        Some(name) => base.with_file_name(format!("{}.{n}", name.to_string_lossy())),
+        Some(name) => {
+            let name = name.as_bytes();
+            let suffix = format!(".{n}");
+            let mut out = Vec::with_capacity(name.len() + suffix.len());
+            out.extend_from_slice(name);
+            out.extend_from_slice(suffix.as_bytes());
+            base.with_file_name(OsString::from_vec(out))
+        }
         None => base.to_path_buf(),
     }
 }
@@ -96,6 +113,8 @@ pub(crate) fn rename_noreplace(src: &Path, dest: &Path) -> std::io::Result<()> {
 /// counter): for atomic publication — evacuation of the original during hardlink/reflink
 /// (`actions/mod.rs`).
 pub(crate) fn staging_path(parent: &Path, name: Option<&std::ffi::OsStr>) -> PathBuf {
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -104,13 +123,15 @@ pub(crate) fn staging_path(parent: &Path, name: Option<&std::ffi::OsStr>) -> Pat
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let base = name
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "item".to_string());
-    parent.join(format!(
-        ".dedcom-tmp-{}-{nanos}-{seq}-{base}",
-        std::process::id()
-    ))
+    // The name's own bytes, like everywhere else: this one is a temporary, but the cleanup
+    // after a failed build is best-effort, and a leftover has to stay greppable back to the
+    // file it was staged for.
+    let base: &[u8] = name.map(OsStr::as_bytes).unwrap_or(b"item");
+    let prefix = format!(".dedcom-tmp-{}-{nanos}-{seq}-", std::process::id());
+    let mut out = Vec::with_capacity(prefix.len() + base.len());
+    out.extend_from_slice(prefix.as_bytes());
+    out.extend_from_slice(base);
+    parent.join(OsString::from_vec(out))
 }
 
 /// Moves file `src` INTO directory `dir`, preserving the name.
@@ -218,6 +239,131 @@ mod tests {
         assert!(!src.exists());
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// A collision suffix is appended to the name's own bytes. Composed through
+    /// `to_string_lossy` the candidate came back with U+FFFD in place of every byte the decoder
+    /// refused, so the moved file landed under a name the operator never chose — and one nothing
+    /// can read back to the original.
+    #[test]
+    fn suffixed_preserves_non_utf8_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let base = PathBuf::from(OsStr::from_bytes(b"/somewhere/\x80.bin"));
+        // `n == 0` is the common path and stays byte-exact by construction.
+        assert_eq!(suffixed(&base, 0), base);
+        assert_eq!(
+            suffixed(&base, 1),
+            PathBuf::from(OsStr::from_bytes(b"/somewhere/\x80.bin.1"))
+        );
+        assert_eq!(
+            suffixed(&base, 12),
+            PathBuf::from(OsStr::from_bytes(b"/somewhere/\x80.bin.12"))
+        );
+
+        // An invalid byte in the extension survives just as literally.
+        let base = PathBuf::from(OsStr::from_bytes(b"/somewhere/photo.\xff"));
+        assert_eq!(
+            suffixed(&base, 1),
+            PathBuf::from(OsStr::from_bytes(b"/somewhere/photo.\xff.1"))
+        );
+    }
+
+    /// The suffix is only ever reached through `EEXIST`, so the guarantee has to hold across a
+    /// real `renameat2` — an occupied destination (a dangling symlink `exists()` reported as
+    /// absent, or a lost race) sends the move to `dest.1`, and those must be the operator's bytes.
+    #[test]
+    fn collision_suffix_keeps_non_utf8_name() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = temp_dir("coll_bytes");
+        let src_dir = root.join("src");
+        let dst_dir = root.join("dst");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&dst_dir).unwrap();
+        let name = OsStr::from_bytes(b"\x80.bin");
+        let src = src_dir.join(name);
+        write_file(&src, b"new");
+        write_file(&dst_dir.join(name), b"old");
+
+        let final_dest = move_into_dir(&src, &dst_dir).unwrap();
+        assert_eq!(final_dest, dst_dir.join(OsStr::from_bytes(b"\x80.bin.1")));
+        assert_eq!(fs::read(dst_dir.join(name)).unwrap(), b"old"); // neighbor intact
+        assert_eq!(fs::read(&final_dest).unwrap(), b"new");
+        assert!(!src.exists());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Two names that differ only outside UTF-8 keep their own slots. Lossy composition mapped
+    /// `\x80` and `\xff` alike onto U+FFFD, so the second survivor queued up as `.2` of the first
+    /// one's name: two unrelated files sharing a name neither of them ever had.
+    #[test]
+    fn distinct_non_utf8_collisions_do_not_collapse() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = temp_dir("coll_collapse");
+        let src_dir = root.join("src");
+        let dst_dir = root.join("dst");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&dst_dir).unwrap();
+        let first = OsStr::from_bytes(b"\x80.bin");
+        let second = OsStr::from_bytes(b"\xff.bin");
+        // The premise, stated before it is relied on: to the lossy decoder these two names ARE
+        // one string. Without that the assertions below would hold on the old code too.
+        assert_eq!(
+            first.to_string_lossy(),
+            second.to_string_lossy(),
+            "both names decode to a single lossy string — that is the collapse being ruled out"
+        );
+        for name in [first, second] {
+            write_file(&src_dir.join(name), b"new");
+            write_file(&dst_dir.join(name), b"old");
+        }
+
+        let moved_first = move_into_dir(&src_dir.join(first), &dst_dir).unwrap();
+        let moved_second = move_into_dir(&src_dir.join(second), &dst_dir).unwrap();
+
+        // Each one takes the `.1` of its OWN name, not `.1` and `.2` of an invented one.
+        assert_eq!(moved_first, dst_dir.join(OsStr::from_bytes(b"\x80.bin.1")));
+        assert_eq!(moved_second, dst_dir.join(OsStr::from_bytes(b"\xff.bin.1")));
+        assert_ne!(
+            moved_first, moved_second,
+            "distinct names do not share a slot"
+        );
+        assert!(moved_first.is_file() && moved_second.is_file());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The evacuation temp carries the original's bytes as well. It is a generated name that
+    /// never becomes anyone's final resting place — publication renames it onto the caller's
+    /// `target`, and every failure arm unlinks it — but that unlink is best-effort, so a leftover
+    /// has to name the file it was staged for.
+    #[test]
+    fn staging_path_preserves_non_utf8_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = staging_path(Path::new("/tank"), Some(OsStr::from_bytes(b"\x80.bin")));
+        let name = path.file_name().unwrap().as_bytes();
+        assert!(
+            name.starts_with(b".dedcom-tmp-"),
+            "hidden staging prefix kept: {}",
+            path.display()
+        );
+        assert!(
+            name.ends_with(b"\x80.bin"),
+            "original bytes kept: {}",
+            path.display()
+        );
+
+        // No name at all still yields the neutral placeholder.
+        let path = staging_path(Path::new("/tank"), None);
+        assert!(path.file_name().unwrap().as_bytes().ends_with(b"-item"));
     }
 
     #[test]
