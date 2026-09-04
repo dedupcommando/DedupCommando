@@ -22,11 +22,12 @@ env:
 
 jobs:
   guard:
-    name: require signing key
+    name: release preflight
     runs-on: ubuntu-latest
     outputs:
       have_apt_key: ${{ steps.aptkey.outputs.have_apt_key }}
     steps:
+      - uses: actions/checkout@v7
       - name: Fail early if MINISIGN_SECRET_KEY is unset
         env:
           HAVE_SIGNING_KEY: ${{ secrets.MINISIGN_SECRET_KEY != '' }}
@@ -36,6 +37,15 @@ jobs:
             exit 1
           fi
           echo "signing key present"
+      - name: Fail early if the release notes are missing
+        env:
+          NOTES: docs/release-notes/${{ github.ref_name }}.md
+        run: |
+          if [ ! -s "$NOTES" ]; then
+            echo "::error::$NOTES is missing or empty — refusing to build a release nobody described. Write the notes, push them, then push the tag."
+            exit 1
+          fi
+          echo "release notes present: $NOTES"
       - name: Record whether the APT signing key is available
         id: aptkey
         env:
@@ -144,6 +154,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Checkout comes first on purpose: it cleans the workspace, and the notes file the
+      # publish step reads is a file in the repository, not an artifact.
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           pattern: dedcom-*
@@ -173,7 +186,12 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: dist/**
-          generate_release_notes: true
+          # The notes are written by hand. Generating them republishes every commit
+          # subject since the previous tag, and a list of subjects cannot say what a
+          # release does NOT establish — for a tool that deletes files, the part that
+          # matters most. The preflight job refuses to build if the file is missing.
+          body_path: docs/release-notes/${{ github.ref_name }}.md
+          generate_release_notes: false
           prerelease: true
           fail_on_unmatched_files: true
 
