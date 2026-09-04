@@ -148,6 +148,23 @@ mod tests {
         assert!(!vacuum_due(0, Some(0), 1_000_000));
     }
 
+    /// Retention runs unasked on every completed scan, so the number it keeps is a promise about
+    /// the user's sessions — and a default that only the code knows is a default nobody agreed to.
+    #[test]
+    fn the_manual_states_the_retention_default_the_code_uses() {
+        let configured = format!("\"history_keep\": {DEFAULT_HISTORY_KEEP}");
+        assert!(
+            crate::testfixtures::manual("12-maintenance.md").contains(&configured),
+            "12-maintenance.md must show the default as {configured}"
+        );
+
+        let stated = format!("(default: {DEFAULT_HISTORY_KEEP})");
+        assert!(
+            crate::testfixtures::manual("10-diff-trash.md").contains(&stated),
+            "10-diff-trash.md must name the retention default as {stated}"
+        );
+    }
+
     #[test]
     fn due_when_never_run() {
         assert!(vacuum_due(120, None, 1_000_000));

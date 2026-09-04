@@ -660,6 +660,28 @@ mod format_tests {
         }
     }
 
+    /// The same wording, held in the chapters that draw those screens.
+    ///
+    /// The test above pins what the code says; this one pins the manual to the same words, on the
+    /// screens a reader meets last before an irreversible batch. The phrase is read from the code
+    /// rather than written here twice, so changing it turns this red until the chapters follow.
+    #[test]
+    fn the_manual_quotes_the_reclaim_wording_the_code_produces() {
+        let phrase = reclaim_phrase(ReclaimEstimate::exact(4096));
+        let (kind, _figure) = phrase
+            .split_once(':')
+            .expect("a reclaim phrase names the kind of figure before the number");
+
+        // The three chapters that draw a confirmation or a post-batch summary.
+        for chapter in ["04-quickstart.md", "05-commando.md", "06-classic.md"] {
+            assert!(
+                crate::testfixtures::manual(chapter).contains(kind),
+                "{chapter} draws the reclaim figure but never with «{kind}» — the wording the \
+                 code produces has to be the wording the chapter shows"
+            );
+        }
+    }
+
     /// The count wording, once, in the same place as the reclaim wording: a count that was never
     /// recorded says so, and every count that exists is printed as it is.
     #[test]

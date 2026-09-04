@@ -35,6 +35,24 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::model::scan::ScanConfig;
 
+/// One file of the user manual, read from the repository this test binary was built from.
+///
+/// The manual is part of the source tree, so a test may assert against it exactly as it asserts
+/// against a constant. What the code does and what the manual says it does are two statements about
+/// one thing; only an assertion keeps them the same statement. Nothing else in the build reads
+/// `docs/` — not `fmt`, not `clippy`, not the compiler — so drift there is silent by default.
+///
+/// `CARGO_MANIFEST_DIR` is fixed at compile time, so the path does not depend on the directory the
+/// test happens to run in.
+pub fn manual(name: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("docs")
+        .join("manual")
+        .join(name);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("cannot read the manual at {}: {err}", path.display()))
+}
+
 /// Size of the duplicated payload. Big enough that a read is a real read, small enough to be free.
 const DUP_SIZE: usize = 4096;
 /// How many pathnames point at the shared inode.

@@ -2978,6 +2978,70 @@ mod keymap_tests {
     }
 }
 
+/// The F9 menu as the manual draws it, held to the menu the code builds.
+///
+/// The keymap tests above check the tables against each other; these check them against the
+/// chapter a user reads. Adding an entry shifts every number below it, and the manual numbers them
+/// twice — once in the drawn menu, once in the prose underneath. Both are held here.
+#[cfg(test)]
+mod manual_tests {
+    use super::{MenuAction, MENU};
+    use crate::testfixtures::manual;
+
+    /// The drawn menu block of `05-commando.md`, as (number, label) pairs.
+    fn drawn_menu(doc: &str) -> Vec<(usize, String)> {
+        doc.lines()
+            .skip_while(|line| !line.starts_with("┌─ Menu — F9"))
+            .take_while(|line| !line.starts_with('└'))
+            .filter_map(|line| {
+                let body = line.strip_prefix('│')?.trim_end_matches(['│', ' ']).trim();
+                let (number, label) = body.split_once(". ")?;
+                Some((number.trim().parse().ok()?, label.trim().to_string()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn manual_draws_the_menu_the_code_builds() {
+        let drawn = drawn_menu(&manual("05-commando.md"));
+        assert_eq!(
+            drawn.len(),
+            MENU.len(),
+            "the manual draws {} menu entries, the code builds {}",
+            drawn.len(),
+            MENU.len()
+        );
+        for (index, (number, label)) in drawn.iter().enumerate() {
+            assert_eq!(*number, index + 1, "the drawn menu skips a number");
+            assert_eq!(
+                label,
+                MENU[index].0,
+                "menu entry {} — the manual says {label:?}, the code says {:?}",
+                index + 1,
+                MENU[index].0
+            );
+        }
+    }
+
+    /// The prose under the drawn menu names entries by number. The one that runs the batch is the
+    /// only entry whose misnumbering costs data, so it is the one pinned here — by the position the
+    /// code gives it, not by a number written into this test.
+    #[test]
+    fn manual_names_the_executing_entry_by_its_own_number() {
+        let position = MENU
+            .iter()
+            .position(|(_, action)| matches!(action, MenuAction::Execute))
+            .expect("the F9 menu has an Execute entry")
+            + 1;
+        let claim = format!("item {position} executes");
+        assert!(
+            manual("05-commando.md").contains(&claim),
+            "Execute is menu entry {position}; the manual must say {claim:?} where it lists the \
+             entries by number"
+        );
+    }
+}
+
 /// U-4b: the Commands tab printed the first screenful and a «… N more lines» note, so the
 /// audit view of a plan could not be audited past its first screen.
 #[cfg(test)]
