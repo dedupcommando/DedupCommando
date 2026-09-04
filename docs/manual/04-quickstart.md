@@ -273,7 +273,7 @@ overlay with two tabs — **Summary** and **Commands**:
 │                                                                         │
 │   Actions to be executed: 9                                            │
 │   By type: delete 2 · hardlink 7                                       │
-│   Approximately freed: 232.0 MiB                                       │
+│   guaranteed after quarantine purge: 232.0 MiB                         │
 │                                                                         │
 │   DELETE    /tank/junk/duplicate.bin                                   │
 │   DELETE    /tank/junk/duplicate-2.bin                                 │

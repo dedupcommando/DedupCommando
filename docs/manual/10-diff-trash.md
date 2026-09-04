@@ -165,9 +165,14 @@ continues.
 
 ### Retention (automatic cleanup)
 
-If retention is configured in `config.json`, `dedcom` may offer at startup to
-move old sessions to the trash. Retention is off by default; it is configured in
-code/config and is not yet surfaced in the UI.
+Retention is **on by default** and runs without asking. On every scan
+completion, completed scans of the same roots beyond the newest `history_keep`
+(default: 2) are moved to the trash, along with stale unfinished ones. Nothing
+is deleted — the sessions stay in the trash and remain recoverable until you
+purge them yourself.
+
+The limit is `history_keep` in `config.json`; it is not yet settable from the
+UI. Values and what they mean: [§12 Maintenance](12-maintenance.md).
 
 ## What's next
 

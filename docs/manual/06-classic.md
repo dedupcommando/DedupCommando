@@ -243,7 +243,7 @@ exactly will happen on apply:
 │   REFLINK    /tank/vm/disk.img                           (80.0 MiB)     │
 │   ...                                                                    │
 ├─────────────────────────────────────────────────────────────────────────┤
-│ Operations: 9 · potential to free: 232.0 MiB                           │
+│ Operations: 9 · guaranteed after quarantine purge: 232.0 MiB           │
 │ Before applying, ZFS snapshots of the affected datasets will be created. │
 │ ↑↓/PgUp/PgDn/Home/End scroll · [Y] execute · [Esc] back to browser     │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -267,7 +267,7 @@ After **Y** — a modal confirmation on top:
 ┌ Confirmation ──────────────────────────────────────────────────────────┐
 │  Execute 9 operations?                                                  │
 │  A snapshot + quarantine are created — actions are reversible until     │
-│  purge.  (frees ~232.0 MiB)                                            │
+│  purge.  (guaranteed after quarantine purge: 232.0 MiB)                │
 │                                                                         │
 │  [Y] yes        [N] no                                                 │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -322,8 +322,8 @@ The cancel semantics — [§03 Data Safety](03-safety.md#press-esc-during-apply)
 │ Files moved to quarantine:                                             │
 │   /tank/.dedcom-quarantine/20260527-143215-0/                          │
 │                                                                         │
-│ Planned to be freed: 232.0 MiB                                         │
-│ Volume of successfully processed files: 232.0 MiB                      │
+│ planned: guaranteed after quarantine purge: 232.0 MiB                  │
+│ realized: guaranteed after quarantine purge: 232.0 MiB                 │
 │                                                                         │
 │ Space is freed AFTER verifying and purging with the commands:          │
 │   zfs destroy tank@dedcom-20260527-143215-0                            │

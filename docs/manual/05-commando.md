@@ -369,8 +369,10 @@ Execute also has the letter alias **x**. See
 | **Enter**   | Apply the selected item                   |
 | **Esc** or **F9** | Close the menu without an action    |
 
-Items 6–12 duplicate the hotkeys (for those who do not yet remember them). Item
-2 = `Shift+F9`, item 3 = `F12`, item 4 = clear all marks in bulk.
+Item 2 = `Shift+F9`, item 3 = `F12`, **item 4 executes the marked actions**
+(`F11` or `x`), item 5 = clear all marks in bulk. Items 7–13 duplicate the
+hotkeys named in their own labels (for those who do not yet remember them);
+item 6 has no key of its own, and item 14 is the help screen.
 
 ## Overlays
 
@@ -384,7 +386,7 @@ Besides the menu there are three more modal overlays:
 │                                                                         │
 │   Actions to be executed: 9                                            │
 │   By type: delete 2 · hardlink 7                                       │
-│   Approximately freed: 232.0 MiB                                       │
+│   guaranteed after quarantine purge: 232.0 MiB                         │
 │                                                                         │
 │   DELETE    /tank/junk/duplicate.bin                                   │
 │   DELETE    /tank/junk/duplicate-2.bin                                 │
