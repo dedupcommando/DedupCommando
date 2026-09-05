@@ -525,6 +525,47 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// A stat that is refused is not a vanished entry: the move fails instead of guessing.
+    ///
+    /// This is the other arm of `same_size_files`, the one that RETURNS the error, and it needs
+    /// a guard of its own because the arm beside it skips. The fault lands on the twin itself:
+    /// skipped like a `NotFound`, the twin would drop out of the listing, the destination would
+    /// answer "nothing here duplicates it", and the file would be filed under its own name with
+    /// `duplicate = false` in the journal, the misfiling this arm exists to refuse. So a wrong
+    /// turn here fails in the direction of the real defect, not merely somewhere.
+    #[test]
+    fn an_entry_whose_stat_is_refused_is_fatal_not_skipped() {
+        let (root, file, dest) = one_and_its_twin("refused");
+        let db = root.join("scan.db");
+
+        let faults = crate::testfixtures::WalkFaults::arm(&[(
+            dest.join("twin.bin"),
+            crate::testfixtures::WalkFault::MetadataRefused,
+        )]);
+        let out = run_batch(&db, std::slice::from_ref(&file), &dest, None);
+
+        assert!(
+            faults.pending().is_empty(),
+            "the fault must have fired: an unfired one means the twin was never stat'ed"
+        );
+        assert_eq!(
+            out.failed, 1,
+            "a refused stat fails the move instead of being skipped like a vanished entry"
+        );
+        assert!(out.moved.is_empty(), "nothing was moved");
+        assert_eq!(out.dups, 0, "nor classified either way");
+        assert!(
+            file.exists(),
+            "the file stays where the operator left it, undamaged"
+        );
+        assert!(
+            !dest.join("photo.bin").exists() && !dest.join("photo.dup1.bin").exists(),
+            "and nothing under either name appeared in the destination"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// A file whose content will not read is not thereby "not a duplicate".
     ///
     /// The destination lists cleanly and holds a same-size twin, so the question is live and only

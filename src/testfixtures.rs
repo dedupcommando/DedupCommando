@@ -329,7 +329,7 @@ pub fn note_content_read(path: &Path) {
     }
 }
 
-/// Which silently-skipping branch an injected fault stands in for.
+/// Which error branch an injected fault stands in for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkFault {
     /// A directory iterator yielded an error instead of an entry — the walk's own, or the
@@ -338,6 +338,13 @@ pub enum WalkFault {
     Iterator,
     /// The entry arrived, but its metadata could not be read.
     Metadata,
+    /// The entry is still there, but the stat itself is refused: `EACCES` from a directory that
+    /// lists but does not search, or `EIO`. Its own kind because the commander's duplicate check
+    /// treats the two failures differently. `Metadata` stands in for `NotFound` there, the one
+    /// stat failure it skips; a refusal must fail the whole listing, and a fixture running as
+    /// root cannot produce one on cue by changing permissions. Only that check consumes it. The
+    /// walk does not tell stat failures apart, so `Metadata` covers it there.
+    MetadataRefused,
     /// The file is there and its metadata reads, but its CONTENT does not. The move's duplicate
     /// check hashes both the file being moved and every same-size candidate, and either read can
     /// fail on its own (`EACCES`, `EIO`) long after the directory listed cleanly. A separate kind
@@ -421,9 +428,16 @@ pub(crate) fn take_content_fault(path: &Path) -> bool {
     take_fault(path, WalkFault::Content)
 }
 
-/// Called by the walk where a metadata error would have skipped the entry.
+/// Called where a metadata error would have skipped the entry: the walk, and the commander's
+/// `same_size_files`, where it stands for `NotFound`.
 pub(crate) fn take_metadata_fault(path: &Path) -> bool {
     take_fault(path, WalkFault::Metadata)
+}
+
+/// Called where a refused stat, anything but `NotFound`, would have failed the listing: the
+/// commander's `same_size_files`.
+pub(crate) fn take_metadata_refusal(path: &Path) -> bool {
+    take_fault(path, WalkFault::MetadataRefused)
 }
 
 /// A real directory of byte-identical files — some of them hardlinked, some with a link outside the

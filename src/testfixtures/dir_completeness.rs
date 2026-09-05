@@ -818,6 +818,12 @@ mod tests {
                     "the completeness fixture arms no content fault: {}",
                     file.display()
                 ),
+                // Likewise a refused stat: the walk does not tell stat failures apart, so it has
+                // no branch for this one either.
+                WalkFault::MetadataRefused => unreachable!(
+                    "the completeness fixture arms no stat refusal: {}",
+                    file.display()
+                ),
             };
             assert_eq!(
                 declared.get(&file).copied(),

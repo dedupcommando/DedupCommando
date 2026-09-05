@@ -2721,11 +2721,12 @@ mod snapshot_tests {
 /// answer "nothing here duplicates it" for anyone — but the blast radius is the whole destination,
 /// and a batch will report one failure per file moved into it.
 ///
-/// **Untested arm, stated rather than implied:** the non-`NotFound` stat failure has no test.
-/// The tests run as root in a container, where permissions refuse nothing, and the injection seam
-/// below produces `NotFound` because that is the arm worth exercising — the one that CONTINUES.
-/// Reaching the returning arm from a fixture would need a filesystem that can refuse a stat, and
-/// no such fixture exists here. What is covered is the `?` on `read_dir` itself, by
+/// Both stat arms are reached through the injection seam below: the tests run as root in a
+/// container, where a permission change refuses nothing, and no fixture can unlink an entry
+/// between `read_dir` and the stat on cue. `WalkFault::Metadata` stands in for `NotFound`,
+/// the arm that CONTINUES; `WalkFault::MetadataRefused` for `PermissionDenied`, the arm that
+/// returns. Each has a test of its own in `move_batch`, and the returning arm one more here, on
+/// the listing itself. The `?` on `read_dir` is covered by
 /// `a_destination_that_will_not_open_is_an_error`, which uses real refusals and no seam.
 fn same_size_files(dir: &Path, size: u64) -> std::io::Result<Vec<PathBuf>> {
     use std::os::unix::fs::MetadataExt;
@@ -2738,11 +2739,14 @@ fn same_size_files(dir: &Path, size: u64) -> std::io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        // Test-only: the entry unlinked between `read_dir` and the stat — a race no fixture can
-        // stage. Absent from every non-test build.
+        // Test-only: the entry unlinked between `read_dir` and the stat, a race no fixture can
+        // stage, or a stat refused outright, which a fixture running as root cannot produce on
+        // cue by changing permissions. Absent from every non-test build.
         #[cfg(test)]
         let stat = if crate::testfixtures::take_metadata_fault(&entry.path()) {
             Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        } else if crate::testfixtures::take_metadata_refusal(&entry.path()) {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
         } else {
             entry.metadata()
         };
@@ -4296,6 +4300,36 @@ mod triage_tests {
         let missing = dir.join("no_such_dir");
         let err = same_size_files(&missing, 5).expect_err("a missing directory is an error too");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A stat that is refused fails the listing, the whole of it, not just its entry.
+    ///
+    /// The refusal lands on one of two same-size files, so the two outcomes are told apart: an
+    /// arm that skipped the entry would still answer `Ok` with the other file in it, a listing
+    /// short by one that the caller cannot tell from a complete one. The kind is checked too:
+    /// what to do with a `PermissionDenied` is the caller's decision, so it must not arrive
+    /// relabelled.
+    #[test]
+    fn a_refused_stat_fails_the_listing_not_only_its_entry() {
+        let dir = temp_dir("refused");
+        let refused = dir.join("a.bin");
+        fs::write(&refused, b"12345").unwrap();
+        fs::write(dir.join("b.bin"), b"12345").unwrap();
+
+        let faults = crate::testfixtures::WalkFaults::arm(&[(
+            refused,
+            crate::testfixtures::WalkFault::MetadataRefused,
+        )]);
+        let listing = same_size_files(&dir, 5);
+
+        assert!(
+            faults.pending().is_empty(),
+            "the fault must have fired: an unfired one means the entry was never stat'ed"
+        );
+        let err = listing.expect_err("a refused stat is an error, not a listing short by one");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
 
         fs::remove_dir_all(&dir).ok();
     }
