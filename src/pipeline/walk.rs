@@ -2257,6 +2257,87 @@ mod tests {
         fs::remove_dir_all(&holder).ok();
     }
 
+    /// The same two guarantees on the branch that CANNOT key its roots — the one that walks every
+    /// root through a single multi-root `WalkBuilder`.
+    ///
+    /// `the_walk_keeps_the_roots_in_configured_order` says nothing about this branch: its roots are
+    /// keyable, so it takes the ledgered arm and its builder-per-root. The two arms share
+    /// `configure` but not their coverage, and the tests that do reach this arm hold one file each,
+    /// which no order is visible in. Dropping the sorter from this builder alone — precisely what
+    /// `build_parallel()` would silently do to it — therefore fails nothing else in this file.
+    ///
+    /// The two halves are asserted apart, so a failure names the one that broke: the roots come
+    /// back in the order they were configured, and within each root the files come back in byte
+    /// order of their names. The root names are anti-alphabetical, so a sorted root list cannot
+    /// pass; the two trees are built in opposite orders, so neither root can be reporting the order
+    /// its entries happened to be created in.
+    #[test]
+    fn an_unkeyable_multi_root_walk_keeps_the_root_and_the_name_order() {
+        let holder = temp_dir("order_roots_unkeyable");
+        // A `..` component is what makes a root unkeyable: `PathKey::new` refuses to resolve one
+        // rather than pop it lexically. The spelling still names the directories built below.
+        let via = holder
+            .join("..")
+            .join(holder.file_name().expect("the temp dir has a name"));
+        build_order_tree(&holder.join("zz_first"), false);
+        build_order_tree(&holder.join("aa_second"), true);
+
+        let mut config = base_config(&holder);
+        config.roots = vec![via.join("zz_first"), via.join("aa_second")];
+        let outcome = collect(&config);
+
+        let walked = match &outcome {
+            WalkOutcome::Finished {
+                files,
+                omissions: OmissionSnapshot::Unavailable(SnapshotUnavailable::Roots { why, .. }),
+            } => {
+                // Without this the fixture could be keyable after all, and everything below would
+                // be re-testing the ledgered arm.
+                assert!(
+                    matches!(why, AuthorityUnavailable::UnkeyableRoot { .. }),
+                    "the fixture must reach the multi-root builder, got {why:?}"
+                );
+                walked_names(files, &via)
+            }
+            other => panic!("expected an unavailable snapshot, got {:?}", other.kind()),
+        };
+
+        // Root order: the first configured root reported whole, then the second. `dedup` leaves one
+        // entry per RUN, so an interleaved walk shows a root twice rather than passing.
+        let mut roots: Vec<&str> = walked
+            .iter()
+            .map(|name| name.split('/').next().expect("a name under a root"))
+            .collect();
+        roots.dedup();
+        assert_eq!(
+            roots,
+            vec!["zz_first", "aa_second"],
+            "configured root order, one uninterrupted run each: {walked:?}"
+        );
+
+        // Name order INSIDE each root: the byte-sorted depth-first sequence, the same for a tree
+        // created forwards and for one created backwards.
+        let under = |dir: &str| -> Vec<String> {
+            walked
+                .iter()
+                .filter_map(|name| name.strip_prefix(&format!("{dir}/")).map(str::to_string))
+                .collect()
+        };
+        assert_eq!(
+            under("zz_first"),
+            ordered_walk(),
+            "byte order within the first root: {walked:?}"
+        );
+        assert_eq!(
+            under("aa_second"),
+            ordered_walk(),
+            "byte order within the second root, whose tree was built in reverse: {walked:?}"
+        );
+        assert_eq!(walked.len(), 18, "both trees whole: {walked:?}");
+
+        fs::remove_dir_all(&holder).ok();
+    }
+
     // -----------------------------------------------------------------------------------------
     // The no-authority observed tally.
     // -----------------------------------------------------------------------------------------
