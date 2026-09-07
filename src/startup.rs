@@ -144,7 +144,9 @@ mod tests {
             "the first opener is the one that settles the checkpoint, and it finds the legacy stamp"
         );
         assert!(
-            seen[1..].iter().all(|version| *version == 5),
+            seen[1..]
+                .iter()
+                .all(|version| *version == crate::state::schema::SCHEMA_VERSION),
             "everything after it must find the migration committed: {seen:?}"
         );
     }
@@ -165,7 +167,11 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 5, "the checkpoint is migrated");
+        assert_eq!(
+            version,
+            crate::state::schema::SCHEMA_VERSION,
+            "the checkpoint is migrated"
+        );
         let materialized: i64 = conn
             .query_row(
                 "SELECT results_materialized FROM scan_stats WHERE scan_id = 1",
@@ -328,7 +334,12 @@ mod tests {
                 (|dir: &Path| {
                     let db = genuine_checkpoint(dir, 0);
                     let conn = rusqlite::Connection::open(&db).unwrap();
-                    conn.pragma_update(None, "user_version", 6i64).unwrap();
+                    conn.pragma_update(
+                        None,
+                        "user_version",
+                        crate::state::schema::SCHEMA_VERSION + 1,
+                    )
+                    .unwrap();
                     db
                 }) as fn(&Path) -> std::path::PathBuf,
                 "newer version",

@@ -6978,7 +6978,15 @@ mod group_list_navigation_tests {
 mod session_store_failures_are_never_empty_data_tests {
     use super::*;
 
-    const NEWER: &str = "dedcom.db was created by a newer version (schema v6; this build supports v5). Upgrade dedcom, or move the old dedcom.db aside.";
+    /// The product's own refusal of a checkpoint one schema version ahead of this build, byte
+    /// for byte; built from `SCHEMA_VERSION` so the fixture stays «a future DB» after every bump.
+    fn newer() -> String {
+        let current = crate::state::schema::SCHEMA_VERSION;
+        format!(
+            "dedcom.db was created by a newer version (schema v{}; this build supports v{current}). Upgrade dedcom, or move the old dedcom.db aside.",
+            current + 1
+        )
+    }
 
     /// A scratch directory that removes itself when the test returns: a green test may not leave
     /// a persistent fixture behind merely because the cargo process eventually exits.
@@ -7006,20 +7014,25 @@ mod session_store_failures_are_never_empty_data_tests {
         Scratch::new(name)
     }
 
-    /// A real v5 checkpoint the product itself created and migrated.
-    fn v5_db(dir: &std::path::Path) -> PathBuf {
+    /// A real checkpoint of the current schema, created and migrated by the product itself.
+    fn current_db(dir: &std::path::Path) -> PathBuf {
         let db = dir.join("dedcom.db");
-        let store = ScanStore::open(&db).expect("the product creates its own v5 checkpoint");
+        let store = ScanStore::open(&db).expect("the product creates its own checkpoint");
         drop(store);
         db
     }
 
     /// The same checkpoint stamped one version into the future. The error under test is the
     /// product's own newer-schema refusal, not a hand-written string.
-    fn v6_db(dir: &std::path::Path) -> PathBuf {
-        let db = v5_db(dir);
+    fn future_db(dir: &std::path::Path) -> PathBuf {
+        let db = current_db(dir);
         let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.pragma_update(None, "user_version", 6i64).unwrap();
+        conn.pragma_update(
+            None,
+            "user_version",
+            crate::state::schema::SCHEMA_VERSION + 1,
+        )
+        .unwrap();
         drop(conn);
         db
     }
@@ -7082,7 +7095,7 @@ mod session_store_failures_are_never_empty_data_tests {
     #[test]
     fn f12_installs_the_real_list_when_the_store_opens() {
         let dir = scratch("f12-ok");
-        let (mut app, rx) = test_app_with_db(v5_db(dir.path()));
+        let (mut app, rx) = test_app_with_db(current_db(dir.path()));
         app.spawn_sessions_load();
         app.handle_event(pump(&rx));
 
@@ -7093,8 +7106,8 @@ mod session_store_failures_are_never_empty_data_tests {
 
     #[test]
     fn f12_refusal_shows_the_exact_error_and_installs_nothing() {
-        let dir = scratch("f12-v6");
-        let db = v6_db(dir.path());
+        let dir = scratch("f12-future");
+        let db = future_db(dir.path());
         let before = census(&db);
         let (mut app, rx) = test_app_with_db(db.clone());
 
@@ -7119,7 +7132,8 @@ mod session_store_failures_are_never_empty_data_tests {
         app.handle_event(pump(&rx));
 
         assert_eq!(
-            app.status, NEWER,
+            app.status,
+            newer(),
             "the store's own words reach the operator"
         );
         assert!(!app.sessions_loading, "the spinner is cleared");
@@ -7148,7 +7162,7 @@ mod session_store_failures_are_never_empty_data_tests {
         let dir = scratch("f2-ok");
         let roots = scratch("f2-ok-root");
         std::fs::write(roots.path().join("a.bin"), b"a").unwrap();
-        let (mut app, rx) = test_app_with_db(v5_db(dir.path()));
+        let (mut app, rx) = test_app_with_db(current_db(dir.path()));
 
         app.handle_event(AppEvent::CommanderResumeProbe {
             roots: vec![roots.path().to_path_buf()],
@@ -7226,10 +7240,10 @@ mod session_store_failures_are_never_empty_data_tests {
 
     #[test]
     fn f2_refusal_starts_no_worker_and_moves_no_resume_state() {
-        let dir = scratch("f2-v6");
-        let roots = scratch("f2-v6-root");
+        let dir = scratch("f2-future");
+        let roots = scratch("f2-future-root");
         std::fs::write(roots.path().join("a.bin"), b"a").unwrap();
-        let db = v6_db(dir.path());
+        let db = future_db(dir.path());
         let before = census(&db);
         let (mut app, rx) = test_app_with_db(db.clone());
         let screen_before = app.screen;
@@ -7238,7 +7252,8 @@ mod session_store_failures_are_never_empty_data_tests {
         app.handle_event(pump(&rx));
 
         assert_eq!(
-            app.commander.status, NEWER,
+            app.commander.status,
+            newer(),
             "the store's own words are shown"
         );
         assert!(
@@ -7271,7 +7286,7 @@ mod session_store_failures_are_never_empty_data_tests {
     #[test]
     fn trash_opens_the_real_list_when_the_store_opens() {
         let dir = scratch("trash-ok");
-        let (mut app, _rx) = test_app_with_db(v5_db(dir.path()));
+        let (mut app, _rx) = test_app_with_db(current_db(dir.path()));
         app.open_trash();
         assert_eq!(app.screen, Screen::Trash);
         assert!(app.status.contains("Trash"), "status: {}", app.status);
@@ -7279,8 +7294,8 @@ mod session_store_failures_are_never_empty_data_tests {
 
     #[test]
     fn trash_refusal_never_prints_an_empty_trash() {
-        let dir = scratch("trash-v6");
-        let db = v6_db(dir.path());
+        let dir = scratch("trash-future");
+        let db = future_db(dir.path());
         let before = census(&db);
         let (mut app, _rx) = test_app_with_db(db.clone());
         let screen_before = app.screen;
@@ -7289,7 +7304,8 @@ mod session_store_failures_are_never_empty_data_tests {
         app.open_trash();
 
         assert_eq!(
-            app.status, NEWER,
+            app.status,
+            newer(),
             "the store's own words reach the operator"
         );
         assert!(
@@ -7384,7 +7400,15 @@ mod session_store_failures_are_never_empty_data_tests {
 mod session_load_error_ownership_tests {
     use super::*;
 
-    const NEWER: &str = "dedcom.db was created by a newer version (schema v6; this build supports v5). Upgrade dedcom, or move the old dedcom.db aside.";
+    /// The product's own refusal of a checkpoint one schema version ahead of this build, byte
+    /// for byte; built from `SCHEMA_VERSION` so the fixture stays «a future DB» after every bump.
+    fn newer() -> String {
+        let current = crate::state::schema::SCHEMA_VERSION;
+        format!(
+            "dedcom.db was created by a newer version (schema v{}; this build supports v{current}). Upgrade dedcom, or move the old dedcom.db aside.",
+            current + 1
+        )
+    }
 
     struct Scratch(PathBuf);
 
@@ -7406,9 +7430,10 @@ mod session_load_error_ownership_tests {
         }
     }
 
-    /// A real v5 checkpoint the product created and migrated, with every connection closed.
-    fn make_v5(db: &std::path::Path) {
-        let store = ScanStore::open(db).expect("the product creates its own v5 checkpoint");
+    /// A real checkpoint of the current schema, created and migrated by the product, with every
+    /// connection closed.
+    fn make_current(db: &std::path::Path) {
+        let store = ScanStore::open(db).expect("the product creates its own checkpoint");
         drop(store);
         for suffix in ["-wal", "-shm"] {
             let mut side = db.as_os_str().to_owned();
@@ -7420,9 +7445,14 @@ mod session_load_error_ownership_tests {
         }
     }
 
-    fn stamp_v6(db: &std::path::Path) {
+    fn stamp_future(db: &std::path::Path) {
         let conn = rusqlite::Connection::open(db).unwrap();
-        conn.pragma_update(None, "user_version", 6i64).unwrap();
+        conn.pragma_update(
+            None,
+            "user_version",
+            crate::state::schema::SCHEMA_VERSION + 1,
+        )
+        .unwrap();
         drop(conn);
     }
 
@@ -7442,31 +7472,36 @@ mod session_load_error_ownership_tests {
     fn a_repaired_checkpoint_clears_the_refusal_it_caused() {
         let scratch = Scratch::new("clears");
         let db = scratch.path().join("dedcom.db");
-        make_v5(&db);
-        stamp_v6(&db);
+        make_current(&db);
+        stamp_future(&db);
         let (mut app, rx) = test_app_with_db(db.clone());
 
         // 1. the refusal is visible and installs nothing
         f12(&mut app, &rx);
-        assert_eq!(app.status, NEWER, "the exact store error is shown");
+        assert_eq!(app.status, newer(), "the exact store error is shown");
         assert!(!app.sessions_loaded, "a refusal is not a successful load");
 
-        // 2. the operator repairs the checkpoint in place: a complete valid v5 at the SAME path,
+        // 2. the operator repairs the checkpoint in place: a complete valid current checkpoint at the SAME path,
         //    written with no connection attached and no WAL/SHM left behind.
         std::fs::remove_file(&db).unwrap();
-        make_v5(&db);
+        make_current(&db);
         let version: i64 = rusqlite::Connection::open(&db)
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5, "the replacement really is a v5 checkpoint");
+        assert_eq!(
+            version,
+            crate::state::schema::SCHEMA_VERSION,
+            "the replacement really is a current checkpoint"
+        );
 
         // 3. an EXPLICIT retry — no automatic loop exists to do it for us
         f12(&mut app, &rx);
 
         assert!(app.sessions_loaded, "the retry really succeeded");
         assert_ne!(
-            app.status, NEWER,
+            app.status,
+            newer(),
             "the sessions screen must not present real data beside a stale refusal"
         );
         assert!(
@@ -7480,19 +7515,19 @@ mod session_load_error_ownership_tests {
     fn a_later_unrelated_status_survives_the_retry() {
         let scratch = Scratch::new("unrelated");
         let db = scratch.path().join("dedcom.db");
-        make_v5(&db);
-        stamp_v6(&db);
+        make_current(&db);
+        stamp_future(&db);
         let (mut app, rx) = test_app_with_db(db.clone());
 
         f12(&mut app, &rx);
-        assert_eq!(app.status, NEWER);
+        assert_eq!(app.status, newer());
 
         // Something else speaks after the refusal — an automatic refresh must not erase it.
         let unrelated = "Scan finished: 12 groups".to_string();
         app.status = unrelated.clone();
 
         std::fs::remove_file(&db).unwrap();
-        make_v5(&db);
+        make_current(&db);
         f12(&mut app, &rx);
 
         assert!(app.sessions_loaded, "the load still succeeded");
@@ -7506,12 +7541,12 @@ mod session_load_error_ownership_tests {
     fn a_second_refusal_replaces_the_owned_error_rather_than_losing_it() {
         let scratch = Scratch::new("replaces");
         let db = scratch.path().join("dedcom.db");
-        make_v5(&db);
-        stamp_v6(&db);
+        make_current(&db);
+        stamp_future(&db);
         let (mut app, rx) = test_app_with_db(db.clone());
 
         f12(&mut app, &rx);
-        assert_eq!(app.status, NEWER);
+        assert_eq!(app.status, newer());
 
         // A different refusal from the same route: the checkpoint is gone entirely.
         std::fs::remove_file(&db).unwrap();
@@ -7521,13 +7556,14 @@ mod session_load_error_ownership_tests {
         assert!(!app.sessions_loaded, "still no successful load");
         assert!(!app.status.is_empty(), "the newest refusal is shown");
         assert_ne!(
-            app.status, NEWER,
+            app.status,
+            newer(),
             "the newest exact store error replaces the previous one"
         );
 
         // And that newest error is the one a later success consumes.
         std::fs::remove_dir(&db).unwrap();
-        make_v5(&db);
+        make_current(&db);
         f12(&mut app, &rx);
         assert!(app.sessions_loaded);
         assert!(
@@ -7545,7 +7581,15 @@ mod session_load_error_ownership_tests {
 mod session_load_request_scoping_tests {
     use super::*;
 
-    const NEWER: &str = "dedcom.db was created by a newer version (schema v6; this build supports v5). Upgrade dedcom, or move the old dedcom.db aside.";
+    /// The product's own refusal of a checkpoint one schema version ahead of this build, byte
+    /// for byte; built from `SCHEMA_VERSION` so the fixture stays «a future DB» after every bump.
+    fn newer() -> String {
+        let current = crate::state::schema::SCHEMA_VERSION;
+        format!(
+            "dedcom.db was created by a newer version (schema v{}; this build supports v{current}). Upgrade dedcom, or move the old dedcom.db aside.",
+            current + 1
+        )
+    }
 
     struct Scratch(PathBuf);
 
@@ -7567,16 +7611,21 @@ mod session_load_request_scoping_tests {
         }
     }
 
-    fn v5(dir: &std::path::Path) -> PathBuf {
+    fn current(dir: &std::path::Path) -> PathBuf {
         let db = dir.join("dedcom.db");
-        drop(ScanStore::open(&db).expect("the product creates its own v5 checkpoint"));
+        drop(ScanStore::open(&db).expect("the product creates its own checkpoint"));
         db
     }
 
-    fn v6(dir: &std::path::Path) -> PathBuf {
-        let db = v5(dir);
+    fn future(dir: &std::path::Path) -> PathBuf {
+        let db = current(dir);
         let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.pragma_update(None, "user_version", 6i64).unwrap();
+        conn.pragma_update(
+            None,
+            "user_version",
+            crate::state::schema::SCHEMA_VERSION + 1,
+        )
+        .unwrap();
         drop(conn);
         db
     }
@@ -7627,7 +7676,7 @@ mod session_load_request_scoping_tests {
     #[test]
     fn an_exhausted_request_counter_panics_before_anything_is_started() {
         let scratch = Scratch::new("exhausted");
-        let db = v5(scratch.path());
+        let db = current(scratch.path());
         let (mut app, rx) = test_app_with_db(db);
         app.session_load_generation = u64::MAX;
 
@@ -7690,7 +7739,7 @@ mod session_load_request_scoping_tests {
     #[test]
     fn a_stale_error_cannot_undo_the_new_success() {
         let scratch = Scratch::new("stale-err");
-        let db = v5(scratch.path());
+        let db = current(scratch.path());
         let (mut app, rx) = test_app_with_db(db);
         let (stale, fresh) = two_real_replies_in_flight(&mut app, &rx);
         // The finished scan spoke; that status is nobody else's to touch.
@@ -7720,7 +7769,7 @@ mod session_load_request_scoping_tests {
 
         app.handle_event(AppEvent::SessionsReady {
             generation: gs,
-            result: Err(NEWER.to_string()),
+            result: Err(newer()),
         });
 
         assert!(
@@ -7741,7 +7790,7 @@ mod session_load_request_scoping_tests {
     #[test]
     fn a_stale_success_cannot_erase_the_new_refusal() {
         let scratch = Scratch::new("stale-ok");
-        let db = v6(scratch.path());
+        let db = future(scratch.path());
         let (mut app, rx) = test_app_with_db(db);
         let (stale, fresh) = two_real_replies_in_flight(&mut app, &rx);
         let AppEvent::SessionsReady { generation: gs, .. } = stale else {
@@ -7753,9 +7802,9 @@ mod session_load_request_scoping_tests {
 
         app.handle_event(AppEvent::SessionsReady {
             generation: gf,
-            result: Err(NEWER.to_string()),
+            result: Err(newer()),
         });
-        assert_eq!(app.status, NEWER);
+        assert_eq!(app.status, newer());
         assert!(!app.sessions_loaded, "a refusal is not a successful load");
         let kept = app.sessions.len();
 
@@ -7768,10 +7817,10 @@ mod session_load_request_scoping_tests {
             !app.sessions_loaded,
             "a stale Ok may not mark the failed request loaded"
         );
-        assert_eq!(app.status, NEWER, "nor erase the refusal on screen");
+        assert_eq!(app.status, newer(), "nor erase the refusal on screen");
         assert_eq!(
             app.session_load_error.as_deref(),
-            Some(NEWER),
+            Some(newer().as_str()),
             "nor consume the error the active request owns"
         );
         assert_eq!(app.sessions.len(), kept, "nor install its list");
@@ -7780,7 +7829,7 @@ mod session_load_request_scoping_tests {
     #[test]
     fn a_stale_reply_does_not_clear_the_spinner_of_the_active_request() {
         let scratch = Scratch::new("spinner");
-        let db = v5(scratch.path());
+        let db = current(scratch.path());
         let (mut app, rx) = test_app_with_db(db);
         let (stale, _fresh) = two_real_replies_in_flight(&mut app, &rx);
         let AppEvent::SessionsReady { generation: gs, .. } = stale else {

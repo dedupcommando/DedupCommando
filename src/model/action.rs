@@ -127,6 +127,50 @@ pub struct MoveEvent {
     pub duplicate: bool,
 }
 
+/// Whether a stored `move_event` row's two pathnames are the exact bytes the move handled.
+///
+/// `Exact` says exactly that and nothing more: not that every move is in the journal (the writer
+/// is best-effort, see `move_batch::record`), and not proof that the move took place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathFidelity {
+    /// Carried over from the v5 TEXT journal by the schema v6 migration: whatever bytes the old
+    /// writer's `to_string_lossy` left, with no claim that they are the pathname's own.
+    CarriedFromText,
+    /// The raw bytes of both pathnames, as a v6 writer bound them.
+    Exact,
+}
+
+impl PathFidelity {
+    /// The value the `path_fidelity` column stores for this fidelity. Both writers of that column
+    /// — the v6 journal writer and the migration's copy of the v5 rows — take it from here, so
+    /// the column's domain and this type cannot drift apart.
+    pub const fn stored(self) -> i64 {
+        match self {
+            PathFidelity::CarriedFromText => 0,
+            PathFidelity::Exact => 1,
+        }
+    }
+
+    /// The fidelity a stored value stands for; `None` outside the column's domain. Test-only with
+    /// its one caller, the journal reader.
+    #[cfg(test)]
+    pub fn from_stored(value: i64) -> Option<Self> {
+        [PathFidelity::CarriedFromText, PathFidelity::Exact]
+            .into_iter()
+            .find(|fidelity| fidelity.stored() == value)
+    }
+}
+
+/// One row of the move journal as it is read back: the event and the fidelity of its pathnames.
+/// Test-only for the same reason as its one reader, `ScanStore::move_events`: no production
+/// code reads the journal yet, and this loses `cfg(test)` together with that reader.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct MoveEventRow {
+    pub event: MoveEvent,
+    pub path_fidelity: PathFidelity,
+}
+
 /// Mode for re-validating contents before a destructive action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RevalidationMode {

@@ -39,7 +39,7 @@ This is SQLite in WAL mode. The main tables:
 | `file_group`  | Materialized duplicate-group summaries (for fast loading)       | hundreds of bytes/group |
 | `dir_dedup`   | Directory signatures (for twin folders)                        | hundreds of bytes/directory |
 | `hash_cache`  | Hash cache: `(device, inode, size, mtime)` → BLAKE3            | bytes × files |
-| `move_event`  | Move journal (Triage Board)                                     | bytes × moves |
+| `move_event`  | Move journal (Triage Board); pathnames stored as raw bytes since schema v6 | bytes × moves |
 
 ### Size estimate
 
@@ -227,27 +227,143 @@ ssh old-host 'tar czf - .local/state/dedcom' | ssh new-host 'tar xzf - -C ~'
 
 But if the paths differ, the DB will not fit; run a fresh scan.
 
-## Backing up the database
+## Backing up and restoring `dedcom.db`
 
 `dedcom.db` is an "index", not the data itself. Losing it means losing scan history and
 marks (but not files!). A backup makes sense if:
 
 - You did a lot of manual keeper marking before an apply.
 - You keep many completed sessions for analytics (ScanDiff).
+- You are about to upgrade `dedcom` across a schema change and want the option to go
+  back. Schema v6 (the move journal stores pathnames as raw bytes) has no downgrade
+  migration: an older build refuses a newer database and leaves it untouched, so the only
+  way back to the older build is a copy taken before the upgrade.
 
-Before backing up, close all `dedcom` instances (the lock is released, the WAL is
-checkpointed):
+A plain `cp dedcom.db` is not enough. `dedcom` runs the database in WAL mode: committed
+transactions can sit in `dedcom.db-wal` until a checkpoint, and a copy of the main file
+alone silently loses them. Take the copy with SQLite's own `.backup`, and only while no
+`dedcom` process is running — the two scripts below check that first, and refuse when
+they cannot tell. Both set `umask 077`: the copy and the set-aside directory hold every
+pathname of the pool and stay readable by the owner alone (`0600` for files, `0700` for
+the directory).
 
-```text
-# check that nobody is working
-ls ~/.local/state/dedcom/dedcom.lock 2>/dev/null && echo "Close dedcom first"
+### Backup (before the upgrade)
 
-# a simple backup
-cp -a ~/.local/state/dedcom ~/dedcom-state-backup-$(date +%F)
+The version check pins the copy to the schema before the v6 upgrade; a copy of a v6
+database is not a way back, because the older build cannot open it.
+
+```bash
+#!/usr/bin/env bash
+# backup-dedcom-db.sh — consistent copy of dedcom.db while dedcom is NOT running.
+set -euo pipefail
+# Nothing this script creates may be readable by anyone else: the copy holds every pathname of the pool.
+umask 077
+S="${DEDCOM_STATE_DIR:-$HOME/.local/state/dedcom}"      # or the directory given to --state-dir
+cd "$S"
+
+# pgrep exit codes: 0 = a dedcom process exists, 1 = none, anything else (2, 3, 127 when pgrep
+# itself is missing) = we could not tell. Only "none" may continue. `|| rc=$?` keeps set -e quiet
+# for the check itself; an `if pgrep` would have read every failure as "no process".
+rc=0; pgrep -a dedcom || rc=$?
+case "$rc" in
+  0) echo "dedcom is running — exit it first (do not use --force to bypass its lock)" >&2; exit 1 ;;
+  1) ;;
+  *) echo "pgrep failed (exit $rc; procps installed?) — cannot prove dedcom is stopped" >&2; exit 1 ;;
+esac
+command -v sqlite3 >/dev/null || {
+  echo "sqlite3 CLI is missing (Debian/Proxmox: apt install sqlite3)." >&2
+  echo "Without it: start the OLD dedcom build once and exit cleanly (it folds the WAL and" >&2
+  echo "removes -wal/-shm), verify that only dedcom.db remains, then: cp -p dedcom.db <new name>" >&2
+  exit 1
+}
+
+BAK="dedcom.db.v5-$(date +%Y%m%d-%H%M%S).bak"
+if [ -e "$BAK" ] || [ -L "$BAK" ]; then echo "$BAK already exists" >&2; exit 1; fi
+
+# -wal/-shm present with dedcom stopped = unclean exit; .backup reads through the WAL correctly.
+ls -l dedcom.db*
+sqlite3 dedcom.db ".backup '$BAK'"
+
+# The copy is a regular file of our own, mode 0600 — never a symlink somebody planted under the name.
+[ -f "$BAK" ] && [ ! -L "$BAK" ] || { echo "$BAK is not a regular file" >&2; exit 1; }
+chmod 600 "$BAK"
+
+# The copy must be sound and must be the OLD schema (5) — verify before trusting it.
+sqlite3 "$BAK" "PRAGMA integrity_check;" | grep -qx ok || { echo "$BAK fails integrity_check" >&2; exit 1; }
+V="$(sqlite3 "$BAK" "PRAGMA user_version;")"
+[ "$V" = 5 ] || { echo "$BAK is schema v$V, not v5 — not a pre-upgrade copy" >&2; exit 1; }
+echo "verified backup: $S/$BAK (schema v5)"
 ```
 
-SQLite supports a "hot backup" via the `.backup` command, but for `dedcom` that is
-overkill.
+### Restore (going back to the older build)
+
+The v6 files are set aside into a new directory, never overwritten; the copy is verified
+before anything is moved and nothing is copied onto a name that is still taken.
+
+```bash
+#!/usr/bin/env bash
+# restore-dedcom-db.sh <verified .bak> — put a v5 copy back; sets the v6 files aside, never over them.
+set -euo pipefail
+# The set-aside directory and everything in it stay private to the owner.
+umask 077
+S="${DEDCOM_STATE_DIR:-$HOME/.local/state/dedcom}"
+BAK="${1:?usage: restore-dedcom-db.sh <verified .bak>}"
+cd "$S"
+
+# Same three-way pgrep check as in the backup script: only exit code 1 ("no process") continues.
+rc=0; pgrep -a dedcom || rc=$?
+case "$rc" in
+  0) echo "dedcom is running — exit it first" >&2; exit 1 ;;
+  1) ;;
+  *) echo "pgrep failed (exit $rc; procps installed?) — cannot prove dedcom is stopped" >&2; exit 1 ;;
+esac
+
+# 1. The backup is verified BEFORE anything is moved.
+[ -f "$BAK" ] || { echo "backup not found: $BAK" >&2; exit 1; }
+sqlite3 "$BAK" "PRAGMA integrity_check;" | grep -qx ok || { echo "$BAK fails integrity_check" >&2; exit 1; }
+[ "$(sqlite3 "$BAK" "PRAGMA user_version;")" = 5 ] || { echo "$BAK is not a v5 checkpoint" >&2; exit 1; }
+
+# 2. A NEW directory, mode 0700. No -p: an existing one is an error, and the script stops here.
+ASIDE="aside-v6-$(date +%Y%m%d-%H%M%S)"
+mkdir -m 700 "$ASIDE"
+
+# 3. The main file must exist and must move; the sidecars move only if present.
+#    "Absent sidecar" is normal after a clean exit; "cannot move" is an error (set -e stops).
+if [ -e dedcom.db ] || [ -L dedcom.db ]; then
+  mv dedcom.db "$ASIDE/"
+else
+  echo "dedcom.db is not here — nothing to set aside; look before restoring" >&2; exit 1
+fi
+for f in dedcom.db-wal dedcom.db-shm; do
+  if [ -e "$f" ] || [ -L "$f" ]; then mv "$f" "$ASIDE/"; fi
+done
+
+# 4. Prove the names are free. Only then copy.
+for f in dedcom.db dedcom.db-wal dedcom.db-shm; do
+  if [ -e "$f" ] || [ -L "$f" ]; then echo "still present: $f — restore aborted" >&2; exit 1; fi
+done
+cp -p "$BAK" dedcom.db
+[ -f dedcom.db ] && [ ! -L dedcom.db ] || { echo "dedcom.db is not a regular file" >&2; exit 1; }
+chmod 600 dedcom.db
+sqlite3 dedcom.db "PRAGMA integrity_check;" | grep -qx ok
+echo "restored $BAK as dedcom.db (schema $(sqlite3 dedcom.db 'PRAGMA user_version;')); v6 files kept in $S/$ASIDE"
+```
+
+### What restoring does not do
+
+Moves made after the copy was taken are not undone: the files stay where the Triage
+Board put them. Their journal stays in the set-aside v6 file and can be read with any
+`sqlite3`:
+
+```text
+sqlite3 aside-v6-<stamp>/dedcom.db \
+  "SELECT id, created_at, hex(source_path), hex(target_path), duplicate, path_fidelity
+     FROM move_event ORDER BY id;"
+```
+
+To roll the files themselves back, use the ZFS snapshot the Triage Board takes before
+each batch (`zfs list -t snapshot | grep dedcom`, see §03). Undo inside the TUI lives in
+the session's memory only and does not survive a restart.
 
 ## What's next
 

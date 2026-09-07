@@ -1307,7 +1307,7 @@ run_scenarios() {  # outdir
 # ------------------------------------------------------------------ provenance
 
 # Provenance starts BEFORE the scan. A checkpoint that was already sitting there would still read
-# user_version 5 and the receipt would still quote our argv — and every word of it would be about
+# user_version 6 and the receipt would still quote our argv — and every word of it would be about
 # somebody else's database. The claim "this run produced this checkpoint" is only available to a
 # run that found nothing there.
 assert_fresh_checkpoint() {
@@ -1422,7 +1422,7 @@ PY
   [ -z "$inv_sha" ] || [ "$inv_sha" = "$got" ] \
     || problems="$problems; the binary that scanned is not the binary the invocation record named"
 
-  [ "$uv" = 5 ] || problems="$problems; user_version=$uv, the product's schema stamp is 5"
+  [ "$uv" = 6 ] || problems="$problems; user_version=$uv, the product's schema stamp is 6"
 
   # A stamp without the tables is a stamp on an empty room. Both halves, or the schema is not the
   # product's.

@@ -97,7 +97,7 @@ grep -q '^bundle-sha256	' "$G6_WORK/TERMINAL" && ok "the record names the bundle
 grep -q '^resource-plan-sha256	' "$G6_WORK/TERMINAL" && ok "and the frozen resource plan" \
                                                       || bad "and the frozen resource plan"
 [ -f "$G6_WORK/RECEIPT" ] && ok "a production receipt is published" || bad "a production receipt"
-grep -q '^user_version	5' "$G6_WORK/RECEIPT" 2>/dev/null \
+grep -q '^user_version	6' "$G6_WORK/RECEIPT" 2>/dev/null \
   && ok "the receipt carries the product's own schema stamp" || bad "the receipt carries the stamp"
 grep -q '^ddl-written-by-harness	none' "$G6_WORK/RECEIPT" 2>/dev/null \
   && ok "and states that no DDL came from the harness" || bad "and states no harness DDL"

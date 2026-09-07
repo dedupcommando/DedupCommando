@@ -7,7 +7,9 @@ use rusqlite::types::Value;
 use rusqlite::{params, Connection, OpenFlags, Transaction};
 
 use crate::error::{AppError, Result};
-use crate::model::action::{ActionKind, MoveEvent};
+#[cfg(test)]
+use crate::model::action::MoveEventRow;
+use crate::model::action::{ActionKind, MoveEvent, PathFidelity};
 #[cfg(test)]
 use crate::model::duplicate::sort_attributed_by_benefit;
 use crate::model::duplicate::{
@@ -2158,60 +2160,79 @@ impl ScanStore {
 
     /// Writes a move event (the «trash bin» journal + the fact of a created duplicate).
     ///
-    /// **Known limit: both pathnames go in lossy.** The names the move puts on disk are built
-    /// from raw bytes and keep them, but this journal stores TEXT, so two names differing only
-    /// outside UTF-8 land here as one `U+FFFD` string and stop being distinguishable. The move
-    /// itself is correct; the record of it is not, for such names. Closing this means storing the
-    /// paths as bytes, which is a schema change with a migration, so it is deliberately NOT done
-    /// here — and until it is, the write path is not byte-correct end to end.
+    /// What this writes is byte-exact and marked `Exact`: both pathnames go in as the raw bytes
+    /// the move handled, so two names that differ only outside UTF-8 stay two distinguishable
+    /// rows. Whether every move reaches this table is the caller's affair — `move_batch::record`
+    /// is best-effort and does not report a refused insert.
     pub fn record_move_event(&mut self, event: &MoveEvent) -> Result<()> {
-        let source = event.source_path.to_string_lossy();
-        let target = event.target_path.to_string_lossy();
+        use std::os::unix::ffi::OsStrExt;
+        let source: &[u8] = event.source_path.as_os_str().as_bytes();
+        let target: &[u8] = event.target_path.as_os_str().as_bytes();
         let hash: Option<&[u8]> = event.hash.as_ref().map(|h| &h[..]);
         self.conn.execute(
             "INSERT INTO move_event
-                (created_at, scan_id, source_path, target_path, hash, duplicate)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (created_at, scan_id, source_path, target_path, hash, duplicate, path_fidelity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 event.created_at,
                 event.scan_id,
-                &*source,
-                &*target,
+                source,
+                target,
                 hash,
-                event.duplicate as i64
+                event.duplicate as i64,
+                PathFidelity::Exact.stored()
             ],
         )?;
         Ok(())
     }
 
-    /// All move events. For now read only by a test; remove `#[cfg(test)]`
-    /// when a dedup pass appears that finishes off the marked `.dupN` (round v2).
+    /// All move events, oldest first, each with the fidelity of its pathnames. For now read only
+    /// by tests; remove `#[cfg(test)]` when a dedup pass appears that finishes off the marked
+    /// `.dupN` (round v2).
+    ///
+    /// The pathnames come back as the bytes SQLite holds — BLOB for a v6 writer's rows, TEXT for a
+    /// row written by a build from before schema versioning — and never through a `String`, which
+    /// would refuse every byte sequence that is not UTF-8. A `path_fidelity` outside its domain is
+    /// an error, not a guess: the CHECK makes one impossible for the product's own writers, so
+    /// seeing one means the file is not what it says.
     #[cfg(test)]
-    pub fn move_events(&self) -> Result<Vec<MoveEvent>> {
+    pub fn move_events(&self) -> Result<Vec<MoveEventRow>> {
+        use std::os::unix::ffi::OsStringExt;
         let mut stmt = self.conn.prepare(
-            "SELECT created_at, scan_id, source_path, target_path, hash, duplicate
+            "SELECT id, created_at, scan_id, source_path, target_path, hash, duplicate,
+                    path_fidelity
              FROM move_event ORDER BY id",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                PathBuf::from(row.get::<_, String>(2)?),
-                PathBuf::from(row.get::<_, String>(3)?),
-                row.get::<_, Option<Vec<u8>>>(4)?,
-                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get_ref(3)?.as_bytes()?.to_vec(),
+                row.get_ref(4)?.as_bytes()?.to_vec(),
+                row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (created_at, scan_id, source_path, target_path, hash, duplicate) = row?;
-            out.push(MoveEvent {
-                created_at,
-                scan_id,
-                source_path,
-                target_path,
-                hash: hash.and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok()),
-                duplicate: duplicate != 0,
+            let (id, created_at, scan_id, source, target, hash, duplicate, fidelity) = row?;
+            let path_fidelity = PathFidelity::from_stored(fidelity).ok_or_else(|| {
+                AppError::msg(format!(
+                    "move_event row {id} carries path_fidelity {fidelity}, outside its domain"
+                ))
+            })?;
+            out.push(MoveEventRow {
+                event: MoveEvent {
+                    created_at,
+                    scan_id,
+                    source_path: PathBuf::from(std::ffi::OsString::from_vec(source)),
+                    target_path: PathBuf::from(std::ffi::OsString::from_vec(target)),
+                    hash: hash.and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok()),
+                    duplicate: duplicate != 0,
+                },
+                path_fidelity,
             });
         }
         Ok(out)
@@ -8344,24 +8365,130 @@ mod tests {
         );
     }
 
+    /// Storage classes of the two pathname columns, one pair per row in id order.
+    fn pathname_storage_classes(store: &ScanStore) -> Vec<(String, String)> {
+        store
+            .conn
+            .prepare("SELECT typeof(source_path), typeof(target_path) FROM move_event ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    /// A UTF-8 pathname — LF and non-ASCII included — comes back exactly, stored as BLOB and
+    /// marked exact. LF is legal inside a pathname, so one row with a newline is one row.
     #[test]
     fn move_event_roundtrip() {
         let mut store = ScanStore::open_in_memory().unwrap();
         let event = MoveEvent {
             created_at: "2026-05-21T00:00:00+00:00".to_string(),
             scan_id: None,
-            source_path: PathBuf::from("/src/a.txt"),
-            target_path: PathBuf::from("/dst/a.txt.dup1"),
+            source_path: PathBuf::from("/src/we\nird/ünïcødé.txt"),
+            target_path: PathBuf::from("/dst/ünïcødé.txt.dup1"),
             hash: Some([3u8; 32]),
             duplicate: true,
         };
         store.record_move_event(&event).unwrap();
-        let events = store.move_events().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].source_path, PathBuf::from("/src/a.txt"));
-        assert_eq!(events[0].target_path, PathBuf::from("/dst/a.txt.dup1"));
-        assert_eq!(events[0].hash, Some([3u8; 32]));
-        assert!(events[0].duplicate);
+        let rows = store.move_events().unwrap();
+        assert_eq!(rows.len(), 1, "the LF name is one row, not two");
+        assert_eq!(
+            rows[0].event.source_path,
+            PathBuf::from("/src/we\nird/ünïcødé.txt")
+        );
+        assert_eq!(
+            rows[0].event.target_path,
+            PathBuf::from("/dst/ünïcødé.txt.dup1")
+        );
+        assert_eq!(rows[0].event.hash, Some([3u8; 32]));
+        assert!(rows[0].event.duplicate);
+        assert_eq!(rows[0].path_fidelity, PathFidelity::Exact);
+        assert_eq!(
+            pathname_storage_classes(&store),
+            vec![("blob".to_string(), "blob".to_string())],
+            "stored as BLOB, not TEXT"
+        );
+    }
+
+    /// The stored value and the fidelity are inverse to each other, and nothing outside the
+    /// column's domain maps back.
+    #[test]
+    fn path_fidelity_round_trips_through_its_stored_value() {
+        for fidelity in [PathFidelity::CarriedFromText, PathFidelity::Exact] {
+            assert_eq!(PathFidelity::from_stored(fidelity.stored()), Some(fidelity));
+        }
+        assert_eq!(PathFidelity::from_stored(2), None);
+        assert_eq!(PathFidelity::from_stored(-1), None);
+    }
+
+    /// Two pathnames that differ only outside UTF-8 stay two rows, each with its own bytes.
+    ///
+    /// The premise first, so the test proves what it claims: the two names differ as bytes, yet
+    /// `to_string_lossy` maps them onto ONE string — a writer that binds a String is blind to the
+    /// difference between them, and a journal fed by it would hold two rows reading the same.
+    #[test]
+    fn distinct_non_utf8_pathnames_stay_distinct_in_the_journal() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let a = OsStr::from_bytes(b"/a/\x80.bin");
+        let b = OsStr::from_bytes(b"/a/\xff.bin");
+        assert_ne!(a, b, "the two names are distinct on disk");
+        assert_eq!(
+            a.to_string_lossy(),
+            b.to_string_lossy(),
+            "but lossy conversion collapses them onto one string"
+        );
+
+        let mut store = ScanStore::open_in_memory().unwrap();
+        for (source, target) in [
+            (a, OsStr::from_bytes(b"/t/\x80.bin")),
+            (b, OsStr::from_bytes(b"/t/\xff.bin")),
+        ] {
+            store
+                .record_move_event(&MoveEvent {
+                    created_at: "2026-09-07T00:00:00+00:00".to_string(),
+                    scan_id: None,
+                    source_path: PathBuf::from(source),
+                    target_path: PathBuf::from(target),
+                    hash: None,
+                    duplicate: false,
+                })
+                .unwrap();
+        }
+
+        let rows = store.move_events().unwrap();
+        assert_eq!(rows.len(), 2, "one row per move");
+        assert_eq!(
+            rows[0].event.source_path.as_os_str(),
+            a,
+            "the first row holds the first name's own bytes"
+        );
+        assert_eq!(
+            rows[1].event.source_path.as_os_str(),
+            b,
+            "and the second row the second name's"
+        );
+        assert_eq!(
+            rows[0].event.target_path.as_os_str().as_bytes(),
+            b"/t/\x80.bin"
+        );
+        assert_eq!(
+            rows[1].event.target_path.as_os_str().as_bytes(),
+            b"/t/\xff.bin"
+        );
+        assert_ne!(
+            rows[0].event.source_path, rows[1].event.source_path,
+            "two names, two rows, no collapse"
+        );
+        for row in &rows {
+            assert_eq!(row.path_fidelity, PathFidelity::Exact);
+        }
+        assert_eq!(
+            pathname_storage_classes(&store),
+            vec![("blob".to_string(), "blob".to_string()); 2],
+            "stored as BLOB, not TEXT"
+        );
     }
 
     #[test]
@@ -11943,13 +12070,14 @@ mod tests {
             id
         };
         // A real pre-versioning (v0.9) checkpoint — the shape that build actually wrote, not
-        // today's shape with its stamp cleared. The v4 and v5 tables go, the v3 columns and
-        // indexes go, the v2 marker goes, and only then the stamp. Clearing the stamp alone would
-        // leave a database declaring v0 while carrying names that arrived at v4 and v5; that is
-        // incoherent rather than legacy, and the opener refuses it — see
-        // `a_current_shape_with_a_zeroed_stamp_is_refused` in main.rs.
+        // today's shape with its stamp cleared. The v6 move journal is rewound to the v5 table,
+        // the v4 and v5 tables go, the v3 columns and indexes go, the v2 marker goes, and only
+        // then the stamp. Clearing the stamp alone would leave a database declaring v0 while
+        // carrying names that arrived at v4 and v5; that is incoherent rather than legacy, and
+        // the opener refuses it — see `a_current_shape_with_a_zeroed_stamp_is_refused` in main.rs.
         {
             let conn = rusqlite::Connection::open(&db).unwrap();
+            crate::testfixtures::strip_v6(&conn);
             conn.execute_batch(
                 "DROP TABLE file_group_member;
                  DROP TABLE scan_membership;

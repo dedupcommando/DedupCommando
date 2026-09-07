@@ -2828,7 +2828,7 @@ mod export_csv_tests {
             assert!(rig.residue().is_empty(), "no temporary for {entry}");
             if entry == "dedcom.db" {
                 assert!(before.starts_with(b"SQLite format 3"));
-                // Still a checkpoint this build accepts, i.e. still schema v5.
+                // Still a checkpoint this build accepts, i.e. still the current schema.
                 drop(ScanStore::open_read_only(&rig.db()).expect("the checkpoint still opens"));
             }
         }
@@ -3138,7 +3138,15 @@ mod export_csv_tests {
 mod boot_session_load_is_fail_closed_tests {
     use super::*;
 
-    const NEWER: &str = "dedcom.db was created by a newer version (schema v6; this build supports v5). Upgrade dedcom, or move the old dedcom.db aside.";
+    /// The product's own refusal of a checkpoint one schema version ahead of this build, byte
+    /// for byte; built from `SCHEMA_VERSION` so the fixture stays «a future DB» after every bump.
+    fn newer() -> String {
+        let current = crate::state::schema::SCHEMA_VERSION;
+        format!(
+            "dedcom.db was created by a newer version (schema v{}; this build supports v{current}). Upgrade dedcom, or move the old dedcom.db aside.",
+            current + 1
+        )
+    }
 
     /// A scratch directory that removes itself when the test returns: a green test may not leave
     /// a persistent fixture behind merely because the cargo process eventually exits.
@@ -3166,17 +3174,22 @@ mod boot_session_load_is_fail_closed_tests {
         Scratch::new(name)
     }
 
-    fn v5_db(dir: &std::path::Path) -> std::path::PathBuf {
+    fn current_db(dir: &std::path::Path) -> std::path::PathBuf {
         let db = dir.join("dedcom.db");
-        let store = ScanStore::open(&db).expect("the product creates its own v5 checkpoint");
+        let store = ScanStore::open(&db).expect("the product creates its own checkpoint");
         drop(store);
         db
     }
 
-    fn v6_db(dir: &std::path::Path) -> std::path::PathBuf {
-        let db = v5_db(dir);
+    fn future_db(dir: &std::path::Path) -> std::path::PathBuf {
+        let db = current_db(dir);
         let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.pragma_update(None, "user_version", 6i64).unwrap();
+        conn.pragma_update(
+            None,
+            "user_version",
+            crate::state::schema::SCHEMA_VERSION + 1,
+        )
+        .unwrap();
         drop(conn);
         db
     }
@@ -3215,23 +3228,23 @@ mod boot_session_load_is_fail_closed_tests {
     #[test]
     fn a_readable_checkpoint_returns_its_real_list() {
         let dir = scratch("ok");
-        let list =
-            boot_session_load(&v5_db(dir.path()), false, false).expect("a v5 checkpoint opens");
+        let list = boot_session_load(&current_db(dir.path()), false, false)
+            .expect("a current checkpoint opens");
         assert!(list.is_empty(), "a fresh checkpoint holds no sessions yet");
     }
 
     #[test]
     fn a_newer_checkpoint_returns_the_exact_error_instead_of_an_empty_list() {
-        let dir = scratch("v6");
-        let db = v6_db(dir.path());
+        let dir = scratch("future");
+        let db = future_db(dir.path());
         let before = census(&db);
 
         let err = boot_session_load(&db, false, false)
-            .expect_err("a v6 checkpoint must refuse, not report zero sessions");
+            .expect_err("a future checkpoint must refuse, not report zero sessions");
 
         assert_eq!(
             err.to_string(),
-            NEWER,
+            newer(),
             "the diagnostic body is the store's own, byte for byte"
         );
         assert_eq!(
@@ -3316,7 +3329,11 @@ mod boot_session_load_is_fail_closed_tests {
 
         assert_eq!(list.len(), 1, "its one completed session is listed");
         let (_, _, version, _) = census(&db);
-        assert_eq!(version, 5, "and the upgrade is stamped");
+        assert_eq!(
+            version,
+            crate::state::schema::SCHEMA_VERSION,
+            "and the upgrade is stamped"
+        );
     }
 
     #[test]
@@ -3330,11 +3347,11 @@ mod boot_session_load_is_fail_closed_tests {
 
         assert!(list.is_empty(), "a brand new checkpoint holds no sessions");
         let (_, _, version, _) = census(&db);
-        assert_eq!(version, 5);
+        assert_eq!(version, crate::state::schema::SCHEMA_VERSION);
     }
 
     #[test]
-    fn a_genuine_v3_checkpoint_migrates_to_v5() {
+    fn a_genuine_v3_checkpoint_migrates_to_the_current_schema() {
         let _role = crate::state::store::role_guard();
         let dir = scratch("floor-v3");
         let db = genuine_checkpoint(dir.path(), 3);
@@ -3343,7 +3360,7 @@ mod boot_session_load_is_fail_closed_tests {
 
         assert_eq!(list.len(), 1);
         let (_, _, version, _) = census(&db);
-        assert_eq!(version, 5);
+        assert_eq!(version, crate::state::schema::SCHEMA_VERSION);
     }
 
     #[test]
@@ -3663,7 +3680,7 @@ mod boot_session_load_is_fail_closed_tests {
     #[test]
     fn commander_and_no_resume_skip_only_this_eager_load() {
         let dir = scratch("skip");
-        let db = v6_db(dir.path());
+        let db = future_db(dir.path());
 
         // Both deliberately load lazily or not at all, so neither touches the store here — and
         // that skip is the ONLY way this function can yield an empty list.

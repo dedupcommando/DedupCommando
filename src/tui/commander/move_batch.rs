@@ -37,8 +37,9 @@ pub struct MoveBatchOutcome {
 }
 
 /// Moves the batch `sources` into the directory `dest_dir`. Files are dedup-aware,
-/// directories are moved whole. Writes the `move_event` log and the hash cache to the DB.
-/// The UI is not involved here.
+/// directories are moved whole. Records each move it completes in the `move_event` journal and
+/// feeds the hash cache, both best-effort: a refused open or a failed insert is not reported
+/// here. The UI is not involved here.
 pub fn run_batch(
     db_path: &Path,
     sources: &[PathBuf],
@@ -375,7 +376,8 @@ fn move_file_item(
     out.moved.push((src.to_path_buf(), final_dest));
 }
 
-/// Writes a move event to the «trash» log (best-effort).
+/// Records one completed move in the `move_event` journal, best-effort: with no store there is
+/// no record, and a failed insert is not reported — the move itself has already happened.
 fn record(
     store: Option<&mut ScanStore>,
     scan_id: Option<i64>,
@@ -890,6 +892,60 @@ mod tests {
         );
         assert_eq!(out.failed, 0);
         assert_eq!(out.dups, 1);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The journal holds the exact bytes of the names the batch put on disk: two files whose
+    /// names differ only outside UTF-8 become two rows, and each row's target is byte for byte one
+    /// of the names `read_dir` now lists in the destination. The contents differ, so neither file
+    /// is the other's duplicate and both keep their own names.
+    #[test]
+    fn a_batch_journals_the_exact_bytes_of_the_names_it_put_on_disk() {
+        use crate::model::action::PathFidelity;
+        use std::collections::BTreeSet;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = temp_dir("journal_bytes");
+        let db = root.join("scan.db");
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        let mut sources = Vec::new();
+        for (name, content) in [
+            (OsStr::from_bytes(b"\x80.bin"), &b"first"[..]),
+            (OsStr::from_bytes(b"\xff.bin"), &b"second, and longer"[..]),
+        ] {
+            let path = src.join(name);
+            write(&path, content);
+            sources.push(path);
+        }
+        let dest = root.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+
+        let out = run_batch(&db, &sources, &dest, None);
+
+        assert_eq!(out.failed, 0);
+        assert_eq!(out.moved.len(), 2);
+        let on_disk: BTreeSet<Vec<u8>> = fs::read_dir(&dest)
+            .unwrap()
+            .map(|entry| entry.unwrap().path().as_os_str().as_bytes().to_vec())
+            .collect();
+        assert_eq!(on_disk.len(), 2, "both files landed under their own names");
+
+        let store = ScanStore::open(&db).unwrap();
+        let rows = store.move_events().unwrap();
+        assert_eq!(rows.len(), 2, "one row per file");
+        let journaled: BTreeSet<Vec<u8>> = rows
+            .iter()
+            .map(|row| row.event.target_path.as_os_str().as_bytes().to_vec())
+            .collect();
+        assert_eq!(
+            journaled, on_disk,
+            "each target is byte for byte a name read_dir lists"
+        );
+        for row in &rows {
+            assert_eq!(row.path_fidelity, PathFidelity::Exact);
+        }
 
         fs::remove_dir_all(&root).ok();
     }

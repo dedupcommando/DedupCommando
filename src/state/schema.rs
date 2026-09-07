@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::error::{AppError, Result};
 
@@ -176,15 +176,8 @@ CREATE TABLE IF NOT EXISTS hash_cache (
     updated_at TEXT    NOT NULL,
     PRIMARY KEY (device, inode, size, mtime)
 );
-CREATE TABLE IF NOT EXISTS move_event (
-    id          INTEGER PRIMARY KEY,
-    created_at  TEXT NOT NULL,
-    scan_id     INTEGER,
-    source_path TEXT NOT NULL,
-    target_path TEXT NOT NULL,
-    hash        BLOB,
-    duplicate   INTEGER NOT NULL
-);
+-- `move_event` is not here: `create_move_event` creates it from `MOVE_EVENT_V6_SQL`, the one text
+-- the v6 migration also rebuilds it from, so a fresh table and a rebuilt one are byte-identical.
 -- The scan's selected roots, in the one normalized representation the omission ledger uses
 -- (`model::omission::PathKey`), each carrying its own completeness authority.
 --
@@ -250,6 +243,297 @@ CREATE INDEX IF NOT EXISTS dir_omission_by_root
     ON dir_omission(scan_id, root_key, dir_key);
 ";
 
+// The `move_event` table from its name on: the ONE text behind both ways the table comes to
+// exist. `create_move_event` puts `CREATE TABLE IF NOT EXISTS ` in front of it on the ordinary
+// path and `CREATE TABLE ` in the rebuild, and SQLite stores the statement as `CREATE TABLE ` +
+// this text either way — so a fresh table and a rebuilt one carry byte for byte the same
+// definition, which is what `move_event_state` compares against. A macro rather than a `const`
+// because `concat!` takes literals only.
+//
+// No SQL comment inside: SQLite keeps everything between the parentheses verbatim, and a `CHECK`
+// that only appears in a comment is stored as if it were a constraint while checking nothing.
+// The columns are explained at `MOVE_EVENT_V6_SQL` instead.
+macro_rules! move_event_v6_tail {
+    () => {
+        "move_event (
+    id            INTEGER PRIMARY KEY,
+    created_at    TEXT    NOT NULL,
+    scan_id       INTEGER,
+    source_path   BLOB    NOT NULL,
+    target_path   BLOB    NOT NULL,
+    hash          BLOB,
+    duplicate     INTEGER NOT NULL,
+    path_fidelity INTEGER NOT NULL DEFAULT 0,
+    CHECK (path_fidelity IN (0, 1)),
+    CHECK (path_fidelity = 0
+           OR (typeof(source_path) = 'blob' AND typeof(target_path) = 'blob'))
+)"
+    };
+}
+
+/// The v6 `move_event` table exactly as `sqlite_master.sql` records it: `CREATE TABLE ` + the
+/// tail, without `IF NOT EXISTS` and without the terminating `;`, which is how SQLite stores every
+/// `CREATE TABLE`.
+///
+/// `source_path` and `target_path` are the raw bytes of the two pathnames the move handled, not
+/// a lossy string of them. `path_fidelity` is 1 when a row's bytes are exactly what a v6 writer
+/// handled and 0 for a row carried over from the v5 TEXT journal, whose writer went through
+/// `to_string_lossy` — those bytes cannot be recovered, and the row says so. The first CHECK pins
+/// the domain; the second is the honesty rule: TEXT with 0 is tolerated (a build from before
+/// schema versioning writes exactly that), TEXT that claims exactness is refused.
+pub const MOVE_EVENT_V6_SQL: &str = concat!("CREATE TABLE ", move_event_v6_tail!());
+
+/// The v5 `move_event` table exactly as `sqlite_master.sql` records it, frozen. The first public
+/// build wrote this text and no build before v6 changed it, so every v5 checkpoint the product
+/// ever created carries these bytes. The migration rebuilds a table only when its stored text is
+/// this, byte for byte (`move_event_state`); the whitespace is the old literal's, not a style.
+pub const MOVE_EVENT_V5_SQL: &str = "CREATE TABLE move_event (
+    id          INTEGER PRIMARY KEY,
+    created_at  TEXT NOT NULL,
+    scan_id     INTEGER,
+    source_path TEXT NOT NULL,
+    target_path TEXT NOT NULL,
+    hash        BLOB,
+    duplicate   INTEGER NOT NULL
+)";
+
+/// Creates the v6 `move_event` table from the one canonical tail. With `IF NOT EXISTS` on the
+/// ordinary migration path, where the table is usually there already; without it in the rebuild,
+/// where the name was freed a statement ago inside the same transaction and anything found under
+/// it would be a defect, not something to adopt.
+fn create_move_event(conn: &Connection, if_not_exists: bool) -> rusqlite::Result<()> {
+    conn.execute_batch(if if_not_exists {
+        concat!("CREATE TABLE IF NOT EXISTS ", move_event_v6_tail!(), ";")
+    } else {
+        concat!("CREATE TABLE ", move_event_v6_tail!(), ";")
+    })
+}
+
+/// One row of `PRAGMA table_xinfo`, as SQLite records it: position, declared name and type, the
+/// NOT NULL flag, the default expression, the 1-based place in the primary key (0 = none) and the
+/// hidden kind — 0 ordinary, 2 a VIRTUAL generated column, 3 a STORED one. `table_info` omits
+/// generated columns altogether; `xinfo` lists them, which is why the classifier reads this one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnShape {
+    pub cid: i64,
+    pub name: String,
+    pub decl_type: String,
+    pub not_null: i64,
+    pub default: Option<String>,
+    pub pk: i64,
+    pub hidden: i64,
+}
+
+/// A reference column: (cid, name, type, notnull, default, pk, hidden).
+type ColumnRef = (
+    i64,
+    &'static str,
+    &'static str,
+    i64,
+    Option<&'static str>,
+    i64,
+    i64,
+);
+
+/// `PRAGMA table_xinfo` of the v5 table, in full. Compared whole: seven rows, none hidden.
+const XINFO_V5: &[ColumnRef] = &[
+    (0, "id", "INTEGER", 0, None, 1, 0),
+    (1, "created_at", "TEXT", 1, None, 0, 0),
+    (2, "scan_id", "INTEGER", 0, None, 0, 0),
+    (3, "source_path", "TEXT", 1, None, 0, 0),
+    (4, "target_path", "TEXT", 1, None, 0, 0),
+    (5, "hash", "BLOB", 0, None, 0, 0),
+    (6, "duplicate", "INTEGER", 1, None, 0, 0),
+];
+
+/// `PRAGMA table_xinfo` of the v6 table, in full. Compared whole: eight rows, none hidden.
+const XINFO_V6: &[ColumnRef] = &[
+    (0, "id", "INTEGER", 0, None, 1, 0),
+    (1, "created_at", "TEXT", 1, None, 0, 0),
+    (2, "scan_id", "INTEGER", 0, None, 0, 0),
+    (3, "source_path", "BLOB", 1, None, 0, 0),
+    (4, "target_path", "BLOB", 1, None, 0, 0),
+    (5, "hash", "BLOB", 0, None, 0, 0),
+    (6, "duplicate", "INTEGER", 1, None, 0, 0),
+    (7, "path_fidelity", "INTEGER", 1, Some("0"), 0, 0),
+];
+
+fn reference_shape(reference: &[ColumnRef]) -> Vec<ColumnShape> {
+    reference
+        .iter()
+        .map(
+            |&(cid, name, decl_type, not_null, default, pk, hidden)| ColumnShape {
+                cid,
+                name: name.to_string(),
+                decl_type: decl_type.to_string(),
+                not_null,
+                default: default.map(str::to_string),
+                pk,
+                hidden,
+            },
+        )
+        .collect()
+}
+
+/// `PRAGMA table_xinfo` of one table, every row. The name is one of ours, never user input.
+pub fn table_xinfo(conn: &Connection, table: &str) -> Result<Vec<ColumnShape>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_xinfo({table})"))?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ColumnShape {
+            cid: row.get(0)?,
+            name: row.get(1)?,
+            decl_type: row.get(2)?,
+            not_null: row.get(3)?,
+            default: row.get(4)?,
+            pk: row.get(5)?,
+            hidden: row.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// What sits under the name `move_event`, judged by the stored definition and nothing weaker.
+///
+/// Column names are not a definition: a table with the seven v5 names could carry an eighth
+/// column, a generated one, a foreign CHECK or a comment that looks like one, and a rebuild that
+/// trusted the names would copy what it knows and drop the rest. So the verdict is the exact
+/// stored text of `sqlite_master.sql` — SQLite keeps `CREATE TABLE ` plus everything from the
+/// table's name on, verbatim, and only `ALTER TABLE` ever rewrites it — confirmed by the full
+/// `PRAGMA table_xinfo`, generated and hidden columns included. Both must match one of the two
+/// texts this product ever wrote; anything else is `Other`, and `Other` is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveEventState {
+    /// No object of that name, in any letter case. Legitimate only on a first run.
+    Absent,
+    /// The v5 table, byte for byte: what every build before v6 wrote.
+    ExactV5,
+    /// The v6 table, byte for byte: what this build writes and rebuilds.
+    ExactV6,
+    /// Anything else, with the first difference found. Never the foreign text itself.
+    Other(String),
+}
+
+impl std::fmt::Display for MoveEventState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MoveEventState::Absent => f.write_str("absent"),
+            MoveEventState::ExactV5 => f.write_str("the v5 table"),
+            MoveEventState::ExactV6 => f.write_str("the v6 table"),
+            MoveEventState::Other(detail) => f.write_str(detail),
+        }
+    }
+}
+
+pub fn move_event_state(conn: &Connection) -> Result<MoveEventState> {
+    // By name alone, without a type filter: names are one namespace, and a view or an index
+    // squatting this one must read as «not a table», never as «absent» — absent is what would let
+    // `CREATE TABLE IF NOT EXISTS` run against it. SQLite compares object names without case, so
+    // the lookup does too.
+    let mut stmt = conn.prepare(
+        "SELECT type, name, sql FROM sqlite_master WHERE name = 'move_event' COLLATE NOCASE",
+    )?;
+    let objects: Vec<(String, String, Option<String>)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let (kind, name, sql) = match objects.as_slice() {
+        [] => return Ok(MoveEventState::Absent),
+        [one] => one.clone(),
+        many => {
+            return Ok(MoveEventState::Other(format!(
+                "{} objects answer to the name move_event",
+                many.len()
+            )))
+        }
+    };
+    if kind != "table" {
+        let article = if kind.starts_with('i') { "an" } else { "a" };
+        return Ok(MoveEventState::Other(format!(
+            "`{name}` is {article} {kind}, not a table"
+        )));
+    }
+    let sql = sql.unwrap_or_default();
+    let shape = table_xinfo(conn, "move_event")?;
+    if sql == MOVE_EVENT_V5_SQL && shape == reference_shape(XINFO_V5) {
+        return Ok(MoveEventState::ExactV5);
+    }
+    if sql == MOVE_EVENT_V6_SQL && shape == reference_shape(XINFO_V6) {
+        return Ok(MoveEventState::ExactV6);
+    }
+    Ok(MoveEventState::Other(first_difference(&sql, &shape)))
+}
+
+/// The first place a stored definition parts from the nearest canon — the one sharing the longer
+/// prefix with it — as lengths, a byte position and column names. Enough to say what is there and
+/// where; deliberately not the foreign text itself.
+fn first_difference(sql: &str, shape: &[ColumnShape]) -> String {
+    let common = |canon: &str| {
+        sql.bytes()
+            .zip(canon.bytes())
+            .take_while(|(a, b)| a == b)
+            .count()
+    };
+    // The nearest canon is the one sharing the longer prefix; on a tie — the name itself differs,
+    // as after a RENAME quoted it or under another letter case — the one whose columns match, and
+    // failing that the v6 this build writes.
+    let (common_v5, common_v6) = (common(MOVE_EVENT_V5_SQL), common(MOVE_EVENT_V6_SQL));
+    let prefer_v6 =
+        common_v6 > common_v5 || (common_v6 == common_v5 && shape != reference_shape(XINFO_V5));
+    let (version, canon, reference) = if prefer_v6 {
+        (6, MOVE_EVENT_V6_SQL, XINFO_V6)
+    } else {
+        (5, MOVE_EVENT_V5_SQL, XINFO_V5)
+    };
+    let mut found = Vec::new();
+    if sql != canon {
+        found.push(format!(
+            "the stored definition ({} bytes) differs from the v{version} definition ({} bytes) at byte {}",
+            sql.len(),
+            canon.len(),
+            common(canon)
+        ));
+    }
+    let expected = reference_shape(reference);
+    if shape != expected {
+        let describe = |column: &ColumnShape| {
+            let kind = match column.hidden {
+                0 => "",
+                2 => ", VIRTUAL generated",
+                3 => ", STORED generated",
+                _ => ", hidden",
+            };
+            let not_null = if column.not_null == 1 {
+                " NOT NULL"
+            } else {
+                ""
+            };
+            let default = column
+                .default
+                .as_deref()
+                .map(|value| format!(" DEFAULT {value}"))
+                .unwrap_or_default();
+            format!(
+                "column {} `{}` ({}{not_null}{default}{kind})",
+                column.cid, column.name, column.decl_type
+            )
+        };
+        match shape.iter().zip(&expected).find(|(got, want)| got != want) {
+            Some((got, _)) => found.push(format!(
+                "{} is not the v{version} column at that position",
+                describe(got)
+            )),
+            None if shape.len() > expected.len() => found.push(format!(
+                "{} is not in the v{version} definition",
+                describe(&shape[expected.len()])
+            )),
+            None => found.push(format!(
+                "column `{}` of the v{version} definition is missing",
+                expected[shape.len()].name
+            )),
+        }
+    }
+    found.join("; ")
+}
+
 /// Current on-disk schema version, stamped into `PRAGMA user_version`. Bump this (and add a
 /// migration step) whenever the schema changes in a way an older build cannot read. A DB from
 /// before versioning reports 0; its schema equals v1, so it is stamped on first open.
@@ -277,7 +561,17 @@ CREATE INDEX IF NOT EXISTS dir_omission_by_root
 /// migration reads no data and rewrites no row. A v4 build must not open a v5 DB: it cannot see the
 /// authority, so it would answer every membership question from raw digests and hand back the very
 /// pathnames verification rejected.
-pub const SCHEMA_VERSION: i64 = 5;
+///
+/// v6 stores the two `move_event` pathnames as BLOB — the raw bytes the move handled — and adds
+/// `path_fidelity`, which says whether a row's bytes are exact (written by a v6 build) or carried
+/// over from the v5 TEXT journal, whose writer went through `to_string_lossy` and cannot be
+/// undone. Not additive: the table is rebuilt inside the migration transaction, rows and ids
+/// preserved, and only after its stored definition and its dependencies were verified to be
+/// exactly what the product wrote — anything else cancels the upgrade before the rebuild, data
+/// intact. A v5 build must not open a v6 DB: it has no production reader of the journal, but its
+/// writer binds a String, so every triage move it recorded would land as TEXT again and the
+/// journal would quietly lose the very property this version establishes.
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Turns foreign-key enforcement on for one freshly opened connection, and proves it took.
 ///
@@ -316,6 +610,13 @@ pub fn enforce_foreign_keys(conn: &Connection) -> Result<()> {
 /// build survive being opened by this one.
 fn ensure_version_at_most(conn: &Connection, supported: i64) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    refuse_if_newer(version, supported)
+}
+
+/// The refusal itself, for a stamp already read: above `supported` the checkpoint was written by
+/// a newer build, and nothing of this build may touch it. One wording for every caller — the
+/// opener's version guard and `migrate`, which reads the stamp inside its own transaction.
+fn refuse_if_newer(version: i64, supported: i64) -> Result<()> {
     if version > supported {
         return Err(AppError::msg(format!(
             "dedcom.db was created by a newer version (schema v{version}; this build supports v{supported}). Upgrade dedcom, or move the old dedcom.db aside."
@@ -503,6 +804,7 @@ const FLOOR_V5_TABLES: &[TableFloor] = &[
     ),
     ("scan_membership", &["scan_id", "mode", "generation"]),
 ];
+const FLOOR_V6_COLUMNS: &[(&str, &str)] = &[("move_event", "path_fidelity")];
 
 fn floor_for(version: i64) -> Vec<(&'static str, Vec<&'static str>)> {
     let mut floor: Vec<(&'static str, Vec<&'static str>)> = FLOOR_V0
@@ -521,6 +823,11 @@ fn floor_for(version: i64) -> Vec<(&'static str, Vec<&'static str>)> {
     }
     if version >= 3 {
         add_columns(FLOOR_V3_COLUMNS);
+    }
+    // v6 adds a column to a v0 table, so it takes the column path; the steps are independent, so
+    // its place among them is immaterial.
+    if version >= 6 {
+        add_columns(FLOOR_V6_COLUMNS);
     }
     if version >= 4 {
         floor.extend(
@@ -547,6 +854,8 @@ fn floor_for(version: i64) -> Vec<(&'static str, Vec<&'static str>)> {
 /// Provenance was read out of this repository's own history, one bump commit at a time, not
 /// transcribed from memory: v0 `0fbbb5e`, v1 `27f698f`, v2 `6c1ecd6`, v3 `75f8370`, v4 `eee4a94`,
 /// v5 `0a0df8d`.
+/// v6 adds no name at all: `path_fidelity` is a column of a table that existed at v0, so it lives
+/// in the floors, not here.
 const PRODUCT_TABLES: &[(&str, i64)] = &[
     ("scan", 0),
     ("file", 0),
@@ -918,14 +1227,256 @@ fn judge_shape(conn: &Connection) -> Result<()> {
     ensure_no_squatted_name(conn, version)
 }
 
+/// The v6 step's refusal, in words that stay true after it: the transaction rolled back, so the
+/// checkpoint keeps its data and its stamp — but the opener switched the journal to WAL before the
+/// migration began, so «nothing was changed» would be a lie. Names the step, the cause and what to
+/// do; used for EVERY error inside the step, SQLite's own included.
+fn upgrade_cancelled(step: &str, version: i64, cause: &str, advice: &str) -> AppError {
+    AppError::msg(format!(
+        "The schema v6 upgrade of dedcom.db was cancelled at {step}: {cause}. The checkpoint keeps \
+         its data and stays at schema v{version}. This attempt may already have switched the file \
+         to WAL mode (dedcom.db-wal and dedcom.db-shm may now exist next to it); that changes no \
+         data. {advice}"
+    ))
+}
+
+const ADVICE_ASIDE: &str = "Move dedcom.db aside to start with a fresh checkpoint, or restore \
+                            the table to the definition this product writes and start dedcom \
+                            again.";
+const ADVICE_DEPENDENT: &str =
+    "Drop it and re-create it after the upgrade, or move dedcom.db aside.";
+const ADVICE_FOREIGN_KEY: &str = "Drop the referencing table's foreign key (rebuild that table \
+                                  without it), or move dedcom.db aside.";
+const ADVICE_TEMP_NAME: &str = "Rename that object, or move dedcom.db aside.";
+const ADVICE_SQLITE: &str = "Repair or drop the object SQLite names, then start dedcom again.";
+
+/// Why a step of the v6 upgrade stops: a refusal of ours, or SQLite's own error on the way.
+enum Cancel {
+    Refused { cause: String, advice: &'static str },
+    Sqlite(rusqlite::Error),
+}
+
+impl From<rusqlite::Error> for Cancel {
+    fn from(err: rusqlite::Error) -> Self {
+        Cancel::Sqlite(err)
+    }
+}
+
+fn refuse(cause: String, advice: &'static str) -> Cancel {
+    Cancel::Refused { cause, advice }
+}
+
+fn cancelled(step: &str, version: i64, cancel: Cancel) -> AppError {
+    match cancel {
+        Cancel::Refused { cause, advice } => upgrade_cancelled(step, version, &cause, advice),
+        Cancel::Sqlite(err) => upgrade_cancelled(step, version, &err.to_string(), ADVICE_SQLITE),
+    }
+}
+
+/// The v6 step of `migrate`: judges what sits under `move_event` in this transaction's snapshot
+/// and, for the v5 table and nothing else, rebuilds it as v6. Runs BEFORE the `SCHEMA` batch, so
+/// the state is read before `IF NOT EXISTS` could have created anything under the name.
+///
+/// `version` is the stamp read inside the same transaction; a stamp above `SCHEMA_VERSION` was
+/// refused before this runs. The stamp and the table have to agree: a v6 table under an older
+/// stamp would mean `path_fidelity` was adopted from a checkpoint that never had it, a v5 table
+/// under the v6 stamp means the file lies about itself. Both are refused.
+fn upgrade_move_event(tx: &Connection, version: i64) -> Result<()> {
+    let state = move_event_state(tx)
+        .map_err(|err| upgrade_cancelled("precheck", version, &err.to_string(), ADVICE_SQLITE))?;
+    match state {
+        MoveEventState::Absent => Ok(()),
+        MoveEventState::ExactV6 if version == SCHEMA_VERSION => Ok(()),
+        MoveEventState::ExactV6 => Err(upgrade_cancelled(
+            "precheck",
+            version,
+            &format!(
+                "move_event already has the v6 definition while the checkpoint declares schema \
+                 v{version}; path_fidelity is introduced by v6 and cannot be adopted from an older \
+                 checkpoint"
+            ),
+            "Rebuild the table without that column, or move dedcom.db aside.",
+        )),
+        MoveEventState::ExactV5 if version >= SCHEMA_VERSION => Err(upgrade_cancelled(
+            "precheck",
+            version,
+            &format!("the checkpoint declares schema v{version} but move_event is the v5 table"),
+            ADVICE_ASIDE,
+        )),
+        MoveEventState::ExactV5 => {
+            ensure_rebuild_is_safe(tx).map_err(|cancel| cancelled("precheck", version, cancel))?;
+            rebuild_move_event(tx, version)
+        }
+        MoveEventState::Other(detail) => Err(upgrade_cancelled(
+            "precheck",
+            version,
+            &format!("move_event is not the table this product wrote ({detail})"),
+            ADVICE_ASIDE,
+        )),
+    }
+}
+
+/// What the rebuild may destroy: nothing that is not ours. `DROP TABLE` takes the table's indexes
+/// and triggers with it, runs the `ON DELETE` clauses of every table whose foreign key points at
+/// it, and leaves a view that named it dangling after `RENAME` rewrote the view onto the temporary
+/// name; a copy by known column names loses unknown ones. The definition itself was judged by
+/// `move_event_state` (P1); this reads the rest of the snapshot the rebuild will act on, inside
+/// the same transaction, and refuses rather than converts — re-creating foreign objects would be
+/// a converter with no specification.
+fn ensure_rebuild_is_safe(tx: &Connection) -> std::result::Result<(), Cancel> {
+    // P2: the canonical table has no index, not even an automatic one.
+    let indexes: Vec<String> = tx
+        .prepare("SELECT name FROM pragma_index_list('move_event')")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if let Some(index) = indexes.first() {
+        return Err(refuse(
+            format!("index `{index}` is defined on move_event"),
+            ADVICE_DEPENDENT,
+        ));
+    }
+    // P3: triggers and views that mention the table, without regard to case. A false hit on a
+    // foreign object that merely contains the word costs a refusal with the data intact.
+    let dependents: Vec<(String, String)> = tx
+        .prepare(
+            "SELECT type, name FROM sqlite_master
+              WHERE type IN ('trigger', 'view') AND instr(lower(sql), 'move_event') > 0",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if let Some((kind, name)) = dependents.first() {
+        return Err(refuse(
+            format!("{kind} `{name}` refers to move_event"),
+            ADVICE_DEPENDENT,
+        ));
+    }
+    // P4: no foreign key of any table points at it. The engine's own tables are skipped by the
+    // literal seven-character prefix, as in `judge_shape` — `LIKE 'sqlite_%'` would also skip a
+    // user table called `sqlitex_notes` and its foreign key with it. The parent name comes back as
+    // it was written, so the comparison folds case.
+    let tables: Vec<String> = tx
+        .prepare(
+            "SELECT name FROM sqlite_master
+              WHERE type = 'table' AND substr(name, 1, 7) <> 'sqlite_'",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for table in &tables {
+        let parents: Vec<String> = tx
+            .prepare("SELECT \"table\" FROM pragma_foreign_key_list(?1)")?
+            .query_map([table], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if parents
+            .iter()
+            .any(|parent| parent.eq_ignore_ascii_case("move_event"))
+        {
+            return Err(refuse(
+                format!("table `{table}` has a foreign key referencing move_event"),
+                ADVICE_FOREIGN_KEY,
+            ));
+        }
+    }
+    // P5: the temporary name is free, in any letter case. SQLite would refuse the RENAME in its
+    // own words; this says whose object holds the name.
+    let squatters: Vec<(String, String)> = tx
+        .prepare(
+            "SELECT type, name FROM sqlite_master WHERE name = 'move_event_v5' COLLATE NOCASE",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if let Some((kind, name)) = squatters.first() {
+        return Err(refuse(
+            format!("the temporary name move_event_v5 is taken by {kind} `{name}`"),
+            ADVICE_TEMP_NAME,
+        ));
+    }
+    // P6: `CAST(text AS BLOB)` yields the bytes in the database's encoding; they are the original
+    // pathname bytes only under UTF-8.
+    let encoding: String = tx.query_row("PRAGMA encoding", [], |row| row.get(0))?;
+    if encoding != "UTF-8" {
+        return Err(refuse(
+            format!("the database encoding is {encoding}, not UTF-8"),
+            ADVICE_ASIDE,
+        ));
+    }
+    Ok(())
+}
+
+/// Rebuilds the v5 table as v6 inside the caller's transaction. The old table steps aside under a
+/// temporary name and the final one is created under its own name at once — never renamed into
+/// place, because `RENAME` quotes the name in the stored text and the rebuilt table would stop
+/// being equal to a fresh one. The rows are copied with their ids, marked as carried, counted, and
+/// only then the old table goes. Only after `ensure_rebuild_is_safe`: P2–P4 are what make the
+/// `DROP` take nothing else with it.
+fn rebuild_move_event(tx: &Connection, version: i64) -> Result<()> {
+    let at = |step: &'static str| {
+        move |err: rusqlite::Error| cancelled(step, version, Cancel::Sqlite(err))
+    };
+    tx.execute_batch("ALTER TABLE move_event RENAME TO move_event_v5;")
+        .map_err(at("rename"))?;
+    create_move_event(tx, false).map_err(at("create"))?;
+    tx.execute_batch(&format!(
+        "INSERT INTO move_event
+             (id, created_at, scan_id, source_path, target_path, hash, duplicate, path_fidelity)
+         SELECT id, created_at, scan_id, CAST(source_path AS BLOB), CAST(target_path AS BLOB),
+                hash, duplicate, {}
+           FROM move_event_v5 ORDER BY id;",
+        crate::model::action::PathFidelity::CarriedFromText.stored()
+    ))
+    .map_err(at("copy"))?;
+    let (carried, copied): (i64, i64) = tx
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM move_event_v5), (SELECT COUNT(*) FROM move_event)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(at("copy"))?;
+    if carried != copied {
+        return Err(cancelled(
+            "copy",
+            version,
+            refuse(
+                format!("copied {copied} of {carried} journal rows"),
+                ADVICE_ASIDE,
+            ),
+        ));
+    }
+    #[cfg(test)]
+    take_migrate_fault(MigrateFaultPoint::RowsCopied, tx)
+        .map_err(|err| upgrade_cancelled("copy", version, &err.to_string(), ADVICE_ASIDE))?;
+    tx.execute_batch("DROP TABLE move_event_v5;")
+        .map_err(at("drop"))?;
+    #[cfg(test)]
+    take_migrate_fault(MigrateFaultPoint::OldTableDropped, tx)
+        .map_err(|err| upgrade_cancelled("drop", version, &err.to_string(), ADVICE_ASIDE))?;
+    Ok(())
+}
+
 /// Upgrades a checkpoint to the current schema. Runs only after `ensure_recognisable_shape` has
 /// established that the database is one of ours — on its own this function would adopt a foreign
-/// file and stamp it.
+/// file and stamp it. What it does NOT leave to the opener is the version rule: a stamp above
+/// `SCHEMA_VERSION` is refused here too, inside the transaction and before anything is judged,
+/// because this function is public and what it writes at the end is `SCHEMA_VERSION` — over a
+/// file a newer build wrote that would be a downgrade in disguise.
+///
+/// One transaction, taken IMMEDIATE: the v6 step reads the definition of `move_event` and then
+/// rewrites the table, and a deferred transaction that read under a shared lock could be denied
+/// the write lock afterwards by a concurrent opener (`SQLITE_BUSY_SNAPSHOT`); holding the write
+/// lock from the first statement means the snapshot the step judged is the snapshot it rewrites.
+/// Every failure before `commit` — the v6 step's own refusals, SQLite's errors, the injected
+/// faults of the tests — rolls the whole of it back, stamp included. What no test proves is a
+/// process or power failure in the middle of the transaction: that is SQLite's WAL recovery, and
+/// it is trusted rather than demonstrated here.
 pub fn migrate(conn: &Connection) -> Result<()> {
-    // The migration is transactional and idempotent — either it all applies,
-    // or the DB stays in its previous state (no half-added columns).
-    let tx = conn.unchecked_transaction()?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    refuse_if_newer(version, SCHEMA_VERSION)?;
+    // v6, the move journal, BEFORE the batch: what sits under `move_event` has to be judged before
+    // `IF NOT EXISTS` could have created anything under the name. Not additive — the table is
+    // rebuilt — and every refusal inside it leaves the checkpoint exactly as it was.
+    upgrade_move_event(&tx, version)?;
     tx.execute_batch(SCHEMA)?;
+    create_move_event(&tx, true)?;
     // Additive candidate-progress columns in scan_stats. `CREATE TABLE IF
     // NOT EXISTS` does NOT add columns to an already existing table in a production DB — hence
     // guarded `ALTER ADD COLUMN` (idempotent, without DROP/rewrite — we do not rewrite the checkpoint).
@@ -1003,8 +1554,24 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // an authority from the rows a v4 result already carries is the one thing this migration must
     // never do: those rows are what the raw-digest readers built, and stamping them `derived` would
     // hand a migrated checkpoint the destructive trust it was never granted.
+    // v6's post-condition, before the stamp: whichever path led here — fresh, rebuilt, or already
+    // v6 — the table under `move_event` is now the v6 definition byte for byte, or the stamp is not
+    // written.
+    let state = move_event_state(&tx).map_err(|err| {
+        upgrade_cancelled("postcondition", version, &err.to_string(), ADVICE_SQLITE)
+    })?;
+    if state != MoveEventState::ExactV6 {
+        return Err(upgrade_cancelled(
+            "postcondition",
+            version,
+            &format!("move_event is {state} after the upgrade, not the v6 table"),
+            ADVICE_ASIDE,
+        ));
+    }
     // Stamp the current schema version (also upgrades a pre-versioning DB from 0).
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    #[cfg(test)]
+    take_migrate_fault(MigrateFaultPoint::Stamped, &tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -1024,11 +1591,81 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &st
     Ok(())
 }
 
+// Test seam: fires once, at one of three points inside the v6 step of `migrate` — the rows copied,
+// the old table dropped, the stamp written — with the open transaction in
+// hand, so a test can look at the database from INSIDE the transaction that is about to fail and
+// then prove that everything it saw was rolled back. Absent from every non-test build.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MigrateFaultPoint {
+    RowsCopied,
+    OldTableDropped,
+    Stamped,
+}
+
+#[cfg(test)]
+type MigrateObserver = Box<dyn FnOnce(&Connection)>;
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATE_FAULT: std::cell::RefCell<Option<(MigrateFaultPoint, MigrateObserver)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms the one-shot migrate fault for this thread and disarms it on drop.
+#[cfg(test)]
+pub(crate) struct MigrateFault;
+
+#[cfg(test)]
+impl MigrateFault {
+    pub(crate) fn armed(
+        point: MigrateFaultPoint,
+        observe: impl FnOnce(&Connection) + 'static,
+    ) -> Self {
+        MIGRATE_FAULT.with(|slot| *slot.borrow_mut() = Some((point, Box::new(observe))));
+        MigrateFault
+    }
+
+    /// Whether the armed shot was consumed. A test whose seam was never reached proved nothing.
+    pub(crate) fn fired(&self) -> bool {
+        MIGRATE_FAULT.with(|slot| slot.borrow().is_none())
+    }
+}
+
+#[cfg(test)]
+impl Drop for MigrateFault {
+    fn drop(&mut self) {
+        MIGRATE_FAULT.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// Consumes the armed fault if it is set for `point`: runs the observer on the open transaction,
+/// then fails the step.
+#[cfg(test)]
+fn take_migrate_fault(point: MigrateFaultPoint, tx: &Connection) -> Result<()> {
+    let armed = MIGRATE_FAULT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let hit = matches!(&*slot, Some((armed_point, _)) if *armed_point == point);
+        if hit {
+            slot.take()
+        } else {
+            None
+        }
+    });
+    if let Some((_, observe)) = armed {
+        observe(tx);
+        return Err(AppError::msg("injected migrate fault"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testfixtures::{genuine_checkpoint, ScratchDir};
+    use crate::model::action::PathFidelity;
+    use crate::testfixtures::{genuine_checkpoint, rebuild_move_event_as, strip_v6, ScratchDir};
     use rusqlite::Connection;
+    use std::os::unix::ffi::OsStrExt;
 
     /// Column names of a table, in declaration order.
     fn columns_of(conn: &Connection, table: &str) -> Vec<String> {
@@ -1229,11 +1866,24 @@ mod tests {
         assert!(!index_names(conn).contains(&"file_group_member_by_path".to_string()));
     }
 
-    /// A genuinely v4-shaped DB: the current schema with every v5 addition taken away again and the
-    /// stamp rewound.
+    /// A genuinely v5-shaped DB: the current schema with the v6 rebuild of `move_event` undone —
+    /// the v5 table, byte for byte — and the stamp rewound. Foreign keys are enforced, as on
+    /// every `ScanStore` connection, so a fixture with a cascading key behaves as it would live.
+    fn v5_shaped_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        enforce_foreign_keys(&conn).unwrap();
+        migrate(&conn).unwrap();
+        strip_v6(&conn);
+        conn.pragma_update(None, "user_version", 5i64).unwrap();
+        conn
+    }
+
+    /// A genuinely v4-shaped DB: the current schema with every v6 and v5 addition taken away again
+    /// and the stamp rewound.
     fn v4_shaped_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
+        strip_v6(&conn);
         strip_v5(&conn);
         conn.pragma_update(None, "user_version", 4i64).unwrap();
         conn
@@ -1259,6 +1909,7 @@ mod tests {
     fn v3_shaped_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
+        strip_v6(&conn);
         strip_v5(&conn);
         strip_v4(&conn);
         conn.pragma_update(None, "user_version", 3i64).unwrap();
@@ -1271,6 +1922,7 @@ mod tests {
     fn v2_shaped_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
+        strip_v6(&conn);
         strip_v5(&conn);
         strip_v4(&conn);
         conn.execute_batch(
@@ -1466,7 +2118,9 @@ mod tests {
     fn migrate_v1_to_v2_adds_results_materialized_and_restamps() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
-        // Rewind to a v1 DB: drop the v2 column (SQLite 3.35+ supports DROP COLUMN) and restamp.
+        // Rewind to a v1 DB: the v5 move journal (a v6 table under an older stamp is refused, not
+        // adopted), then drop the v2 column (SQLite 3.35+ supports DROP COLUMN) and restamp.
+        strip_v6(&conn);
         conn.execute_batch("ALTER TABLE scan_stats DROP COLUMN results_materialized")
             .unwrap();
         conn.execute_batch("INSERT INTO scan_stats(scan_id, groups_found) VALUES (7, 4)")
@@ -1504,18 +2158,1129 @@ mod tests {
         assert_eq!((groups, prepared), (4, 0));
     }
 
-    /// A fresh writable DB is exactly schema v5: every new column, table and index comes from
+    // ------------------------------------------------------------------ move_event v6
+
+    /// The stored definition of `move_event`, as SQLite records it — the text the classifier
+    /// judges, found without regard to the letter case of the name.
+    fn move_event_sql(conn: &Connection) -> String {
+        conn.query_row(
+            "SELECT sql FROM sqlite_master
+              WHERE type = 'table' AND name = 'move_event' COLLATE NOCASE",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Journal rows with EXPLICIT, non-consecutive ids, for a v5-era table (TEXT pathnames): a
+    /// plain name, one with LF, and one that already holds U+FFFD — the character a lossy
+    /// conversion leaves behind, which the migration must carry as it is, not «repair».
+    const JOURNAL: &[(i64, &str)] = &[(3, "/a/x"), (7, "/a/we\nird"), (12, "/a/\u{FFFD}.bin")];
+
+    fn seed_journal_rows(conn: &Connection, rows: &[(i64, &str)]) {
+        for (id, path) in rows {
+            conn.execute(
+                "INSERT INTO move_event
+                     (id, created_at, scan_id, source_path, target_path, hash, duplicate)
+                 VALUES (?1, 'then', NULL, ?2, ?2 || '.moved', NULL, 0)",
+                params![id, path],
+            )
+            .unwrap();
+        }
+    }
+
+    /// The ids of the journal rows, in order.
+    fn journal_ids(conn: &Connection) -> Vec<i64> {
+        conn.prepare("SELECT id FROM move_event ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    /// The source pathnames of the journal, as the reader hands them back, in id order.
+    fn journaled_sources(rows: &[crate::model::action::MoveEventRow]) -> Vec<Vec<u8>> {
+        rows.iter()
+            .map(|row| row.event.source_path.as_os_str().as_bytes().to_vec())
+            .collect()
+    }
+
+    fn seeded_sources() -> Vec<Vec<u8>> {
+        JOURNAL
+            .iter()
+            .map(|(_, path)| path.as_bytes().to_vec())
+            .collect()
+    }
+
+    fn row_count(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    /// Every column of every row of `move_event`, in id order, rendered by `quote()` so the storage
+    /// class is part of the text (X'..' for a BLOB, '..' for TEXT). Reads the columns the table HAS
+    /// — a user's column or a generated one is part of the dump — so «equal to its own state before
+    /// the attempt» means all of it.
+    fn journal_dump(conn: &Connection) -> Vec<String> {
+        let columns: Vec<String> = table_xinfo(conn, "move_event")
+            .unwrap()
+            .into_iter()
+            .map(|column| column.name)
+            .collect();
+        let select = columns
+            .iter()
+            .map(|column| format!("quote(\"{column}\")"))
+            .collect::<Vec<_>>()
+            .join(" || '|' || ");
+        conn.prepare(&format!("SELECT {select} FROM move_event ORDER BY id"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    /// Everything the pre-check judges and a rebuild would touch: the table's own definition and
+    /// full column list, its rows, the whole schema and the stamp. Compared before and after a
+    /// refused upgrade — against the table's OWN prior state, not against a canon.
+    #[derive(Debug, PartialEq)]
+    struct TableState {
+        sql: String,
+        shape: Vec<ColumnShape>,
+        rows: Vec<String>,
+        schema: Vec<String>,
+        version: i64,
+    }
+
+    fn table_state(conn: &Connection) -> TableState {
+        TableState {
+            sql: move_event_sql(conn),
+            shape: table_xinfo(conn, "move_event").unwrap(),
+            rows: journal_dump(conn),
+            schema: schema_fingerprint(conn),
+            version: user_version(conn),
+        }
+    }
+
+    /// The eight v6 columns with both CHECKs only in comments: the shape of v6 and none of its
+    /// rules. SQLite stores the comments in the text and enforces nothing.
+    const V6_CHECKS_IN_COMMENTS: &str = "CREATE TABLE move_event (
+    id            INTEGER PRIMARY KEY,
+    created_at    TEXT    NOT NULL,
+    scan_id       INTEGER,
+    source_path   BLOB    NOT NULL,
+    target_path   BLOB    NOT NULL,
+    hash          BLOB,
+    duplicate     INTEGER NOT NULL,
+    path_fidelity INTEGER NOT NULL DEFAULT 0
+    -- CHECK (path_fidelity IN (0, 1)),
+    -- CHECK (path_fidelity = 0 OR (typeof(source_path) = 'blob' AND typeof(target_path) = 'blob'))
+)";
+
+    /// The v6 text with one extra space inside a CHECK — the same words, not the same bytes.
+    fn v6_with_an_extra_space() -> String {
+        MOVE_EVENT_V6_SQL.replacen("path_fidelity IN (0, 1)", "path_fidelity  IN (0, 1)", 1)
+    }
+
+    /// A fresh table and a v5 table are recognised, each from its full definition; nothing else
+    /// answers to either name.
+    #[test]
+    fn move_event_state_recognises_exactly_the_two_canons() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(move_event_state(&conn).unwrap(), MoveEventState::Absent);
+        create_move_event(&conn, true).unwrap();
+        assert_eq!(move_event_state(&conn).unwrap(), MoveEventState::ExactV6);
+        assert_eq!(
+            move_event_sql(&conn),
+            MOVE_EVENT_V6_SQL,
+            "IF NOT EXISTS leaves no trace in the stored text"
+        );
+        assert_eq!(
+            table_xinfo(&conn, "move_event").unwrap(),
+            reference_shape(XINFO_V6)
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MOVE_EVENT_V5_SQL).unwrap();
+        assert_eq!(move_event_state(&conn).unwrap(), MoveEventState::ExactV5);
+        assert_eq!(
+            table_xinfo(&conn, "move_event").unwrap(),
+            reference_shape(XINFO_V5)
+        );
+    }
+
+    /// Lookalikes are `Other`, each with the difference named: (a) the v6 columns with the CHECKs
+    /// only in comments; (b) the v6 text with one extra space; (c) v5 plus a column added later;
+    /// (d) v5 plus a VIRTUAL generated column, which `table_info` does not even list; (e) the v5
+    /// body under the name in another letter case — found, but not the canon; (f) a view under the
+    /// name, which a lookup filtered to tables would have mistaken for «absent»; (g) the v6 body
+    /// under the quoted name a RENAME leaves behind — the v6 columns, not the v6 text.
+    #[test]
+    fn move_event_state_refuses_lookalikes() {
+        let other = |conn: &Connection| match move_event_state(conn).unwrap() {
+            MoveEventState::Other(detail) => detail,
+            state => panic!("expected Other, got {state:?}"),
+        };
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(V6_CHECKS_IN_COMMENTS).unwrap();
+        let detail = other(&conn);
+        assert!(
+            detail.contains("differs from the v6 definition"),
+            "(a) {detail}"
+        );
+        assert!(
+            !detail.contains("column"),
+            "(a) the columns are the v6 columns: {detail}"
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&v6_with_an_extra_space()).unwrap();
+        let detail = other(&conn);
+        assert!(
+            detail.contains("differs from the v6 definition"),
+            "(b) {detail}"
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MOVE_EVENT_V5_SQL).unwrap();
+        conn.execute_batch("ALTER TABLE move_event ADD COLUMN note TEXT")
+            .unwrap();
+        let detail = other(&conn);
+        assert!(
+            detail.contains("differs from the v5 definition"),
+            "(c) {detail}"
+        );
+        assert!(
+            detail.contains("column 7 `note` (TEXT) is not in the v5 definition"),
+            "(c) {detail}"
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MOVE_EVENT_V5_SQL).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE move_event ADD COLUMN v INTEGER GENERATED ALWAYS AS (duplicate + 2) VIRTUAL",
+        )
+        .unwrap();
+        assert_eq!(
+            columns_of(&conn, "move_event").len(),
+            7,
+            "(d) table_info does not list the generated column — names alone would pass it"
+        );
+        let detail = other(&conn);
+        assert!(
+            detail
+                .contains("column 7 `v` (INTEGER, VIRTUAL generated) is not in the v5 definition"),
+            "(d) {detail}"
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&MOVE_EVENT_V5_SQL.replacen("move_event", "Move_Event", 1))
+            .unwrap();
+        let detail = other(&conn);
+        assert_eq!(
+            detail,
+            format!(
+                "the stored definition ({} bytes) differs from the v5 definition ({} bytes) at byte 13",
+                MOVE_EVENT_V5_SQL.len(),
+                MOVE_EVENT_V5_SQL.len()
+            ),
+            "(e)"
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE VIEW move_event AS SELECT 1 AS one")
+            .unwrap();
+        assert_eq!(other(&conn), "`move_event` is a view, not a table", "(f)");
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&MOVE_EVENT_V6_SQL.replacen("move_event (", "\"move_event\" (", 1))
+            .unwrap();
+        let detail = other(&conn);
+        assert_eq!(
+            detail,
+            format!(
+                "the stored definition ({} bytes) differs from the v6 definition ({} bytes) at byte 13",
+                MOVE_EVENT_V6_SQL.len() + 2,
+                MOVE_EVENT_V6_SQL.len()
+            ),
+            "(g) the name quoted, as a RENAME leaves it: the v6 columns, not the v6 text"
+        );
+    }
+
+    /// The rewind fixture really is the v5 table — byte for byte, and by its full column list —
+    /// so the migration tests below start from what the old builds wrote, not from a paraphrase.
+    /// (That the canon IS what the old builds wrote is evidence taken from a checkpoint one of them
+    /// created, outside this crate; this only proves the fixture carries the canon.)
+    #[test]
+    fn the_v5_fixture_carries_the_v5_canon() {
+        let conn = v5_shaped_db();
+        assert_eq!(move_event_sql(&conn), MOVE_EVENT_V5_SQL);
+        assert_eq!(
+            table_xinfo(&conn, "move_event").unwrap(),
+            reference_shape(XINFO_V5)
+        );
+        assert_eq!(move_event_state(&conn).unwrap(), MoveEventState::ExactV5);
+        assert_eq!(user_version(&conn), 5);
+        assert!(!table_names(&conn).contains(&"move_event_v6_tmp".to_string()));
+    }
+
+    /// T4: the carried rows keep their ids and their bytes, and none of them claims exactness — a
+    /// U+FFFD that a lossy writer left is carried as U+FFFD, not turned back into the byte it
+    /// replaced. A second migration changes nothing and leaves no temporary table behind.
+    #[test]
+    fn carried_rows_keep_their_ids_and_never_claim_exactness() {
+        let conn = v5_shaped_db();
+        seed_journal_rows(&conn, JOURNAL);
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(user_version(&conn), 6);
+        assert_eq!(move_event_state(&conn).unwrap(), MoveEventState::ExactV6);
+        let rows: Vec<(i64, Vec<u8>, String, i64)> = conn
+            .prepare(
+                "SELECT id, source_path, typeof(source_path), path_fidelity
+                   FROM move_event ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            vec![3, 7, 12],
+            "the ids are the old ids"
+        );
+        for ((id, path), (_, bytes, class, fidelity)) in JOURNAL.iter().zip(&rows) {
+            assert_eq!(
+                bytes,
+                path.as_bytes(),
+                "row {id}: the bytes are the UTF-8 of the old text"
+            );
+            assert_eq!(class, "blob", "row {id}: stored as BLOB");
+            assert_eq!(
+                *fidelity, 0,
+                "row {id}: carried rows must not claim exactness"
+            );
+        }
+        assert_ne!(
+            rows[2].1,
+            b"/a/\x80.bin".to_vec(),
+            "the replacement character is carried as it is, not «recovered»"
+        );
+
+        let fingerprint = schema_fingerprint(&conn);
+        migrate(&conn).unwrap();
+        assert_eq!(
+            schema_fingerprint(&conn),
+            fingerprint,
+            "a repeated migration rewrites nothing"
+        );
+        assert_eq!(journal_ids(&conn), vec![3, 7, 12]);
+        assert!(
+            !table_names(&conn).contains(&"move_event_v5".to_string()),
+            "no temporary table is left behind"
+        );
+    }
+
+    /// What the observer sees from inside the transaction at a fault point.
+    #[derive(Debug)]
+    struct Seen {
+        version: i64,
+        sql: String,
+        temporary_table: bool,
+        rows: i64,
+    }
+
+    fn observe(tx: &Connection) -> Seen {
+        Seen {
+            version: user_version(tx),
+            sql: move_event_sql(tx),
+            temporary_table: table_names(tx).contains(&"move_event_v5".to_string()),
+            rows: row_count(tx, "move_event"),
+        }
+    }
+
+    /// T5: a failure at any of the three points inside the v6 step — after the copy, after the old
+    /// table is dropped, after the stamp — rolls everything back: the observer sees the half-done
+    /// state from inside the transaction, and afterwards the table, its rows, the whole schema and
+    /// the stamp are what they were. The next attempt completes the upgrade.
+    #[test]
+    fn a_fault_at_any_point_of_the_v6_step_rolls_everything_back() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        for point in [
+            MigrateFaultPoint::RowsCopied,
+            MigrateFaultPoint::OldTableDropped,
+            MigrateFaultPoint::Stamped,
+        ] {
+            let conn = v5_shaped_db();
+            seed_journal_rows(&conn, JOURNAL);
+            let before = table_state(&conn);
+
+            let seen: Rc<RefCell<Option<Seen>>> = Rc::new(RefCell::new(None));
+            let slot = Rc::clone(&seen);
+            let fault = MigrateFault::armed(point, move |tx| {
+                *slot.borrow_mut() = Some(observe(tx));
+            });
+            let err = migrate(&conn).expect_err("the injected fault must cancel the upgrade");
+            assert!(
+                fault.fired(),
+                "[{point:?}] the seam was never reached — the test proved nothing"
+            );
+            let text = err.to_string();
+            assert!(
+                text.contains("injected migrate fault"),
+                "[{point:?}] {text}"
+            );
+            let seen = seen.borrow_mut().take().expect("the observer ran");
+            assert_eq!(
+                seen.sql, MOVE_EVENT_V6_SQL,
+                "[{point:?}] inside the transaction the new table is in place"
+            );
+            assert_eq!(seen.rows, 3, "[{point:?}] with every row copied");
+            match point {
+                MigrateFaultPoint::RowsCopied => {
+                    assert!(text.contains("cancelled at copy"), "{text}");
+                    assert!(
+                        seen.temporary_table,
+                        "the old table still waits under its temporary name"
+                    );
+                    assert_eq!(seen.version, 5);
+                }
+                MigrateFaultPoint::OldTableDropped => {
+                    assert!(text.contains("cancelled at drop"), "{text}");
+                    assert!(!seen.temporary_table, "the old table is gone");
+                    assert_eq!(seen.version, 5, "and the stamp is not yet written");
+                }
+                MigrateFaultPoint::Stamped => {
+                    assert!(!seen.temporary_table);
+                    assert_eq!(seen.version, 6, "the stamp is written, the commit is not");
+                }
+            }
+
+            assert_eq!(
+                table_state(&conn),
+                before,
+                "[{point:?}] the rollback restores everything the transaction touched"
+            );
+            assert_eq!(move_event_state(&conn).unwrap(), MoveEventState::ExactV5);
+
+            migrate(&conn).unwrap();
+            assert_eq!(
+                user_version(&conn),
+                6,
+                "[{point:?}] the next attempt completes"
+            );
+            assert_eq!(move_event_state(&conn).unwrap(), MoveEventState::ExactV6);
+            assert_eq!(journal_ids(&conn), vec![3, 7, 12]);
+            assert!(!table_names(&conn).contains(&"move_event_v5".to_string()));
+        }
+    }
+
+    /// T5, on a file: an interrupted upgrade returns the error to the opener and leaves a v5
+    /// checkpoint that opens again — and the next open completes the upgrade with every row.
+    #[test]
+    fn an_interrupted_upgrade_leaves_a_reopenable_v5_file() {
+        let _role = crate::state::store::role_guard();
+        crate::state::store::set_observer_role(false);
+        let dir = ScratchDir::new("interrupted-upgrade");
+        let db = genuine_checkpoint(dir.path(), 5);
+        seed_journal_rows(&Connection::open(&db).unwrap(), JOURNAL);
+
+        let fault = MigrateFault::armed(MigrateFaultPoint::OldTableDropped, |_| {});
+        let err = crate::state::ScanStore::open(&db)
+            .err()
+            .expect("an interrupted upgrade refuses the open");
+        assert!(fault.fired(), "the seam was never reached");
+        drop(fault);
+        let text = err.to_string();
+        assert!(text.contains("cancelled at drop"), "{text}");
+        assert!(text.contains("stays at schema v5"), "{text}");
+        {
+            let conn = Connection::open(&db).unwrap();
+            assert_eq!(user_version(&conn), 5);
+            assert_eq!(move_event_state(&conn).unwrap(), MoveEventState::ExactV5);
+            assert_eq!(journal_ids(&conn), vec![3, 7, 12]);
+        }
+
+        let store =
+            crate::state::ScanStore::open(&db).expect("the next open completes the upgrade");
+        let rows = store.move_events().unwrap();
+        assert_eq!(journaled_sources(&rows), seeded_sources());
+        assert!(rows
+            .iter()
+            .all(|row| row.path_fidelity == PathFidelity::CarriedFromText));
+        drop(store);
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(user_version(&conn), 6);
+        assert_eq!(move_event_state(&conn).unwrap(), MoveEventState::ExactV6);
+    }
+
+    /// T5b: the temporary name is taken, in another letter case — the upgrade is cancelled in our
+    /// words at the pre-check, naming the object and its type, and that object keeps its row.
+    #[test]
+    fn a_taken_temporary_name_cancels_the_upgrade_and_keeps_the_foreign_table() {
+        let conn = v5_shaped_db();
+        seed_journal_rows(&conn, JOURNAL);
+        conn.execute_batch(
+            "CREATE TABLE Move_Event_V5 (z INTEGER); INSERT INTO Move_Event_V5 VALUES (42);",
+        )
+        .unwrap();
+        let before = table_state(&conn);
+
+        let err = migrate(&conn).expect_err("the temporary name is taken");
+        let text = err.to_string();
+        assert!(text.contains("cancelled at precheck"), "{text}");
+        assert!(
+            text.contains("the temporary name move_event_v5 is taken by table `Move_Event_V5`"),
+            "{text}"
+        );
+        assert!(text.contains("stays at schema v5"), "{text}");
+
+        assert_eq!(table_state(&conn), before);
+        assert_eq!(move_event_state(&conn).unwrap(), MoveEventState::ExactV5);
+        let z: i64 = conn
+            .query_row("SELECT z FROM Move_Event_V5", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(z, 42, "the foreign table keeps its row");
+    }
+
+    /// T6: the honesty rule of the journal, on INSERT and on UPDATE, each refusal pinned to the
+    /// CHECK's own extended code. TEXT with 0 is tolerated (a build from before schema versioning
+    /// writes that) and reads back as bytes; BLOB with 1 is the v6 writer's row; TEXT claiming
+    /// exactness — both pathnames or one of them — is refused, and so is anything outside {0, 1}.
+    #[test]
+    fn fidelity_may_claim_exactness_only_for_blob_pathnames() {
+        let conn = enforced_db();
+        let insert = |id: i64, source: &str, target: &str, fidelity: i64| {
+            conn.execute(
+                &format!(
+                    "INSERT INTO move_event
+                         (id, created_at, source_path, target_path, duplicate, path_fidelity)
+                     VALUES ({id}, 'then', {source}, {target}, 0, {fidelity})"
+                ),
+                [],
+            )
+        };
+        insert(1, "'/a/x'", "'/b/x'", 0).expect("TEXT with 0 is tolerated");
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT source_path FROM move_event WHERE id = 1",
+                [],
+                |row| Ok(row.get_ref(0)?.as_bytes()?.to_vec()),
+            )
+            .unwrap();
+        assert_eq!(bytes, b"/a/x", "and reads back as bytes");
+        insert(2, "X'2F612F80'", "X'2F622F80'", 1).expect("BLOB with 1 is the v6 writer's row");
+
+        assert_constraint(
+            insert(3, "'/a/y'", "'/b/y'", 1),
+            CONSTRAINT_CHECK,
+            "TEXT pathnames claiming exactness",
+        );
+        assert_constraint(
+            insert(3, "X'2F'", "'/b/y'", 1),
+            CONSTRAINT_CHECK,
+            "one TEXT pathname claiming exactness",
+        );
+        assert_constraint(
+            insert(3, "X'2F'", "X'2F'", 2),
+            CONSTRAINT_CHECK,
+            "path_fidelity 2",
+        );
+        assert_constraint(
+            insert(3, "X'2F'", "X'2F'", -1),
+            CONSTRAINT_CHECK,
+            "path_fidelity -1",
+        );
+
+        assert_constraint(
+            conn.execute("UPDATE move_event SET path_fidelity = 1 WHERE id = 1", []),
+            CONSTRAINT_CHECK,
+            "promoting a TEXT row to exact",
+        );
+        assert_constraint(
+            conn.execute(
+                "UPDATE move_event SET source_path = '/a/text' WHERE id = 2",
+                [],
+            ),
+            CONSTRAINT_CHECK,
+            "an exact row rewritten as TEXT",
+        );
+        assert_constraint(
+            conn.execute("UPDATE move_event SET path_fidelity = 2 WHERE id = 2", []),
+            CONSTRAINT_CHECK,
+            "an exact row moved outside the domain",
+        );
+
+        assert_eq!(
+            journal_dump(&conn),
+            vec![
+                "1|'then'|NULL|'/a/x'|'/b/x'|NULL|0|0".to_string(),
+                "2|'then'|NULL|X'2F612F80'|X'2F622F80'|NULL|0|1".to_string(),
+            ],
+            "what survived is exactly the two accepted rows"
+        );
+    }
+
+    /// T7: a v5-aware build refuses a real v6 checkpoint and names both versions; the same
+    /// comparison with this build's own maximum accepts it. Executed, not asserted from constants.
+    #[test]
+    fn a_v5_aware_build_refuses_a_v6_db_and_accepts_its_own() {
+        let conn = v5_shaped_db();
+        seed_journal_rows(&conn, JOURNAL);
+        migrate(&conn).unwrap();
+        let fingerprint = schema_fingerprint(&conn);
+
+        let text = ensure_version_at_most(&conn, 5)
+            .expect_err("a v5 build must refuse a v6 DB")
+            .to_string();
+        assert!(text.contains("schema v6"), "{text}");
+        assert!(text.contains("supports v5"), "{text}");
+        assert_eq!(user_version(&conn), 6, "a refusal must not restamp");
+        assert_eq!(schema_fingerprint(&conn), fingerprint, "nor migrate");
+
+        ensure_version_at_most(&conn, 6).expect("this build's own maximum accepts it");
+        ensure_version_supported(&conn).expect("and so does the production entry point");
+    }
+
+    /// T8: the v6 definition is canonical on the bundled SQLite wherever a table can come from —
+    /// fresh, migrated, migrated and reopened twice more, and on a file after `VACUUM` (which the
+    /// product runs on its own schedule) and another open: the stored text equals the constant
+    /// byte for byte, the full column list equals the reference, the classifier says v6, the rows
+    /// keep their ids, and no path created the temporary table.
+    #[test]
+    fn the_v6_definition_is_canonical_fresh_migrated_reopened_and_after_vacuum() {
+        let canonical = |conn: &Connection, what: &str| {
+            assert_eq!(
+                move_event_sql(conn),
+                MOVE_EVENT_V6_SQL,
+                "{what}: the stored text"
+            );
+            assert_eq!(
+                table_xinfo(conn, "move_event").unwrap(),
+                reference_shape(XINFO_V6),
+                "{what}: the full column list"
+            );
+            assert_eq!(
+                move_event_state(conn).unwrap(),
+                MoveEventState::ExactV6,
+                "{what}: the verdict"
+            );
+            assert!(
+                !table_names(conn).contains(&"move_event_v5".to_string()),
+                "{what}: no temporary table"
+            );
+        };
+
+        let fresh = Connection::open_in_memory().unwrap();
+        migrate(&fresh).unwrap();
+        canonical(&fresh, "fresh");
+
+        let migrated = v5_shaped_db();
+        seed_journal_rows(&migrated, JOURNAL);
+        migrate(&migrated).unwrap();
+        canonical(&migrated, "migrated");
+        migrate(&migrated).unwrap();
+        migrate(&migrated).unwrap();
+        canonical(&migrated, "reopened twice");
+        assert_eq!(journal_ids(&migrated), vec![3, 7, 12]);
+
+        let _role = crate::state::store::role_guard();
+        crate::state::store::set_observer_role(false);
+        let dir = ScratchDir::new("canon-vacuum");
+        let db = genuine_checkpoint(dir.path(), 5);
+        seed_journal_rows(&Connection::open(&db).unwrap(), JOURNAL);
+        let store = crate::state::ScanStore::open(&db).unwrap();
+        store.vacuum().unwrap();
+        drop(store);
+        {
+            let conn = Connection::open(&db).unwrap();
+            canonical(&conn, "after VACUUM");
+            assert_eq!(journal_ids(&conn), vec![3, 7, 12]);
+            assert_eq!(user_version(&conn), 6);
+        }
+        let store = crate::state::ScanStore::open(&db).unwrap();
+        let rows = store.move_events().unwrap();
+        assert_eq!(
+            journaled_sources(&rows),
+            seeded_sources(),
+            "after VACUUM and another open: the rows"
+        );
+        assert!(rows
+            .iter()
+            .all(|row| row.path_fidelity == PathFidelity::CarriedFromText));
+        drop(store);
+        canonical(
+            &Connection::open(&db).unwrap(),
+            "after VACUUM and another open",
+        );
+    }
+
+    /// T9: the shape guard knows v6. (a) A genuine v5 checkpoint opens and upgrades. (b) A file
+    /// stamped v6 whose `move_event` lost `path_fidelity` is refused by the floor, in the guard's
+    /// own words, and the refusal writes nothing.
+    #[test]
+    fn the_shape_guard_requires_path_fidelity_at_v6() {
+        let _role = crate::state::store::role_guard();
+        crate::state::store::set_observer_role(false);
+        let dir = ScratchDir::new("floor-v6");
+        let db = genuine_checkpoint(dir.path(), 5);
+
+        drop(crate::state::ScanStore::open(&db).expect("(a) a genuine v5 checkpoint upgrades"));
+        {
+            let conn = Connection::open(&db).unwrap();
+            assert_eq!(user_version(&conn), 6);
+            assert_eq!(move_event_state(&conn).unwrap(), MoveEventState::ExactV6);
+            conn.execute_batch("ALTER TABLE move_event RENAME COLUMN path_fidelity TO fidelity_x")
+                .unwrap();
+        }
+        let before = std::fs::read(&db).unwrap();
+        let expected =
+            format!("{NOT_A_CHECKPOINT}: table `move_event` has no column `path_fidelity`");
+        {
+            let conn = Connection::open(&db).unwrap();
+            let text = ensure_recognisable_shape(&conn)
+                .expect_err("(b) the floor requires the column")
+                .to_string();
+            assert!(text.starts_with(&expected), "(b) {text}");
+        }
+        let text = crate::state::ScanStore::open(&db)
+            .err()
+            .expect("(b) the production open refuses the same way")
+            .to_string();
+        assert!(text.starts_with(&expected), "(b) {text}");
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            before,
+            "(b) a refused open leaves the file byte-identical"
+        );
+    }
+
+    /// T11: the owner's counter-example — a v5 checkpoint whose user added a `path_fidelity` column
+    /// of their own, defaulting to 1. The name alone would pass a floor; the definition does not
+    /// pass the classifier. Refused at the pre-check with the column named, and the table equals
+    /// its own state before the attempt: the eighth column and its values included.
+    #[test]
+    fn a_v5_checkpoint_with_a_foreign_path_fidelity_column_is_refused_intact() {
+        let conn = v5_shaped_db();
+        seed_journal_rows(&conn, JOURNAL);
+        conn.execute_batch(
+            "ALTER TABLE move_event ADD COLUMN path_fidelity INTEGER NOT NULL DEFAULT 1",
+        )
+        .unwrap();
+        let before = table_state(&conn);
+        assert_eq!(before.shape.len(), 8);
+        assert!(
+            before.rows.iter().all(|row| row.ends_with("|1")),
+            "the user's values are in the dump: {:?}",
+            before.rows
+        );
+
+        let outcome = migrate(&conn);
+
+        // Preservation first, whatever the outcome said. A rebuild that trusted the column names
+        // would have copied the seven it knows and dropped the eighth with its values — that loss,
+        // not a missing refusal, is what a weaker classifier costs, so it is what this shows.
+        assert_eq!(
+            table_state(&conn),
+            before,
+            "the table equals its own state before the attempt"
+        );
+        assert_eq!(user_version(&conn), 5);
+        let text = match outcome {
+            Err(err) => err.to_string(),
+            Ok(()) => panic!("a foreign path_fidelity must not be adopted"),
+        };
+        assert!(text.contains("cancelled at precheck"), "{text}");
+        assert!(
+            text.contains(
+                "column 7 `path_fidelity` (INTEGER NOT NULL DEFAULT 1) is not in the v5 definition"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("stays at schema v5"), "{text}");
+    }
+
+    /// T12: nothing foreign is destroyed. Extensions of the v5 table — a user column, a STORED
+    /// generated column in the original definition, a VIRTUAL one added to a filled table, an
+    /// index, a trigger, a view, and two tables whose foreign keys cascade from it (one of them
+    /// named so that `LIKE 'sqlite_%'` would hide it) — each cancels the upgrade at the pre-check
+    /// with the object named, and afterwards the extended table equals its OWN state before the
+    /// attempt: definition, full column list, rows with the user's and the computed values, the
+    /// whole schema, the stamp. The cascading rows are still there.
+    #[test]
+    fn extensions_of_move_event_cancel_the_upgrade_and_survive_it() {
+        struct Case {
+            tag: &'static str,
+            /// Built before the rows are seeded — for a column that has to be in the original
+            /// definition (a STORED generated column cannot be added to a filled table).
+            before_rows: bool,
+            build: fn(&Connection),
+            named: &'static str,
+            cascading: Option<&'static str>,
+        }
+        let cases = [
+            Case {
+                tag: "a: user column",
+                before_rows: false,
+                build: |conn| {
+                    conn.execute_batch(
+                        "ALTER TABLE move_event ADD COLUMN note TEXT;
+                         UPDATE move_event SET note = 'keep' WHERE id = 7;",
+                    )
+                    .unwrap()
+                },
+                named: "column 7 `note` (TEXT) is not in the v5 definition",
+                cascading: None,
+            },
+            Case {
+                tag: "a2: STORED generated column in the original definition",
+                before_rows: true,
+                build: |conn| {
+                    let ddl = format!(
+                        "{},\n    g INTEGER GENERATED ALWAYS AS (duplicate + 1) STORED\n)",
+                        &MOVE_EVENT_V5_SQL[..MOVE_EVENT_V5_SQL.len() - 2]
+                    );
+                    rebuild_move_event_as(conn, &ddl)
+                },
+                named: "column 7 `g` (INTEGER, STORED generated) is not in the v5 definition",
+                cascading: None,
+            },
+            Case {
+                tag: "a3: VIRTUAL generated column added to a filled table",
+                before_rows: false,
+                build: |conn| {
+                    conn.execute_batch(
+                        "ALTER TABLE move_event
+                             ADD COLUMN v INTEGER GENERATED ALWAYS AS (duplicate + 2) VIRTUAL",
+                    )
+                    .unwrap()
+                },
+                named: "column 7 `v` (INTEGER, VIRTUAL generated) is not in the v5 definition",
+                cascading: None,
+            },
+            Case {
+                tag: "b: index",
+                before_rows: false,
+                build: |conn| {
+                    conn.execute_batch("CREATE INDEX user_idx ON move_event(created_at)")
+                        .unwrap()
+                },
+                named: "index `user_idx` is defined on move_event",
+                cascading: None,
+            },
+            Case {
+                tag: "c: trigger",
+                before_rows: false,
+                build: |conn| {
+                    conn.execute_batch(
+                        "CREATE TRIGGER user_trg AFTER INSERT ON move_event BEGIN SELECT 1; END",
+                    )
+                    .unwrap()
+                },
+                named: "trigger `user_trg` refers to move_event",
+                cascading: None,
+            },
+            Case {
+                tag: "d: view",
+                before_rows: false,
+                build: |conn| {
+                    conn.execute_batch(
+                        "CREATE VIEW user_view AS SELECT source_path FROM move_event",
+                    )
+                    .unwrap()
+                },
+                named: "view `user_view` refers to move_event",
+                cascading: None,
+            },
+            Case {
+                tag: "e: cascading foreign key, parent named in upper case",
+                before_rows: false,
+                build: |conn| {
+                    conn.execute_batch(
+                        "CREATE TABLE note(id INTEGER PRIMARY KEY,
+                                           ev INTEGER REFERENCES MOVE_EVENT(id) ON DELETE CASCADE);
+                         INSERT INTO note VALUES (1, 7);",
+                    )
+                    .unwrap()
+                },
+                named: "table `note` has a foreign key referencing move_event",
+                cascading: Some("note"),
+            },
+            Case {
+                tag: "e2: the same under a name LIKE 'sqlite_%' would hide",
+                before_rows: false,
+                build: |conn| {
+                    conn.execute_batch(
+                        "CREATE TABLE sqlitex_notes(id INTEGER PRIMARY KEY,
+                                           ev INTEGER REFERENCES MOVE_EVENT(id) ON DELETE CASCADE);
+                         INSERT INTO sqlitex_notes VALUES (1, 7);",
+                    )
+                    .unwrap()
+                },
+                named: "table `sqlitex_notes` has a foreign key referencing move_event",
+                cascading: Some("sqlitex_notes"),
+            },
+        ];
+
+        for case in &cases {
+            let conn = v5_shaped_db();
+            if case.before_rows {
+                (case.build)(&conn);
+            }
+            seed_journal_rows(&conn, JOURNAL);
+            if !case.before_rows {
+                (case.build)(&conn);
+            }
+            if let Some(table) = case.cascading {
+                assert_eq!(row_count(&conn, table), 1, "[{}] the fixture", case.tag);
+            }
+            let before = table_state(&conn);
+            assert_eq!(before.version, 5, "[{}] the fixture", case.tag);
+
+            let outcome = migrate(&conn);
+
+            // Preservation first, whatever the outcome said: the cascading row (DROP TABLE under
+            // enforced keys runs ON DELETE CASCADE), then the whole extended table. A pre-check
+            // that lets one of these through costs exactly this, and this is what shows.
+            if let Some(table) = case.cascading {
+                assert_eq!(
+                    row_count(&conn, table),
+                    1,
+                    "[{}] the cascading row survives",
+                    case.tag
+                );
+            }
+            assert_eq!(
+                table_state(&conn),
+                before,
+                "[{}] the extended table equals its own state before the attempt",
+                case.tag
+            );
+            let text = match outcome {
+                Err(err) => err.to_string(),
+                Ok(()) => panic!("[{}] the extension must cancel the upgrade", case.tag),
+            };
+            assert!(
+                text.contains("cancelled at precheck"),
+                "[{}] {text}",
+                case.tag
+            );
+            assert!(
+                text.contains(case.named),
+                "[{}] the object must be named: {text}",
+                case.tag
+            );
+            assert!(text.contains("stays at schema v5"), "[{}] {text}", case.tag);
+        }
+    }
+
+    /// T13: a v6 stamp over a table that is not the v6 table is refused in `migrate` — the shape
+    /// guard's floor is satisfied by the column names, so this is where a hand-stamped file stops:
+    /// (a) the v5 table with a foreign `path_fidelity`; (b) the eight columns with the CHECKs only
+    /// in comments — the fixture proves it accepts a TEXT row claiming exactness, which is what
+    /// accepting it as v6 would let into the product; (c) the v6 text with one extra space.
+    #[test]
+    fn a_v6_stamp_over_a_non_canonical_table_is_refused() {
+        let conn = v5_shaped_db();
+        seed_journal_rows(&conn, JOURNAL);
+        conn.execute_batch(
+            "ALTER TABLE move_event ADD COLUMN path_fidelity INTEGER NOT NULL DEFAULT 1",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 6i64).unwrap();
+        let before = table_state(&conn);
+        let text = migrate(&conn).expect_err("(a)").to_string();
+        assert!(
+            text.contains("cancelled at precheck") && text.contains("`path_fidelity`"),
+            "(a) {text}"
+        );
+        assert_eq!(table_state(&conn), before, "(a)");
+        assert_eq!(user_version(&conn), 6, "(a) the stamp is left as it was");
+
+        let conn = Connection::open_in_memory().unwrap();
+        enforce_foreign_keys(&conn).unwrap();
+        conn.execute_batch(V6_CHECKS_IN_COMMENTS).unwrap();
+        conn.execute(
+            "INSERT INTO move_event (id, created_at, source_path, target_path, duplicate)
+             VALUES (7, 'then', X'2F61', X'2F62', 0)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 6i64).unwrap();
+        let before = table_state(&conn);
+        let text = migrate(&conn).expect_err("(b)").to_string();
+        assert!(
+            text.contains("cancelled at precheck")
+                && text.contains("differs from the v6 definition"),
+            "(b) {text}"
+        );
+        assert_eq!(table_state(&conn), before, "(b)");
+        conn.execute(
+            "INSERT INTO move_event (id, created_at, source_path, target_path, duplicate, path_fidelity)
+             VALUES (99, 'then', '/text', '/text', 0, 1)",
+            [],
+        )
+        .expect("(b) the lookalike has no CHECK: a TEXT row claiming exactness goes in");
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&v6_with_an_extra_space()).unwrap();
+        conn.pragma_update(None, "user_version", 6i64).unwrap();
+        let before = table_state(&conn);
+        let text = migrate(&conn).expect_err("(c)").to_string();
+        assert!(
+            text.contains("cancelled at precheck")
+                && text.contains("differs from the v6 definition"),
+            "(c) {text}"
+        );
+        assert_eq!(table_state(&conn), before, "(c)");
+    }
+
+    /// T14: the refusal's promise is true on a file. A v5 checkpoint in rollback-journal mode with
+    /// a cascading foreign key onto the journal: the open is refused with the step, the version the
+    /// file stays at and the WAL caveat — never «nothing was changed» — the stamp, the schema and
+    /// every row are as they were, the journal mode really is WAL now, and once the foreign key
+    /// holder is gone the next open upgrades with every row.
+    #[test]
+    fn a_cancelled_upgrade_tells_the_truth_about_the_file() {
+        let _role = crate::state::store::role_guard();
+        crate::state::store::set_observer_role(false);
+        let dir = ScratchDir::new("cancelled-truth");
+        let db = genuine_checkpoint(dir.path(), 5);
+        let (schema_before, rows_before) = {
+            let conn = Connection::open(&db).unwrap();
+            seed_journal_rows(&conn, JOURNAL);
+            conn.execute_batch(
+                "CREATE TABLE note(id INTEGER PRIMARY KEY,
+                                   ev INTEGER REFERENCES MOVE_EVENT(id) ON DELETE CASCADE);
+                 INSERT INTO note VALUES (1, 7);",
+            )
+            .unwrap();
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "delete", "the fixture rests in rollback-journal mode");
+            (schema_fingerprint(&conn), journal_dump(&conn))
+        };
+
+        let text = crate::state::ScanStore::open(&db)
+            .err()
+            .expect("the cascading key cancels the upgrade")
+            .to_string();
+        for promise in [
+            "cancelled at precheck",
+            "table `note` has a foreign key referencing move_event",
+            "stays at schema v5",
+            "may already have switched the file to WAL mode",
+        ] {
+            assert!(text.contains(promise), "missing «{promise}»: {text}");
+        }
+        assert!(
+            !text.contains("Nothing was changed"),
+            "the journal mode did change: {text}"
+        );
+
+        {
+            let conn = Connection::open(&db).unwrap();
+            assert_eq!(user_version(&conn), 5);
+            assert_eq!(schema_fingerprint(&conn), schema_before);
+            assert_eq!(journal_dump(&conn), rows_before);
+            assert_eq!(row_count(&conn, "note"), 1);
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "wal", "the flip happened, and the refusal said so");
+            conn.execute_batch("DROP TABLE note").unwrap();
+        }
+        let store = crate::state::ScanStore::open(&db)
+            .expect("without the foreign key the upgrade completes");
+        assert_eq!(
+            journaled_sources(&store.move_events().unwrap()),
+            seeded_sources()
+        );
+        drop(store);
+        assert_eq!(user_version(&Connection::open(&db).unwrap()), 6);
+    }
+
+    /// T15: `migrate` is public and stamps `SCHEMA_VERSION`; over a file a newer build wrote that
+    /// would be a downgrade in disguise. So the refusal the opener makes is made here as well,
+    /// inside the transaction and before anything is judged: (a) the canonical v6 table under a
+    /// stamp one ahead — the shape a newer build may well leave — and (b) the v5 table under the
+    /// same stamp are both left exactly as they are, stamp included, and the words are the
+    /// version rule's, not the v6 step's.
+    #[test]
+    fn a_future_stamp_is_refused_by_migrate_itself() {
+        let future = SCHEMA_VERSION + 1;
+
+        let conn = Connection::open_in_memory().unwrap();
+        enforce_foreign_keys(&conn).unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO move_event
+                 (id, created_at, source_path, target_path, duplicate, path_fidelity)
+             VALUES (5, 'then', X'2F61', X'2F62', 0, 1)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", future).unwrap();
+        let before = table_state(&conn);
+        assert_eq!(before.version, future);
+
+        let text = migrate(&conn)
+            .expect_err("(a) a newer stamp must be refused, not restamped")
+            .to_string();
+        assert!(text.contains("newer version"), "(a) {text}");
+        assert!(text.contains(&format!("schema v{future}")), "(a) {text}");
+        assert!(
+            text.contains(&format!("supports v{SCHEMA_VERSION}")),
+            "(a) {text}"
+        );
+        assert_eq!(
+            table_state(&conn),
+            before,
+            "(a) nothing judged, nothing written, the stamp stays"
+        );
+        assert_eq!(user_version(&conn), future);
+
+        let conn = v5_shaped_db();
+        seed_journal_rows(&conn, JOURNAL);
+        conn.pragma_update(None, "user_version", future).unwrap();
+        let before = table_state(&conn);
+
+        let text = migrate(&conn).expect_err("(b)").to_string();
+        assert!(text.contains("newer version"), "(b) {text}");
+        assert!(
+            !text.contains("cancelled at"),
+            "(b) the stamp is refused before the v6 step judges anything: {text}"
+        );
+        assert_eq!(table_state(&conn), before, "(b)");
+        assert_eq!(user_version(&conn), future);
+    }
+
+    /// A fresh writable DB is exactly schema v6: every new column, table and index comes from
     /// `CREATE TABLE`/`CREATE INDEX`, not only from the `ALTER` path a migrated DB takes.
     #[test]
-    fn fresh_db_is_schema_v5_with_every_new_column_table_and_index() {
+    fn fresh_db_is_schema_v6_with_every_new_column_table_and_index() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
 
-        assert_eq!(SCHEMA_VERSION, 5, "v5 is the schema this build writes");
+        assert_eq!(SCHEMA_VERSION, 6, "v6 is the schema this build writes");
         let stamped: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(stamped, 5, "a fresh DB is stamped v5");
+        assert_eq!(stamped, 6, "a fresh DB is stamped v6");
+
+        // v6: the move journal carries its fidelity column, and the table is the canon itself.
+        assert!(columns_of(&conn, "move_event").contains(&"path_fidelity".to_string()));
+        assert_eq!(move_event_state(&conn).unwrap(), MoveEventState::ExactV6);
 
         // v5: the membership authority and its members, with the one reverse index.
         let tables = table_names(&conn);
@@ -2030,9 +3795,13 @@ mod tests {
         assert!(ensure_version_supported(&conn).is_ok());
         migrate(&conn).unwrap();
         let after_first = schema_fingerprint(&conn);
-        migrate(&conn).unwrap(); // reopening a v5 DB is idempotent
+        migrate(&conn).unwrap(); // reopening a current DB is idempotent
 
-        assert_eq!(user_version(&conn), SCHEMA_VERSION, "the stamp moves to v5");
+        assert_eq!(
+            user_version(&conn),
+            SCHEMA_VERSION,
+            "the stamp moves to the current schema"
+        );
         assert_eq!(
             schema_fingerprint(&conn),
             after_first,

@@ -24,12 +24,12 @@ import hashlib
 import sqlite3
 import sys
 
-EXPECTED_USER_VERSION = 5
+EXPECTED_USER_VERSION = 6
 PRODUCT_MIN_SIZE = 4096
 
-# The v5 structural contract, transcribed from the product's own schema (src/state/schema.rs).
+# The v6 structural contract, transcribed from the product's own schema (src/state/schema.rs).
 #
-# A stamp and four table names are not a schema. `PRAGMA user_version = 5` is one integer any
+# A stamp and four table names are not a schema. `PRAGMA user_version = 6` is one integer any
 # writer can set, and a database carrying that integer over three empty tables would satisfy a
 # check that only counts names. What is checked here is the shape the product actually creates:
 # every table, the columns of the tables this verifier reads, and the indexes those columns are
@@ -39,7 +39,7 @@ PRODUCT_MIN_SIZE = 4096
 # nothing about a schema can, because a schema is copyable — which is why provenance is settled
 # by the invocation record and the receipt, and this only refuses a database that could not have
 # come from the product at all.
-V5_TABLES = (
+V6_TABLES = (
     "scan", "file", "scan_stats", "file_mark", "dir_dedup", "file_group", "file_dedup",
     "scan_membership", "file_group_member", "hash_cache", "move_event", "scan_root",
     "dir_omission",
@@ -47,8 +47,8 @@ V5_TABLES = (
 
 # Every table, not only the ones this program reads: a checkpoint missing a column of a table
 # nobody queries here is still not a checkpoint the product would have created.
-V5_COLUMNS = {
-    # `trashed` is part of the v5 floor (schema.rs FLOOR_V0): a checkpoint without it is not
+V6_COLUMNS = {
+    # `trashed` is part of the v0 floor (schema.rs FLOOR_V0): a checkpoint without it is not
     # one this product wrote, and leaving it out of the contract left a real column unguarded.
     "scan": ("id", "created_at", "updated_at", "status", "config_json", "trashed"),
     "file": ("scan_id", "path", "size", "mtime", "mtime_nsec", "ctime_sec", "ctime_nsec",
@@ -69,17 +69,50 @@ V5_COLUMNS = {
     "scan_membership": ("scan_id", "mode", "generation"),
     "file_group_member": ("scan_id", "group_rank", "path", "generation"),
     "hash_cache": ("device", "inode", "size", "mtime", "hash", "updated_at"),
+    # `path_fidelity` arrived with schema v6, when the two pathnames became raw bytes.
     "move_event": ("id", "created_at", "scan_id", "source_path", "target_path", "hash",
-                   "duplicate"),
+                   "duplicate", "path_fidelity"),
     "scan_root": ("scan_id", "root_key", "generation"),
     "dir_omission": ("scan_id", "root_key", "dir_key", "reason", "event_count", "generation"),
 }
+
+# The move journal's contract is more than its column names. Schema v6 stores both pathnames as
+# BLOB — the raw bytes the move handled — and marks every row with `path_fidelity`, whose two
+# CHECKs are the rule that a row may claim exactness only for BLOB pathnames. A database with the
+# old TEXT columns plus a `path_fidelity` column carries every v6 name and none of the v6 meaning,
+# and so does a copy of the table whose CHECKs live only in a comment. So this one table is sealed
+# by its full `PRAGMA table_xinfo` — (cid, name, type, notnull, default, pk, hidden), generated and
+# hidden columns included — AND by the exact text SQLite stores for it: the text is the only
+# complete record of the constraints, and the product compares it the same way.
+MOVE_EVENT_XINFO = (
+    (0, "id", "INTEGER", 0, None, 1, 0),
+    (1, "created_at", "TEXT", 1, None, 0, 0),
+    (2, "scan_id", "INTEGER", 0, None, 0, 0),
+    (3, "source_path", "BLOB", 1, None, 0, 0),
+    (4, "target_path", "BLOB", 1, None, 0, 0),
+    (5, "hash", "BLOB", 0, None, 0, 0),
+    (6, "duplicate", "INTEGER", 1, None, 0, 0),
+    (7, "path_fidelity", "INTEGER", 1, "0", 0, 0),
+)
+MOVE_EVENT_SQL = """CREATE TABLE move_event (
+    id            INTEGER PRIMARY KEY,
+    created_at    TEXT    NOT NULL,
+    scan_id       INTEGER,
+    source_path   BLOB    NOT NULL,
+    target_path   BLOB    NOT NULL,
+    hash          BLOB,
+    duplicate     INTEGER NOT NULL,
+    path_fidelity INTEGER NOT NULL DEFAULT 0,
+    CHECK (path_fidelity IN (0, 1)),
+    CHECK (path_fidelity = 0
+           OR (typeof(source_path) = 'blob' AND typeof(target_path) = 'blob'))
+)"""
 
 # An index is not its name. Which table it belongs to, whether it is unique, whether it is
 # partial, and the ORDER, direction and collation of its key columns are the index; a check that
 # reads the name list would accept a one-column index wearing the name of a five-column one.
 #   name -> (table, unique, ((column, desc, collation), ...), partial)
-V5_INDEXES = {
+V6_INDEXES = {
     "file_size": ("file", 0, (("scan_id", 0, "BINARY"), ("size", 0, "BINARY")), 0),
     "file_hash": ("file", 0, (("scan_id", 0, "BINARY"), ("hash", 0, "BINARY")), 0),
     "file_content": ("file", 0, (("device", 0, "BINARY"), ("inode", 0, "BINARY"),
@@ -173,8 +206,34 @@ def read_sealed(path):
     return fields, hashlib.sha256(raw).hexdigest()
 
 
+def move_event_problems(conn):
+    """The v6 move journal, by its full column list and its stored definition — not by names."""
+    problems = []
+    got = tuple(tuple(r) for r in conn.execute("PRAGMA table_xinfo(move_event)"))
+    for index in range(max(len(got), len(MOVE_EVENT_XINFO))):
+        have = got[index] if index < len(got) else None
+        want = MOVE_EVENT_XINFO[index] if index < len(MOVE_EVENT_XINFO) else None
+        if have != want:
+            problems.append(f"move_event column {index}: {have}, expected {want}")
+            break
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'move_event'").fetchone()
+    sql = row[0] if row else ""
+    if sql != MOVE_EVENT_SQL:
+        common = 0
+        for a, b in zip(sql, MOVE_EVENT_SQL):
+            if a != b:
+                break
+            common += 1
+        problems.append(
+            f"move_event: the stored definition ({len(sql)} chars) is not the v6 text "
+            f"({len(MOVE_EVENT_SQL)} chars): first difference at char {common} — BLOB pathnames, "
+            f"path_fidelity and both CHECKs are required, as real constraints, not as names")
+    return problems
+
+
 def structural_problems(conn):
-    """Every way this database fails to be the shape v5 creates."""
+    """Every way this database fails to be the shape v6 creates."""
     problems = []
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version != EXPECTED_USER_VERSION:
@@ -182,11 +241,11 @@ def structural_problems(conn):
 
     present = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table'")}
-    missing = [t for t in V5_TABLES if t not in present]
+    missing = [t for t in V6_TABLES if t not in present]
     if missing:
         problems.append(f"tables missing: {', '.join(missing)}")
 
-    for table, columns in V5_COLUMNS.items():
+    for table, columns in V6_COLUMNS.items():
         if table not in present:
             continue
         have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -194,15 +253,18 @@ def structural_problems(conn):
         if absent:
             problems.append(f"{table} is missing columns: {', '.join(absent)}")
 
+    if "move_event" in present:
+        problems.extend(move_event_problems(conn))
+
     indexes = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'index'")}
-    absent = [i for i in V5_INDEXES if i not in indexes]
+    absent = [i for i in V6_INDEXES if i not in indexes]
     if absent:
         problems.append(f"indexes missing: {', '.join(absent)}")
 
     # The shape of every index that IS there: owner, uniqueness, partiality, and the key columns
     # in order with their direction and collation.
-    for name, (table, unique, keys, partial) in V5_INDEXES.items():
+    for name, (table, unique, keys, partial) in V6_INDEXES.items():
         if name in absent or table not in present:
             continue
         listed = [r for r in conn.execute(f"PRAGMA index_list({table})") if r[1] == name]
@@ -318,7 +380,7 @@ def main(argv):
     if structural:
         print("VERIFY: FAIL", file=sys.stderr)
         for problem in structural:
-            print(f"  - v5 structure: {problem}", file=sys.stderr)
+            print(f"  - v6 structure: {problem}", file=sys.stderr)
         print("  - this database is not the shape the product's schema-creation path produces",
               file=sys.stderr)
         return 1

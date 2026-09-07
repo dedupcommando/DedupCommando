@@ -302,8 +302,9 @@ If two people ran `--force` or otherwise bypassed the lock and the database then
 behaves strangely, the options are few:
 
 1. Close both processes.
-2. Back up the database just in case: `cp ~/.local/state/dedcom/dedcom.db
-   ~/.local/state/dedcom/dedcom.db.bak`.
+2. Back up the database just in case — not with a plain `cp`: in WAL mode the `-wal`
+   file can hold committed data the main file does not. Use the procedure in
+   [§12 Backing up and restoring](12-maintenance.md#backing-up-and-restoring-dedcomdb).
 3. Run `dedcom --stats` to see which scans exist at all and in what status.
 4. If the data in the datasets is intact and the snapshots are present (`zfs list
    -t snapshot | grep dedcom`) — only the index was hurt, not the data. You can

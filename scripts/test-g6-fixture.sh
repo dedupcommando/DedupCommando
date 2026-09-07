@@ -149,8 +149,8 @@ c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
 print(c.execute("PRAGMA user_version").fetchone()[0])
 PY
 )"
-[ "$uv" = "5" ] && ok "schema provenance: the production path stamped user_version=5" \
-                || bad "schema provenance: the production path stamped user_version=5" "saw $uv"
+[ "$uv" = "6" ] && ok "schema provenance: the production path stamped user_version=6" \
+                || bad "schema provenance: the production path stamped user_version=6" "saw $uv"
 
 # The two generations must also agree on the checkpoint's LOGICAL content — same counts and the
 # same set of group hashes. Byte equality of the database is not required and not checked.
@@ -190,6 +190,47 @@ PY
 
 kill_check "schema: a database the product never wrote" "user_version" -- \
   "$VERIFY" --db "$WORK/foreign.db" --groups "$R_G" --members-per-group "$R_M" \
+            --singletons "$R_U"
+
+# schema semantics, not names: the v6 column names over the v5 storage classes, and the v6
+# columns with the honesty CHECKs only in comments. Both carry the stamp and every name the
+# product uses; both must be refused, and refused for move_event.
+python3 - "$STA/dedcom.db" "$WORK/text-paths.db" "$WORK/no-checks.db" <<'PY'
+import shutil, sqlite3, sys
+src, text_paths, no_checks = sys.argv[1:4]
+NAMES = "id, created_at, scan_id, source_path, target_path, hash, duplicate, path_fidelity"
+def rebuild(path, ddl):
+    shutil.copyfile(src, path)
+    c = sqlite3.connect(path)
+    c.executescript(f"ALTER TABLE move_event RENAME TO move_event_old; {ddl}; "
+                    f"INSERT INTO move_event ({NAMES}) SELECT {NAMES} FROM move_event_old; "
+                    "DROP TABLE move_event_old;")
+    c.commit()
+    c.close()
+rebuild(text_paths, """CREATE TABLE move_event (
+    id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, scan_id INTEGER,
+    source_path TEXT NOT NULL, target_path TEXT NOT NULL, hash BLOB, duplicate INTEGER NOT NULL,
+    path_fidelity INTEGER NOT NULL DEFAULT 0)""")
+rebuild(no_checks, """CREATE TABLE move_event (
+    id            INTEGER PRIMARY KEY,
+    created_at    TEXT    NOT NULL,
+    scan_id       INTEGER,
+    source_path   BLOB    NOT NULL,
+    target_path   BLOB    NOT NULL,
+    hash          BLOB,
+    duplicate     INTEGER NOT NULL,
+    path_fidelity INTEGER NOT NULL DEFAULT 0
+    -- CHECK (path_fidelity IN (0, 1)),
+    -- CHECK (path_fidelity = 0 OR (typeof(source_path) = 'blob' AND typeof(target_path) = 'blob'))
+)""")
+PY
+
+kill_check "schema: v6 names over TEXT pathnames under the v6 stamp" "move_event" -- \
+  "$VERIFY" --db "$WORK/text-paths.db" --groups "$R_G" --members-per-group "$R_M" \
+            --singletons "$R_U"
+
+kill_check "schema: the honesty CHECKs only in comments" "move_event" -- \
+  "$VERIFY" --db "$WORK/no-checks.db" --groups "$R_G" --members-per-group "$R_M" \
             --singletons "$R_U"
 
 kill_check "formula: membership read from file_group_member" "members" -- \

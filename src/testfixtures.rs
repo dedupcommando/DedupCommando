@@ -634,6 +634,9 @@ pub fn genuine_checkpoint(dir: &Path, version: i64) -> PathBuf {
             .unwrap();
     }
     let conn = rusqlite::Connection::open(&db).unwrap();
+    if version < 6 {
+        strip_v6(&conn);
+    }
     if version < 5 {
         conn.execute_batch("DROP TABLE file_group_member; DROP TABLE scan_membership;")
             .unwrap();
@@ -667,6 +670,45 @@ pub fn genuine_checkpoint(dir: &Path, version: i64) -> PathBuf {
         .unwrap();
     drop(conn);
     db
+}
+
+/// Rewinds `move_event` from v6 to a v5-era table: the v6 table steps aside, `ddl` — the v5 canon,
+/// or a variant of it for a fixture that needs a column in the ORIGINAL definition — is created
+/// under the name, the rows come back with their ids and their pathnames cast to TEXT, and the v6
+/// table goes. A rebuild rather than `DROP COLUMN`: SQLite refuses to drop a column named in a
+/// table CHECK, and `path_fidelity` is named in two.
+pub fn rebuild_move_event_as(conn: &rusqlite::Connection, ddl: &str) {
+    conn.execute_batch(&format!(
+        "ALTER TABLE move_event RENAME TO move_event_v6_tmp;
+         {ddl};
+         INSERT INTO move_event (id, created_at, scan_id, source_path, target_path, hash, duplicate)
+              SELECT id, created_at, scan_id, CAST(source_path AS TEXT), CAST(target_path AS TEXT),
+                     hash, duplicate
+                FROM move_event_v6_tmp ORDER BY id;
+         DROP TABLE move_event_v6_tmp;"
+    ))
+    .expect("rewinding move_event to a v5-era table");
+}
+
+/// Strips what v6 adds: `move_event` becomes the v5 table, byte for byte the canon. The self-check
+/// is what keeps every migration test honest — a fixture that quietly stopped being the v5 table
+/// would make those tests pass for the wrong reason. It proves only that SQLite stored the text it
+/// was given; that the canon is what the old builds wrote is evidence taken from a checkpoint one
+/// of them created, outside this crate.
+pub fn strip_v6(conn: &rusqlite::Connection) {
+    rebuild_move_event_as(conn, crate::state::schema::MOVE_EVENT_V5_SQL);
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'move_event'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the rewound move_event exists");
+    assert_eq!(
+        sql,
+        crate::state::schema::MOVE_EVENT_V5_SQL,
+        "the rewound move_event must be the v5 canon byte for byte"
+    );
 }
 
 #[cfg(test)]
