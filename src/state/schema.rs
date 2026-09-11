@@ -976,6 +976,8 @@ const PRODUCT_INDEXES: &[IndexSpec] = &[
 /// The kind of the object that answers to one of our names, looked up as SQLite resolves it:
 /// without regard to ASCII case. A trigger may share a table's name, so two matches are refused as
 /// ambiguous, and a single match in a spelling this product never writes is refused as not ours.
+/// A table is reported by its class, `table`, `virtual table` or `shadow table`: `sqlite_master`
+/// says `table` for all three.
 fn object_kind(conn: &Connection, name: &str) -> Result<Option<String>> {
     let mut stmt =
         conn.prepare("SELECT type, name FROM sqlite_master WHERE name = ?1 COLLATE NOCASE")?;
@@ -986,7 +988,17 @@ fn object_kind(conn: &Connection, name: &str) -> Result<Option<String>> {
     found.sort();
     match found.as_slice() {
         [] => Ok(None),
-        [(kind, stored)] if stored == name => Ok(Some(kind.clone())),
+        [(kind, stored)] if stored == name => {
+            if kind != "table" {
+                return Ok(Some(kind.clone()));
+            }
+            // sqlite_master says table for a virtual and a shadow table as well.
+            let class = table_class(conn, name)?;
+            Ok(Some(match class.as_str() {
+                "virtual" | "shadow" => format!("{class} table"),
+                _ => class,
+            }))
+        }
         [(kind, stored)] => Err(not_ours(format!(
             "schema name `{name}` is held by {} {kind} spelled `{stored}`, a spelling this \
              product never writes",
@@ -1003,6 +1015,23 @@ fn object_kind(conn: &Connection, name: &str) -> Result<Option<String>> {
                 listed.join(", ")
             )))
         }
+    }
+}
+
+/// SQLite's own class of the table under one of our names in `main`: `table`, `virtual`,
+/// `shadow` or `view`, from the parsed schema. The argument folds ASCII case like every name
+/// lookup, and no two tables of one schema share a name.
+fn table_class(conn: &Connection, name: &str) -> Result<String> {
+    let mut stmt = conn.prepare("SELECT type FROM pragma_table_list(?1) WHERE schema = 'main'")?;
+    let classes: Vec<String> = stmt
+        .query_map([name], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    match classes.as_slice() {
+        [class] => Ok(class.clone()),
+        _ => Err(not_ours(format!(
+            "SQLite lists {} tables named `{name}`",
+            classes.len()
+        ))),
     }
 }
 
@@ -1043,7 +1072,7 @@ fn ensure_no_squatted_name(conn: &Connection, version: i64) -> Result<()> {
         }
         if kind != "table" {
             return Err(not_ours(format!(
-                "`{table}` is {} {kind}, not a table",
+                "`{table}` is {} {kind}, not an ordinary table",
                 article(&kind)
             )));
         }
@@ -1188,8 +1217,10 @@ fn take_shape_race_hook() {
 ///
 ///   * a database with no user objects at all is a first run and passes — anything else in an
 ///     otherwise empty file means it is not ours;
-///   * every table of the claimed version's floor must exist AND be a table: `PRAGMA table_info`
-///     answers for a view as well, so the storage class is read from `sqlite_master` instead;
+///   * every table of the claimed version's floor must exist AND be an ordinary table:
+///     `PRAGMA table_info` answers for a view as well, so the kind is read from `sqlite_master`,
+///     and as that says `table` for a virtual and a shadow table too, the class of a table is read
+///     from `pragma_table_list`;
 ///   * every floor column must be present as this product writes it: in its one spelling, as an
 ///     ordinary column. Types and constraints are NOT checked: a declared type is an affinity,
 ///     and judging by it would refuse live databases over nothing;
@@ -1256,7 +1287,7 @@ fn judge_shape(conn: &Connection) -> Result<()> {
             Some("table") => {}
             Some(other) => {
                 return Err(not_ours(format!(
-                    "`{table}` is {} {other}, not a table",
+                    "`{table}` is {} {other}, not an ordinary table",
                     article(other)
                 )))
             }
@@ -4532,10 +4563,14 @@ mod tests {
             Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let version = user_version(&conn);
         let schema = schema_fingerprint(&conn);
+        // Stored tables only: a virtual table keeps its rows in its shadow tables or outside the
+        // file, and one whose module this build lacks cannot be read at all.
         let tables: Vec<String> = conn
             .prepare(
-                "SELECT name FROM sqlite_master
-                  WHERE type = 'table' AND substr(name, 1, 7) <> 'sqlite_' ORDER BY name",
+                "SELECT name FROM pragma_table_list
+                  WHERE schema = 'main' AND type IN ('table', 'shadow')
+                    AND substr(name, 1, 7) <> 'sqlite_'
+                  ORDER BY name",
             )
             .unwrap()
             .query_map([], |row| row.get(0))
@@ -5247,5 +5282,309 @@ mod tests {
             before,
             "the whole migration was rolled back"
         );
+    }
+
+    /// V1. A virtual table under one of our table names carries our visible columns and passes
+    /// the floor by their names alone. Three modules, each refused before the WAL flip.
+    #[test]
+    fn a_virtual_table_under_our_table_name_is_refused_intact() {
+        let _role = operator();
+        for (table, sql) in [
+            (
+                "scan_root",
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE scan_root;
+                 CREATE VIRTUAL TABLE scan_root USING fts5(scan_id, root_key, generation);",
+            ),
+            (
+                "hash_cache",
+                "DROP TABLE hash_cache;
+                 CREATE VIRTUAL TABLE hash_cache
+                     USING fts4(device, inode, size, mtime, hash, updated_at);",
+            ),
+            (
+                "file_mark",
+                "DROP TABLE file_mark;
+                 CREATE VIRTUAL TABLE file_mark
+                     USING rtree(id, lo, hi, +scan_id, +path, +is_keeper, +action);",
+            ),
+        ] {
+            let dir = ScratchDir::new(&format!("virtual-{table}"));
+            let db = genuine_then(&dir, 6, sql);
+            let expected = format!("`{table}` is a virtual table, not an ordinary table");
+            assert_refused_intact(&db, &format!("virtual {table} at v6"), &[expected.as_str()]);
+        }
+    }
+
+    /// V2. A virtual `move_event` with the eight v6 column names. The migration's check of the
+    /// stored definition refuses it too, but only after the WAL flip.
+    #[test]
+    fn a_virtual_move_event_is_refused_before_the_wal_flip() {
+        let _role = operator();
+        let dir = ScratchDir::new("virtual-move-event");
+        let db = genuine_then(
+            &dir,
+            6,
+            "DROP TABLE move_event;
+             CREATE VIRTUAL TABLE move_event USING fts5(id, created_at, scan_id, source_path,
+                 target_path, hash, duplicate, path_fidelity);",
+        );
+        assert_refused_intact(
+            &db,
+            "virtual move_event at v6",
+            &["`move_event` is a virtual table, not an ordinary table"],
+        );
+    }
+
+    /// V3. Where the migration would touch the table, SQLite refuses a virtual one in its own
+    /// words after the WAL flip: `ALTER` at an older stamp, `CREATE INDEX` at the current one.
+    #[test]
+    fn a_virtual_table_is_refused_before_the_migration_touches_it() {
+        let _role = operator();
+        for (table, version, sql) in [
+            (
+                "scan_stats",
+                1,
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE scan_stats;
+                 CREATE VIRTUAL TABLE scan_stats USING fts5(scan_id, elapsed_seconds,
+                     storage_type, pool_layout, zfs_version, files_scanned, bytes_hashed,
+                     groups_found, reclaimable_bytes, hash_failures, cand_files_total,
+                     cand_bytes_total, cand_files_hashed, cand_bytes_hashed);",
+            ),
+            (
+                "dir_dedup",
+                6,
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE dir_dedup;
+                 CREATE VIRTUAL TABLE dir_dedup
+                     USING fts5(scan_id, signature, path, file_count, size_per_dir);",
+            ),
+        ] {
+            let dir = ScratchDir::new(&format!("virtual-{table}"));
+            let db = genuine_then(&dir, version, sql);
+            let expected = format!("`{table}` is a virtual table, not an ordinary table");
+            assert_refused_intact(
+                &db,
+                &format!("virtual {table} at v{version}"),
+                &[expected.as_str()],
+            );
+        }
+    }
+
+    /// V4. A virtual table whose module this build lacks: its columns cannot be read at all, so
+    /// the refusal has to come from its class, before the floor reads them.
+    #[test]
+    fn a_virtual_table_of_a_module_this_build_lacks_is_refused_in_the_gates_words() {
+        let _role = operator();
+        let dir = ScratchDir::new("virtual-unknown-module");
+        let db = genuine_then(
+            &dir,
+            6,
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE scan_root;
+             PRAGMA writable_schema = ON;
+             INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql)
+                  VALUES ('table', 'scan_root', 'scan_root', 0,
+                          'CREATE VIRTUAL TABLE scan_root USING nosuch(scan_id, root_key, generation)');
+             PRAGMA writable_schema = OFF;",
+        );
+        assert_refused_intact(
+            &db,
+            "scan_root of an unknown module at v6",
+            &["`scan_root` is a virtual table, not an ordinary table"],
+        );
+    }
+
+    /// V5. A v4 table name held by a virtual table in a v3 checkpoint: refused by the version,
+    /// and the refusal names what was found.
+    #[test]
+    fn a_later_table_name_held_by_a_virtual_table_says_so() {
+        let _role = operator();
+        let dir = ScratchDir::new("virtual-later-name");
+        let db = genuine_then(
+            &dir,
+            3,
+            "CREATE VIRTUAL TABLE scan_root USING fts5(scan_id, root_key, generation);",
+        );
+        assert_refused_intact(
+            &db,
+            "virtual scan_root at v3",
+            &[
+                "schema name `scan_root` is reserved for a table since schema v4, but the \
+               checkpoint declares v3; found a virtual table named `scan_root`",
+            ],
+        );
+    }
+
+    /// V6. Our index name `file_path_content` is also the name of the content table of an FTS5
+    /// table called `file_path`, and SQLite counts that table as the FTS5 table's shadow.
+    #[test]
+    fn a_shadow_table_under_our_index_name_is_refused_as_one() {
+        let _role = operator();
+        let dir = ScratchDir::new("shadow-index-name");
+        let db = genuine_then(
+            &dir,
+            6,
+            "DROP INDEX file_path_content;
+             CREATE VIRTUAL TABLE file_path USING fts5(x);",
+        );
+        assert_refused_intact(
+            &db,
+            "shadow file_path_content at v6",
+            &["`file_path_content` is a shadow table, not an index"],
+        );
+    }
+
+    /// V7. A virtual table and a trigger under one of our names, created in either order: still
+    /// ambiguous, and named as `sqlite_master` records them.
+    #[test]
+    fn a_virtual_table_and_a_trigger_under_one_name_stay_ambiguous() {
+        let _role = operator();
+        for (order, sql) in [
+            (
+                "table first",
+                "DROP TABLE hash_cache;
+                 CREATE VIRTUAL TABLE hash_cache
+                     USING fts5(device, inode, size, mtime, hash, updated_at);
+                 CREATE TRIGGER hash_cache AFTER INSERT ON scan BEGIN SELECT 1; END;",
+            ),
+            (
+                "trigger first",
+                "DROP TABLE hash_cache;
+                 CREATE TRIGGER hash_cache AFTER INSERT ON scan BEGIN SELECT 1; END;
+                 CREATE VIRTUAL TABLE hash_cache
+                     USING fts5(device, inode, size, mtime, hash, updated_at);",
+            ),
+        ] {
+            let dir = ScratchDir::new("virtual-and-trigger");
+            let db = genuine_then(&dir, 6, sql);
+            assert_refused_intact(
+                &db,
+                &format!("virtual hash_cache and trigger hash_cache, {order}"),
+                &[
+                    "2 objects answer to the schema name `hash_cache`: table `hash_cache`, \
+                   trigger `hash_cache`",
+                ],
+            );
+        }
+    }
+
+    /// V8. A virtual table in another case: the spelling is judged before the class.
+    #[test]
+    fn a_virtual_table_in_another_case_is_refused_by_its_spelling() {
+        let _role = operator();
+        let dir = ScratchDir::new("virtual-other-case");
+        let db = genuine_then(
+            &dir,
+            6,
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE scan_root;
+             CREATE VIRTUAL TABLE SCAN_ROOT USING fts5(scan_id, root_key, generation);",
+        );
+        assert_refused_intact(
+            &db,
+            "virtual SCAN_ROOT at v6",
+            &[
+                "schema name `scan_root` is held by a table spelled `SCAN_ROOT`, a spelling this \
+               product never writes",
+            ],
+        );
+    }
+
+    /// V9. Virtual tables under names that are not ours stay welcome, in a current checkpoint and
+    /// in one the v6 upgrade rebuilds: FTS5, R*Tree and one whose module this build lacks.
+    #[test]
+    fn foreign_virtual_tables_under_unrelated_names_still_pass() {
+        let _role = operator();
+        for version in [6, 5] {
+            let dir = ScratchDir::new("virtual-unrelated");
+            let db = genuine_then(
+                &dir,
+                version,
+                "CREATE VIRTUAL TABLE notes USING fts5(body);
+                 INSERT INTO notes (body) VALUES ('kept');
+                 CREATE VIRTUAL TABLE boxes USING rtree(id, x0, x1);
+                 INSERT INTO boxes VALUES (1, 0, 1);
+                 PRAGMA writable_schema = ON;
+                 INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql)
+                      VALUES ('table', 'alien', 'alien', 0,
+                              'CREATE VIRTUAL TABLE alien USING nosuch(a)');
+                 PRAGMA writable_schema = OFF;",
+            );
+            let foreign = |db: &std::path::Path| -> Vec<String> {
+                let conn = Connection::open(db).unwrap();
+                let mut seen: Vec<String> = conn
+                    .prepare(
+                        "SELECT type || ' ' || name || ' ' || sql FROM sqlite_master
+                          WHERE name IN ('notes', 'boxes', 'alien') ORDER BY name",
+                    )
+                    .unwrap()
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .map(|row| row.unwrap())
+                    .collect();
+                let body: String = conn
+                    .query_row("SELECT body FROM notes", [], |row| row.get(0))
+                    .unwrap();
+                seen.push(format!("notes holds {body}"));
+                seen
+            };
+            let before = foreign(&db);
+            assert_eq!(
+                before.len(),
+                4,
+                "the fixture at v{version}: three virtual tables and a row"
+            );
+
+            if let Err(err) = crate::state::ScanStore::open(&db) {
+                panic!("v{version}: virtual tables under names that are not ours are no reason to refuse: {err}");
+            }
+
+            assert_eq!(
+                user_version(&Connection::open(&db).unwrap()),
+                SCHEMA_VERSION,
+                "v{version}"
+            );
+            assert_eq!(
+                foreign(&db),
+                before,
+                "v{version}: each foreign table kept its definition, and the row is there"
+            );
+        }
+    }
+
+    /// V10. The kind `object_kind` reports for a table is SQLite's own class of it, and only the
+    /// one in `main` answers.
+    #[test]
+    fn object_kind_reads_the_class_of_a_table_from_sqlite() {
+        let dir = ScratchDir::new("table-class");
+        let db = dir.path().join("classes.db");
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE plain (a INTEGER);
+                 CREATE TABLE keyed (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;
+                 CREATE TABLE strict_one (a INTEGER) STRICT;
+                 CREATE VIEW seen AS SELECT a FROM plain;
+                 CREATE VIRTUAL TABLE words USING fts5(body);",
+            )
+            .unwrap();
+        // A fresh connection reads the classes back from the file, as the guard does.
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TEMP TABLE words (z INTEGER);")
+            .unwrap();
+        let kind = |name: &str| object_kind(&conn, name).unwrap();
+        assert_eq!(kind("plain").as_deref(), Some("table"));
+        assert_eq!(kind("keyed").as_deref(), Some("table"), "WITHOUT ROWID");
+        assert_eq!(kind("strict_one").as_deref(), Some("table"), "STRICT");
+        assert_eq!(kind("seen").as_deref(), Some("view"));
+        assert_eq!(
+            kind("words").as_deref(),
+            Some("virtual table"),
+            "the TEMP table of the same name does not answer"
+        );
+        assert_eq!(kind("words_content").as_deref(), Some("shadow table"));
+        assert_eq!(kind("absent"), None);
     }
 }
