@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 
 use crate::error::{AppError, Result};
 
@@ -806,28 +806,28 @@ const FLOOR_V5_TABLES: &[TableFloor] = &[
 ];
 const FLOOR_V6_COLUMNS: &[(&str, &str)] = &[("move_event", "path_fidelity")];
 
+/// Columns that later versions added to existing tables, by version. The floor requires each one
+/// from its version on, and `ensure_no_later_column` refuses it below that version.
+const LATER_COLUMNS: &[(i64, &[(&str, &str)])] = &[
+    (2, FLOOR_V2_COLUMNS),
+    (3, FLOOR_V3_COLUMNS),
+    (6, FLOOR_V6_COLUMNS),
+];
+
 fn floor_for(version: i64) -> Vec<(&'static str, Vec<&'static str>)> {
     let mut floor: Vec<(&'static str, Vec<&'static str>)> = FLOOR_V0
         .iter()
         .map(|(table, columns)| (*table, columns.to_vec()))
         .collect();
-    let mut add_columns = |adds: &[(&'static str, &'static str)]| {
-        for (table, column) in adds {
-            if let Some(entry) = floor.iter_mut().find(|(name, _)| name == table) {
+    for &(since, adds) in LATER_COLUMNS {
+        if version < since {
+            continue;
+        }
+        for &(table, column) in adds {
+            if let Some(entry) = floor.iter_mut().find(|(name, _)| *name == table) {
                 entry.1.push(column);
             }
         }
-    };
-    if version >= 2 {
-        add_columns(FLOOR_V2_COLUMNS);
-    }
-    if version >= 3 {
-        add_columns(FLOOR_V3_COLUMNS);
-    }
-    // v6 adds a column to a v0 table, so it takes the column path; the steps are independent, so
-    // its place among them is immaterial.
-    if version >= 6 {
-        add_columns(FLOOR_V6_COLUMNS);
     }
     if version >= 4 {
         floor.extend(
@@ -973,14 +973,45 @@ const PRODUCT_INDEXES: &[IndexSpec] = &[
     ),
 ];
 
+/// The kind of the object that answers to one of our names, looked up as SQLite resolves it:
+/// without regard to ASCII case. A trigger may share a table's name, so two matches are refused as
+/// ambiguous, and a single match in a spelling this product never writes is refused as not ours.
 fn object_kind(conn: &Connection, name: &str) -> Result<Option<String>> {
-    Ok(conn
-        .query_row(
-            "SELECT type FROM sqlite_master WHERE name = ?1",
-            [name],
-            |row| row.get(0),
-        )
-        .optional()?)
+    let mut stmt =
+        conn.prepare("SELECT type, name FROM sqlite_master WHERE name = ?1 COLLATE NOCASE")?;
+    let mut found: Vec<(String, String)> = stmt
+        .query_map([name], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    // Rows come back in creation order; sorted, the refusal reads the same either way.
+    found.sort();
+    match found.as_slice() {
+        [] => Ok(None),
+        [(kind, stored)] if stored == name => Ok(Some(kind.clone())),
+        [(kind, stored)] => Err(not_ours(format!(
+            "schema name `{name}` is held by {} {kind} spelled `{stored}`, a spelling this \
+             product never writes",
+            article(kind)
+        ))),
+        many => {
+            let listed: Vec<String> = many
+                .iter()
+                .map(|(kind, stored)| format!("{kind} `{stored}`"))
+                .collect();
+            Err(not_ours(format!(
+                "{} objects answer to the schema name `{name}`: {}",
+                many.len(),
+                listed.join(", ")
+            )))
+        }
+    }
+}
+
+fn article(kind: &str) -> &'static str {
+    if kind.starts_with('i') {
+        "an"
+    } else {
+        "a"
+    }
 }
 
 fn not_ours(detail: String) -> AppError {
@@ -991,9 +1022,9 @@ fn not_ours(detail: String) -> AppError {
 ///
 /// Every name here is created with `IF NOT EXISTS`, which is silent when the name is already
 /// occupied. That silence is the danger: the object we meant to create never appears, the
-/// migration reports success, and the stamp at the end says v5. For
+/// migration reports success, and the stamp at the end declares the current schema version. For
 /// `file_group_member_by_path` — the one UNIQUE index in the schema — that means a checkpoint
-/// declared v5 with no uniqueness behind membership at all.
+/// at the current schema version with no uniqueness behind membership at all.
 ///
 /// A name introduced later than the claimed version is refused WITHOUT looking at its shape. A
 /// genuine v0 checkpoint cannot carry a name that only came into existence at v5; the fact that
@@ -1005,11 +1036,16 @@ fn ensure_no_squatted_name(conn: &Connection, version: i64) -> Result<()> {
         };
         if *since > version {
             return Err(not_ours(format!(
-                "`{table}` belongs to schema v{since}, but this checkpoint declares v{version}"
+                "schema name `{table}` is reserved for a table since schema v{since}, but the \
+                 checkpoint declares v{version}; found {} {kind} named `{table}`",
+                article(&kind)
             )));
         }
         if kind != "table" {
-            return Err(not_ours(format!("`{table}` is a {kind}, not a table")));
+            return Err(not_ours(format!(
+                "`{table}` is {} {kind}, not a table",
+                article(&kind)
+            )));
         }
     }
 
@@ -1019,11 +1055,16 @@ fn ensure_no_squatted_name(conn: &Connection, version: i64) -> Result<()> {
         };
         if *since > version {
             return Err(not_ours(format!(
-                "`{name}` belongs to schema v{since}, but this checkpoint declares v{version}"
+                "schema name `{name}` is reserved for an index since schema v{since}, but the \
+                 checkpoint declares v{version}; found {} {kind} named `{name}`",
+                article(&kind)
             )));
         }
         if kind != "index" {
-            return Err(not_ours(format!("`{name}` is a {kind}, not an index")));
+            return Err(not_ours(format!(
+                "`{name}` is {} {kind}, not an index",
+                article(&kind)
+            )));
         }
         let indexed: String = conn.query_row(
             "SELECT tbl_name FROM sqlite_master WHERE name = ?1",
@@ -1139,23 +1180,27 @@ fn take_shape_race_hook() {
 ///
 /// The migration below is additive: it creates missing tables and adds missing later columns. On
 /// a file that was never one of our checkpoints that is not a repair, it is adoption — the batch
-/// would write our tables into someone else's database and the stamp at the end would declare it
-/// v5. So the shape is judged first, and a database that fails keeps its bytes, its mtime and its
-/// sidecar census exactly as they were.
+/// would write our tables into someone else's database and the stamp at the end would declare the
+/// current schema version. So the shape is judged first, and a database that fails keeps its bytes,
+/// its mtime and its sidecar census exactly as they were.
 ///
-/// Three rules, in order:
+/// The rules, in order:
 ///
 ///   * a database with no user objects at all is a first run and passes — anything else in an
 ///     otherwise empty file means it is not ours;
 ///   * every table of the claimed version's floor must exist AND be a table: `PRAGMA table_info`
-///     answers for a view as well, so the storage class is read from `sqlite_master` instead.
-///     Names share one namespace in SQLite, so an index or trigger squatting a required name is
-///     caught by the same test;
-///   * every floor column must be present. Types and constraints are NOT checked: a declared type
-///     is an affinity, and judging by it would refuse live databases over nothing;
-///   * finally `ensure_no_squatted_name`: none of the 26 names the migration will create with
+///     answers for a view as well, so the storage class is read from `sqlite_master` instead;
+///   * every floor column must be present as this product writes it: in its one spelling, as an
+///     ordinary column. Types and constraints are NOT checked: a declared type is an affinity,
+///     and judging by it would refuse live databases over nothing;
+///   * `ensure_no_squatted_name`: none of the 26 names the migration will create with
 ///     `IF NOT EXISTS` may be held by something that is not ours, and none of them may be present
-///     at all if it was introduced after the version this checkpoint declares.
+///     at all if it was introduced after the version this checkpoint declares;
+///   * finally `ensure_no_later_column`: no column a later version adds may be present at all.
+///
+/// Names are looked up the way SQLite resolves them, without regard to ASCII case. A spelling this
+/// product never writes marks an object that is not ours, and since triggers have a namespace of
+/// their own, two objects under one name are refused as ambiguous.
 ///
 /// This is not proof of provenance. It proves only a minimally recognisable checkpoint shape.
 /// Foreign objects whose names do not collide are left exactly as they are — an extra table is
@@ -1209,22 +1254,77 @@ fn judge_shape(conn: &Connection) -> Result<()> {
         let kind: Option<String> = object_kind(conn, table)?;
         match kind.as_deref() {
             Some("table") => {}
-            Some(other) => return Err(not_ours(format!("`{table}` is a {other}, not a table"))),
+            Some(other) => {
+                return Err(not_ours(format!(
+                    "`{table}` is {} {other}, not a table",
+                    article(other)
+                )))
+            }
             None => return Err(not_ours(format!("table `{table}` is missing"))),
         }
-        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-        let present: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let present = table_xinfo(conn, table)?;
         for column in columns {
-            if !present.iter().any(|name| name == column) {
+            let Some(found) = column_named(&present, column) else {
                 return Err(not_ours(format!(
                     "table `{table}` has no column `{column}`"
+                )));
+            };
+            if let Some(detail) = foreign_column(table, column, found) {
+                return Err(not_ours(detail));
+            }
+        }
+    }
+    ensure_no_squatted_name(conn, version)?;
+    // After the names: a later table is the clearer diagnosis when a file carries both.
+    ensure_no_later_column(conn, version)
+}
+
+/// Refuses a column that a later version adds when the stamp is older, in any spelling and any
+/// form: `add_column_if_missing` would take it for its own.
+fn ensure_no_later_column(conn: &Connection, version: i64) -> Result<()> {
+    for &(since, adds) in LATER_COLUMNS {
+        if since <= version {
+            continue;
+        }
+        for &(table, column) in adds {
+            if let Some(found) = column_named(&table_xinfo(conn, table)?, column) {
+                return Err(not_ours(format!(
+                    "column name `{column}` of table `{table}` is reserved since schema v{since}, \
+                     but the checkpoint declares v{version}; found a column named `{}`",
+                    found.name
                 )));
             }
         }
     }
-    ensure_no_squatted_name(conn, version)
+    Ok(())
+}
+
+/// The column that answers to one of our names, compared without regard to ASCII case as SQLite
+/// does. Pass the table's `table_xinfo`: `table_info` leaves hidden and generated columns out.
+/// SQLite allows no two columns that differ only in case, so at most one answers.
+fn column_named<'a>(columns: &'a [ColumnShape], column: &str) -> Option<&'a ColumnShape> {
+    columns
+        .iter()
+        .find(|found| found.name.eq_ignore_ascii_case(column))
+}
+
+/// Why a column under one of our names is not ours, if it is not: this product writes each column
+/// in one spelling and as an ordinary column, never hidden or generated.
+fn foreign_column(table: &str, column: &str, found: &ColumnShape) -> Option<String> {
+    if found.name != column {
+        return Some(format!(
+            "column name `{column}` of table `{table}` is held by a column spelled `{}`, a \
+             spelling this product never writes",
+            found.name
+        ));
+    }
+    if found.hidden != 0 {
+        return Some(format!(
+            "column `{column}` of table `{table}` is a hidden or generated column, which this \
+             product never writes"
+        ));
+    }
+    None
 }
 
 /// The v6 step's refusal, in words that stay true after it: the transaction rolled back, so the
@@ -1578,16 +1678,18 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
 /// Adds a column to a table if it does not exist yet (idempotent migration of a production DB without
 /// DROP/rewrite). The names are internal constants, not user input.
+///
+/// A column under the name that is not an ordinary column in our spelling is refused, not built
+/// around. The shape guard catches it before the WAL flip; this is the second line for a caller
+/// without the guard, so the refusal does not claim that nothing was changed.
 fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let present = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .filter_map(|r| r.ok())
-        .any(|name| name == column);
-    drop(stmt);
-    if !present {
-        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    if let Some(found) = column_named(&table_xinfo(conn, table)?, column) {
+        return match foreign_column(table, column, found) {
+            None => Ok(()),
+            Some(detail) => Err(AppError::msg(format!("{NOT_A_CHECKPOINT}: {detail}"))),
+        };
     }
+    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
     Ok(())
 }
 
@@ -4410,5 +4512,740 @@ mod tests {
         assert!(text.contains("file_scan_identity"), "{text}");
         assert!(text.contains("v3"), "{text}");
         assert!(text.contains("v0"), "{text}");
+    }
+
+    /// What a refused open must leave as it was: the file's bytes, the names beside it, the
+    /// stamp, the schema and every row.
+    #[derive(Debug, PartialEq)]
+    struct FileCensus {
+        bytes: Vec<u8>,
+        siblings: Vec<String>,
+        version: i64,
+        schema: Vec<String>,
+        rows: Vec<String>,
+    }
+
+    /// Read through its own read-only connection, so the census cannot be what changed the file.
+    fn file_census(db: &std::path::Path) -> FileCensus {
+        let bytes = std::fs::read(db).unwrap();
+        let conn =
+            Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let version = user_version(&conn);
+        let schema = schema_fingerprint(&conn);
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                  WHERE type = 'table' AND substr(name, 1, 7) <> 'sqlite_' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let mut rows = Vec::new();
+        for table in tables {
+            let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+            let width = stmt.column_count();
+            let dumped = stmt
+                .query_map([], |row| {
+                    let mut cells = vec![table.clone()];
+                    for i in 0..width {
+                        cells.push(format!("{:?}", row.get_ref(i)?));
+                    }
+                    Ok(cells.join("|"))
+                })
+                .unwrap()
+                .map(|row| row.unwrap());
+            rows.extend(dumped);
+        }
+        rows.sort();
+        drop(conn);
+        let mut siblings: Vec<String> = std::fs::read_dir(db.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "dedcom.db")
+            .collect();
+        siblings.sort();
+        FileCensus {
+            bytes,
+            siblings,
+            version,
+            schema,
+            rows,
+        }
+    }
+
+    /// Opens `db` as the operator does and asserts the guard's own refusal before the WAL flip.
+    /// Header bytes 18 and 19 hold the journal mode and are checked first: closing the last
+    /// connection deletes `-wal` and `-shm`, so their absence alone would not prove it.
+    #[track_caller]
+    fn assert_refused_intact(db: &std::path::Path, what: &str, expected: &[&str]) -> String {
+        let before = file_census(db);
+        let text = match crate::state::ScanStore::open(db) {
+            Ok(_) => panic!("{what}: must be refused, but the checkpoint was opened and adopted"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            text.starts_with(NOT_A_CHECKPOINT) && text.ends_with(NOTHING_CHANGED),
+            "{what}: the refusal must be the shape guard's own: {text}"
+        );
+        for fragment in expected {
+            assert!(
+                text.contains(fragment),
+                "{what}: the refusal must say {fragment:?}: {text}"
+            );
+        }
+        let after = file_census(db);
+        assert_eq!(
+            after.bytes[18..20],
+            before.bytes[18..20],
+            "{what}: the journal mode in the header is what it was, so there was no WAL flip"
+        );
+        assert_eq!(
+            after.siblings, before.siblings,
+            "{what}: no -wal, no -shm, nothing new beside the file"
+        );
+        assert_eq!(after.version, before.version, "{what}: the stamp is kept");
+        assert_eq!(after.schema, before.schema, "{what}: the schema is kept");
+        assert_eq!(after.rows, before.rows, "{what}: every row is kept");
+        assert!(
+            after.bytes == before.bytes,
+            "{what}: the file is byte for byte what it was"
+        );
+        text
+    }
+
+    /// A genuine checkpoint of `version` with `sql` run over it by hand.
+    fn genuine_then(dir: &ScratchDir, version: i64, sql: &str) -> std::path::PathBuf {
+        let db = genuine_checkpoint(dir.path(), version);
+        Connection::open(&db).unwrap().execute_batch(sql).unwrap();
+        db
+    }
+
+    /// Holds the operator role for a test that opens a checkpoint the way the product does.
+    fn operator() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::state::store::role_guard();
+        crate::state::store::set_observer_role(false);
+        guard
+    }
+
+    /// T1. A later table in another case under an older stamp: `CREATE TABLE IF NOT EXISTS` would
+    /// adopt it in silence.
+    #[test]
+    fn a_later_table_in_another_case_is_refused_intact() {
+        let _role = operator();
+        let dir = ScratchDir::new("case-later-table");
+        let db = genuine_then(
+            &dir,
+            3,
+            "CREATE TABLE SCAN_ROOT (z INTEGER); INSERT INTO SCAN_ROOT (z) VALUES (7);",
+        );
+        assert_refused_intact(
+            &db,
+            "SCAN_ROOT at v3",
+            &[
+                "schema name `scan_root` is held by a table spelled `SCAN_ROOT`, a spelling this \
+               product never writes",
+            ],
+        );
+    }
+
+    /// T2. A compatible squatter whose row would read as an explicit membership authority.
+    #[test]
+    fn a_compatible_squatter_never_becomes_the_authority() {
+        let _role = operator();
+        let dir = ScratchDir::new("case-compatible");
+        let db = genuine_then(
+            &dir,
+            4,
+            "CREATE TABLE Scan_Membership (scan_id INTEGER, mode INTEGER, generation INTEGER);
+             INSERT INTO Scan_Membership (scan_id, mode, generation) VALUES (1, 2, 1);",
+        );
+        assert_refused_intact(
+            &db,
+            "Scan_Membership at v4",
+            &[
+                "schema name `scan_membership` is held by a table spelled `Scan_Membership`, a \
+               spelling this product never writes",
+            ],
+        );
+    }
+
+    /// T3. The one UNIQUE index replaced by a plain one in another case, at the current stamp.
+    /// Indexes are not in the floor, so nothing else would ever notice.
+    #[test]
+    fn the_unique_index_replaced_in_another_case_is_refused() {
+        let _role = operator();
+        let dir = ScratchDir::new("case-unique-index");
+        let db = genuine_then(
+            &dir,
+            6,
+            "DROP INDEX file_group_member_by_path;
+             CREATE INDEX FILE_GROUP_MEMBER_BY_PATH ON file_group_member(generation);",
+        );
+        let unique: i64 = Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT \"unique\" FROM pragma_index_list('file_group_member')
+                  WHERE name = 'FILE_GROUP_MEMBER_BY_PATH'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unique, 0, "the fixture: the squatter carries no uniqueness");
+        assert_refused_intact(
+            &db,
+            "FILE_GROUP_MEMBER_BY_PATH at v6",
+            &[
+                "schema name `file_group_member_by_path` is held by an index spelled \
+               `FILE_GROUP_MEMBER_BY_PATH`, a spelling this product never writes",
+            ],
+        );
+    }
+
+    /// T4. A later index in another case at v0.
+    #[test]
+    fn a_later_index_in_another_case_at_v0_is_refused() {
+        let _role = operator();
+        let dir = ScratchDir::new("case-later-index");
+        let db = genuine_then(&dir, 0, "CREATE INDEX FILE_SCAN_IDENTITY ON file(path);");
+        assert_refused_intact(
+            &db,
+            "FILE_SCAN_IDENTITY at v0",
+            &["schema name `file_scan_identity` is held by an index spelled `FILE_SCAN_IDENTITY`, \
+               a spelling this product never writes"],
+        );
+    }
+
+    /// T5. A view in another case: the spelling is judged before the kind.
+    #[test]
+    fn a_view_in_another_case_is_refused_by_its_spelling() {
+        let _role = operator();
+        let dir = ScratchDir::new("case-view");
+        let db = genuine_then(&dir, 3, "CREATE VIEW Scan_Root AS SELECT 1 AS scan_id;");
+        assert_refused_intact(
+            &db,
+            "view Scan_Root at v3",
+            &[
+                "schema name `scan_root` is held by a view spelled `Scan_Root`, a spelling this \
+               product never writes",
+            ],
+        );
+    }
+
+    /// T6a. A later column in another case. Past the guard, the migration's ALTER would fail on
+    /// SQLite's «duplicate column name», after the WAL flip.
+    #[test]
+    fn a_later_column_in_another_case_is_refused_before_the_alter() {
+        let _role = operator();
+        let dir = ScratchDir::new("case-later-column");
+        let db = genuine_then(
+            &dir,
+            1,
+            "ALTER TABLE scan_stats ADD COLUMN RESULTS_MATERIALIZED INTEGER;",
+        );
+        assert_refused_intact(
+            &db,
+            "RESULTS_MATERIALIZED at v1",
+            &["column name `results_materialized` of table `scan_stats` is reserved since schema \
+               v2, but the checkpoint declares v1; found a column named `RESULTS_MATERIALIZED`"],
+        );
+    }
+
+    /// T6b. A later column in exactly the spelling and form v2 writes, proven against a genuine v2,
+    /// under a v1 stamp. Still refused: `add_column_if_missing` would take it for its own.
+    #[test]
+    fn a_later_column_in_its_exact_v2_form_is_refused_at_v1() {
+        let _role = operator();
+        let dir = ScratchDir::new("later-column-v2-form");
+        let db = genuine_then(
+            &dir,
+            1,
+            "ALTER TABLE scan_stats ADD COLUMN results_materialized INTEGER NOT NULL DEFAULT 0;",
+        );
+        let reference = ScratchDir::new("later-column-v2-reference");
+        let v2 = genuine_checkpoint(reference.path(), 2);
+        let scan_stats =
+            |db: &std::path::Path| table_info(&Connection::open(db).unwrap(), "scan_stats");
+        assert_eq!(
+            scan_stats(&db),
+            scan_stats(&v2),
+            "the fixture's scan_stats is the v2 table, column for column"
+        );
+        assert_eq!(
+            user_version(&Connection::open(&db).unwrap()),
+            1,
+            "under a v1 stamp"
+        );
+        assert_refused_intact(
+            &db,
+            "results_materialized in its v2 form at v1",
+            &["column name `results_materialized` of table `scan_stats` is reserved since schema \
+               v2, but the checkpoint declares v1; found a column named `results_materialized`"],
+        );
+    }
+
+    /// T6c. A required column in another case: it is there, so «has no column» would be a lie.
+    #[test]
+    fn a_required_column_in_another_case_is_refused_by_its_spelling() {
+        let _role = operator();
+        let dir = ScratchDir::new("case-required-column");
+        let db = genuine_then(
+            &dir,
+            3,
+            "ALTER TABLE hash_cache RENAME COLUMN updated_at TO tmp_hop;
+             ALTER TABLE hash_cache RENAME COLUMN tmp_hop TO UPDATED_AT;",
+        );
+        let text = assert_refused_intact(
+            &db,
+            "hash_cache.UPDATED_AT at v3",
+            &[
+                "column name `updated_at` of table `hash_cache` is held by a column spelled \
+               `UPDATED_AT`, a spelling this product never writes",
+            ],
+        );
+        assert!(
+            !text.contains("has no column"),
+            "the column is there: {text}"
+        );
+    }
+
+    /// T6d. Every checkpoint the product really wrote, v0 to v6, passes the guard and migrates;
+    /// also the equality case of `since > version`.
+    #[test]
+    fn every_genuine_checkpoint_passes_the_guard_and_migrates() {
+        let _role = operator();
+        for version in 0..=SCHEMA_VERSION {
+            let dir = ScratchDir::new(&format!("genuine-v{version}"));
+            let db = genuine_checkpoint(dir.path(), version);
+            drop(
+                crate::state::ScanStore::open(&db)
+                    .unwrap_or_else(|err| panic!("a genuine v{version} checkpoint opens: {err}")),
+            );
+            let conn = Connection::open(&db).unwrap();
+            assert_eq!(
+                user_version(&conn),
+                SCHEMA_VERSION,
+                "v{version} is migrated"
+            );
+            ensure_recognisable_shape(&conn)
+                .unwrap_or_else(|err| panic!("v{version} after its migration: {err}"));
+        }
+    }
+
+    /// T6e. Every later column, listed here rather than read from the registry the guard iterates,
+    /// so a registry that loses an entry cannot take the coverage with it.
+    #[test]
+    fn every_later_column_is_refused_one_version_early() {
+        const LATER: [(&str, &str, i64); 6] = [
+            ("scan_stats", "results_materialized", 2),
+            ("file", "nlink", 3),
+            ("file_group", "object_count", 3),
+            ("file_group", "reclaim_state", 3),
+            ("scan_stats", "reclaim_state", 3),
+            ("move_event", "path_fidelity", 6),
+        ];
+        let _role = operator();
+        for (table, column, since) in LATER {
+            let dir = ScratchDir::new(&format!("later-{table}-{column}"));
+            let db = genuine_then(
+                &dir,
+                since - 1,
+                &format!("ALTER TABLE {table} ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"),
+            );
+            let expected = format!(
+                "column name `{column}` of table `{table}` is reserved since schema v{since}, but \
+                 the checkpoint declares v{}; found a column named `{column}`",
+                since - 1
+            );
+            assert_refused_intact(
+                &db,
+                &format!("{table}.{column} at v{}", since - 1),
+                &[expected.as_str()],
+            );
+        }
+        // And the other way round: every column the floor adds to an existing table is listed.
+        for version in 1..=SCHEMA_VERSION {
+            let earlier = floor_for(version - 1);
+            for (table, columns) in floor_for(version) {
+                let Some((_, had)) = earlier.iter().find(|(name, _)| *name == table) else {
+                    continue;
+                };
+                for column in columns {
+                    if !had.contains(&column) {
+                        assert!(
+                            LATER.contains(&(table, column, version)),
+                            "`{table}.{column}` arrives at v{version} and this test does not \
+                             cover it"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// T6f. A later column hidden as a generated column, which `table_info` does not list.
+    #[test]
+    fn a_later_column_hidden_as_a_generated_column_is_refused() {
+        let _role = operator();
+        let dir = ScratchDir::new("later-generated-column");
+        let db = genuine_then(
+            &dir,
+            1,
+            "ALTER TABLE scan_stats
+                 ADD COLUMN results_materialized INTEGER GENERATED ALWAYS AS (1) VIRTUAL;",
+        );
+        assert!(
+            !columns_of(&Connection::open(&db).unwrap(), "scan_stats")
+                .contains(&"results_materialized".to_string()),
+            "the fixture: table_info does not list a generated column"
+        );
+        assert_refused_intact(
+            &db,
+            "generated results_materialized at v1",
+            &["column name `results_materialized` of table `scan_stats` is reserved since schema \
+               v2, but the checkpoint declares v1; found a column named `results_materialized`"],
+        );
+    }
+
+    /// T7. Foreign names in any case pass untouched, including `Scan-Root`, which only `LIKE`
+    /// (where `_` is a wildcard) would confuse with `scan_root`.
+    #[test]
+    fn foreign_objects_under_unrelated_names_in_any_case_still_pass() {
+        let _role = operator();
+        let dir = ScratchDir::new("case-foreign-unrelated");
+        let db = genuine_then(
+            &dir,
+            3,
+            "CREATE TABLE Notes (x INTEGER);
+             CREATE INDEX Notes_By_X ON Notes(x);
+             CREATE VIEW Scan_Roots_View AS SELECT x FROM Notes;
+             CREATE TRIGGER Note_Trg AFTER INSERT ON Notes BEGIN SELECT 1; END;
+             CREATE TABLE \"Scan-Root\" (y INTEGER);
+             INSERT INTO Notes (x) VALUES (1);",
+        );
+        let foreign = |db: &std::path::Path| -> Vec<String> {
+            let conn = Connection::open(db).unwrap();
+            let mut seen: Vec<String> = conn
+                .prepare(
+                    "SELECT type || ' ' || name || ' ' || sql FROM sqlite_master
+                      WHERE name IN ('Notes', 'Notes_By_X', 'Scan_Roots_View', 'Note_Trg',
+                                     'Scan-Root')
+                      ORDER BY type, name",
+                )
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect();
+            let x: i64 = conn
+                .query_row("SELECT x FROM Notes", [], |row| row.get(0))
+                .unwrap();
+            seen.push(format!("Notes holds {x}"));
+            seen
+        };
+        let before = foreign(&db);
+        assert_eq!(
+            before.len(),
+            6,
+            "the fixture: five foreign objects and a row"
+        );
+
+        drop(
+            crate::state::ScanStore::open(&db)
+                .expect("names that are not ours are no reason to refuse a checkpoint that is"),
+        );
+
+        assert_eq!(
+            user_version(&Connection::open(&db).unwrap()),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            foreign(&db),
+            before,
+            "each foreign object kept its spelling and its definition, and the row is there"
+        );
+    }
+
+    /// T9a. A trigger under our table's name, created after the table: ambiguous, both named.
+    #[test]
+    fn a_trigger_created_after_our_table_under_its_name_is_ambiguous() {
+        let _role = operator();
+        let dir = ScratchDir::new("ambiguous-table-first");
+        let db = genuine_then(
+            &dir,
+            6,
+            "CREATE TRIGGER scan_root AFTER INSERT ON scan BEGIN SELECT 1; END;",
+        );
+        assert_refused_intact(
+            &db,
+            "table scan_root, then trigger scan_root",
+            &[
+                "2 objects answer to the schema name `scan_root`: table `scan_root`, trigger \
+               `scan_root`",
+            ],
+        );
+    }
+
+    /// T9b. The same pair created the other way round; the refusal must read the same.
+    #[test]
+    fn a_trigger_created_before_our_table_under_its_name_is_ambiguous() {
+        let _role = operator();
+        let dir = ScratchDir::new("ambiguous-trigger-first");
+        let db = genuine_then(
+            &dir,
+            6,
+            "DROP TABLE dir_omission;
+             DROP TABLE scan_root;
+             CREATE TRIGGER scan_root AFTER INSERT ON scan BEGIN SELECT 1; END;",
+        );
+        // Our own DDL brings the two tables and their index back, now after the trigger.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(SCHEMA)
+            .unwrap();
+        {
+            let conn = Connection::open(&db).unwrap();
+            let order: Vec<String> = conn
+                .prepare("SELECT type FROM sqlite_master WHERE name = 'scan_root' ORDER BY rowid")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect();
+            assert_eq!(
+                order,
+                ["trigger", "table"],
+                "the fixture: the trigger came first"
+            );
+            assert_eq!(
+                user_version(&conn),
+                SCHEMA_VERSION,
+                "the fixture: stamped v6"
+            );
+        }
+        assert_refused_intact(
+            &db,
+            "trigger scan_root, then table scan_root",
+            &[
+                "2 objects answer to the schema name `scan_root`: table `scan_root`, trigger \
+               `scan_root`",
+            ],
+        );
+    }
+
+    /// T9c. A lone trigger under a v4 table name in a v3 checkpoint: refused by the version, and
+    /// the refusal says a trigger was found.
+    #[test]
+    fn a_lone_trigger_under_a_later_table_name_tells_the_whole_truth() {
+        let _role = operator();
+        let dir = ScratchDir::new("lone-trigger");
+        let db = genuine_then(
+            &dir,
+            3,
+            "CREATE TRIGGER scan_root AFTER INSERT ON scan BEGIN SELECT 1; END;",
+        );
+        assert_refused_intact(
+            &db,
+            "trigger scan_root at v3",
+            &[
+                "schema name `scan_root` is reserved for a table since schema v4, but the \
+               checkpoint declares v3; found a trigger named `scan_root`",
+            ],
+        );
+    }
+
+    /// T9d. A trigger `FILE_SIZE` beside our index `file_size`: ambiguous, both named as stored.
+    #[test]
+    fn a_trigger_carrying_our_index_name_in_another_case_is_ambiguous() {
+        let _role = operator();
+        let dir = ScratchDir::new("ambiguous-index");
+        let db = genuine_then(
+            &dir,
+            6,
+            "CREATE TRIGGER FILE_SIZE AFTER INSERT ON file BEGIN SELECT 1; END;",
+        );
+        assert_refused_intact(
+            &db,
+            "index file_size and trigger FILE_SIZE",
+            &[
+                "2 objects answer to the schema name `file_size`: index `file_size`, trigger \
+               `FILE_SIZE`",
+            ],
+        );
+    }
+
+    /// T10. The second line: `migrate` without the guard refuses the column in its own words and
+    /// rolls everything back.
+    #[test]
+    fn a_column_in_another_case_is_refused_by_the_migration_too() {
+        let conn = v2_shaped_db();
+        conn.execute_batch(
+            "ALTER TABLE scan_stats RENAME COLUMN results_materialized TO hop;
+             ALTER TABLE scan_stats RENAME COLUMN hop TO RESULTS_MATERIALIZED;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+        let before = schema_fingerprint(&conn);
+
+        let text = migrate(&conn)
+            .expect_err("a column in a spelling this product never writes is not ours")
+            .to_string();
+
+        assert_eq!(
+            text,
+            format!(
+                "{NOT_A_CHECKPOINT}: column name `results_materialized` of table `scan_stats` is \
+                 held by a column spelled `RESULTS_MATERIALIZED`, a spelling this product never \
+                 writes"
+            )
+        );
+        assert_eq!(user_version(&conn), 1, "the stamp is kept");
+        assert_eq!(
+            schema_fingerprint(&conn),
+            before,
+            "the whole migration was rolled back"
+        );
+    }
+
+    /// T11. A table of the floor in another case. It exists, so «is missing» would be a lie.
+    #[test]
+    fn a_floor_table_in_another_case_is_refused_by_its_spelling() {
+        let _role = operator();
+        let dir = ScratchDir::new("case-floor-table");
+        let db = genuine_then(
+            &dir,
+            3,
+            "ALTER TABLE hash_cache RENAME TO hash_cache_hop;
+             ALTER TABLE hash_cache_hop RENAME TO HASH_CACHE;",
+        );
+        let text = assert_refused_intact(
+            &db,
+            "HASH_CACHE at v3",
+            &["schema name `hash_cache` is held by a table spelled `HASH_CACHE`, a spelling this \
+               product never writes"],
+        );
+        assert!(!text.contains("is missing"), "the table is there: {text}");
+    }
+
+    /// T12a. A required column in another case, as a generated column, which `table_info` does
+    /// not list: the floor must refuse its spelling, not call the column missing.
+    #[test]
+    fn a_generated_required_column_in_another_case_is_refused_by_its_spelling() {
+        let _role = operator();
+        let dir = ScratchDir::new("generated-required-case");
+        let db = genuine_then(
+            &dir,
+            3,
+            "ALTER TABLE hash_cache RENAME COLUMN updated_at TO updated_text;
+             ALTER TABLE hash_cache
+                 ADD COLUMN UPDATED_AT TEXT GENERATED ALWAYS AS (updated_text) VIRTUAL;",
+        );
+        let text = assert_refused_intact(
+            &db,
+            "generated hash_cache.UPDATED_AT at v3",
+            &[
+                "column name `updated_at` of table `hash_cache` is held by a column spelled \
+               `UPDATED_AT`, a spelling this product never writes",
+            ],
+        );
+        assert!(
+            !text.contains("has no column"),
+            "the column is there: {text}"
+        );
+    }
+
+    /// T12b. The second line meets a generated column in another case: refused in the product's
+    /// words, not by SQLite's «duplicate column name», and rolled back.
+    #[test]
+    fn a_generated_column_in_another_case_is_refused_by_the_migration_too() {
+        let conn = v2_shaped_db();
+        conn.execute_batch(
+            "ALTER TABLE scan_stats DROP COLUMN results_materialized;
+             ALTER TABLE scan_stats
+                 ADD COLUMN RESULTS_MATERIALIZED INTEGER GENERATED ALWAYS AS (0) VIRTUAL;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+        let before = schema_fingerprint(&conn);
+
+        let text = migrate(&conn)
+            .expect_err("a generated column in another spelling is not ours")
+            .to_string();
+
+        assert_eq!(
+            text,
+            format!(
+                "{NOT_A_CHECKPOINT}: column name `results_materialized` of table `scan_stats` is \
+                 held by a column spelled `RESULTS_MATERIALIZED`, a spelling this product never \
+                 writes"
+            )
+        );
+        assert_eq!(user_version(&conn), 1, "the stamp is kept");
+        assert_eq!(
+            schema_fingerprint(&conn),
+            before,
+            "the whole migration was rolled back"
+        );
+    }
+
+    /// T12c. A generated column under a required name in our own spelling. Seen through
+    /// `table_xinfo`, it must still not pass for ours: this product never writes one.
+    #[test]
+    fn a_generated_column_under_a_required_name_is_refused_as_generated() {
+        let _role = operator();
+        let dir = ScratchDir::new("generated-required-exact");
+        let db = genuine_then(
+            &dir,
+            3,
+            "ALTER TABLE hash_cache RENAME COLUMN updated_at TO updated_text;
+             ALTER TABLE hash_cache
+                 ADD COLUMN updated_at TEXT GENERATED ALWAYS AS (updated_text) VIRTUAL;",
+        );
+        let text = assert_refused_intact(
+            &db,
+            "generated hash_cache.updated_at at v3",
+            &[
+                "column `updated_at` of table `hash_cache` is a hidden or generated column, which \
+               this product never writes",
+            ],
+        );
+        assert!(
+            !text.contains("has no column"),
+            "the column is there: {text}"
+        );
+    }
+
+    /// T12d. The second line meets a generated column in our own spelling: refused, never taken
+    /// for the column it would otherwise skip adding.
+    #[test]
+    fn a_generated_column_under_our_name_is_refused_by_the_migration_too() {
+        let conn = v2_shaped_db();
+        conn.execute_batch(
+            "ALTER TABLE scan_stats DROP COLUMN results_materialized;
+             ALTER TABLE scan_stats
+                 ADD COLUMN results_materialized INTEGER GENERATED ALWAYS AS (0) VIRTUAL;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+        let before = schema_fingerprint(&conn);
+
+        let text = migrate(&conn)
+            .expect_err("a generated column is not the column this product adds")
+            .to_string();
+
+        assert_eq!(
+            text,
+            format!(
+                "{NOT_A_CHECKPOINT}: column `results_materialized` of table `scan_stats` is a \
+                 hidden or generated column, which this product never writes"
+            )
+        );
+        assert_eq!(user_version(&conn), 1, "the stamp is kept");
+        assert_eq!(
+            schema_fingerprint(&conn),
+            before,
+            "the whole migration was rolled back"
+        );
     }
 }
