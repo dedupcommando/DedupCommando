@@ -134,13 +134,16 @@ expect_rejected() {
 	shift 2
 	local output status
 	output="$(scan_roots "$label" "$@")" && status=0 || status=$?
+	# Matching is done with here-strings throughout this file: `printf | grep -q` lets grep exit
+	# at the first hit, the producer takes SIGPIPE, and pipefail reports 141 — a match read as a
+	# miss as soon as the scan output outgrows a pipe buffer, which it does on a real fixture.
 	printf '%s\n' "$output" | sed 's/^/    /'
 	[ "$status" -ne 0 ] || fail "$label: the scan was expected to fail, it exited 0"
-	printf '%s' "$output" | grep -q "$class" ||
+	grep -q "$class" <<<"$output" ||
 		fail "$label: output does not name the conflict class '$class'"
 	local stats
 	stats="$(stats_of "$label")"
-	printf '%s' "$stats" | grep -q "$FIXTURE" &&
+	grep -q "$FIXTURE" <<<"$stats" &&
 		fail "$label: a scan session was recorded even though the roots were refused"
 	pass "$label: refused ($class), no session recorded"
 }
@@ -179,9 +182,10 @@ if bind_mount "$FIXTURE/src" "$FIXTURE/src/inner_mirror"; then
 	output="$(scan_roots walk "$FIXTURE/src")" && status=0 || status=$?
 	printf '%s\n' "$output" | sed 's/^/    /'
 	[ "$status" -ne 0 ] || fail "walk: the scan was expected to fail, it exited 0"
-	printf '%s' "$output" | grep -q "same directory" ||
+	grep -q "same directory" <<<"$output" ||
 		fail "walk: output does not name the walk-time alias"
-	stats_of walk | grep -qE "\[(complete|complete_with_warnings)\]" &&
+	walk_stats="$(stats_of walk)" || fail "walk: the session query itself failed"
+	grep -qE "\[(complete|complete_with_warnings)\]" <<<"$walk_stats" &&
 		fail "walk: a partial scan was published as complete"
 	pass "walk: alias found during the walk aborted the scan, nothing published as complete"
 	umount "$FIXTURE/src/inner_mirror"
@@ -193,9 +197,12 @@ fi
 banner "6. control: one root over the same tree still scans"
 output="$(scan_roots control "$FIXTURE/src")" || fail "control: a disjoint root set must scan"
 printf '%s\n' "$output" | sed 's/^/    /'
-printf '%s' "$output" | grep -q "Duplicate groups:     1" ||
+grep -q "Duplicate groups:     1" <<<"$output" ||
 	fail "control: the two identical files must still form one group"
-stats_of control | grep -q "$FIXTURE/src" || fail "control: the session must be recorded"
+# A here-string swallows the exit status of what produced it, so a broken query would read as
+# "no match" and the assertion would pass. Take the status first, the text second.
+control_stats="$(stats_of control)" || fail "control: the session query itself failed"
+grep -q "$FIXTURE/src" <<<"$control_stats" || fail "control: the session must be recorded"
 pass "control: scanned to completion, one group found"
 
 banner "RESULT"

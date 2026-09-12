@@ -193,6 +193,45 @@ y09="$(line_of 09 'Y  ONCE')"; e09="$(line_of 09 'changed after the scan (conten
 q09="$(line_of 09 'Q  from that summary')"
 [ "$y09" -lt "$e09" ] && [ "$e09" -lt "$q09" ]
 check "pause 09: Y < the cancelled-action line < Q ($y09 < $e09 < $q09)" "$?"
+
+# Both refusal screens must be described. The product shows the summary only when the batch was
+# aborted after it started; a batch refused by preflight comes back to the panels with a status
+# line instead, and a contract naming just one of them sends the operator to "stop and report" a
+# refusal that is in fact correct (round-2 finding, G4).
+has 06 "Actions failed:";                 check "pause 06 names the status-line refusal too"   "$?"
+has 06 "no file has moved and nothing has reached the quarantine"
+check "pause 06 states the invariant both screens share" "$?"
+a06="$(line_of 06 'Actions failed:')"
+[ "$y06" -lt "$a06" ] && [ "$a06" -lt "$q06" ]
+check "pause 06: Y < the status-line refusal < Q ($y06 < $a06 < $q06)" "$?"
+has 09 "rescan required";                 check "pause 09 names the refusal that arrives at «x»" "$?"
+r09="$(line_of 09 'rescan required')"; x09="$(line_of 09 'x  (F11')"
+[ "$r09" -gt 0 ] && [ "$r09" -lt "$x09" ]
+check "pause 09 describes the «x»-time refusal before the key that can trigger it ($r09 < $x09)" "$?"
+has 09 "In both cases dup.bin must still be at its own path"
+check "pause 09 states the invariant both outcomes share" "$?"
+
+# A pause that describes two possible screens has to describe two ways out of them. Sending the
+# operator to press Q on panels that never opened a summary is the same defect one step later.
+has 06 "F10 (q) from the Commander panels"
+check "pause 06 names the exit from the panels as well as from the summary" "$?"
+has 09 "F10 (q) from the Commander panels"
+check "pause 09 names the exit from the panels as well as from the summary" "$?"
+
+# The refusal names WHICH part of the identity moved, and `first_drift` can pick any of eight
+# (model/plan.rs:223). Pinning one of them in the instructions sends the operator looking for a
+# literal the product will not print: overwriting a file in place moved mtime_nsec on the live
+# run, while the text said mtime. Name the placeholder and the eight fields, not one of them.
+has 06 "changed since the scan (<field>)"
+check "pause 06 leaves the drifted field open" "$?"
+has 09 "changed since the scan (<field>)"
+check "pause 09 leaves the drifted field open" "$?"
+for idx in 06 09; do
+    has "$idx" "device, inode, size, mtime, mtime_nsec, ctime, ctime_nsec or link count"
+    check "pause $idx lists every field the refusal can name" "$?"
+    ! has "$idx" "changed since the scan (mtime) —"
+    check "pause $idx does not pin one field as the expected one" "$?"
+done
 has 05 "LEAVE THE OVERLAY OPEN";          check "pause 05 stops with the overlay open"       "$?"
 has 05 "stage 1 of 2";                    check "pause 05 names its stage"                   "$?"
 has 06 "stage 2 of 2";                    check "pause 06 names its stage"                   "$?"

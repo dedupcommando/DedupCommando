@@ -241,7 +241,10 @@ pool_presence() {  # name
         printf '  the pool enumeration failed: %s\n' "$(printf '%s' "$out" | head -1)" >&2
         return 0
     fi
-    if printf '%s\n' "$out" | grep -qxF -- "$1"; then
+    # A here-string, not a pipe: `printf | grep -q` lets grep exit on the first hit, printf takes
+    # SIGPIPE, and pipefail turns its 141 into "no match" — this pool would be called absent while
+    # it is imported. Rare on a short list, wrong on a long one, and this answer gates a teardown.
+    if grep -qxF -- "$1" <<<"$out"; then
         G5_PRESENCE=present
     else
         G5_PRESENCE=absent
@@ -832,13 +835,22 @@ pause_record() {  # index -> operator text on stdout
      stage opens nothing and marks nothing.
   2. Apply:
 EOF
-        route_apply_to_summary
-        printf '%s\n' "  3. On that summary screen, BEFORE leaving it, the batch must have refused"
-        printf '%s\n' "     itself: the screen carries «BATCH REFUSED before any change: <reason>»,"
-        printf '%s\n' "     no file has been moved and nothing has reached the quarantine."
-        printf '%s\n' "     A summary WITHOUT that line means the batch ran: stop and report it."
-        printf '%s\n' "  4. Leave the summary:"
+        printf '%s\n' "       Y  ONCE, inside that overlay. This is the only Y in the whole scenario."
+        printf '%s\n' "         -> the Commander leaves the overlay behind; WHICH screen comes next is"
+        printf '%s\n' "            exactly what step 3 is about."
+        printf '%s\n' "  3. The batch must refuse ITSELF, before a single change on disk. Two screens are"
+        printf '%s\n' "     possible and both mean the same refusal — read whichever one appears:"
+        printf '%s\n' "       a) the summary carries «BATCH REFUSED before any change: <reason>», or"
+        printf '%s\n' "       b) the Commander returns to the panels with a status line"
+        printf '%s\n' "          «Actions failed: <path> changed since the scan (<field>) — rescan required»,"
+        printf '%s\n' "          where <field> is the first part of the identity that no longer matches:"
+        printf '%s\n' "          device, inode, size, mtime, mtime_nsec, ctime, ctime_nsec or link count."
+        printf '%s\n' "     In both cases no file has moved and nothing has reached the quarantine."
+        printf '%s\n' "     Note which of the two you saw. A screen that reports the actions as DONE means"
+        printf '%s\n' "     the batch ran: stop and report it."
+        printf '%s\n' "  4. Leave the screen you got — the key depends on which one it was:"
         route_exit_summary
+        printf '%s\n' "       F10 (q) from the Commander panels of (b), where no summary ever opened."
         ;;
     07)
         printf '%s\n' "saved ScanScript — save the plan's .sh from the confirmation and apply NOTHING."
@@ -871,17 +883,27 @@ EOF
         route_prologue "$1"
         printf '%s\n' "  8. Mark, waiting for each settlement:"
         route_marks "$1"
-        printf '%s\n' "  9. Apply, and expect the refusal:"
+        printf '%s\n' "  9. Apply, and expect the refusal. It arrives at one of two points, and both are a"
+        printf '%s\n' "     correct refusal — record which one you saw:"
+        printf '%s\n' "       a) already at «x»: no confirmation opens and the status line reads"
+        printf '%s\n' "          «$G5_FIXTURE/dup.bin changed since the scan (<field>) — rescan required»,"
+        printf '%s\n' "          where <field> is the first part of the identity that no longer matches:"
+        printf '%s\n' "          device, inode, size, mtime, mtime_nsec, ctime, ctime_nsec or link count."
+        printf '%s\n' "          Overwriting the file in place moves several of them at once, so do not"
+        printf '%s\n' "          expect one particular name — any of them is the same refusal."
+        printf '%s\n' "          The two keys printed after x are then unreachable and this step is done;"
+        printf '%s\n' "       b) or the confirmation opens and the refusal comes after Y, on the summary."
         route_open_confirmation
         route_apply_to_summary
-        printf '%s\n' " 10. On that summary screen, BEFORE leaving it, the action must appear as a"
-        printf '%s\n' "     failure line"
+        printf '%s\n' " 10. In case (b), BEFORE leaving the summary, the action must appear as a failure"
+        printf '%s\n' "     line"
         printf '%s\n' "       «✗ Hardlink $G5_FIXTURE/dup.bin — … changed after the scan (content)"
         printf '%s\n' "        — action cancelled»"
-        printf '%s\n' "     and dup.bin must still be at its own path with its new content. A summary"
-        printf '%s\n' "     that reports the hardlink as done is a failure of this scenario."
-        printf '%s\n' " 11. Only then leave the summary:"
+        printf '%s\n' "     In both cases dup.bin must still be at its own path with its new content. A"
+        printf '%s\n' "     screen that reports the hardlink as done is a failure of this scenario."
+        printf '%s\n' " 11. Leave the screen you got — the key depends on which one it was:"
         route_exit_summary
+        printf '%s\n' "       F10 (q) from the Commander panels of (a), where no summary ever opened."
         ;;
     10)
         printf '%s\n' "snapshot — the safety snapshot taken before a destructive batch."
@@ -997,20 +1019,56 @@ except OSError: pass' "$1" "$2"
         return 127
     fi
 }
-quarantined() { find "$PMNT" -path '*/.dedcom-quarantine/*' -name "$1" 2>/dev/null | grep -q .; }
+# `-print -quit` stops at the first hit inside find itself; piping into `grep -q` would race
+# find to the SIGPIPE and report a quarantined file as missing under pipefail.
+quarantined() { [ -n "$(find "$PMNT" -path '*/.dedcom-quarantine/*' -name "$1" -print -quit 2>/dev/null)" ]; }
 
-# Data-block addresses of one file, sorted and de-duplicated (R2D-C5-2).
+# Data-block addresses of one file's data blocks, sorted and de-duplicated (R2D-C5-2).
 #
 # `bcloneused` is a pool-wide counter and says nothing about WHICH blocks two files share, so it
 # cannot tell a clone from a fresh copy written into free space. The DVAs can: a block clone makes
 # the published file point at the keeper's own vdev offsets.
-dvas_of() {  # dataset abspath -> "vdev:offset:size" per line
+#
+# Two flags and a parse rule, all three load-bearing, all three measured on OpenZFS 2.4.3:
+#
+#   -e -p "$POOLDIR"   make-test-pool.sh creates the pool with `cachefile=none` (it must not
+#                      register itself on a shared host), so a plain `zdb <pool>/<ds>` finds no
+#                      pool at all and prints nothing. Without these the function returned empty
+#                      for every file and the scenario failed "produced no DVAs" on every run.
+#   -ddddd             the per-block "Indirect blocks:" listing appears only from the fifth `d`.
+#                      At -dddd the only `DVA[0]=<...>` in the output is the DATASET rootbp on the
+#                      header line, the same string for every object in the dataset. The old grep
+#                      for `DVA[0]=` therefore reported "1 shared block" for any two files at all,
+#                      a plain copy included: it compared the dataset with itself. Measured
+#                      2026-09-12 on 4 MiB, 128 KiB and 100-byte fixtures: keeper against a
+#                      `--reflink=never` copy scored 1 shared under the old parse, 0 under this one.
+#                      The positive half is measured too, same day, the live reflink scenario on
+#                      the box: 4 keeper blocks, 4 published blocks, 4 shared after the action and
+#                      0 shared between the two fixture files before it.
+#   $2 == "L0"         the listing prints the pointer in short form, `vdev:offset:asize`, never as
+#                      `DVA[0]=<...>`. L1 and above are indirect metadata, not the file's data, and
+#                      an all-zero address is a hole that would match between any two sparse files.
+dvas_of() {  # dataset abspath -> "vdev:offset:asize" per data block
     local ds="$1" path="$2" obj
     obj="$(stat -c '%i' -- "$path")" || return 1
     sync; zpool sync "$POOL" 2>/dev/null || true
-    "$G5_ZDB" -dddd "$ds" "$obj" 2>/dev/null \
-        | grep -oE 'DVA\[0\]=<[0-9]+:[0-9a-fA-F]+:[0-9a-fA-F]+>' \
-        | sed 's/DVA\[0\]=<//; s/>//' | sort -u
+    "$G5_ZDB" -e -p "$POOLDIR" -ddddd "$ds" "$obj" 2>/dev/null \
+        | sed -n '/^Indirect blocks:/,/^$/p' \
+        | awk '$2 == "L0" { for (i = 3; i <= NF; i++)
+                                if ($i ~ /^[0-9]+:[0-9a-f]+:[0-9a-f]+$/ && $i !~ /^[0-9]+:0:0$/)
+                                    print $i }' \
+        | sort -u
+}
+
+# How many data-block addresses two files hold in common.
+#
+# `grep -c .` exits 1 on zero matches, which is a legitimate answer here, so it cannot simply be
+# `|| true`: that would turn a broken `comm` into "0 shared" as well, and 0 is exactly what the
+# pre-action control reads as a pass. Count the lines with something that cannot fail on empty.
+shared_dvas() {  # dataset fileA fileB -> count on stdout
+    local common
+    common="$(comm -12 <(dvas_of "$1" "$2") <(dvas_of "$1" "$3"))" || return 1
+    printf '%s\n' "$common" | sed '/^$/d' | wc -l
 }
 
 # Allocated bytes of a dataset, for a before/after delta that can be compared with a claim.
@@ -1064,7 +1122,11 @@ scenario_hardlink() {
 scenario_reflink() {
     banner "reflink — separate inode, shared blocks, and the target's own metadata (D-1)"
     local d="$G5ROOT/reflink"; rm -rf "$d"; mkdir -p "$d"
-    head -c 512K /dev/urandom > "$d/keeper.bin"; cp "$d/keeper.bin" "$d/dup.bin"
+    head -c 512K /dev/urandom > "$d/keeper.bin"
+    # `cp` defaults to --reflink=auto, and this pool has block cloning on, so a plain `cp` here
+    # would hand the fixture to the test already cloned and the DVA proof below would be green
+    # before dedcom had run at all. dd copies through read/write and cannot clone.
+    dd if="$d/keeper.bin" of="$d/dup.bin" bs=128K status=none
     # D-1: the clone is a NEW inode, so it must come back with dup.bin's owner/mode/xattr —
     # not the keeper's, and not root's. Make all three differ, or the check proves nothing.
     chmod 0644 "$d/keeper.bin"
@@ -1074,6 +1136,23 @@ scenario_reflink() {
         || { fail "cannot set user.dedcom_e2e on dup.bin (install 'attr' or python3; ensure the dataset stores xattrs)"; return; }
     local i_keep; i_keep="$(inode "$d/keeper.bin")"
     info "fixture: keeper.bin 0644 root:root, dup.bin 0600 12345:12345 + user.dedcom_e2e; keeper inode=$i_keep"
+    # The proof below is only worth running if the same comparison can currently come out NEGATIVE.
+    # Two independently written files with identical content must share nothing; if they do, either
+    # the fixture was cloned behind our back or dvas_of is reading the wrong thing, and a green
+    # result afterwards would mean nothing. This is the gate's own red-before-green.
+    local pre_keep pre_dup pre_shared
+    pre_keep="$(dvas_of "$POOL/ds_a" "$d/keeper.bin" | grep -c .)"
+    pre_dup="$(dvas_of "$POOL/ds_a" "$d/dup.bin" | grep -c .)"
+    pre_shared="$(shared_dvas "$POOL/ds_a" "$d/keeper.bin" "$d/dup.bin")"
+    if [ "$pre_keep" -eq 0 ] || [ "$pre_dup" -eq 0 ]; then
+        fail "$G5_ZDB lists no data blocks for the fixture — block sharing cannot be proven either way"
+        return
+    fi
+    if [ "$pre_shared" -ne 0 ]; then
+        fail "fixture already shares $pre_shared block address(es) before any action — the clone proof would be vacuous"
+        return
+    fi
+    ok "control: the two fixture files share no block address yet ($pre_keep and $pre_dup blocks apart)"
     scan "$d"
     pause_context "$d" || return 1
     operator_pause 02 reflink || return 1
@@ -1085,15 +1164,19 @@ scenario_reflink() {
     cmp -s "$d/keeper.bin" "$d/dup.bin" && ok "content identical" || fail "content differs"
     # R2D-C5-2: the blocks, by address. A pool-wide `bcloneused` counter cannot say which file
     # shares which block, and a fresh copy written into free space would satisfy it just as well.
-    local keeper_dvas dup_dvas shared
-    keeper_dvas="$(dvas_of "$POOL/ds_a" "$d/keeper.bin")"
-    dup_dvas="$(dvas_of "$POOL/ds_a" "$d/dup.bin")"
-    if [ -z "$keeper_dvas" ] || [ -z "$dup_dvas" ]; then
-        fail "/usr/sbin/zdb produced no DVAs — block sharing is UNPROVEN (do not call this scenario green)"
+    local n_keep n_dup shared
+    n_keep="$(dvas_of "$POOL/ds_a" "$d/keeper.bin" | grep -c .)"
+    n_dup="$(dvas_of "$POOL/ds_a" "$d/dup.bin" | grep -c .)"
+    shared="$(shared_dvas "$POOL/ds_a" "$d/keeper.bin" "$d/dup.bin")"
+    if [ "$n_keep" -eq 0 ] || [ "$n_dup" -eq 0 ]; then
+        fail "$G5_ZDB produced no DVAs — block sharing is UNPROVEN (do not call this scenario green)"
+    elif [ "$shared" -eq 0 ]; then
+        fail "no block address in common — the published file is a COPY, not a clone"
+    elif [ "$shared" -ne "$n_dup" ]; then
+        # Partial sharing is not "mostly a clone": some of the file was written afresh.
+        fail "only $shared of the published file's $n_dup block addresses come from the keeper"
     else
-        shared="$(comm -12 <(printf '%s\n' "$keeper_dvas") <(printf '%s\n' "$dup_dvas") | wc -l)"
-        [ "$shared" -gt 0 ] && ok "published clone shares $shared block address(es) with the keeper" \
-                            || fail "no DVA in common — the published file is a COPY, not a clone"
+        ok "published clone shares all $shared block address(es) with the keeper"
     fi
     quarantined "dup.bin" && ok "original dup.bin evacuated to quarantine" \
                           || info "note: original dup.bin not seen in quarantine — verify manually"

@@ -52,7 +52,20 @@ zfs create -o mountpoint="$TP_MNT/ds_b" "$TP_POOL/ds_b"
 # Identity, verified the moment it exists rather than assumed at teardown time.
 tp_assert_dataset_mounts_contained "$TP_POOL" || {
     echo "REFUSED: a dataset of '$TP_POOL' is mounted outside $TP_MNT" >&2; exit 1; }
-tp_manifest_write "$TP_POOL" || { echo "REFUSED: could not record the pool manifest" >&2; exit 1; }
+# The pool exists by now, so a manifest failure would leave an imported pool that teardown can
+# never confirm (it reads the pool identity FROM the manifest) — the leaked-pool-on-a-shared-host
+# state this harness exists to avoid. This process created the pool seconds ago and knows its
+# name, which is the one case where destroying without a manifest is not destroying on faith.
+if ! tp_manifest_write "$TP_POOL"; then
+    echo "REFUSED: could not record the pool manifest" >&2
+    echo "         removing the pool this run had just created, so nothing is left behind:" >&2
+    if zpool destroy "$TP_POOL" 2>&1 | sed 's/^/           /' >&2; then
+        echo "         pool '$TP_POOL' destroyed." >&2
+    else
+        echo "         pool '$TP_POOL' could NOT be destroyed — remove it by hand." >&2
+    fi
+    exit 1
+fi
 tp_manifest_verify || { echo "REFUSED: the pool does not match the manifest just written" >&2; exit 1; }
 
 mkdir -p "$TP_MNT/ds_a/dup" "$TP_MNT/ds_b/dup"

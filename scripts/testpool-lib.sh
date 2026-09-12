@@ -303,6 +303,114 @@ tp_remove_file() {  # path -> 0 only when the path is proved absent afterwards
 }
 
 # --------------------------------------------------------------- pool identity
+# The full leaf-vdev paths, as `zpool status -P` prints them.
+#
+# WHY A SECOND VIEW: `zpool list -v` truncates the vdev name. Measured on OpenZFS 2.4.3 (the pool
+# name length makes no difference): a path of 63 characters comes back whole, 64 and longer comes
+# back cut to 63 — while `zpool status -P` printed 120 characters unchanged. Teardown compares the
+# vdev with our image path EXACTLY, so under the truncated view a pool whose image path is long can
+# never be confirmed and stays imported forever. The status view is therefore the source of the
+# PATH; the list view above stays the source of the TOPOLOGY (containers, sections, extra devices).
+#
+# Fail-closed on every shape this harness does not create: a container vdev, a second top-level row
+# (logs/cache/spare/dedup/special or another pool), a row nested deeper than one level, a relative
+# name, a name with whitespace in it, a leaf row before the pool row, a second config block, an
+# unreadable or empty config block.
+#
+# `-P` and NOT `-PL`, however tempting it is to resolve both views the same way. Measured on the
+# box, OpenZFS 2.4.3, 2026-09-12, on image paths of 40/62/63/64/76/100 characters:
+#
+#   path length   zpool status -P   zpool status -PL   zpool list -vHPL
+#   up to 63      exact             exact              exact
+#   64 and more   exact             cut at 63          cut at 63
+#
+# Adding -L therefore puts the truncation straight back and this whole fix with it. The price is
+# that the two views are compared unresolved-against-resolved, so a pool whose vdev was given as a
+# symlink (/dev/disk/by-id/...) would make them disagree and teardown would refuse. That is the
+# safe direction, and this harness always creates its vdev as a plain file path.
+#
+# Measured on the box, OpenZFS 2.4.3, 2026-09-12: `zpool status` exits 0 on a DEGRADED pool and on
+# a pool with a device it cannot open, so a non-zero exit really is an error and not a health
+# report. A device that cannot be opened is named by its GUID instead of a path, and a GUID fails
+# the absolute-path rule below — which is the right answer: an unidentifiable vdev must not
+# license a destroy.
+tp_pool_status_vdevs() {
+    local pool="$1" raw out rc=0
+    if ! raw="$(tp_zpool status -P "$pool" 2>/dev/null)"; then
+        tp_die "'zpool status -P $pool' exited with an error"; return 1
+    fi
+    [ -n "$raw" ] || { tp_die "empty output of 'zpool status' for $pool"; return 1; }
+    out="$(awk -v pool="$pool" '
+        # The config block is entered ONCE and left ONCE. Without that, a second «config:» or a
+        # second NAME header later in the output re-arms the parser and its rows are then read as
+        # leaves of THIS pool, while the "second top-level row" refusal never fires: the injected
+        # block has no indent-0 row of its own.
+        /^config:/ {
+            if (cfg) { print "REFUSED: a second «config:» block in zpool status" > "/dev/stderr"; bail = 4; exit bail }
+            cfg = 1; next
+        }
+        /^\tNAME[ \t]+STATE/ {
+            if (!cfg) { print "REFUSED: a config header before «config:»" > "/dev/stderr"; bail = 4; exit bail }
+            if (hdr)  { print "REFUSED: a second config header in zpool status" > "/dev/stderr"; bail = 4; exit bail }
+            hdr = 1; incfg = 1; next
+        }
+        !incfg { next }
+        /^[ \t]*$/ { incfg = 0; next }
+        {
+            if ($0 !~ /^\t/) { printf("REFUSED: config row without a leading tab: [%s]\n", $0) > "/dev/stderr"; bail = 5; exit bail }
+            row = substr($0, 2)
+            indent = match(row, /[^ ]/) - 1
+            body = row; sub(/^ +/, "", body)
+            # zpool separates the name from the STATE column by two or more spaces. Splitting on
+            # the FIRST space instead would silently turn «/root/my pool/pool.img» into
+            # «/root/my» — an absolute path that passes every rule below and is then handed
+            # to a destroy. Split on the column gap, then refuse a name that still holds whitespace,
+            # and refuse a row whose next column is not a STATE.
+            name = body; sub(/[ \t][ \t]+.*$/, "", name)
+            rest = substr(body, length(name) + 1); sub(/^[ \t]+/, "", rest)
+            if (name == "") { print "REFUSED: empty vdev name in status" > "/dev/stderr"; bail = 2; exit bail }
+            if (name ~ /[ \t]/) {
+                printf("REFUSED: vdev name «%s» contains whitespace — this view cannot be parsed\n", name) > "/dev/stderr"; bail = 9; exit bail
+            }
+            if (indent == 0) {
+                if (seenpool) {
+                    printf("REFUSED: second top-level row «%s» — a section (logs/cache/spare/dedup/special) or another pool\n", name) > "/dev/stderr"
+                    bail = 6; exit bail
+                }
+                if (name != pool) { printf("REFUSED: status names pool «%s», expected «%s»\n", name, pool) > "/dev/stderr"; bail = 3; exit bail }
+                seenpool = 1; next
+            }
+            # A leaf is a leaf OF something. A row that arrives before the pool row belongs to no
+            # pool this call has identified, so it is never emitted.
+            if (!seenpool) { printf("REFUSED: vdev row «%s» before the pool row\n", name) > "/dev/stderr"; bail = 8; exit bail }
+            # A leaf row always carries a STATE. A section header («logs», «cache») does not,
+            # but it sits at indent 0 and was already refused above, so requiring the column here
+            # costs nothing and catches a row this parser cannot read.
+            if (rest !~ /^(ONLINE|DEGRADED|FAULTED|OFFLINE|UNAVAIL|REMOVED|AVAIL|INUSE|SPLIT)([ \t]|$)/) {
+                printf("REFUSED: row «%s» is not followed by a STATE column — unreadable\n", body) > "/dev/stderr"; bail = 9; exit bail
+            }
+            if (indent != 2) { printf("REFUSED: vdev row nested %d deep — harness has no containers\n", indent) > "/dev/stderr"; bail = 6; exit bail }
+            if (name ~ /^(mirror|raidz[0-9]*|draid[0-9]*|spare|replacing|log|dedup|special|indirect)-[0-9]+$/) {
+                printf("REFUSED: container vdev «%s» — harness has no containers\n", name) > "/dev/stderr"; bail = 6; exit bail
+            }
+            if (substr(name, 1, 1) != "/") { printf("REFUSED: vdev name «%s» — not an absolute path\n", name) > "/dev/stderr"; bail = 7; exit bail }
+            print name; leaves++
+            next
+        }
+        END {
+            # A rule-level exit lands here too, and an unguarded exit in END would overwrite its
+            # status: every refusal would report 8 and the reason would be readable only in the
+            # message. Keep the code the rule chose.
+            if (bail) exit bail
+            if (!seenpool) { print "REFUSED: no pool row in the status config block" > "/dev/stderr"; bail = 8; exit bail }
+            if (leaves == 0) { print "REFUSED: no leaf-vdev in the status config block" > "/dev/stderr"; bail = 8; exit bail }
+        }
+    ' <<< "$raw")" || rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
+    printf '%s\n' "$out"
+    return 0
+}
+
 # The actual leaf-vdevs of the pool (canonical paths, one per line).
 # Returns != 0 on ANY zpool error OR an unexpected structure (fail-closed).
 #
@@ -353,20 +461,51 @@ tp_pool_leaf_vdevs() {
         }
         END { if (leaves == 0) { print "REFUSED: no leaf-vdev found" > "/dev/stderr"; exit 8 } }
     ' <<< "$raw")" || rc=$?
-    if [ "$rc" -eq 0 ]; then
-        local p canon
-        while IFS= read -r p; do
-            [ -n "$p" ] || continue
-            # Canonicalization of the actual vdev path is fail-closed: on a readlink error we do
-            # NOT substitute the raw path (otherwise it could falsely match the expected one).
-            if ! canon="$(readlink -f -- "$p" 2>/dev/null)"; then
-                tp_die "canonicalization of the actual vdev path '$p' failed"
-                return 1
-            fi
-            printf '%s\n' "$canon"
-        done <<< "$out"
+    [ "$rc" -eq 0 ] || return "$rc"
+
+    # The PATH itself comes from `zpool status -P` (tp_pool_status_vdevs): `zpool list -v`
+    # truncates a long vdev name and teardown compares the path EXACTLY, so the list view alone
+    # can never confirm a pool whose image path is long.
+    #
+    # What the cross-check below proves, and what it does not: equal leaf count plus «the list
+    # name is a prefix of the status path» detects the two views having DESYNCED — a
+    # different device set, a different topology, one view stale. It does not IDENTIFY the file:
+    # once the list view has been cut at 63 characters, pool.img and pool.img.bak share their
+    # prefix and are indistinguishable here. Identity is not this check's job; it is the exact
+    # compare of the canonical status path against `readlink -f "$TP_IMG"` in
+    # teardown-test-pool.sh, plus the pool GUID and the dataset set in the manifest. A
+    # disagreement here is never reconciled — it refuses.
+    local full n_list n_status
+    full="$(tp_pool_status_vdevs "$pool")" || {
+        tp_die "leaf-vdev paths of '$pool' unreadable from 'zpool status' — refusing"
+        return 1
+    }
+    n_list="$(printf '%s\n' "$out" | grep -c . || true)"
+    n_status="$(printf '%s\n' "$full" | grep -c . || true)"
+    if [ "$n_list" != "$n_status" ]; then
+        tp_die "'zpool list' sees $n_list leaf-vdev(s) of '$pool', 'zpool status' sees $n_status"
+        return 1
     fi
-    return "$rc"
+    local -a L=() S=()
+    mapfile -t L < <(printf '%s\n' "$out"  | LC_ALL=C sort)
+    mapfile -t S < <(printf '%s\n' "$full" | LC_ALL=C sort)
+    local i canon
+    for i in "${!S[@]}"; do
+        [ -n "${S[$i]}" ] || continue
+        # Substring compare, never a glob: a vdev path may legitimately contain * or [.
+        if [ "${S[$i]:0:${#L[$i]}}" != "${L[$i]}" ]; then
+            tp_die "vdev views disagree: list gives '${L[$i]}', status gives '${S[$i]}'"
+            return 1
+        fi
+        # Canonicalization of the actual vdev path is fail-closed: on a readlink error we do
+        # NOT substitute the raw path (otherwise it could falsely match the expected one).
+        if ! canon="$(readlink -f -- "${S[$i]}" 2>/dev/null)"; then
+            tp_die "canonicalization of the actual vdev path '${S[$i]}' failed"
+            return 1
+        fi
+        printf '%s\n' "$canon"
+    done
+    return 0
 }
 
 # The pool GUID, as a bare decimal string. Fail-closed on any error or on anything that is

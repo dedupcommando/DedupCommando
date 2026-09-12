@@ -62,6 +62,19 @@ STUBBODY
   chmod +x "$BIN/$1"
 }
 
+# The `zpool status -P` view: the guard takes the untruncated leaf path from here, while
+# `zpool list -v` keeps deciding the topology (tp_pool_status_vdevs in testpool-lib.sh).
+ct_status() {  # pool leaf...
+  local pool="$1"; shift
+  printf '  pool: %s\n state: ONLINE\nconfig:\n\n' "$pool"
+  printf '\tNAME                 STATE     READ WRITE CKSUM\n'
+  printf '\t%s                 ONLINE       0     0     0\n' "$pool"
+  local leaf
+  for leaf in "$@"; do printf '\t  %s  ONLINE       0     0     0\n' "$leaf"; done
+  printf '\nerrors: No known data errors\n'
+}
+
+
 make_stub zpool '
 case "$1" in
   list)
@@ -70,13 +83,15 @@ case "$1" in
     [ "${STUB_ENUM_RC:-0}" = "0" ] || exit "${STUB_ENUM_RC}"
     if [ "$#" -eq 1 ] && [ "${1#-}" = "$1" ]; then
       # Single-pool query, the pre-tristate form: succeed only when the name is enumerated.
-      printf "%b" "${STUB_POOLNAMES:-}" | grep -qxF -- "$1"
+      grep -qxF -- "$1" <<<"$(printf "%b" "${STUB_POOLNAMES:-}")"
       exit $?
     fi
     printf "%b" "${STUB_POOLNAMES:-}"
     exit 0 ;;
   get)     [ "${STUB_GUID_RC:-0}" = "0" ] || exit "${STUB_GUID_RC}"
            printf "%s\n" "${STUB_GUID-7777777777777777777}"; exit 0 ;;
+  status)  [ "${STUB_STATUS_RC:-0}" = "0" ] || exit "${STUB_STATUS_RC}"
+           printf "%b" "${STUB_STATUS:-}"; exit 0 ;;
   create)  exit 0 ;;
   destroy) exit "${STUB_DESTROY_RC:-0}" ;;
   sync)    exit 0 ;;
@@ -331,6 +346,7 @@ env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" STUB_FAKE_UID=0 \
     DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
     DEDCOM_TESTPOOL_NAME="$POOL" DEDCOM_TESTPOOL_SIZE=1M \
     STUB_VDEV="$POOL\n\t$PDIR/pool.img\n" \
+    STUB_STATUS="$(ct_status "$POOL" "$PDIR/pool.img")" \
     STUB_DS="$(printf '%s\t%s\n%s/ds_a\t%s/ds_a\n%s/ds_b\t%s/ds_b\n' \
                "$POOL" "$PDIR/mount" "$POOL" "$PDIR/mount" "$POOL" "$PDIR/mount")" \
     bash "$HERE/make-test-pool.sh" > "$createlog" 2>&1
@@ -452,6 +468,82 @@ audit_bare_zdb() {  # dir -> 0 = no executable bare `zdb`; the absolute path is 
   [ -n "$hits" ] && return 1
   return 0
 }
+# The pools this harness creates carry `cachefile=none`, so a zdb call without `-e -p <pooldir>`
+# finds no pool, prints nothing, and the reflink scenario fails with "produced no DVAs" — the one
+# check that tells a clone from a copy. 0 = every call names the directory.
+audit_zdb_uncached() {  # dir -> 0 = no zdb INVOCATION without -e -p (the -x guard is not one)
+  local dir="$1" calls bad
+  calls="$(sed 's/[[:space:]]*#.*$//' "$dir/e2e-g5.sh" | grep -E '^[[:space:]]*"[$]G5_ZDB"' || true)"
+  [ -n "$calls" ] || return 1
+  bad="$(printf '%s\n' "$calls" | grep -v -- '-e -p' || true)"
+  [ -n "$bad" ] && return 1
+  return 0
+}
+
+audit_zdb_blockdump() {  # dir -> 0 = the clone proof reads real per-block addresses
+  local dir="$1" src calls bad
+  src="$(sed 's/[[:space:]]*#.*$//' "$dir/e2e-g5.sh")"
+  # Here-strings, not pipes: `producer | grep -q` lets grep exit on the first hit, the producer
+  # takes SIGPIPE and `set -o pipefail` reports its 141 as the pipeline's status, so a hit reads
+  # as a miss whenever the text is longer than a pipe buffer. e2e-g5.sh always is.
+  calls="$(grep -E '^[[:space:]]*"[$]G5_ZDB"' <<<"$src" || true)"
+  [ -n "$calls" ] || return 1
+  # -dddd stops one level short of the per-block listing, and the only DVA[0]= it does print is
+  # the dataset rootbp — the same string for every object in the dataset, so a comparison built
+  # on it is true for a plain copy just as much as for a clone.
+  bad="$(grep -vE -- '-d{5,}' <<<"$calls" || true)"
+  [ -n "$bad" ] && return 1
+  case "$src" in *'Indirect blocks:'*) ;; *) return 1 ;; esac
+  case "$src" in *'$2 == "L0"'*)      ;; *) return 1 ;; esac
+  return 0
+}
+
+audit_reflink_control() {  # dir -> 0 = the clone proof carries its own negative control
+  local dir="$1" body
+  body="$(sed -n '/^scenario_reflink()/,/^}/p' "$dir/e2e-g5.sh")"
+  [ -n "$body" ] || return 1
+  # `cp` defaults to --reflink=auto: on a block-cloning pool it would hand the fixture over
+  # already shared, and the proof would be green before dedcom ran.
+  grep -qE '^[[:space:]]*cp[[:space:]]' <<<"$body" && return 1
+  # and the scenario must measure the sharing BEFORE the action and refuse to go on if it is
+  # not zero — otherwise a check that always answers "shared" looks like a pass.
+  case "$body" in *'pre_shared="$(shared_dvas'*) ;; *) return 1 ;; esac
+  awk '
+      /pre_shared" -ne 0/          { w = 1; next }
+      w && /^[[:space:]]*fail /    { found = 1 }
+      w && /^[[:space:]]*fi$/      { w = 0 }
+      END { exit(found ? 0 : 1) }' <<<"$body" || return 1
+  return 0
+}
+
+audit_status_exact() {  # dir -> 0 = the status view is asked for in the form that is NOT truncated
+  local dir="$1" hits
+  # Measured on the box, OpenZFS 2.4.3, 2026-09-12, image paths of 40/62/63/64/76/100 chars:
+  # `zpool status -P` prints the vdev path in full at every length, while `zpool status -PL`
+  # cuts it at 63 exactly like `zpool list -v`. Adding -L "so both views resolve symlinks the
+  # same way" therefore puts back the very truncation this view exists to remove, and nothing
+  # else offline would notice: the pool simply stops being removable again.
+  hits="$(sed 's/[[:space:]]*#.*$//' "$dir/testpool-lib.sh" | grep -E 'tp_zpool[[:space:]]+status' || true)"
+  [ -n "$hits" ] || return 1
+  grep -qE -- '-P([[:space:]]|$)' <<<"$hits" || return 1
+  grep -qE -- '-[A-Za-z]*L' <<<"$hits" && return 1
+  return 0
+}
+
+audit_no_pipe_grep_q() {  # dir -> 0 = no harness script decides anything through `| grep -q`
+  local dir="$1" f hits
+  # grep -q exits at the first hit; the producer then takes SIGPIPE and `set -o pipefail` turns
+  # its 141 into the pipeline's status, so a match reads as a miss as soon as the text outgrows
+  # a pipe buffer. These scripts decide "is the pool still imported" and "was the scan refused"
+  # that way, so the failure is silent and lands on the destructive side. Here-strings instead.
+  for f in $HARNESS_FILES; do
+    [ -f "$dir/$f" ] || continue
+    hits="$(sed 's/[[:space:]]*#.*$//' "$dir/$f" | grep -E '[|][[:space:]]*grep[[:space:]]+-[A-Za-z]*q' || true)"
+    [ -n "$hits" ] && return 1
+  done
+  return 0
+}
+
 audit_no_nobody() {  # dir -> 0 = no harness script runs anything as `nobody`
   local dir="$1" f hits
   for f in $HARNESS_FILES; do
@@ -475,6 +567,16 @@ audit_rootguard_shared() {  # dir -> 0 = root-guard sources the shared guard, no
 
 audit_bare_zdb "$HERE"          && ok "zdb is invoked only as /usr/sbin/zdb" \
                                 || bad "zdb is invoked only as /usr/sbin/zdb"
+audit_zdb_uncached "$HERE"      && ok "every zdb call names the pool directory (-e -p)" \
+                                || bad "every zdb call names the pool directory (-e -p)"
+audit_zdb_blockdump "$HERE"     && ok "the clone proof reads per-block addresses, not the dataset rootbp" \
+                                || bad "the clone proof reads per-block addresses, not the dataset rootbp"
+audit_reflink_control "$HERE"   && ok "the clone proof carries its own negative control" \
+                                || bad "the clone proof carries its own negative control"
+audit_status_exact "$HERE"      && ok "the status view is read in the form that is not truncated" \
+                                || bad "the status view is read in the form that is not truncated"
+audit_no_pipe_grep_q "$HERE"    && ok "no harness script decides through a «| grep -q» pipeline" \
+                                || bad "no harness script decides through a «| grep -q» pipeline"
 audit_no_nobody "$HERE"         && ok "no harness script runs as nobody" \
                                 || bad "no harness script runs as nobody"
 audit_no_destroy_advice "$HERE" && ok "e2e-g5.sh prints no manual zpool-destroy bypass" \
@@ -567,6 +669,7 @@ mkdir -p "$cl_dir/mount"; chmod 0700 "$cl_dir" "$cl_dir/mount" 2>/dev/null || tr
 : > "$CMDLOG"
 env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" \
     STUB_POOLNAMES="$cl_pool\n" STUB_VDEV="$cl_pool\n\t$cl_canon\n" \
+    STUB_STATUS="$(ct_status "$cl_pool" "$cl_canon")" \
     STUB_DS="$(printf '%s\t%s\n' "$cl_pool" "$cl_dir/mount")" \
     STUB_RM_FAIL_PATH="$cl_dir/pool.img" \
     DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME="$cl_pool" \
@@ -590,6 +693,7 @@ fi
 } > "$cl_dir/manifest.txt"
 env PATH="$BIN:$PATH" STUB_CMDLOG="$CMDLOG" \
     STUB_POOLNAMES="$cl_pool\n" STUB_VDEV="$cl_pool\n\t$cl_canon\n" \
+    STUB_STATUS="$(ct_status "$cl_pool" "$cl_canon")" \
     STUB_DS="$(printf '%s\t%s\n' "$cl_pool" "$cl_dir/mount")" \
     DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME="$cl_pool" \
     bash "$HERE/teardown-test-pool.sh" >/dev/null 2>&1
@@ -638,9 +742,9 @@ rg_run() { env "$@" DEDCOM=/bin/true bash "$HERE/e2e-root-guard.sh" 2>&1 || true
 mkdir -p "$WORK/rg-real/sub"; chmod 0700 "$WORK/rg-real/sub" 2>/dev/null || true
 if ln -s "$WORK/rg-real" "$WORK/rg-link" 2>/dev/null && [ -L "$WORK/rg-link" ]; then
   out="$(rg_run DEDCOM_E2E_ROOT="$WORK/rg-link/sub" DEDCOM_E2E_OWNER_UID="$UID_NOW")"
-  if printf '%s' "$out" | grep -q '========== fixture'; then
+  if grep -q '========== fixture' <<<"$out"; then
     bad "root-guard: a symlink parent in the root -> refused before any fixture" "$out"
-  elif printf '%s' "$out" | grep -Eq 'REFUSED|containment guard refused'; then
+  elif grep -Eq 'REFUSED|containment guard refused' <<<"$out"; then
     ok "root-guard: a symlink parent in the root -> refused before any fixture"
   else
     bad "root-guard: a symlink parent in the root -> refused before any fixture" "$out"
@@ -651,16 +755,16 @@ fi
 
 out="$(rg_run PATH="$BIN:$PATH" STAT_FAKE_PATH="$E2E" STAT_FAKE_UID=4242 \
               DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW")"
-if printf '%s' "$out" | grep -q '========== fixture'; then
+if grep -q '========== fixture' <<<"$out"; then
   bad "root-guard: a foreign-owned chain component -> refused before any fixture" "$out"
-elif printf '%s' "$out" | grep -Eq 'REFUSED|containment guard refused'; then
+elif grep -Eq 'REFUSED|containment guard refused' <<<"$out"; then
   ok "root-guard: a foreign-owned chain component -> refused before any fixture"
 else
   bad "root-guard: a foreign-owned chain component -> refused before any fixture" "$out"
 fi
 
 out="$(rg_run DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW")"
-if printf '%s' "$out" | grep -q '========== fixture'; then
+if grep -q '========== fixture' <<<"$out"; then
   ok "root-guard: a valid root passes the shared guard and reaches the fixture stage"
 else
   bad "root-guard: a valid root passes the shared guard and reaches the fixture stage" "$out"
@@ -722,6 +826,7 @@ chk_create_opts() {  # 0 = zpool create still carries -m under the root and cach
       DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" \
       DEDCOM_TESTPOOL_NAME="$pool" DEDCOM_TESTPOOL_SIZE=1M \
       STUB_VDEV="$pool\n\t$pdir/pool.img\n" \
+      STUB_STATUS="$(ct_status "$pool" "$pdir/pool.img")" \
       STUB_DS="$(printf '%s\t%s\n' "$pool" "$pdir/mount")" \
       bash "$dir/make-test-pool.sh" >/dev/null 2>&1
   line="$(grep -m1 '^zpool create ' "$log" || true)"
@@ -948,6 +1053,11 @@ chk_owner_comparison() {  # 0 = a third uid owning a chain node still refuses
   return 0
 }
 chk_bare_zdb()   { audit_bare_zdb "$1"; }
+chk_zdb_uncached() { audit_zdb_uncached "$1"; }
+chk_zdb_blockdump() { audit_zdb_blockdump "$1"; }
+chk_reflink_control() { audit_reflink_control "$1"; }
+chk_no_pipe_grep_q() { audit_no_pipe_grep_q "$1"; }
+chk_status_exact() { audit_status_exact "$1"; }
 chk_no_nobody()  { audit_no_nobody "$1"; }
 chk_no_advice()  { audit_no_destroy_advice "$1"; }
 
@@ -961,13 +1071,76 @@ mutate "9. owner comparison removed from tp_check_node" testpool-lib.sh \
   "$M_FROM" "$M_TO" chk_owner_comparison
 
 setvar M_FROM <<'EOT'
-    "$G5_ZDB" -dddd "$ds" "$obj" 2>/dev/null \
+    "$G5_ZDB" -e -p "$POOLDIR" -ddddd "$ds" "$obj" 2>/dev/null \
 EOT
 setvar M_TO <<'EOT'
-    zdb -dddd "$ds" "$obj" 2>/dev/null \
+    zdb -e -p "$POOLDIR" -ddddd "$ds" "$obj" 2>/dev/null \
 EOT
 mutate "10. bare zdb restored" e2e-g5.sh \
   "$M_FROM" "$M_TO" chk_bare_zdb
+
+setvar M_FROM <<'EOT'
+    "$G5_ZDB" -e -p "$POOLDIR" -ddddd "$ds" "$obj" 2>/dev/null \
+EOT
+setvar M_TO <<'EOT'
+    "$G5_ZDB" -ddddd "$ds" "$obj" 2>/dev/null \
+EOT
+mutate "11. zdb without -e -p restored" e2e-g5.sh \
+  "$M_FROM" "$M_TO" chk_zdb_uncached
+
+setvar M_FROM <<'EOT'
+    "$G5_ZDB" -e -p "$POOLDIR" -ddddd "$ds" "$obj" 2>/dev/null \
+EOT
+setvar M_TO <<'EOT'
+    "$G5_ZDB" -e -p "$POOLDIR" -dddd "$ds" "$obj" 2>/dev/null \
+EOT
+mutate "12. zdb back to -dddd (dataset rootbp only)" e2e-g5.sh \
+  "$M_FROM" "$M_TO" chk_zdb_blockdump
+
+setvar M_FROM <<'EOT'
+        | sed -n '/^Indirect blocks:/,/^$/p' \
+EOT
+setvar M_TO <<'EOT'
+        | cat \
+EOT
+mutate "13. per-block listing no longer isolated" e2e-g5.sh \
+  "$M_FROM" "$M_TO" chk_zdb_blockdump
+
+setvar M_FROM <<'EOT'
+        | awk '$2 == "L0" { for (i = 3; i <= NF; i++)
+EOT
+setvar M_TO <<'EOT'
+        | awk '$2 != "" { for (i = 3; i <= NF; i++)
+EOT
+mutate "14. indirect metadata counted as data blocks" e2e-g5.sh \
+  "$M_FROM" "$M_TO" chk_zdb_blockdump
+
+setvar M_FROM <<'EOT'
+    dd if="$d/keeper.bin" of="$d/dup.bin" bs=128K status=none
+EOT
+setvar M_TO <<'EOT'
+    cp "$d/keeper.bin" "$d/dup.bin"
+EOT
+mutate "15. reflink fixture built with a cloning cp" e2e-g5.sh \
+  "$M_FROM" "$M_TO" chk_reflink_control
+
+setvar M_FROM <<'EOT'
+        fail "fixture already shares $pre_shared block address(es) before any action — the clone proof would be vacuous"
+EOT
+setvar M_TO <<'EOT'
+        info "fixture already shares $pre_shared block address(es) before any action"
+EOT
+mutate "16. pre-action sharing no longer stops the scenario" e2e-g5.sh \
+  "$M_FROM" "$M_TO" chk_reflink_control
+
+setvar M_FROM <<'EOT'
+    if grep -qxF -- "$1" <<<"$out"; then
+EOT
+setvar M_TO <<'EOT'
+    if printf '%s\n' "$out" | grep -qxF -- "$1"; then
+EOT
+mutate "17. pool presence decided through a grep -q pipeline" e2e-g5.sh \
+  "$M_FROM" "$M_TO" chk_no_pipe_grep_q
 
 setvar M_FROM <<'EOT'
 runuser -u "$OWNER_USER" -- "$DEDCOM" --state-dir "$STATE_FAIL" --scan "$FAILROOT" --no-resume
@@ -975,7 +1148,7 @@ EOT
 setvar M_TO <<'EOT'
 runuser -u nobody -- "$DEDCOM" --state-dir "$STATE_FAIL" --scan "$FAILROOT" --no-resume
 EOT
-mutate "11. runuser nobody restored" e2e-dir-completeness.sh \
+mutate "18. runuser nobody restored" e2e-dir-completeness.sh \
   "$M_FROM" "$M_TO" chk_no_nobody
 
 setvar M_FROM <<'EOT'
@@ -984,7 +1157,7 @@ EOT
 setvar M_TO <<'EOT'
     printf '       recover manually: sudo zpool destroy %s && sudo rm -f %s/pool.img\n' "$POOL" "$POOLDIR" >&2
 EOT
-mutate "12. manual destroy advice restored" e2e-g5.sh \
+mutate "19. manual destroy advice restored" e2e-g5.sh \
   "$M_FROM" "$M_TO" chk_no_advice
 
 # ---- FIX2B mutations: tri-state, verified closure, tmux isolation ----
@@ -1046,6 +1219,7 @@ chk_removal_verified() {  # 0 = a failed artifact removal still turns teardown n
   local rc=0 out
   out="$(env PATH="$BIN:$PATH" STUB_CMDLOG="$WORK/mut.log" \
       STUB_POOLNAMES="$pool\n" STUB_VDEV="$pool\n\t$canon\n" \
+      STUB_STATUS="$(ct_status "$pool" "$canon")" \
       STUB_DS="$(printf '%s\t%s\n' "$pool" "$pdir/mount")" \
       STUB_RM_FAIL_PATH="$pdir/pool.img" \
       DEDCOM_E2E_ROOT="$E2E" DEDCOM_E2E_OWNER_UID="$UID_NOW" DEDCOM_TESTPOOL_NAME="$pool" \
@@ -1072,7 +1246,7 @@ EOT
 setvar M_TO <<'EOT'
         printf 'absent\n'; return 0
 EOT
-mutate "13. a failed enumeration reported as absent" testpool-lib.sh \
+mutate "20. a failed enumeration reported as absent" testpool-lib.sh \
   "$M_FROM" "$M_TO" chk_unknown_not_absent
 
 setvar M_FROM <<'EOT'
@@ -1081,7 +1255,7 @@ EOT
 setvar M_TO <<'EOT'
         ;;   # mutant: carry on after a failed enumeration
 EOT
-mutate "14. make continues past an enumeration error" make-test-pool.sh \
+mutate "21. make continues past an enumeration error" make-test-pool.sh \
   "$M_FROM" "$M_TO" chk_make_enum_gate
 
 setvar M_FROM <<'EOT'
@@ -1090,7 +1264,7 @@ EOT
 setvar M_TO <<'EOT'
         exit 0 ;;   # mutant: residue waved through
 EOT
-mutate "15. absent-plus-residue returns success" teardown-test-pool.sh \
+mutate "22. absent-plus-residue returns success" teardown-test-pool.sh \
   "$M_FROM" "$M_TO" chk_residue_blocked
 
 setvar M_FROM <<'EOT'
@@ -1099,7 +1273,7 @@ EOT
 setvar M_TO <<'EOT'
     return 0   # mutant: residue reported but ignored
 EOT
-mutate "16. removal errors ignored by the closure" teardown-test-pool.sh \
+mutate "23. removal errors ignored by the closure" teardown-test-pool.sh \
   "$M_FROM" "$M_TO" chk_removal_verified
 
 setvar M_FROM <<'EOT'
@@ -1108,7 +1282,7 @@ EOT
 setvar M_TO <<'EOT'
 ptmux() { tmux "$@"; }
 EOT
-mutate "17. a tmux call loses the private socket" e2e-dir-completeness.sh \
+mutate "24. a tmux call loses the private socket" e2e-dir-completeness.sh \
   "$M_FROM" "$M_TO" chk_tmux_private
 
 setvar M_FROM <<'EOT'
@@ -1117,8 +1291,17 @@ EOT
 setvar M_TO <<'EOT'
         tmux kill-server 2>/dev/null \
 EOT
-mutate "18. the global tmux kill-server returns" e2e-dir-completeness.sh \
+mutate "25. the global tmux kill-server returns" e2e-dir-completeness.sh \
   "$M_FROM" "$M_TO" chk_tmux_private
+
+setvar M_FROM <<'EOT'
+    if ! raw="$(tp_zpool status -P "$pool" 2>/dev/null)"; then
+EOT
+setvar M_TO <<'EOT'
+    if ! raw="$(tp_zpool status -PL "$pool" 2>/dev/null)"; then
+EOT
+mutate "26. the status view asked for with -L (truncated again)" testpool-lib.sh \
+  "$M_FROM" "$M_TO" chk_status_exact
 
 echo "== 9. every control must distinguish =="
 
