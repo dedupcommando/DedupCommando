@@ -142,8 +142,8 @@ expect_rejected() {
 	grep -q "$class" <<<"$output" ||
 		fail "$label: output does not name the conflict class '$class'"
 	local stats
-	stats="$(stats_of "$label")"
-	grep -q "$FIXTURE" <<<"$stats" &&
+	stats="$(stats_of "$label")" || fail "$label: the session query itself failed"
+	grep -qF "$FIXTURE" <<<"$stats" &&
 		fail "$label: a scan session was recorded even though the roots were refused"
 	pass "$label: refused ($class), no session recorded"
 }
@@ -202,7 +202,7 @@ grep -q "Duplicate groups:     1" <<<"$output" ||
 # A here-string swallows the exit status of what produced it, so a broken query would read as
 # "no match" and the assertion would pass. Take the status first, the text second.
 control_stats="$(stats_of control)" || fail "control: the session query itself failed"
-grep -q "$FIXTURE/src" <<<"$control_stats" || fail "control: the session must be recorded"
+grep -qF "$FIXTURE/src" <<<"$control_stats" || fail "control: the session must be recorded"
 pass "control: scanned to completion, one group found"
 
 banner "RESULT"

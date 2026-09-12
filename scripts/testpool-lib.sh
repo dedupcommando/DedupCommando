@@ -354,22 +354,40 @@ tp_pool_status_vdevs() {
             if (hdr)  { print "REFUSED: a second config header in zpool status" > "/dev/stderr"; bail = 4; exit bail }
             hdr = 1; incfg = 1; next
         }
-        !incfg { next }
-        /^[ \t]*$/ { incfg = 0; next }
+        # Once the block has ended it stays ended. Without the latch a bare blank line inside the
+        # block silently dropped every leaf below it and still returned 0: the pool came back with
+        # fewer vdevs than it has, which is the one direction a teardown must never be told.
+        !incfg {
+            if (closed && $0 ~ /^\t/) {
+                print "REFUSED: a config row after the block had ended" > "/dev/stderr"; bail = 4; exit bail
+            }
+            next
+        }
+        /^[ \t]*$/ { incfg = 0; closed = 1; next }
         {
             if ($0 !~ /^\t/) { printf("REFUSED: config row without a leading tab: [%s]\n", $0) > "/dev/stderr"; bail = 5; exit bail }
             row = substr($0, 2)
             indent = match(row, /[^ ]/) - 1
             body = row; sub(/^ +/, "", body)
+            # Trailing blanks are presentation, not part of the name. Measured on the box: a real
+            # section header prints as a single "logs" + TAB and nothing else, so without this it
+            # came back as a name CONTAINING whitespace and was refused as unreadable instead of
+            # as the section it is. The AVAIL column of a spare is padded the same way.
+            sub(/[[:blank:]]+$/, "", body)
             # zpool separates the name from the STATE column by two or more spaces. Splitting on
             # the FIRST space instead would silently turn «/root/my pool/pool.img» into
             # «/root/my» — an absolute path that passes every rule below and is then handed
             # to a destroy. Split on the column gap, then refuse a name that still holds whitespace,
             # and refuse a row whose next column is not a STATE.
-            name = body; sub(/[ \t][ \t]+.*$/, "", name)
-            rest = substr(body, length(name) + 1); sub(/^[ \t]+/, "", rest)
+            # POSIX classes, not [ \t]: an awk that does not take the escape inside a bracket
+            # expression would read it as "space, backslash or the letter t" and cut a path at
+            # the first «t». A vdev path whose LAST character is a space stays indistinguishable
+            # here — its own space merges with the column gap — and is left to the exact compare
+            # against readlink -f "$TP_IMG" downstream, which cannot be fooled by it.
+            name = body; sub(/[[:blank:]][[:blank:]]+.*$/, "", name)
+            rest = substr(body, length(name) + 1); sub(/^[[:blank:]]+/, "", rest)
             if (name == "") { print "REFUSED: empty vdev name in status" > "/dev/stderr"; bail = 2; exit bail }
-            if (name ~ /[ \t]/) {
+            if (name ~ /[[:blank:]]/) {
                 printf("REFUSED: vdev name «%s» contains whitespace — this view cannot be parsed\n", name) > "/dev/stderr"; bail = 9; exit bail
             }
             if (indent == 0) {
@@ -386,7 +404,7 @@ tp_pool_status_vdevs() {
             # A leaf row always carries a STATE. A section header («logs», «cache») does not,
             # but it sits at indent 0 and was already refused above, so requiring the column here
             # costs nothing and catches a row this parser cannot read.
-            if (rest !~ /^(ONLINE|DEGRADED|FAULTED|OFFLINE|UNAVAIL|REMOVED|AVAIL|INUSE|SPLIT)([ \t]|$)/) {
+            if (rest !~ /^(ONLINE|DEGRADED|FAULTED|OFFLINE|UNAVAIL|REMOVED|AVAIL|INUSE|SPLIT)([[:blank:]]|$)/) {
                 printf("REFUSED: row «%s» is not followed by a STATE column — unreadable\n", body) > "/dev/stderr"; bail = 9; exit bail
             }
             if (indent != 2) { printf("REFUSED: vdev row nested %d deep — harness has no containers\n", indent) > "/dev/stderr"; bail = 6; exit bail }

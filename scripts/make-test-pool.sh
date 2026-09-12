@@ -44,7 +44,47 @@ truncate -s "$TP_SIZE" "$TP_IMG"
 # The two options that keep this pool inside the root and out of the host's cache:
 #   -m "$TP_MNT"          every dataset inherits a mountpoint under $DEDCOM_E2E_ROOT
 #   -o cachefile=none     the host does not record this pool and will not re-import it
+# From the moment the pool exists until the manifest describes it, ANY exit leaves an imported
+# pool that teardown can never confirm: it reads the pool identity FROM the manifest, so with no
+# manifest it BLOCKS for ever and the pool stays on the shared host. `set -e` makes that window
+# several statements wide (the two `zfs create`s, the containment assertion, the manifest write),
+# so the removal is a trap over the whole window rather than an `if` around one call.
+#
+# Destroying here is not destroying on faith: this process created that pool seconds ago, under a
+# name it chose, and the trap re-checks before acting — the pool must still be enumerated, and it
+# must still have exactly our image as its single leaf. If either check cannot be made, nothing is
+# destroyed and the operator is told what to remove.
+tp_created_cleanup() {
+    local rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    echo "REFUSED: the pool was created but never got a verified manifest (exit $rc)." >&2
+    echo "         Without one, teardown-test-pool.sh can never confirm it, so it is removed now." >&2
+    if [ "$(tp_pool_presence "$TP_POOL")" != "present" ]; then
+        echo "         pool '$TP_POOL' is not enumerated — nothing to remove." >&2
+        exit "$rc"
+    fi
+    local leaves expected
+    if ! leaves="$(tp_pool_leaf_vdevs "$TP_POOL")" || ! expected="$(tp_expected_vdevs)"; then
+        echo "         its topology cannot be confirmed — NOTHING is removed." >&2
+        echo "         remove it by hand after checking: zpool status -P $TP_POOL" >&2
+        exit "$rc"
+    fi
+    if [ "$leaves" != "$expected" ]; then
+        echo "         its leaf-vdevs are not this run's image — NOTHING is removed." >&2
+        echo "         expected: $expected" >&2
+        echo "         actual:   $leaves" >&2
+        exit "$rc"
+    fi
+    if tp_zpool destroy "$TP_POOL"; then
+        echo "         pool '$TP_POOL' destroyed." >&2
+    else
+        echo "         pool '$TP_POOL' could NOT be destroyed — remove it by hand." >&2
+    fi
+    exit "$rc"
+}
+
 zpool create -o cachefile=none -m "$TP_MNT" "$TP_POOL" "$TP_IMG"
+trap tp_created_cleanup EXIT
 
 zfs create -o mountpoint="$TP_MNT/ds_a" "$TP_POOL/ds_a"
 zfs create -o mountpoint="$TP_MNT/ds_b" "$TP_POOL/ds_b"
@@ -52,21 +92,10 @@ zfs create -o mountpoint="$TP_MNT/ds_b" "$TP_POOL/ds_b"
 # Identity, verified the moment it exists rather than assumed at teardown time.
 tp_assert_dataset_mounts_contained "$TP_POOL" || {
     echo "REFUSED: a dataset of '$TP_POOL' is mounted outside $TP_MNT" >&2; exit 1; }
-# The pool exists by now, so a manifest failure would leave an imported pool that teardown can
-# never confirm (it reads the pool identity FROM the manifest) — the leaked-pool-on-a-shared-host
-# state this harness exists to avoid. This process created the pool seconds ago and knows its
-# name, which is the one case where destroying without a manifest is not destroying on faith.
-if ! tp_manifest_write "$TP_POOL"; then
-    echo "REFUSED: could not record the pool manifest" >&2
-    echo "         removing the pool this run had just created, so nothing is left behind:" >&2
-    if zpool destroy "$TP_POOL" 2>&1 | sed 's/^/           /' >&2; then
-        echo "         pool '$TP_POOL' destroyed." >&2
-    else
-        echo "         pool '$TP_POOL' could NOT be destroyed — remove it by hand." >&2
-    fi
-    exit 1
-fi
+tp_manifest_write "$TP_POOL" || { echo "REFUSED: could not record the pool manifest" >&2; exit 1; }
 tp_manifest_verify || { echo "REFUSED: the pool does not match the manifest just written" >&2; exit 1; }
+# The pool is now describable by its own manifest, so teardown can confirm and remove it.
+trap - EXIT
 
 mkdir -p "$TP_MNT/ds_a/dup" "$TP_MNT/ds_b/dup"
 head -c 1M /dev/urandom > "$TP_MNT/ds_a/dup/orig.bin"

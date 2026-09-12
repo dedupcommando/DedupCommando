@@ -846,8 +846,12 @@ EOF
         printf '%s\n' "          where <field> is the first part of the identity that no longer matches:"
         printf '%s\n' "          device, inode, size, mtime, mtime_nsec, ctime, ctime_nsec or link count."
         printf '%s\n' "     In both cases no file has moved and nothing has reached the quarantine."
-        printf '%s\n' "     Note which of the two you saw. A screen that reports the actions as DONE means"
-        printf '%s\n' "     the batch ran: stop and report it."
+        printf '%s\n' "     A screen that reports the actions as DONE means the batch ran: stop and report it."
+        printf '%s\n' "     The acknowledgement below is the letter of the screen you saw, then your initials:"
+        printf '%s\n' "       a<initials>  the summary carrying BATCH REFUSED, or"
+        printf '%s\n' "       b<initials>  the panels carrying the Actions failed status line."
+        printf '%s\n' "     Nothing else in this scenario can tell the two apart, or tell either of them from"
+        printf '%s\n' "     a batch you cancelled instead of applying, so this letter is the only record."
         printf '%s\n' "  4. Leave the screen you got — the key depends on which one it was:"
         route_exit_summary
         printf '%s\n' "       F10 (q) from the Commander panels of (b), where no summary ever opened."
@@ -901,6 +905,10 @@ EOF
         printf '%s\n' "        — action cancelled»"
         printf '%s\n' "     In both cases dup.bin must still be at its own path with its new content. A"
         printf '%s\n' "     screen that reports the hardlink as done is a failure of this scenario."
+        printf '%s\n' "     The acknowledgement at the end is the letter of the outcome, then your initials:"
+        printf '%s\n' "       a<initials>  the refusal that arrived already at x, or"
+        printf '%s\n' "       b<initials>  the refusal that arrived after Y, on the summary."
+        printf '%s\n' "     Nothing else in this scenario records which of the two happened."
         printf '%s\n' " 11. Leave the screen you got — the key depends on which one it was:"
         route_exit_summary
         printf '%s\n' "       F10 (q) from the Commander panels of (a), where no summary ever opened."
@@ -922,8 +930,20 @@ EOF
 }
 
 # One human pause: markers, the record, and an acknowledgement that fails closed.
+# Pauses whose contract accepts more than one screen. The product refuses a whole batch in two
+# visibly different ways, so the text has to describe both — and the moment it does, the harness
+# can no longer tell a refusal from an operator who cancelled and walked away: every file check it
+# runs afterwards is satisfied by both. The acknowledgement is what closes that gap, so for these
+# pauses it is not initials but the letter of the screen that actually appeared.
+pause_outcomes() {  # index -> allowed outcome letters, empty when the pause has one screen
+    case "$1" in
+        06|09) printf 'ab' ;;
+        *)     printf '' ;;
+    esac
+}
+
 operator_pause() {  # index scenario
-    local idx="$1" scen="$2" body ack
+    local idx="$1" scen="$2" body ack want
     case " $G5_PAUSE_SEEN " in
         *" $idx "*) fail "pause $idx was emitted twice"; return 1 ;;
     esac
@@ -935,7 +955,14 @@ operator_pause() {  # index scenario
     printf '\nPAUSE %s BEGIN scenario=%s pool=%s state=%s fixture=%s scan=%s\n' \
            "$idx" "$scen" "$POOL" "$STATE" "$G5_FIXTURE" "$G5_SCAN"
     printf '%s\n' "$body" | sed 's/^/      /'
-    printf '\n      Type your initials, then ENTER, to record the acknowledgement: '
+    want="$(pause_outcomes "$idx")"
+    if [ -n "$want" ]; then
+        printf '\n      Type the letter of the screen you actually saw (%s), then your initials,\n' \
+               "$(printf '%s' "$want" | sed 's/./&, /g; s/, $//')"
+        printf '      then ENTER: '
+    else
+        printf '\n      Type your initials, then ENTER, to record the acknowledgement: '
+    fi
     if ! IFS= read -r ack; then
         printf '\nPAUSE %s ABORT reason=eof\n' "$idx" >&2
         fail "pause $idx: end of input — no acknowledgement was ever given"
@@ -945,6 +972,22 @@ operator_pause() {  # index scenario
         printf '\nPAUSE %s ABORT reason=blank\n' "$idx" >&2
         fail "pause $idx: blank acknowledgement"
         return 1
+    fi
+    if [ -n "$want" ]; then
+        local letter
+        letter="$(printf '%s' "$ack" | tr -d '[:space:]' | cut -c1 | tr '[:upper:]' '[:lower:]')"
+        case "$want" in
+            *"$letter"*) ;;
+            *)
+                printf '\nPAUSE %s ABORT reason=outcome\n' "$idx" >&2
+                fail "pause $idx: the acknowledgement must start with the letter of the screen that appeared (one of: $want), got: $ack"
+                return 1 ;;
+        esac
+        # Recorded on its own line so the run log says WHICH refusal the operator saw. The file
+        # checks that follow cannot tell the two apart, and neither can they tell either of them
+        # from a cancelled batch; this line is the only evidence of that in the whole scenario.
+        printf 'PAUSE %s HUMAN-ACK outcome=%s initials=%s\n' "$idx" "$letter" "$ack"
+        return 0
     fi
     printf 'PAUSE %s HUMAN-ACK initials=%s\n' "$idx" "$ack"
 }
@@ -1021,7 +1064,15 @@ except OSError: pass' "$1" "$2"
 }
 # `-print -quit` stops at the first hit inside find itself; piping into `grep -q` would race
 # find to the SIGPIPE and report a quarantined file as missing under pipefail.
-quarantined() { [ -n "$(find "$PMNT" -path '*/.dedcom-quarantine/*' -name "$1" -print -quit 2>/dev/null)" ]; }
+#
+# Status 2 is deliberately NOT "nothing was quarantined": `quarantined x || ok "nothing moved"` is
+# a pass branch in two scenarios, so a find that could not run would announce the very thing it
+# failed to check. The caller distinguishes 0 (found), 1 (searched, absent) and 2 (could not look).
+quarantined() {
+    local hit
+    hit="$(find "$PMNT" -path '*/.dedcom-quarantine/*' -name "$1" -print -quit 2>/dev/null)" || return 2
+    [ -n "$hit" ]
+}
 
 # Data-block addresses of one file's data blocks, sorted and de-duplicated (R2D-C5-2).
 #
@@ -1057,7 +1108,7 @@ dvas_of() {  # dataset abspath -> "vdev:offset:asize" per data block
         | awk '$2 == "L0" { for (i = 3; i <= NF; i++)
                                 if ($i ~ /^[0-9]+:[0-9a-f]+:[0-9a-f]+$/ && $i !~ /^[0-9]+:0:0$/)
                                     print $i }' \
-        | sort -u
+        | LC_ALL=C sort -u
 }
 
 # How many data-block addresses two files hold in common.
@@ -1065,9 +1116,12 @@ dvas_of() {  # dataset abspath -> "vdev:offset:asize" per data block
 # `grep -c .` exits 1 on zero matches, which is a legitimate answer here, so it cannot simply be
 # `|| true`: that would turn a broken `comm` into "0 shared" as well, and 0 is exactly what the
 # pre-action control reads as a pass. Count the lines with something that cannot fail on empty.
-shared_dvas() {  # dataset fileA fileB -> count on stdout
+shared_dvas() {  # dataset fileA fileB -> count on stdout, non-zero status if it could not compare
     local common
-    common="$(comm -12 <(dvas_of "$1" "$2") <(dvas_of "$1" "$3"))" || return 1
+    # LC_ALL=C on both halves: `comm` refuses input its own collation calls unsorted, and the two
+    # sides are only comparable if they agreed on the order. The sort above is pinned for the same
+    # reason.
+    common="$(LC_ALL=C comm -12 <(dvas_of "$1" "$2") <(dvas_of "$1" "$3"))" || return 1
     printf '%s\n' "$common" | sed '/^$/d' | wc -l
 }
 
@@ -1143,7 +1197,14 @@ scenario_reflink() {
     local pre_keep pre_dup pre_shared
     pre_keep="$(dvas_of "$POOL/ds_a" "$d/keeper.bin" | grep -c .)"
     pre_dup="$(dvas_of "$POOL/ds_a" "$d/dup.bin" | grep -c .)"
-    pre_shared="$(shared_dvas "$POOL/ds_a" "$d/keeper.bin" "$d/dup.bin")"
+    # The status, not just the output. A scenario body runs with errexit suppressed (`run` calls
+    # it as `scenario_x || rc=1`), so a failed comparison would come back as the EMPTY STRING, and
+    # `[ "" -ne 0 ]` is not false — it is status 2, which every `if` below reads as "no". The
+    # control would then announce itself green without having compared anything.
+    pre_shared="$(shared_dvas "$POOL/ds_a" "$d/keeper.bin" "$d/dup.bin")" || {
+        fail "the block-address comparison itself failed — the clone proof cannot run"
+        return
+    }
     if [ "$pre_keep" -eq 0 ] || [ "$pre_dup" -eq 0 ]; then
         fail "$G5_ZDB lists no data blocks for the fixture — block sharing cannot be proven either way"
         return
@@ -1167,7 +1228,10 @@ scenario_reflink() {
     local n_keep n_dup shared
     n_keep="$(dvas_of "$POOL/ds_a" "$d/keeper.bin" | grep -c .)"
     n_dup="$(dvas_of "$POOL/ds_a" "$d/dup.bin" | grep -c .)"
-    shared="$(shared_dvas "$POOL/ds_a" "$d/keeper.bin" "$d/dup.bin")"
+    shared="$(shared_dvas "$POOL/ds_a" "$d/keeper.bin" "$d/dup.bin")" || {
+        fail "the block-address comparison itself failed — block sharing is UNPROVEN"
+        return
+    }
     if [ "$n_keep" -eq 0 ] || [ "$n_dup" -eq 0 ]; then
         fail "$G5_ZDB produced no DVAs — block sharing is UNPROVEN (do not call this scenario green)"
     elif [ "$shared" -eq 0 ]; then
@@ -1413,8 +1477,11 @@ scenario_preflight() {
     banner "verify the batch refused itself before touching anything"
     [ -f "$d/alias_a.bin" ] && ok "alias_a.bin untouched — no file was mutated" \
                             || fail "alias_a.bin moved: the batch ran past a plan that no longer held"
-    quarantined "alias_a.bin" && fail "alias_a.bin reached the quarantine — a mutation happened" \
-                              || ok "nothing was moved to quarantine"
+    case "$(quarantined "alias_a.bin"; echo $?)" in
+        0) fail "alias_a.bin reached the quarantine — a mutation happened" ;;
+        1) ok "nothing was moved to quarantine" ;;
+        *) fail "the quarantine could not be searched — cannot say whether anything moved" ;;
+    esac
     local snaps_after; snaps_after="$(zfs list -H -t snapshot -o name -r "$POOL" | wc -l)"
     info "snapshots before=$snaps_before after=$snaps_after (a safety snapshot may exist; it must be reported)"
     info "the summary screen must name every snapshot it created and say the batch was refused"

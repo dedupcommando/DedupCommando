@@ -229,8 +229,18 @@ check "pause 09 leaves the drifted field open" "$?"
 for idx in 06 09; do
     has "$idx" "device, inode, size, mtime, mtime_nsec, ctime, ctime_nsec or link count"
     check "pause $idx lists every field the refusal can name" "$?"
-    ! has "$idx" "changed since the scan (mtime) —"
-    check "pause $idx does not pin one field as the expected one" "$?"
+    # Every one of the eight, not just the one that happened to be written here before: banning a
+    # single literal would let the next edit re-pin a different one.
+    pinned=""
+    for field in device inode size mtime mtime_nsec ctime ctime_nsec "link count"; do
+        if has "$idx" "changed since the scan ($field)"; then pinned="$pinned $field"; fi
+    done
+    [ -z "$pinned" ]
+    check "pause $idx pins no single field as the expected one (${pinned:-none})" "$?"
+    # Two screens described, so the outcome has to be recorded; the file checks cannot tell them
+    # apart, nor either of them from a cancelled batch.
+    has "$idx" "then your initials"
+    check "pause $idx asks for the outcome letter with the acknowledgement" "$?"
 done
 has 05 "LEAVE THE OVERLAY OPEN";          check "pause 05 stops with the overlay open"       "$?"
 has 05 "stage 1 of 2";                    check "pause 05 names its stage"                   "$?"

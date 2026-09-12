@@ -508,6 +508,14 @@ audit_reflink_control() {  # dir -> 0 = the clone proof carries its own negative
   # and the scenario must measure the sharing BEFORE the action and refuse to go on if it is
   # not zero — otherwise a check that always answers "shared" looks like a pass.
   case "$body" in *'pre_shared="$(shared_dvas'*) ;; *) return 1 ;; esac
+  # BEFORE the action, or it is not a control at all: the same measurement taken afterwards would
+  # simply be the result again.
+  awk '/pre_shared="[$]\(shared_dvas/ { before = NR }
+       /operator_pause 02/            { if (!before) exit 1 }
+       END { exit(before ? 0 : 1) }' <<<"$body" || return 1
+  # and the status of that measurement has to be looked at: a failed comparison returns nothing,
+  # and `[ "" -ne 0 ]` is status 2, which every `if` reads as "no".
+  case "$body" in *'"$d/dup.bin")" || {'*) ;; *) return 1 ;; esac
   awk '
       /pre_shared" -ne 0/          { w = 1; next }
       w && /^[[:space:]]*fail /    { found = 1 }
@@ -538,7 +546,10 @@ audit_no_pipe_grep_q() {  # dir -> 0 = no harness script decides anything throug
   # that way, so the failure is silent and lands on the destructive side. Here-strings instead.
   for f in $HARNESS_FILES; do
     [ -f "$dir/$f" ] || continue
-    hits="$(sed 's/[[:space:]]*#.*$//' "$dir/$f" | grep -E '[|][[:space:]]*grep[[:space:]]+-[A-Za-z]*q' || true)"
+    # The whole pipe stage, not just an option cluster glued to the pipe: `grep -F -q`,
+    # `grep -m1 -q`, `grep --quiet` and `LC_ALL=C grep -q` are all the same construct, and the
+    # narrow form matched none of them.
+    hits="$(sed 's/[[:space:]]*#.*$//' "$dir/$f" | grep -E '[|][^|]*[^A-Za-z_-]grep[^|]*(-[A-Za-z]*q|--quiet|--silent)' || true)"
     [ -n "$hits" ] && return 1
   done
   return 0
@@ -1315,7 +1326,9 @@ for pristine_fn in chk_create_opts chk_prefix_cleanup chk_make_enum_gate chk_uid
                    chk_symlink_guard chk_removal_verified chk_residue_blocked \
                    chk_unknown_not_absent chk_dataset_mounts chk_guid_failopen \
                    chk_owner_comparison chk_no_root_mount chk_no_tmp chk_bare_zdb \
-                   chk_no_nobody chk_no_advice chk_tmux_private; do
+                   chk_no_nobody chk_no_advice chk_tmux_private \
+                   chk_zdb_uncached chk_zdb_blockdump chk_reflink_control \
+                   chk_no_pipe_grep_q chk_status_exact; do
   if ! "$pristine_fn" "$pristine_dir" >/dev/null 2>&1; then
     vacuous="$vacuous $pristine_fn"
   fi

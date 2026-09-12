@@ -139,7 +139,12 @@ mkstatus() {  # pool leaf...
   printf '\nerrors: No known data errors\n'
 }
 
-# scenario LABEL PRESENT LISTRC DESTRC VDEV MKIMG WANT_EC WANT_DESTROY WANT_IMG [SYMLINK] [STATUS] [STATUSRC]
+# scenario LABEL PRESENT LISTRC DESTRC VDEV MKIMG WANT_EC WANT_DESTROY WANT_IMG [SYMLINK] [STATUS] [STATUSRC] [REASON]
+#
+# REASON is an ERE the refusal text must match. Without it a case only asserts THAT teardown
+# refused, and a refusal from an earlier guard passes just as well — which is how two cases here
+# quietly stopped exercising the check they were written for once a new guard landed in front of
+# them. A case that names a specific guard must pin that guard's own words.
 #
 # STATUS defaults to the view that AGREES with a healthy single-image pool; a case that wants the
 # two kernel views to disagree passes its own. @IMGCUT@ is the image path with its last four
@@ -147,6 +152,7 @@ mkstatus() {  # pool leaf...
 scenario() {
   local label="$1" present="$2" listrc="$3" destrc="$4" vdev="$5" mkimg="$6"
   local wec="$7" wdes="$8" wimg="$9" symlink="${10:-no}" status="${11:-}" statusrc="${12:-0}"
+  local reason="${13:-}"
   N=$((N+1))
   local pool="tp$N"
   local dir="$E2E/pools/$pool"; mkdir -p "$dir/mount"; chmod 0700 "$dir" "$dir/mount" 2>/dev/null || true
@@ -185,6 +191,7 @@ scenario() {
   if [ "$ec"  != "$wec"  ]; then err="$err ec=$ec(want $wec)"; fi
   if [ "$des" != "$wdes" ]; then err="$err destroy=$des(want $wdes)"; fi
   if [ "$wimg" != "na" ] && [ "$imgstate" != "$wimg" ]; then err="$err img=$imgstate(want $wimg)"; fi
+  if [ -n "$reason" ] && ! grep -qE -- "$reason" <<<"$out"; then err="$err reason!~/$reason/"; fi
   if [ -z "$err" ]; then ok "$label"; else fail "$label" "$err"$'\n'"$out"; fi
 }
 
@@ -199,10 +206,14 @@ scenario "mirror container -> refuse" \
   1 0 0 "@SUM@\n\tmirror-0\n\t@IMG@\n\t/dev/sdb\n" yes  1 no exists
 
 scenario "real disk only (same name) -> refuse" \
-  1 0 0 "@SUM@\n\t/dev/sdb\n" yes  1 no exists
+  1 0 0 "@SUM@\n\t/dev/sdb\n" yes  1 no exists no \
+  "  pool: @SUM@\n state: ONLINE\nconfig:\n\n\tNAME  STATE     READ WRITE CKSUM\n\t@SUM@  ONLINE       0     0     0\n\t  /dev/sdb  ONLINE       0     0     0\n" \
+  0 "did not match the harness config"
 
 scenario "our image + extra stripe disk -> refuse" \
-  1 0 0 "@SUM@\n\t@IMG@\n\t/dev/sdb\n" yes  1 no exists
+  1 0 0 "@SUM@\n\t@IMG@\n\t/dev/sdb\n" yes  1 no exists no \
+  "  pool: @SUM@\n state: ONLINE\nconfig:\n\n\tNAME  STATE     READ WRITE CKSUM\n\t@SUM@  ONLINE       0     0     0\n\t  @IMG@  ONLINE       0     0     0\n\t  /dev/sdb  ONLINE       0     0     0\n" \
+  0 "did not match the harness config"
 
 scenario "summary has extra TAB field -> refuse" \
   1 0 0 "@SUM@\tMALFORMED\n\t@IMG@\n" yes  1 no exists
@@ -214,8 +225,13 @@ scenario "ZFS 2.3 vdev row carries property columns -> destroy" \
 
 # The image file is real (require_real_image passes), but the CANONICAL path of the actual vdev
 # fails (the parent doesn't exist) -> refuse without destroy (no fallback to the raw path).
+#
+# BOTH views have to name that path, or the cross-check between them refuses first and this case
+# stops touching the canonicalization guard it is named for.
 scenario "actual vdev canon fails -> refuse" \
-  1 0 0 "@SUM@\n\t/nonexistent-dedcom-canon-probe/pool.img\n" yes  1 no exists
+  1 0 0 "@SUM@\n\t/nonexistent-dedcom-canon-probe/pool.img\n" yes  1 no exists no \
+  "  pool: @SUM@\n state: ONLINE\nconfig:\n\n\tNAME  STATE     READ WRITE CKSUM\n\t@SUM@  ONLINE       0     0     0\n\t  /nonexistent-dedcom-canon-probe/pool.img  ONLINE       0     0     0\n" \
+  0 "canonicalization of the actual vdev path"
 
 scenario "garbage row (no leading tab) -> refuse" \
   1 0 0 "@SUM@\nTHIS_IS_NOT_A_VDEV\n" yes  1 no exists
@@ -277,8 +293,14 @@ echo "== identity guard: GUID, datasets, containment =="
 
 # One helper for the identity cases: a legitimate-looking pool whose manifest and stub answers
 # are made to disagree in exactly one place.
-identity_case() {  # label guid_stub ds_stub want_ec want_destroy
-  local label="$1" guid="$2" ds="$3" wec="$4" wdes="$5"
+# identity_case LABEL GUID_STUB DS_TEMPLATE WANT_EC WANT_DESTROY [REASON]
+#
+# DS_TEMPLATE is a plain template with @P@ for the pool name and @M@ for the mount directory,
+# NOT a printf format: a format couples the row count to an argument count, and when a third row
+# was added the two silently went out of step — printf reused the format for the leftovers and
+# the case stopped testing what its label says.
+identity_case() {
+  local label="$1" guid="$2" ds="$3" wec="$4" wdes="$5" reason="${6:-}"
   N=$((N+1))
   local pool="tp$N"
   local dir="$E2E/pools/$pool"; mkdir -p "$dir/mount"; chmod 0700 "$dir" "$dir/mount" 2>/dev/null || true
@@ -286,19 +308,21 @@ identity_case() {  # label guid_stub ds_stub want_ec want_destroy
   local canon; canon="$(readlink -f "$img")"
   local mds; mds="$(printf 'dataset\t%s\t%s\ndataset\t%s\t%s\n' "$pool" "$dir/mount" "$pool/ds_a" "$dir/mount/ds_a")"
   mkmanifest "$dir" "$pool" "$GUID_OK" "$canon" "$mds"
+  local ds_rows="${ds//@P@/$pool}"; ds_rows="${ds_rows//@M@/$dir/mount}"
   : > "$DLOG"
   local out ec
   out="$(PATH="$BIN:$PATH" STUB_DESTROY_LOG="$DLOG" DEDCOM_TESTPOOL_NAME="$pool" \
          FIX_PRESENT=1 FIX_POOLNAME="$pool" \
          FIX_LIST_RC=0 FIX_DESTROY_RC=0 FIX_VDEV="$pool\n\t$canon\n" \
          FIX_STATUS="$(mkstatus "$pool" "$canon")" \
-         FIX_GUID="$guid" FIX_DS="$(printf "$ds" "$pool" "$dir/mount" "$pool" "$dir/mount")\n" \
+         FIX_GUID="$guid" FIX_DS="${ds_rows}\n" \
          bash "$TEARDOWN" 2>&1)"; ec=$?
   local des=no
   if grep -q STUB-DESTROY "$DLOG" 2>/dev/null; then des=yes; fi
   local err=""
   if [ "$ec"  != "$wec"  ]; then err="$err ec=$ec(want $wec)"; fi
   if [ "$des" != "$wdes" ]; then err="$err destroy=$des(want $wdes)"; fi
+  if [ -n "$reason" ] && ! grep -qE -- "$reason" <<<"$out"; then err="$err reason!~/$reason/"; fi
   if [ -z "$err" ]; then ok "$label"; else fail "$label" "$err"$'\n'"$out"; fi
 }
 
@@ -333,7 +357,20 @@ scenario "status names another pool -> REFUSE, no destroy" \
 
 scenario "status carries a logs section -> REFUSE, no destroy" \
   1 0 0 "@SUM@\n\t@IMG@\n" yes  1 no exists no \
-  "  pool: @SUM@\n state: ONLINE\nconfig:\n\n\tNAME  STATE     READ WRITE CKSUM\n\t@SUM@  ONLINE       0     0     0\n\t  @IMG@  ONLINE       0     0     0\n\tlogs\t\n\t  /root/log.img  ONLINE       0     0     0\n\nerrors: No known data errors\n"
+  "  pool: @SUM@\n state: ONLINE\nconfig:\n\n\tNAME  STATE     READ WRITE CKSUM\n\t@SUM@  ONLINE       0     0     0\n\t  @IMG@  ONLINE       0     0     0\n\tlogs\t\n\t  /root/log.img  ONLINE       0     0     0\n\nerrors: No known data errors\n" \
+  0 "second top-level row"
+
+scenario "status carries a spares section -> REFUSE, no destroy" \
+  1 0 0 "@SUM@\n\t@IMG@\n" yes  1 no exists no \
+  "  pool: @SUM@\n state: ONLINE\nconfig:\n\n\tNAME  STATE     READ WRITE CKSUM\n\t@SUM@  ONLINE       0     0     0\n\t  @IMG@  ONLINE       0     0     0\n\tspares\n\t  /root/spare.img  AVAIL\n\nerrors: No known data errors\n" \
+  0 "second top-level row"
+
+# A bare blank line inside the block used to end it silently and drop every leaf below, so the
+# pool came back with fewer vdevs than it has — the one direction a destroy must never be told.
+scenario "status hides a leaf behind a blank line -> REFUSE, no destroy" \
+  1 0 0 "@SUM@\n\t@IMG@\n" yes  1 no exists no \
+  "  pool: @SUM@\n state: ONLINE\nconfig:\n\n\tNAME  STATE     READ WRITE CKSUM\n\t@SUM@  ONLINE       0     0     0\n\t  @IMG@  ONLINE       0     0     0\n\n\t  /root/hidden.img  ONLINE       0     0     0\n" \
+  0 "after the block had ended"
 
 scenario "status has no config block -> REFUSE, no destroy" \
   1 0 0 "@SUM@\n\t@IMG@\n" yes  1 no exists no \
@@ -374,8 +411,12 @@ echo "== mutations: the guards this change adds must each be a kill =="
 # the parser's remaining shape rules are defence in depth behind the exact image compare, and
 # they are proved one by one in the shape cases above instead of being given a fake kill here.
 MUTN=0
-line_sub() {  # file whole-line-from whole-line-to  -> 0 if exactly that line was replaced
-  local file="$1" from="$2" to="$3" n
+line_sub() {  # file whole-line-from whole-line-to  -> 0 if EXACTLY ONE such line was replaced
+  local file="$1" from="$2" to="$3" n hits
+  # Exactly one, not the first of several: patching one copy of a duplicated line would leave the
+  # guard standing and the mutation would be reported as a kill it never earned.
+  hits="$(grep -cxF -- "$from" "$file")" || return 1
+  [ "$hits" = 1 ] || return 1
   n="$(grep -nxF -- "$from" "$file" | head -1 | cut -d: -f1)"
   [ -n "$n" ] || return 1
   TO="$to" awk -v n="$n" 'NR == n { print ENVIRON["TO"]; next } { print }' "$file" > "$file.mut" \
@@ -413,13 +454,15 @@ mut_scenario "mutation: the status pool-name rule removed -> another pool's conf
   "  pool: someother\n state: ONLINE\nconfig:\n\n\tNAME  STATE     READ WRITE CKSUM\n\tsomeother  ONLINE       0     0     0\n\t  @IMG@  ONLINE       0     0     0\n\nerrors: No known data errors\n"
 
 identity_case "matching identity -> destroy" \
-  "$GUID_OK" '%s\t%s\n%s/ds_a\t%s/ds_a\n' 0 yes
+  "$GUID_OK" '@P@\t@M@\n@P@/ds_a\t@M@/ds_a\n' 0 yes
 
 identity_case "GUID changed since create -> REFUSE, no destroy" \
-  2222222222222222222 '%s\t%s\n%s/ds_a\t%s/ds_a\n' 1 no
+  2222222222222222222 '@P@\t@M@\n@P@/ds_a\t@M@/ds_a\n' 1 no \
+  "now has GUID"
 
 identity_case "dataset set changed since create -> REFUSE, no destroy" \
-  "$GUID_OK" '%s\t%s\n%s/ds_a\t%s/ds_a\n%s/ds_c\t%s/ds_c\n' 1 no
+  "$GUID_OK" '@P@\t@M@\n@P@/ds_a\t@M@/ds_a\n@P@/ds_c\t@M@/ds_c\n' 1 no \
+  "dataset set or mountpoints"
 
 N=$((N+1))
 esc_pool="tp$N"; esc_dir="$E2E/pools/$esc_pool"; mkdir -p "$esc_dir/mount"
