@@ -77,6 +77,10 @@ mod version_tests {
 }
 
 fn main() {
+    // Before anything can print. The runtime ignores SIGPIPE, which turns `dedcom --stats | head`
+    // into a panic on EPIPE (exit 101) instead of the quiet end every other tool gives.
+    signals::restore_default_sigpipe();
+
     let cli = match cli::Cli::parse() {
         Ok(cli) => cli,
         Err(msg) => {
@@ -157,6 +161,21 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
     let (lock_state, holder, mut lock_to_hold) = match lock::try_acquire(&state_dir) {
         Ok(lock::Acquire::Operator(guard)) => (lock::LockState::Held, None, Some(guard)),
         Ok(lock::Acquire::Busy(h)) => (lock::LockState::Busy, h, None),
+        // Something else under the lock's name is its own answer, not "the lock is unknown": the
+        // advice for an unevaluable lock is to move the state directory or use --force, and both
+        // are wrong here. The error carries which shape it was — a link, a second name, a device
+        // node — because "is a symbolic link" sends the operator looking for a link that is not
+        // there when the answer was a block device.
+        Err(err) if lock::is_not_our_lock_file(&err) => {
+            eprintln!(
+                "dedcom: {err}.\n\
+                 The lock file is truncated and rewritten on every start, so dedcom will not\n\
+                 write through anything that is not a plain file of its own. Remove it, or point\n\
+                 --state-dir at a directory dedcom owns. --force does not apply: this is not a\n\
+                 lock that could not be evaluated, it is a file that is not ours."
+            );
+            return Ok(());
+        }
         Err(err) => {
             // NOT «continue as operator»: we have no idea whether one is already running.
             tracing::warn!("single-instance lock could not be evaluated: {err}");
@@ -178,7 +197,7 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
             return Ok(());
         }
         let who = holder
-            .map(|h| format!(" (PID {}, since {})", h.pid, h.since))
+            .map(|h| format!(" (PID {}, since {})", h.pid, textsan::terminal(&h.since)))
             .unwrap_or_default();
         eprintln!(
             "dedcom: another instance is already running{who}.\n\
@@ -489,6 +508,16 @@ fn acquire_write_lock(cli: &cli::Cli) -> Result<Option<lock::InstanceLock>> {
     let (lock_state, holder, guard) = match lock::try_acquire(&state_dir) {
         Ok(lock::Acquire::Operator(g)) => (lock::LockState::Held, None, Some(g)),
         Ok(lock::Acquire::Busy(h)) => (lock::LockState::Busy, h, None),
+        // See the TUI path: this is not an unevaluable lock, and the standing advice for one
+        // ("move the state directory, or --force") would be wrong in both halves.
+        Err(err) if lock::is_not_our_lock_file(&err) => {
+            return Err(AppError::msg(format!(
+                "write cancelled: {err}. The lock file is truncated and rewritten on every start, \
+                 so dedcom will not write through anything that is not a plain file of its own. \
+                 Remove it, or point --state-dir at a directory dedcom owns; --force does not \
+                 apply."
+            )))
+        }
         Err(err) => {
             // Used to return Ok(None) — the write then proceeded with no lock whatsoever.
             tracing::warn!("single-instance lock could not be evaluated: {err}");
@@ -506,7 +535,7 @@ fn acquire_write_lock(cli: &cli::Cli) -> Result<Option<lock::InstanceLock>> {
         ))),
         _ => {
             let who = holder
-                .map(|h| format!(" (PID {}, since {})", h.pid, h.since))
+                .map(|h| format!(" (PID {}, since {})", h.pid, textsan::terminal(&h.since)))
                 .unwrap_or_default();
             Err(AppError::msg(format!(
                 "write cancelled{who}: held by another instance or --read-only given — \
@@ -1316,6 +1345,43 @@ const EXPORT_WRITER_CAPACITY: usize = 256 * 1024;
 ///
 /// Read-only, and still without the instance lock: it opens the checkpoint read-only, writes only
 /// its own artifact, and takes one consistent snapshot rather than a lock.
+/// Refuses to publish over a name that is currently a symbolic link.
+///
+/// The publication is a rename onto the name the operator gave, so a symlink there is not written
+/// THROUGH — it is replaced, and the link itself is destroyed. That is the safer of the two
+/// automatic choices (the link's target survives untouched), but it is still damage the operator
+/// did not ask for, and on a system path it is damage that lasts: `--export-csv /dev/stdout` run
+/// as root replaces the system's own `/dev/stdout` link with an ordinary file until the next boot.
+/// Writing through the link instead would be worse, so neither is done: the operator is told, and
+/// picks a real pathname.
+///
+/// The check is `fstatat(AT_SYMLINK_NOFOLLOW)` on the ALREADY-OPENED destination directory, not on
+/// the pathname, so the DIRECTORY cannot be re-pointed between the check and the rename. The NAME
+/// still can: this is a check-then-rename, the window between them holds the checkpoint open and
+/// the whole CSV write, and a link planted inside it would be replaced by `renameat` exactly as
+/// before. That is deliberate, not overlooked — there is no "replace unless it is a symlink"
+/// primitive to make it atomic, and the threat this guards is an operator typo, not a racing
+/// attacker. What holds in every case, race included, is that the bytes go to the NAME and the
+/// link's target is never written through; `the_publication_itself_never_writes_through_a_link`
+/// pins that half.
+fn refuse_symlink_destination(
+    parent: &paths::DirHandle,
+    name: &std::ffi::OsStr,
+    out_path: &Path,
+) -> Result<()> {
+    let shown = textsan::terminal(&out_path.display().to_string());
+    match parent.is_symlink_at(name) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(AppError::msg(format!(
+            "the export destination {shown} is a symbolic link. Publishing replaces the name, \
+             which would destroy the link itself — give a regular pathname instead."
+        ))),
+        Err(err) => Err(AppError::msg(format!(
+            "cannot tell whether the export destination {shown} is a symbolic link: {err}"
+        ))),
+    }
+}
+
 fn run_export_csv(cli: &cli::Cli, out_path: &Path) -> Result<()> {
     // The destination directory is opened ONCE, here, and every step below acts on that handle.
     // Both halves matter. The protected-state check has to compare directory OBJECTS, because a
@@ -1331,6 +1397,7 @@ fn run_export_csv(cli: &cli::Cli, out_path: &Path) -> Result<()> {
         ))
     })?;
     refuse_dedcoms_own_state(cli, &parent, &artifact_name, out_path)?;
+    refuse_symlink_destination(&parent, &artifact_name, out_path)?;
     // Test seam: anything that could re-point the destination pathname lands exactly here, after
     // the check and before the publication. The handle above is what publishes, so a swap must
     // not move the artifact.
@@ -1617,10 +1684,12 @@ impl TempArtifact {
     /// Durability first, then the atomic replacement of the final name — inside the directory
     /// this artifact has held open all along.
     ///
-    /// The rename replaces the NAME the operator gave, deliberately: if the destination is a
-    /// symlink, its target is never written through. Re-exporting over an existing file is the
-    /// ordinary case, so this is a plain replace rather than `RENAME_NOREPLACE` — that rule
-    /// belongs to the destructive action path, where the target is a file nobody asked to lose.
+    /// The rename replaces the NAME the operator gave, so a symlink's target is never written
+    /// through. A symlink AT that name is refused earlier, by `refuse_symlink_destination`:
+    /// replacing it would destroy the link, which on a system path (`/dev/stdout`) lasts until
+    /// the next boot. Re-exporting over an existing regular file is the ordinary case, so this is
+    /// a plain replace rather than `RENAME_NOREPLACE` — that rule belongs to the destructive
+    /// action path, where the target is a file nobody asked to lose.
     fn publish(mut self) -> Result<()> {
         self.file.sync_data()?;
         self.dir.rename(&self.temp, &self.dest).map_err(|err| {
@@ -2635,9 +2704,13 @@ mod export_csv_tests {
         assert!(rig.residue().is_empty(), "Drop ran during the unwind");
     }
 
-    /// G18 — the destination NAME is replaced; a symlink's target is never written through.
+    /// G18 — a symlink's target is never written through. It never was: publishing is a rename
+    /// onto the NAME, so the link was replaced rather than followed. But replacing it destroys
+    /// the link, and as root with a typo that link can be a system one — `--export-csv
+    /// /dev/stdout` left the system without its own `/dev/stdout` until the next boot. So the
+    /// answer is now neither: refuse, and leave the link and its target exactly as they were.
     #[test]
-    fn a_symlinked_destination_is_replaced_not_followed() {
+    fn a_symlinked_destination_is_refused_and_both_it_and_its_target_survive() {
         let rig = Rig::new("symlink");
         let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
         complete_derived(&mut rig.store(), &rows, 0xB6);
@@ -2645,20 +2718,24 @@ mod export_csv_tests {
         std::fs::write(&target, b"not to be overwritten\n").unwrap();
         std::os::unix::fs::symlink(&target, rig.dest()).unwrap();
 
-        let csv = rig.export();
-        assert!(csv.starts_with("group,keep"), "the export succeeded");
+        let err = run_export_csv(&rig.cli(), &rig.dest())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symbolic link"), "{err}");
         assert_eq!(
             std::fs::read(&target).unwrap(),
             b"not to be overwritten\n",
             "the link's target is untouched"
         );
         assert!(
-            !std::fs::symlink_metadata(rig.dest())
+            std::fs::symlink_metadata(rig.dest())
                 .unwrap()
                 .file_type()
                 .is_symlink(),
-            "the name now holds the artifact itself"
+            "and the link itself is still a link"
         );
+        assert_eq!(std::fs::read_link(rig.dest()).unwrap(), target);
+        assert!(rig.residue().is_empty(), "no temporary file left behind");
     }
 
     /// The published artifact is not world-readable: it is the pool's complete pathname
@@ -2911,6 +2988,95 @@ mod export_csv_tests {
             assert_eq!(modified(&dest), stamp);
             assert!(rig.residue().is_empty());
         }
+    }
+
+    /// G18 proper: the publication itself must never write THROUGH a link, independently of the
+    /// refusal above.
+    ///
+    /// The refusal is a check-then-rename, and the window between them holds the checkpoint open,
+    /// the trusted-export open and the whole CSV write — minutes on a real pool. A link planted
+    /// inside that window is not caught, and `renameat` then replaces the name (POSIX `rename(2)`:
+    /// `newpath` is removed, never resolved). That is the accepted outcome for an operator typo,
+    /// but the property that must hold in every case is that the link's TARGET is untouched: the
+    /// bytes go to the name, and the name only.
+    ///
+    /// Without this, reverting `publish` to `fs::copy(temp, dest)` — which would follow the link
+    /// and overwrite its target — leaves the suite green, because the refusal fires first and no
+    /// test ever reaches the publication over a link.
+    #[test]
+    fn the_publication_itself_never_writes_through_a_link() {
+        let rig = Rig::new("publishlink");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        complete_derived(&mut rig.store(), &rows, 0xB7);
+
+        let target = rig.dir.join("elsewhere.csv");
+        std::fs::write(&target, b"not to be overwritten\n").unwrap();
+
+        // The seam fires AFTER refuse_symlink_destination and BEFORE the publication — exactly
+        // the window a real race would use.
+        let dest = rig.dest();
+        let link_target = target.clone();
+        let swap = ExportParentSwap::armed(move || {
+            std::os::unix::fs::symlink(&link_target, &dest).unwrap();
+        });
+
+        run_export_csv(&rig.cli(), &rig.dest()).unwrap();
+        assert!(swap.fired(), "the seam must have been reached");
+
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"not to be overwritten\n",
+            "the link's target must not have been written through"
+        );
+        assert!(
+            !std::fs::symlink_metadata(rig.dest())
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the destination name now holds the artifact itself"
+        );
+        let body = std::fs::read_to_string(rig.dest()).unwrap();
+        assert!(
+            body.starts_with("group,keep"),
+            "and it is the export: {body:.40}"
+        );
+        assert!(rig.residue().is_empty(), "no temporary file left behind");
+    }
+
+    /// A dangling link is still a link: the refusal must not depend on the target existing, or
+    /// the one case where replacing it is silently harmless teaches the wrong rule.
+    #[test]
+    fn a_dangling_symlink_at_the_destination_is_refused_too() {
+        let rig = Rig::new("dangling");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        complete_derived(&mut rig.store(), &rows, 0xD2);
+
+        let dest = rig.dir.join("export.csv");
+        std::os::unix::fs::symlink(rig.dir.join("nowhere"), &dest).unwrap();
+
+        let err = run_export_csv(&rig.cli(), &dest).unwrap_err().to_string();
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(std::fs::symlink_metadata(&dest)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// And the ordinary case still works: re-exporting over yesterday's regular file replaces it.
+    /// Without this the fix could be "refuse everything" and the tests above would not notice.
+    #[test]
+    fn an_ordinary_existing_file_is_still_replaced() {
+        let rig = Rig::new("replace");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        complete_derived(&mut rig.store(), &rows, 0xD3);
+
+        let dest = rig.dir.join("export.csv");
+        std::fs::write(&dest, b"yesterday\n").unwrap();
+
+        run_export_csv(&rig.cli(), &dest).unwrap();
+        let body = std::fs::read_to_string(&dest).unwrap();
+        assert!(body.contains("/tank/a"), "{body}");
+        assert!(!body.contains("yesterday"), "{body}");
     }
 
     /// The destination directory is opened once and pinned: re-pointing the path afterwards must

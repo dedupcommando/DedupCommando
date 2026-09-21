@@ -37,10 +37,31 @@ pub fn load(state_dir: &Path) -> Option<Consent> {
 }
 
 /// Saves the consent to disk. Returns whether it succeeded (like `board.json`).
+///
+/// `O_NOFOLLOW` and `O_TRUNC` rather than `fs::write`, which is the same primitive without the
+/// first flag: this is the same hazard the lock file has, in the same directory. `--state-dir`
+/// takes any pathname the operator types, and a link left at `consent.json` would send the
+/// truncation to whatever it points at. Every other writer under the state directory already
+/// refuses to follow one — the checkpoint (`prepare_db_file`), the logs (`logging::make_writer`),
+/// the export temp (`DirHandle::create_new_file`) — and this was the last one that did not.
+///
+/// Still best-effort: a consent that cannot be written is a notice shown again next time, not a
+/// reason to stop, so the refusal comes back as `false` exactly like every other failure here.
 pub fn save(state_dir: &Path, consent: &Consent) -> bool {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let path = consent_path(state_dir);
-    match serde_json::to_string_pretty(consent) {
-        Ok(json) => std::fs::write(&path, json).is_ok(),
+    let Ok(json) = serde_json::to_string_pretty(consent) else {
+        return false;
+    };
+    let opened = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path);
+    match opened {
+        Ok(mut file) => file.write_all(json.as_bytes()).is_ok(),
         Err(_) => false,
     }
 }
@@ -51,6 +72,79 @@ pub fn should_show_disclaimer(saved: Option<&Consent>, current_version: u32) -> 
     match saved {
         Some(c) => !(c.suppressed && c.disclaimer_version == current_version),
         None => true,
+    }
+}
+
+#[cfg(test)]
+mod symlink_tests {
+    use super::*;
+
+    /// The consent file is truncated and rewritten in place, so a link left under its name would
+    /// empty whatever it points at — the same hazard as the lock file, in the same directory and
+    /// reachable by the same `--state-dir` typo. Saving must refuse and leave both alone.
+    #[test]
+    fn a_symlinked_consent_file_is_not_followed() {
+        let dir = std::env::temp_dir().join(format!("dedcom_consent_link_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("precious.txt");
+        std::fs::write(&victim, b"keep me\n").unwrap();
+        std::os::unix::fs::symlink(&victim, consent_path(&dir)).unwrap();
+
+        let saved = save(
+            &dir,
+            &Consent {
+                suppressed: true,
+                disclaimer_version: 1,
+            },
+        );
+
+        assert!(!saved, "saving through a symlink must not report success");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"keep me\n",
+            "the link's target must not be truncated"
+        );
+        assert!(
+            std::fs::symlink_metadata(consent_path(&dir))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "and the link itself must still be a link"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And the ordinary case still round-trips, or "refuse everything" would pass the test above.
+    #[test]
+    fn an_ordinary_consent_file_is_written_and_read_back() {
+        let dir = std::env::temp_dir().join(format!("dedcom_consent_ok_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(save(
+            &dir,
+            &Consent {
+                suppressed: true,
+                disclaimer_version: 7,
+            }
+        ));
+        let back = load(&dir).expect("what was just written must read back");
+        assert!(back.suppressed);
+        assert_eq!(back.disclaimer_version, 7);
+
+        // And a second save replaces it rather than appending to it.
+        assert!(save(
+            &dir,
+            &Consent {
+                suppressed: false,
+                disclaimer_version: 8,
+            }
+        ));
+        let back = load(&dir).expect("the replacement must read back too");
+        assert!(!back.suppressed);
+        assert_eq!(back.disclaimer_version, 8);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

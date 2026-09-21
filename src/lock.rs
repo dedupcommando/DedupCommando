@@ -119,16 +119,65 @@ fn lock_path(state_dir: &Path) -> PathBuf {
     state_dir.join(LOCK_FILE)
 }
 
+/// Whether this [`try_acquire`] error means the lock NAME holds something dedcom may not write to.
+///
+/// Three shapes, one answer, and each carries its own sentence in the error itself — a symbolic
+/// link, a file with more than one name, a device or other non-regular node. The caller prints
+/// that sentence rather than guessing which one it was: told "is a symbolic link" about a block
+/// device, an operator goes looking for a link that is not there.
+///
+/// Recognised by `ErrorKind::InvalidInput` with no errno, which is the shape `try_acquire`
+/// composes for exactly these and for nothing else. Everything else — EACCES, ENOSPC, an NFS
+/// mount without lockd — stays a "the lock could not be evaluated" condition, whose standing
+/// advice is to move the state directory or push past with `--force`. Neither applies here: this
+/// is not the state directory dedcom made, and `--force` would proceed with no lock at all rather
+/// than fix anything.
+pub fn is_not_our_lock_file(err: &std::io::Error) -> bool {
+    err.raw_os_error().is_none() && err.kind() == std::io::ErrorKind::InvalidInput
+}
+
 /// Tries to acquire `flock(LOCK_EX|LOCK_NB)` without waiting. Success → writes
 /// PID+time and returns [`Acquire::Operator`]. Held → [`Acquire::Busy`].
+///
+/// The very next thing that happens to this file is `set_len(0)` and a write, so what is behind
+/// the name has to be established before that, not assumed. `O_NOFOLLOW` rules out a symbolic
+/// link. It rules out nothing else, and two other shapes carry the same truncation to somewhere
+/// it was never meant to go:
+///
+/// - a HARD link, which looks exactly like a regular file at open time. A state directory copied
+///   with `cp -al` or `rsync --link-dest` is full of them, and truncating one empties its partner;
+/// - a DEVICE node. As root, `--state-dir` at a directory whose `dedcom.lock` is a block device
+///   opens fine, `set_len(0)` fails silently on it, and the PID and timestamp land at offset 0 of
+///   the device. This project has a post-mortem for exactly that outcome.
+///
+/// So the fd is `fstat`ed and has to be a regular file with exactly one link. Anything else is
+/// refused by name, and the operator is told which file it is. The state directory is 0700 and
+/// normally nobody else can put anything there — but `--state-dir` takes any pathname the
+/// operator types, and being wrong about this costs someone their data.
 pub fn try_acquire(state_dir: &Path) -> std::io::Result<Acquire> {
+    use std::os::unix::fs::OpenOptionsExt;
     let path = lock_path(state_dir);
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&path)?;
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|err| {
+            // ELOOP from THIS open is the trailing component and nothing else — but only because
+            // of a caller obligation, not because of anything here. `O_NOFOLLOW` constrains just
+            // the last component (`open(2)`); a link anywhere in the `--state-dir` prefix would
+            // raise ELOOP too. `establish_state_dir` runs first at both call sites and walks every
+            // component from `/` with `openat(O_DIRECTORY|O_NOFOLLOW)`, refusing any link in the
+            // chain, so by the time this runs `dedcom.lock` is the only component left.
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                not_our_lock_file(&path, "is a symbolic link")
+            } else {
+                err
+            }
+        })?;
+    require_plain_lock_file(&file, &path)?;
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
         write_holder(&file);
@@ -145,6 +194,42 @@ pub fn try_acquire(state_dir: &Path) -> std::io::Result<Acquire> {
     }
 }
 
+/// Refuses a lock fd that is not a regular file with exactly one name.
+///
+/// `InvalidInput` and no errno, so [`is_planted_symlink`] can recognise it alongside the ELOOP a
+/// symbolic link produces: from the operator's side all three are the same answer — the file
+/// under that name is not one this program may truncate.
+fn require_plain_lock_file(file: &File, path: &Path) -> std::io::Result<()> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` owns a valid fd for the whole call, and `st` is a repr(C) aggregate of
+    // integers for which an all-zero value is valid.
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Err(not_our_lock_file(path, "is not a regular file"));
+    }
+    if st.st_nlink != 1 {
+        return Err(not_our_lock_file(
+            path,
+            &format!("has {} names, not one", st.st_nlink),
+        ));
+    }
+    Ok(())
+}
+
+/// One shape for every "the name holds something else" refusal: `InvalidInput` with no errno, so
+/// [`is_not_our_lock_file`] recognises it, carrying the sentence the operator needs to read.
+fn not_our_lock_file(path: &Path, what: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "the lock file {} {what}",
+            crate::textsan::terminal(&path.display().to_string())
+        ),
+    )
+}
+
 /// Writes the PID+time to the lock file (diagnostics). Errors are ignored — the
 /// lock is already ours, the contents are merely informational.
 fn write_holder(file: &File) {
@@ -159,6 +244,12 @@ fn write_holder(file: &File) {
 }
 
 /// Reads the PID+time from the lock file. `None` if the file is empty/unreadable.
+///
+/// Re-opens by path rather than reading the fd above, because on the busy branch that fd belongs
+/// to the failed `flock` attempt and is dropped before this runs. The path was proven not to be a
+/// link moments earlier, and the payload is only a pid and a timestamp that the caller prints
+/// through `textsan::terminal` — but the re-open is the one place in this module that still
+/// resolves a name instead of holding a descriptor.
 fn read_holder(path: &Path) -> Option<Holder> {
     let mut s = String::new();
     File::open(path).ok()?.read_to_string(&mut s).ok()?;
@@ -258,6 +349,91 @@ mod tests {
             std::env::temp_dir().join(format!("dedcom_lock_test_{}_{}", std::process::id(), n));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A symlink under the lock's name must not be followed: acquiring the lock truncates the
+    /// file and writes the PID into it, so following the link would empty whatever it points at.
+    /// Both the link and its target have to come back untouched.
+    #[test]
+    fn a_symlinked_lock_file_is_refused_and_its_target_survives() {
+        let dir = temp_state_dir();
+        let victim = dir.join("precious.txt");
+        std::fs::write(&victim, b"keep me\n").unwrap();
+        std::os::unix::fs::symlink(&victim, lock_path(&dir)).unwrap();
+
+        match try_acquire(&dir) {
+            Err(err) => {
+                assert!(
+                    is_not_our_lock_file(&err),
+                    "the refusal must be recognisable as «not our file», not a generic failure: {err}"
+                );
+                assert!(
+                    err.to_string().contains("is a symbolic link"),
+                    "and must say which shape it was: {err}"
+                );
+            }
+            Ok(_) => panic!("a symlinked lock file must not be acquired"),
+        }
+
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"keep me\n",
+            "the link's target must not be truncated"
+        );
+        assert!(
+            std::fs::symlink_metadata(lock_path(&dir))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "and the link itself must still be a link"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hard link is indistinguishable from a regular file at open time, and truncating one
+    /// empties its partner. `cp -al` and `rsync --link-dest` copies of a state directory are full
+    /// of them, so this is not a hypothetical shape.
+    #[test]
+    fn a_hard_linked_lock_file_is_refused_by_its_link_count() {
+        let dir = temp_state_dir();
+        let victim = dir.join("precious.txt");
+        std::fs::write(&victim, b"keep me\n").unwrap();
+        std::fs::hard_link(&victim, lock_path(&dir)).unwrap();
+
+        match try_acquire(&dir) {
+            Err(err) => {
+                assert!(is_not_our_lock_file(&err), "{err}");
+                assert!(
+                    err.to_string().contains("names, not one"),
+                    "a hard link must be named as one, not called a symlink: {err}"
+                );
+            }
+            Ok(_) => panic!("a hard-linked lock file must not be acquired"),
+        }
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"keep me\n",
+            "the partner name must not be truncated"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ordinary case must keep working, or "refuse everything" would pass the tests above.
+    #[test]
+    fn a_regular_lock_file_is_still_acquired() {
+        let dir = temp_state_dir();
+        let lock = match try_acquire(&dir).unwrap() {
+            Acquire::Operator(lock) => lock,
+            Acquire::Busy(_) => panic!("an unheld lock must grant the operator role"),
+        };
+        assert!(lock_path(&dir).is_file(), "the lock file is a regular file");
+        let body = std::fs::read_to_string(lock_path(&dir)).unwrap();
+        assert!(
+            body.starts_with(&std::process::id().to_string()),
+            "and carries this process's pid: {body:?}"
+        );
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

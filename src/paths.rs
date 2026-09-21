@@ -345,8 +345,9 @@ pub const PROTECTED_STATE_ENTRIES: [&str; 5] = [
 /// The comparison is the canonicalized **parent directory** plus the final basename, never the
 /// canonicalized destination itself. That distinction is the whole point: `../dedcom/dedcom.db`
 /// and a symlinked alias of the state directory both resolve to the same parent and are caught,
-/// while an ordinary final symlink (`groups.csv -> elsewhere.csv`) keeps the accepted behaviour of
-/// being replaced as a NAME, with its target never followed.
+/// while an ordinary final symlink (`groups.csv -> elsewhere.csv`) is REFUSED by
+/// `refuse_symlink_destination` in `main.rs` — replacing it destroys the link, which on a system
+/// path lasts until the next boot. Its target is never written through in either case.
 ///
 /// `None` when the basename is not one of the protected entries, when the path has no filename, or
 /// when either directory cannot be canonicalized — a destination whose directory does not exist is
@@ -429,6 +430,32 @@ impl DirHandle {
         }
         // SAFETY: fd >= 0 and just obtained from openat — we own it.
         Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+
+    /// Whether `name` in this directory is a symbolic link.
+    ///
+    /// `Ok(false)` when the name does not exist — nothing is there to be a link. Any OTHER error
+    /// is returned rather than swallowed: the caller uses this to decide whether it may replace
+    /// the name, and "I could not look" is not "it is fine".
+    pub fn is_symlink_at(&self, name: &OsStr) -> io::Result<bool> {
+        let c = name_cstring(name)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                self.fd.as_raw_fd(),
+                c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                return Ok(false);
+            }
+            return Err(err);
+        }
+        Ok(st.st_mode & libc::S_IFMT == libc::S_IFLNK)
     }
 
     /// Removes a name from this directory.

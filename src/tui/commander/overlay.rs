@@ -489,9 +489,79 @@ mod resume_tests {
     }
 }
 
+#[cfg(test)]
+mod info_overlay_size_tests {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn lines(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("line {i}")).collect()
+    }
+
+    /// A terminal can be any size the user drags it to, and the file-info overlay is the one
+    /// place that asked for a minimum taller than the screen. Four rows is one less than the
+    /// minimum it wanted, which is where `clamp(5, height)` gets a min above its max and the
+    /// standard library panics — inside the draw closure, with the terminal still in raw mode,
+    /// so the shell is left unusable as well.
+    #[test]
+    fn renders_in_a_terminal_shorter_than_the_overlays_minimum() {
+        for height in 1..=6u16 {
+            let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+            // A panic inside the closure propagates rather than becoming an `Err`, so the
+            // failure this test catches is the panic itself, not this expect.
+            terminal
+                .draw(|frame| super::render_info(frame, &lines(12)))
+                .expect("the test backend must not fail");
+        }
+    }
+
+    /// The same corner from the other side: one column and one row, which is what a terminal
+    /// reports mid-resize, plus an empty line list so the width falls back to its default.
+    #[test]
+    fn renders_in_a_one_by_one_terminal() {
+        let mut terminal = Terminal::new(TestBackend::new(1, 1)).unwrap();
+        terminal
+            .draw(|frame| super::render_info(frame, &[]))
+            .expect("the test backend must not fail");
+    }
+
+    /// And the ordinary size still shows the content, so the fix is not "draw nothing".
+    #[test]
+    fn still_draws_the_lines_at_a_normal_size() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| super::render_info(frame, &lines(3)))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            text.contains("line 0"),
+            "the overlay must still show its content"
+        );
+        assert!(text.contains("line 2"), "including the last line");
+    }
+}
+
 /// Draws the file-info overlay (F3).
+///
+/// The height is «as tall as the content, but at least 5 rows and never taller than the screen»,
+/// and the order of those two is not a detail: written as `clamp(5, screen_height)` it panics
+/// whenever the screen is shorter than 5 rows, because `clamp` requires min <= max. A terminal
+/// is whatever size the user drags it to, and the panic happens inside the draw closure with the
+/// terminal still in raw mode, so it takes the shell down with it. Raise to the minimum first,
+/// then cut to what the screen actually has; on a screen shorter than 5 rows the overlay simply
+/// gets the rows there are. `centered` clips the width the same way.
 pub fn render_info(frame: &mut Frame, lines: &[String]) {
-    let height = (lines.len() as u16 + 2).clamp(5, frame.area().height);
+    let height = (lines.len().saturating_add(2)).min(u16::MAX as usize) as u16;
+    // NOT `clamp(5, frame.area().height)`, however much it reads like one: `clamp` panics when
+    // min > max, and min > max is exactly the case here — a terminal shorter than five rows. This
+    // is the defect. `clippy::manual_clamp` proposes the panicking form for this shape, so the
+    // allow is part of the fix, not a lint being silenced for convenience.
+    #[allow(clippy::manual_clamp)]
+    let height = height.max(5).min(frame.area().height);
     let width = lines
         .iter()
         .map(|line| line.chars().count())

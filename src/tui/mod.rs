@@ -40,6 +40,14 @@ pub struct TerminalGuard {
 
 impl TerminalGuard {
     pub fn enter() -> io::Result<Self> {
+        // `main` puts SIGPIPE back to its default for the headless modes, where ending at a closed
+        // pipe is what a shell pipeline means. The TUI is the opposite case: nothing here checks
+        // that stdout is a terminal, so `dedcom | tee session.log` really does draw into a pipe,
+        // and the default disposition would end the process at the write syscall — no unwinding,
+        // so no `Drop` below, so the operator keeps raw mode and the alternate screen and gets no
+        // message. Ignored for as long as this guard lives; the draw call then returns the EPIPE
+        // and the restore happens on the way out.
+        crate::signals::ignore_sigpipe();
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -72,6 +80,9 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // The terminal is going away, so the reason for ignoring SIGPIPE goes with it: whatever
+        // prints after this is an ordinary command-line write and should end at a closed pipe.
+        crate::signals::restore_default_sigpipe();
         if self.keyboard_enhanced {
             let _ = execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags);
         }

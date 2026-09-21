@@ -7386,8 +7386,12 @@ mod session_store_failures_are_never_empty_data_tests {
             app_flat.contains(".map(|open| open.files.clone()) .unwrap_or_default()"),
             "the open-group rows keep their real optional default"
         );
+        // The needle names the holder map's tail, not its whole body: the body gained a
+        // `textsan::terminal` around `h.since` (the timestamp is read from a file and printed to
+        // the terminal), and the property this test defends is the `unwrap_or_default` on a
+        // genuinely optional holder, not the formatting inside it.
         assert!(
-            main_flat.contains("h.pid, h.since)) .unwrap_or_default()"),
+            main_flat.contains("textsan::terminal(&h.since))) .unwrap_or_default()"),
             "the lock-holder description keeps its real optional default"
         );
     }
