@@ -51,10 +51,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         rows[0],
     );
 
-    // The currently processed path — truncated on the left.
+    // The currently processed path — escaped, then truncated on the left.
     if let Some(path) = &scanning.current_path {
         let text = ellipsize_left(
-            &path.display().to_string(),
+            &crate::textsan::path(path),
             rows[1].width.saturating_sub(2) as usize,
         );
         frame.render_widget(

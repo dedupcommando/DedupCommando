@@ -134,7 +134,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 .commander
                 .pending_scan_roots
                 .first()
-                .map(|path| path.display().to_string())
+                .map(|path| crate::textsan::path(path))
                 .unwrap_or_default();
             overlay::render_resume_scan(
                 frame,
@@ -252,7 +252,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let dedup = match app.commander.dedup_scan_id {
         None => format!(
             "no scan for {} · F12 — select",
-            app.commander.active_panel().cwd.display()
+            crate::textsan::path(&app.commander.active_panel().cwd)
         ),
         Some(id) => {
             let when = scan_created_at(app, id)
@@ -359,7 +359,8 @@ pub(crate) fn apply_auto_switch(app: &mut App, cwd: &Path, target: Option<i64>) 
             app.spawn_dedup_load(Some(id));
         }
         None => {
-            app.commander.status = format!("No scan for {} · F12 — select", cwd.display());
+            app.commander.status =
+                format!("No scan for {} · F12 — select", crate::textsan::path(cwd));
             app.commander.dedup = dedup::DedupCache::default();
             app.commander.dedup_scan_id = None;
             app.commander.group_summaries = Vec::new();
@@ -383,7 +384,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, visible: usize) {
                 .sources
                 .first()
                 .and_then(|path| path.file_name())
-                .map(|name| format!("«{}»", name.to_string_lossy()))
+                .map(|name| format!("«{}»", crate::textsan::os_str(name)))
                 .unwrap_or_else(|| "file".to_string())
         } else {
             format!("{} files", pending.sources.len())
@@ -415,7 +416,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, visible: usize) {
             panel.entries.len(),
         )
     } else {
-        format!(" {} ", app.commander.status)
+        format!(" {} ", crate::tui::status_shown(&app.commander.status))
     };
     let text = if total > visible {
         format!(
@@ -856,7 +857,11 @@ fn change_panel_root(app: &mut App) {
         .unwrap_or(0);
     let target = roots[next].clone();
     navigate_panel(app, panel_index, target.clone());
-    app.commander.status = format!("Panel {} → {}", panel_index + 1, target.display());
+    app.commander.status = format!(
+        "Panel {} → {}",
+        panel_index + 1,
+        crate::textsan::path(&target)
+    );
 }
 
 /// Shift+F1: opens the active panel's directory in all the other panels.
@@ -869,7 +874,7 @@ fn sync_panels(app: &mut App) {
             navigate_panel(app, index, cwd.clone());
         }
     }
-    app.commander.status = format!("Panels synchronized: {}", cwd.display());
+    app.commander.status = format!("Panels synchronized: {}", crate::textsan::path(&cwd));
 }
 
 /// Shift+F2: compares the directories of the active and adjacent panels. Covered by a scan —
@@ -907,8 +912,8 @@ fn compare_panels(app: &mut App) {
     } else {
         app.commander.status = format!(
             "Scanning for comparison: {} ↔ {}",
-            active_cwd.display(),
-            other_cwd.display(),
+            crate::textsan::path(&active_cwd),
+            crate::textsan::path(&other_cwd),
         );
         app.commander_scan(vec![active_cwd, other_cwd]);
     }
@@ -1046,15 +1051,16 @@ fn recompute_dir_size(app: &mut App) {
             return;
         }
     };
+    let shown = crate::textsan::path(&path);
     if is_pseudo_fs(&path) {
-        app.commander.status = format!("{} — pseudo-FS, size not computed", path.display());
+        app.commander.status = format!("{shown} — pseudo-FS, size not computed");
         return;
     }
     if app.commander.dir_size_pending.contains(&path) {
-        app.commander.status = format!("Size already being computed: {}", path.display());
+        app.commander.status = format!("Size already being computed: {shown}");
         return;
     }
-    app.commander.status = format!("Computing directory size: {}", path.display());
+    app.commander.status = format!("Computing directory size: {shown}");
     enqueue_dir_size(app, path);
 }
 
@@ -1284,7 +1290,7 @@ fn save_confirm_script(app: &mut App) {
     let path = dir.join(format!("{ts}.sh"));
     let result = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &script));
     app.commander.status = match result {
-        Ok(()) => format!("Script saved: {}", path.display()),
+        Ok(()) => format!("Script saved: {}", crate::textsan::path(&path)),
         Err(err) => format!("Failed to save script: {err}"),
     };
 }
@@ -1335,7 +1341,7 @@ fn run_menu_action(app: &mut App, action: MenuAction) {
 /// Starts a scan of the active panel's directory.
 fn scan_active_panel(app: &mut App) {
     let cwd = app.commander.active_panel().cwd.clone();
-    app.commander.status = format!("Scanning: {}", cwd.display());
+    app.commander.status = format!("Scanning: {}", crate::textsan::path(&cwd));
     app.commander_scan(vec![cwd]);
 }
 
@@ -1358,7 +1364,7 @@ fn hash_cursor(app: &mut App) {
             return;
         }
     };
-    app.commander.status = format!("Hashing: {}", path.display());
+    app.commander.status = format!("Hashing: {}", crate::textsan::path(&path));
     app.commander_hash(path);
 }
 
@@ -1369,8 +1375,8 @@ fn show_file_info(app: &mut App) {
         None => return,
     };
     let mut lines = vec![
-        format!("Name:     {}", entry.name),
-        format!("Path:     {}", entry.path.display()),
+        format!("Name:     {}", crate::textsan::terminal(&entry.name)),
+        format!("Path:     {}", crate::textsan::path(&entry.path)),
     ];
     if matches!(entry.kind, EntryKind::File) {
         lines.push(format!("Size:     {}", crate::tui::human_bytes(entry.size)));
@@ -1672,8 +1678,8 @@ pub(crate) fn check_jump_landed(commander: &mut CommanderState, panel_idx: usize
         if !landed_ok {
             let name = p_file
                 .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| p_file.display().to_string());
+                .map(crate::textsan::os_str)
+                .unwrap_or_else(|| crate::textsan::path(&p_file));
             commander.status = format!(
                 "File «{name}» not found in the directory — it may have been moved or deleted"
             );
@@ -3714,6 +3720,40 @@ mod mark_is_fail_closed_tests {
             "the refusal came from the store, not from an absent browsing surface: {}",
             app.commander.status
         );
+    }
+
+    /// The three sentences a mark can end in all name the pathname, and the pathname is whatever
+    /// the directory held — here a real file on disk, scanned, marked and acknowledged.
+    #[test]
+    fn every_mark_status_names_a_hostile_pathname_escaped() {
+        use crate::tui::hostile::{RETITLE, RETITLE_SHOWN};
+        let _role = crate::state::store::role_guard();
+        let scenario = PlanScenario::new("commander_mark_hostile");
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file(RETITLE);
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper, twin.clone()]);
+        drop(store);
+        let (mut app, rx) = commander_on(&scenario, scan_id);
+
+        let names_it_escaped = |status: &str, opening: &str| {
+            assert!(status.contains(opening), "{status:?}");
+            assert!(!status.chars().any(char::is_control), "{status:?}");
+            assert!(status.contains(RETITLE_SHOWN), "{status:?}");
+        };
+
+        panel_over(&mut app, &twin);
+        mark_cursor(&mut app, Mark::Keeper);
+        names_it_escaped(&app.commander.status, "Saving mark");
+        settle_mark(&mut app, &rx);
+        names_it_escaped(&app.commander.status, "Mark saved");
+
+        let stranger = scenario.outside.join(RETITLE);
+        std::fs::write(&stranger, b"not in this scan").unwrap();
+        panel_over(&mut app, &stranger);
+        mark_cursor(&mut app, Mark::Delete);
+        settle_mark(&mut app, &rx);
+        names_it_escaped(&app.commander.status, "not part of the loaded scan");
     }
 
     /// A refused write leaves the panel showing what the database still holds — the exact
@@ -5760,6 +5800,215 @@ mod dir_watch_tests {
         assert!(
             narrow.contains("file group unavailable:"),
             "the subject survives the floor whole — `unavailable` is never truncated: {narrow}"
+        );
+    }
+}
+
+/// A name is data on every commander surface that is not a panel row: the header, the status
+/// line and what is written into it, the triage prompt, the overlays. The rows are covered next
+/// to `entry_line`.
+#[cfg(test)]
+mod hostile_name_tests {
+    use super::*;
+    use crate::tui::event::AppEvent;
+    use crate::tui::hostile::{self, RETITLE, RETITLE_SHOWN};
+    use crossbeam_channel::Receiver;
+
+    /// Nothing under this path exists: several of these calls start a background read of it.
+    fn hostile_dir() -> PathBuf {
+        PathBuf::from("/nonexistent").join(RETITLE)
+    }
+
+    /// A commander whose active panel sits in a hostile directory, one hostile entry under the
+    /// cursor.
+    fn commander_over(path: PathBuf, kind: EntryKind) -> (App, Receiver<AppEvent>) {
+        let (mut app, rx) = crate::app::test_app();
+        app.show_disclaimer = false;
+        let panel = app.commander.active_panel_mut();
+        panel.cwd = hostile_dir();
+        panel.loading = false;
+        panel.entries = vec![hostile::entry(path, kind)];
+        panel.list.select(Some(0));
+        (app, rx)
+    }
+
+    fn commander(kind: EntryKind) -> (App, Receiver<AppEvent>) {
+        commander_over(hostile_dir().join(hostile::CLEAR), kind)
+    }
+
+    /// The status names the path, escaped — and then survives being drawn.
+    fn assert_status_inert(app: &mut App, site: &str) {
+        let status = app.commander.status.clone();
+        hostile::assert_text_inert(&status, site);
+        assert!(
+            status.contains("\\u{1b}"),
+            "{site} names the path it is about: {status:?}"
+        );
+        let buffer = hostile::frame_of(300, 24, |frame| render(frame, app));
+        hostile::assert_inert(&buffer, site);
+    }
+
+    #[test]
+    fn the_header_shows_a_hostile_directory_escaped() {
+        let (mut app, _rx) = commander(EntryKind::File);
+        assert!(
+            app.commander.dedup_scan_id.is_none(),
+            "the fixture's premise"
+        );
+        let shown = hostile::inert_text(300, 24, "commander", |frame| render(frame, &mut app));
+        assert!(
+            shown.contains(&format!("no scan for /nonexistent/{RETITLE_SHOWN}")),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn the_triage_prompt_shows_a_hostile_name_escaped() {
+        let (mut app, _rx) = commander(EntryKind::File);
+        app.commander.triage = Some(TriagePending {
+            sources: vec![hostile_dir().join(RETITLE)],
+            source_panel: 0,
+        });
+        let shown = hostile::inert_text(300, 24, "triage prompt", |frame| render(frame, &mut app));
+        assert!(
+            shown.contains(&format!("Move «{RETITLE_SHOWN}»")),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn losing_the_covering_scan_names_the_directory_escaped() {
+        let (mut app, _rx) = commander(EntryKind::File);
+        app.commander.dedup_scan_id = Some(1);
+        apply_auto_switch(&mut app, &hostile_dir(), None);
+        assert_status_inert(&mut app, "apply_auto_switch");
+    }
+
+    #[test]
+    fn a_directory_size_request_names_the_directory_escaped() {
+        let (mut app, _rx) = commander(EntryKind::Dir);
+        recompute_dir_size(&mut app);
+        assert!(app.commander.status.starts_with("Computing directory size"));
+        assert_status_inert(&mut app, "recompute_dir_size, queued");
+
+        recompute_dir_size(&mut app);
+        assert!(app
+            .commander
+            .status
+            .starts_with("Size already being computed"));
+        assert_status_inert(&mut app, "recompute_dir_size, already queued");
+
+        let (mut app, _rx) = commander_over(PathBuf::from("/proc").join(RETITLE), EntryKind::Dir);
+        recompute_dir_size(&mut app);
+        assert!(app.commander.status.contains("pseudo-FS"));
+        assert_status_inert(&mut app, "recompute_dir_size, pseudo-FS");
+    }
+
+    #[test]
+    fn a_hash_request_names_the_file_escaped() {
+        let (mut app, _rx) = commander(EntryKind::File);
+        hash_cursor(&mut app);
+        assert!(app.commander.status.starts_with("Hashing"));
+        assert_status_inert(&mut app, "hash_cursor");
+    }
+
+    #[test]
+    fn changing_the_panel_root_names_the_root_escaped() {
+        let (mut app, _rx) = commander(EntryKind::File);
+        app.commander.roots = vec![hostile_dir()];
+        change_panel_root(&mut app);
+        assert!(app.commander.status.starts_with("Panel 1 →"));
+        assert_status_inert(&mut app, "change_panel_root");
+    }
+
+    #[test]
+    fn synchronizing_the_panels_names_the_directory_escaped() {
+        let (mut app, _rx) = commander(EntryKind::File);
+        sync_panels(&mut app);
+        assert!(app.commander.status.starts_with("Panels synchronized"));
+        assert_status_inert(&mut app, "sync_panels");
+    }
+
+    #[test]
+    fn a_jump_that_missed_names_the_file_escaped() {
+        let (mut app, _rx) = commander(EntryKind::File);
+        let generation = app.commander.panels[0].generation;
+        app.commander.pending_jump = Some(state::PendingJump {
+            panel: 0,
+            generation,
+            file: hostile_dir().join(RETITLE),
+        });
+        check_jump_landed(&mut app.commander, 0, generation);
+        assert!(app.commander.status.starts_with("File «"));
+        assert_status_inert(&mut app, "check_jump_landed");
+
+        // A path with no final component falls back to the whole path.
+        app.commander.pending_jump = Some(state::PendingJump {
+            panel: 0,
+            generation,
+            file: hostile_dir().join(".."),
+        });
+        check_jump_landed(&mut app.commander, 0, generation);
+        assert!(
+            app.commander
+                .status
+                .contains(&format!("/nonexistent/{RETITLE_SHOWN}/..")),
+            "{:?}",
+            app.commander.status
+        );
+        assert_status_inert(&mut app, "check_jump_landed, no file name");
+    }
+
+    /// The script goes under the state directory, and the state directory is whatever
+    /// `--state-dir` named.
+    #[test]
+    fn saving_the_script_names_a_hostile_state_directory_escaped() {
+        let scratch = crate::testfixtures::ScratchDir::new("hostile_plans");
+        let (mut app, _rx) = commander(EntryKind::File);
+        app.db_path = scratch.path().join(RETITLE).join("dedcom.db");
+        app.commander.confirm_script = state::ConfirmScript::Ready("#!/bin/sh\n".to_string());
+        save_confirm_script(&mut app);
+        assert!(
+            app.commander.status.starts_with("Script saved"),
+            "{:?}",
+            app.commander.status
+        );
+        assert_status_inert(&mut app, "save_confirm_script");
+    }
+
+    /// F3 on a directory is answered on the spot, without the store.
+    #[test]
+    fn the_file_info_overlay_shows_a_hostile_name_and_path_escaped() {
+        let (mut app, _rx) = commander(EntryKind::Dir);
+        show_file_info(&mut app);
+        assert!(matches!(app.commander.overlay, Overlay::FileInfo));
+        // The overlay escapes what it is given as well, so the lines are checked on their own:
+        // they are kept in the state, and the state holds them escaped.
+        for line in &app.commander.info_lines {
+            hostile::assert_text_inert(line, "an F3 line");
+        }
+        let shown = hostile::inert_text(300, 24, "F3", |frame| render(frame, &mut app));
+        assert!(shown.contains("Name:     wipe\\u{1b}[2Jme.txt"), "{shown}");
+        assert!(
+            shown.contains(&format!(
+                "Path:     /nonexistent/{RETITLE_SHOWN}/wipe\\u{{1b}}[2Jme.txt"
+            )),
+            "{shown}"
+        );
+    }
+
+    /// The box is as wide as its longest line, so it has to be measured on the text it shows:
+    /// the escaped root is the wider one, and a box measured on the raw root would cut its tail.
+    #[test]
+    fn the_resume_overlay_shows_a_hostile_root_escaped_and_whole() {
+        let (mut app, _rx) = commander(EntryKind::File);
+        let root = PathBuf::from(format!("/tank/{}", "r".repeat(60))).join(RETITLE);
+        app.commander.pending_scan_roots = vec![root];
+        app.commander.overlay = Overlay::ResumeScan;
+        let shown = hostile::inert_text(300, 24, "F2", |frame| render(frame, &mut app));
+        assert!(
+            shown.contains(&format!("Root: /tank/{}/{RETITLE_SHOWN}", "r".repeat(60))),
+            "the root is there whole:\n{shown}"
         );
     }
 }

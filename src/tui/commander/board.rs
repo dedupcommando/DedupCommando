@@ -126,7 +126,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let mut status = if app.commander.status.is_empty() {
         "Triage Board".to_string()
     } else {
-        app.commander.status.clone()
+        crate::tui::status_shown(&app.commander.status)
     };
     if app.commander.move_pending > 0 {
         status.push_str(&format!(
@@ -630,5 +630,56 @@ fn assign_receiver(app: &mut App, receiver: usize) {
         panel.marks.clear();
     }
     load(app, LoadTarget::BoardReceiver(receiver));
-    app.commander.status = format!("Receiver {} ← {}", receiver + 1, dir.display());
+    app.commander.status = format!("Receiver {} ← {}", receiver + 1, crate::textsan::path(&dir));
+}
+
+#[cfg(test)]
+mod hostile_name_tests {
+    use super::*;
+    use crate::tui::commander::state::{BoardState, EntryKind, PanelEntry};
+    use crate::tui::hostile::{self, RETITLE, RETITLE_SHOWN};
+    use std::path::PathBuf;
+
+    /// A board whose source and receivers all sit in hostile directories over hostile entries.
+    /// Nothing under the path exists: assigning a receiver starts a background read of it.
+    fn hostile_board() -> BoardState {
+        let dir = PathBuf::from("/nonexistent").join(RETITLE);
+        let mut board = BoardState::new(dir.clone(), [(); 4].map(|()| dir.clone()));
+        let entries: Vec<PanelEntry> = hostile::NAMES
+            .iter()
+            .map(|name| hostile::entry(dir.join(name), EntryKind::File))
+            .collect();
+        for panel in std::iter::once(&mut board.source).chain(board.receivers.iter_mut()) {
+            panel.loading = false;
+            panel.entries = entries.clone();
+            panel.select(0);
+        }
+        board
+    }
+
+    #[test]
+    fn the_board_shows_hostile_names_and_directories_escaped() {
+        let (mut app, _rx) = crate::app::test_app();
+        app.commander.board = Some(hostile_board());
+        let shown = hostile::inert_text(300, 40, "triage board", |frame| render(frame, &mut app));
+        assert_eq!(
+            shown
+                .matches(&format!("/nonexistent/{RETITLE_SHOWN}"))
+                .count(),
+            5,
+            "the source and four receivers name their directory:\n{shown}"
+        );
+    }
+
+    #[test]
+    fn assigning_a_receiver_names_the_directory_escaped() {
+        let (mut app, _rx) = crate::app::test_app();
+        app.commander.board = Some(hostile_board());
+        app.commander.board_active = true;
+        assign_receiver(&mut app, 0);
+        let status = app.commander.status.clone();
+        assert_eq!(status, format!("Receiver 1 ← /nonexistent/{RETITLE_SHOWN}"));
+        let buffer = hostile::frame_of(300, 40, |frame| render(frame, &mut app));
+        hostile::assert_inert(&buffer, "triage board after assigning a receiver");
+    }
 }

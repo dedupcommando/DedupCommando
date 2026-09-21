@@ -282,18 +282,24 @@ from a single consistent read of the database.
 
 The artifact is written to a temporary file in the destination's own directory
 and then renamed into place, so a failure never leaves a half-written CSV and
-never damages a previous one. If the destination is a symlink, the **name** is
-replaced — the link's target is never written through. The file is created mode
-`0600`: it is a complete list of pathnames in your pool.
+never damages a previous one. If the destination is a symbolic link, the export
+refuses: renaming over it would destroy the link, writing through it would
+overwrite whatever it points at, and as root with a typo (`--export-csv
+/dev/stdout`) that link can be a system one. Give a regular pathname. The file is
+created mode `0600`: it is a complete list of pathnames in your pool.
 
-CSV escaping: paths with commas/quotes/newlines are wrapped in double quotes,
+CSV escaping: paths with commas or quotes are wrapped in double quotes,
 and quotes inside are doubled (RFC 4180). A path that begins with `=`, `+`, `-`,
 `@`, tab or CR is prefixed with an apostrophe so a spreadsheet treats it as text
 rather than a formula.
 
-A pathname the scan could not read as UTF-8 is exported in the same replacement
-spelling the rest of dedcom shows (`?`-like `U+FFFD`) — it is not byte-faithful,
-so do not feed such a row back to `rm` expecting it to name the same file.
+A pathname that holds control characters — a newline, a tab, a terminal escape
+sequence — is exported with them spelled out: `\n`, `\t`, `\u{1b}`. The export is
+a file that gets printed, and a terminal would act on the raw bytes; spelled out,
+every record is also exactly one line. A pathname the scan could not read as
+UTF-8 is exported in the same replacement spelling the rest of dedcom shows
+(`?`-like `U+FFFD`). Neither row is byte-faithful, so do not feed such a row back
+to `rm` expecting it to name the same file.
 
 ### What to do with this CSV
 

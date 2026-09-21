@@ -117,8 +117,11 @@ fn main() {
     };
 
     if let Err(err) = result {
-        tracing::error!("exiting with error: {err}");
-        eprintln!("dedcom: error: {err}");
+        // Whatever layer wrote the sentence, it may quote a pathname, and both of these end up on
+        // a terminal: stderr now, the log at the next `cat`.
+        let shown = textsan::terminal(&err.to_string());
+        tracing::error!("exiting with error: {shown}");
+        eprintln!("dedcom: error: {shown}");
         std::process::exit(1);
     }
 }
@@ -377,9 +380,7 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
         // Resource sampling before the frame — self-throttles by interval.
         app.resource.sample();
         if !panicked {
-            guard
-                .terminal()
-                .draw(|frame| tui::render(frame, &mut app))?;
+            guard.terminal().draw(|frame| tui::draw(frame, &mut app))?;
         }
 
         match rx.recv_timeout(Duration::from_millis(200)) {
@@ -729,10 +730,7 @@ fn run_stats(cli: &cli::Cli) -> Result<()> {
         println!();
         println!("#{}  {}  [{}]", row.scan_id, row.created_at, row.status);
         println!("  roots:       {roots}");
-        println!(
-            "  environment: storage={} layout={} ZFS={}",
-            row.storage_type, row.pool_layout, row.zfs_version,
-        );
+        println!("{}", environment_line(row));
         for line in stats_lines(row) {
             println!("{line}");
         }
@@ -1211,6 +1209,18 @@ fn completion_lines(summary: &model::scan::ScanSummary) -> Vec<String> {
     lines
 }
 
+/// The environment line of the `--stats` report. The values were stored with the scan, and the
+/// storage type was once whatever `--storage-type` was given: a checkpoint written before that
+/// flag was validated can hold anything, so they are printed escaped.
+fn environment_line(row: &model::scan::ScanStatsRow) -> String {
+    format!(
+        "  environment: storage={} layout={} ZFS={}",
+        textsan::terminal(&row.storage_type),
+        textsan::terminal(&row.pool_layout),
+        textsan::terminal(&row.zfs_version),
+    )
+}
+
 /// The per-scan block of the `--stats` report, for the same reason.
 fn stats_lines(row: &model::scan::ScanStatsRow) -> Vec<String> {
     vec![
@@ -1300,6 +1310,21 @@ mod reporting_tests {
             !unknown.contains("KiB") && !unknown.contains(" B"),
             "an unestablished result offers no number: {unknown}"
         );
+    }
+
+    /// A checkpoint written before `--storage-type` was validated can hold a terminal sequence
+    /// where the storage type should be; `--stats` prints it as text.
+    #[test]
+    fn stats_report_prints_a_stored_environment_escaped() {
+        let mut row = stats_row(ReclaimEstimate::exact(4096));
+        assert_eq!(
+            environment_line(&row),
+            "  environment: storage=ssd layout=mirror ZFS=2.3.1"
+        );
+        row.storage_type = "\u{1b}]0;PWNED\u{7}".to_string();
+        let line = environment_line(&row);
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        assert!(line.contains("storage=\\u{1b}]0;PWNED\\u{7} "), "{line}");
     }
 
     /// `--stats` reports the same three shapes in the same words.
@@ -1818,12 +1843,19 @@ fn record_export_fault_len(len: u64) {
 /// CSV field escaping per RFC 4180 (quotes, commas, line breaks) with formula-injection
 /// neutralization (CWE-1236).
 ///
+/// Control characters go first, spelled out the way `textsan::terminal` spells them: the export
+/// is a file people `cat`, and a file name may hold `ESC ] 0 ; … BEL` as easily as a newline.
+/// Spelled out, a record is also always one line, which is what `grep` and `wc -l` assume. Such a
+/// cell is no longer the file's exact name; the manual says so next to the replacement spelling
+/// of a name that is not UTF-8, which already was not.
+///
 /// Excel/LibreOffice execute a cell as a formula if it starts with `= + - @` or the control
 /// characters `\t`/`\r`. A file name on /tank can set such a first character; opening the
 /// export, the operator would run the formula. Before RFC quoting we prefix an apostrophe
 /// (OWASP) — the cell is treated as text. Defense-in-depth: exported paths are usually
 /// absolute (leading `/`), but we harden the helper in the general case.
 fn csv_field(value: &str) -> String {
+    let value = textsan::terminal(value);
     let guarded = if value
         .chars()
         .next()
@@ -1831,7 +1863,7 @@ fn csv_field(value: &str) -> String {
     {
         format!("'{value}")
     } else {
-        value.to_string()
+        value
     };
     if guarded.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", guarded.replace('"', "\"\""))
@@ -1850,7 +1882,21 @@ mod csv_tests {
         assert_eq!(csv_field("+1"), "'+1");
         assert_eq!(csv_field("-2+3"), "'-2+3");
         assert_eq!(csv_field("@SUM(A1)"), "'@SUM(A1)");
-        assert_eq!(csv_field("\tx"), "'\tx");
+    }
+
+    /// A tab or a CR in front is a formula lead too, and neither survives to be one: every
+    /// control character is spelled out before anything else looks at the cell.
+    #[test]
+    fn control_characters_are_spelled_out() {
+        assert_eq!(csv_field("\tx"), "\\tx");
+        assert_eq!(csv_field("\r=cmd"), "\\r=cmd");
+        assert_eq!(
+            csv_field("/tank/\u{1b}]0;PWNED\u{7}a\nb.bin"),
+            "/tank/\\u{1b}]0;PWNED\\u{7}a\\nb.bin"
+        );
+        assert_eq!(csv_field("/tank/8bit\u{9b}2J"), "/tank/8bit\\u{9b}2J");
+        // Spelled out first, quoted after: the comma still gets its quotes.
+        assert_eq!(csv_field("/tank/a,\u{1b}b"), "\"/tank/a,\\u{1b}b\"");
     }
 
     #[test]
@@ -2140,6 +2186,42 @@ mod export_csv_tests {
         assert_eq!(parsed.iter().filter(|row| row.keep == "1").count(), 1);
         assert_eq!(find(&parsed, "/tank/c").keep, "1", "freshest mtime keeps");
         assert!(rig.residue().is_empty());
+    }
+
+    /// A pathname is whatever bytes the directory held, and the export is a file people print.
+    /// No control character reaches it, a name with a newline in it is still one record, and the
+    /// manual tells whoever scripts over the file that such a row is not the exact name.
+    #[test]
+    fn a_pathname_with_control_characters_is_exported_spelled_out() {
+        let rig = Rig::new("control");
+        let rows = [
+            row("/tank/\u{1b}]0;PWNED\u{7}a\nb.bin", 1, 1000),
+            row("/tank/plain", 2, 2000),
+        ];
+        complete_derived(&mut rig.store(), &rows, 0xA2);
+
+        let csv = rig.export();
+        assert!(
+            !csv.chars().any(|c| c.is_control() && c != '\n'),
+            "{}",
+            csv.escape_debug()
+        );
+        assert_eq!(
+            csv.lines().count(),
+            3,
+            "a header, then a line per pathname:\n{csv}"
+        );
+        let parsed = rows_of(&csv);
+        assert_eq!(
+            find(&parsed, "/tank/\\u{1b}]0;PWNED\\u{7}a\\nb.bin").size,
+            "8192"
+        );
+
+        let manual = crate::testfixtures::manual("11-headless.md");
+        assert!(
+            manual.contains("control characters") && manual.contains("`\\u{1b}`"),
+            "the manual states the spelling a script will meet"
+        );
     }
 
     /// G2 — the pathname byte verification rejected is absent from the artifact.
@@ -2736,6 +2818,14 @@ mod export_csv_tests {
         );
         assert_eq!(std::fs::read_link(rig.dest()).unwrap(), target);
         assert!(rig.residue().is_empty(), "no temporary file left behind");
+
+        // The manual used to promise the old behaviour — the name replaced, the link lost.
+        let manual = crate::testfixtures::manual("11-headless.md");
+        let manual = manual.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            manual.contains("If the destination is a symbolic link, the export refuses"),
+            "the manual states the refusal"
+        );
     }
 
     /// The published artifact is not world-readable: it is the pool's complete pathname

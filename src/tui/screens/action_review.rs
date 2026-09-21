@@ -48,7 +48,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             ListItem::new(format!(
                 "{:9}  {}   ({})",
                 action.kind().label(),
-                action.target().display(),
+                crate::textsan::path(action.target()),
                 human_bytes(action.size()),
             ))
         })
@@ -90,7 +90,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             }
             line
         }
-        _ => format!(" {} ", app.status),
+        _ => format!(" {} ", crate::tui::status_shown(&app.status)),
     };
     let footer = vec![
         Line::from(counts),

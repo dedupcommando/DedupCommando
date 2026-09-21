@@ -436,6 +436,9 @@ pub struct App {
     /// `Some` → show the startup role-selection overlay when an operator is live
     /// (`ask` policy): `[R]` read-only / `[F]` as operator / `Esc` exit.
     pub concurrency_prompt: Option<crate::lock::Holder>,
+    /// The frame guard has already reported, in the log, a control character it had to take out
+    /// of a frame. It says so once per run: the frame is redrawn five times a second.
+    pub(crate) frame_guard_reported: bool,
     /// TUI frame counter — for animating indicators (the "process alive" spinner).
     pub tick: u64,
     /// scan_id of the scan whose groups are open in Browser — for saving marks.
@@ -781,6 +784,7 @@ impl App {
             read_only: lock_startup.read_only,
             instance_lock: lock_startup.lock,
             concurrency_prompt: lock_startup.prompt,
+            frame_guard_reported: false,
             tick: 0,
             current_scan_id: None,
             mode,
@@ -813,10 +817,14 @@ impl App {
             AppEvent::ApplyFinished(outcome) => self.on_apply_finished(*outcome),
             AppEvent::CommanderHash(path, hash) => {
                 self.commander.dedup.insert_hash(path.clone(), hash);
-                self.commander.status = format!("Hash computed: {}", path.display());
+                self.commander.status = format!("Hash computed: {}", crate::textsan::path(&path));
             }
             AppEvent::CommanderHashFailed(path, err) => {
-                self.commander.status = format!("Failed to compute hash {}: {err}", path.display());
+                self.commander.status = format!(
+                    "Failed to compute hash {}: {}",
+                    crate::textsan::path(&path),
+                    crate::textsan::terminal(&err),
+                );
             }
             AppEvent::CommanderHashCached(path, hash) => {
                 // Quietly: into memory + the persistent identity-keyed cache (layout §B). The
@@ -955,7 +963,7 @@ impl App {
             }
             AppEvent::ScanDiffFailed(err) => {
                 self.scan_diff.loading = false;
-                self.status = format!("Diff failed: {err}");
+                self.status = format!("Diff failed: {}", crate::textsan::terminal(&err));
             }
             AppEvent::Mouse(mouse) => self.on_mouse(mouse),
         }
@@ -1844,7 +1852,7 @@ impl App {
                         let peers = info.peers.len();
                         lines.push(format!("Duplicates ({}):", info.total.saturating_sub(1)));
                         for peer in info.peers.iter() {
-                            lines.push(format!("  · {}", peer.display()));
+                            lines.push(format!("  · {}", crate::textsan::path(peer)));
                         }
                         if info.truncated {
                             lines.push(format!(
@@ -2366,7 +2374,7 @@ impl App {
         requested: Option<crate::tui::commander::state::Mark>,
         after: &[(PathBuf, Option<MarkIntent>)],
     ) {
-        let shown = crate::textsan::terminal(&path.display().to_string());
+        let shown = crate::textsan::path(path);
         let Some((_, returned)) = after.iter().find(|(candidate, _)| candidate == path) else {
             self.commander.status = format!(
                 "The mark was not confirmed: the database did not report {shown} — do not treat it as saved"
@@ -2399,7 +2407,7 @@ impl App {
             // variant would tell them the shape of an enum instead of what is wrong.
             crate::state::MarkWriteError::NotInManifest { path } => format!(
                 "The mark was not saved: {} is not part of the loaded scan",
-                crate::textsan::terminal(&path.display().to_string())
+                crate::textsan::path(path)
             ),
             _ => format!("the mark was not saved: {error:?}"),
         };
@@ -2528,7 +2536,9 @@ impl App {
                 }
                 PlanWindow::Commander => "No marked files (F5/F6/F7/F8)".to_string(),
             },
-            other => other.to_string(),
+            // A refusal names the pathname it is about — a file that vanished, drifted or turned
+            // into a link since the scan — and that name is whatever the directory held.
+            other => crate::textsan::terminal(&other.to_string()),
         };
         match window {
             PlanWindow::Wizard => self.status = message,
@@ -2649,7 +2659,8 @@ impl App {
                 self.screen = Screen::ScanConfig;
             }
             Err(message) => {
-                self.status = format!("Scan error: {message}");
+                // The walker's sentence, and it quotes the directory it stopped at.
+                self.status = format!("Scan error: {}", crate::textsan::terminal(&message));
                 self.screen = Screen::ScanConfig;
             }
         }
@@ -2980,13 +2991,15 @@ impl App {
             }
             ApplyOutcome::Failed(err) => {
                 self.apply_affected.clear();
+                // The error is a lower layer's sentence and may quote a pathname.
+                let failed = format!("Actions failed: {}", crate::textsan::terminal(&err));
                 if from_commander {
                     self.mode = AppMode::Commander;
                     self.commander.return_to_commander = false;
-                    self.commander.status = format!("Actions failed: {err}");
+                    self.commander.status = failed;
                 } else {
                     self.screen = Screen::ActionReview;
-                    self.status = format!("Actions failed: {err}");
+                    self.status = failed;
                 }
             }
         }
@@ -4147,8 +4160,9 @@ impl App {
     /// Adds the current file-browser directory to the list of scan roots.
     fn add_current_folder(&mut self) {
         let path = self.folder_picker.current_dir.clone();
+        let shown = crate::textsan::path(&path);
         if self.config.roots.iter().any(|root| root.path == path) {
-            self.status = format!("Folder already in the list: {}", path.display());
+            self.status = format!("Folder already in the list: {shown}");
         } else {
             self.config.roots.push(RootChoice {
                 label: String::new(),
@@ -4157,7 +4171,7 @@ impl App {
                 is_dataset: false,
             });
             self.config.cursor = self.config.roots.len() - 1;
-            self.status = format!("Folder added: {}", path.display());
+            self.status = format!("Folder added: {shown}");
         }
         self.screen = Screen::ScanConfig;
     }
@@ -4766,10 +4780,7 @@ impl App {
             Ok(()) => {
                 // «Submitted», never «saved». The operator learns the write landed only from the
                 // acknowledgement, and only after the after-image is checked against the request.
-                self.commander.status = format!(
-                    "Saving mark: {}",
-                    crate::textsan::terminal(&path.display().to_string())
-                );
+                self.commander.status = format!("Saving mark: {}", crate::textsan::path(&path));
                 self.pending_marks.insert(
                     req.0,
                     MarkOrigin::CommanderMark {
@@ -5432,6 +5443,16 @@ pub(crate) fn open_and_settle(
 /// with nothing in it is a shape `ActionPlan` refuses to hold.
 #[cfg(test)]
 pub(crate) fn test_plan(count: usize) -> Option<ActionPlan> {
+    let targets: Vec<PathBuf> = (0..count)
+        .map(|index| PathBuf::from(format!("/x/dup{index:02}.bin")))
+        .collect();
+    test_plan_over(&targets)
+}
+
+/// The same plan over targets the caller names, for the screens that have to print a pathname they
+/// did not choose.
+#[cfg(test)]
+pub(crate) fn test_plan_over(targets: &[PathBuf]) -> Option<ActionPlan> {
     use crate::model::plan::{PlanGroupInput, PlanMemberEvidence, PlanObjectKey};
     use crate::model::reclaim::LinkCount;
 
@@ -5454,9 +5475,9 @@ pub(crate) fn test_plan(count: usize) -> Option<ActionPlan> {
         10,
         MarkIntent::Keeper,
     )];
-    for index in 0..count {
+    for (index, target) in targets.iter().enumerate() {
         members.push(member(
-            PathBuf::from(format!("/x/dup{index:02}.bin")),
+            target.clone(),
             100 + index as u64,
             MarkIntent::Act(ActionKind::Delete),
         ));
@@ -7853,5 +7874,135 @@ mod session_load_request_scoping_tests {
             "a superseded reply must not tell the screen its own request has landed"
         );
         assert!(!app.sessions_loaded);
+    }
+}
+
+/// The status lines and the F3 lines this file writes stay in the state, where more than the
+/// screen reads them, so a pathname goes into them escaped.
+#[cfg(test)]
+mod hostile_name_tests {
+    use super::*;
+    use crate::tui::hostile::{self, RETITLE, RETITLE_SHOWN};
+
+    fn hostile_path() -> PathBuf {
+        PathBuf::from("/tank").join(RETITLE)
+    }
+
+    #[test]
+    fn a_computed_hash_names_the_file_escaped() {
+        let (mut app, _rx) = test_app();
+        app.handle_event(AppEvent::CommanderHash(hostile_path(), [0u8; 32]));
+        assert_eq!(
+            app.commander.status,
+            format!("Hash computed: /tank/{RETITLE_SHOWN}")
+        );
+    }
+
+    /// The error text is somebody else's sentence and may quote the name again.
+    #[test]
+    fn a_failed_hash_names_the_file_and_its_error_escaped() {
+        let (mut app, _rx) = test_app();
+        app.handle_event(AppEvent::CommanderHashFailed(
+            hostile_path(),
+            format!("cannot open {RETITLE}: permission denied"),
+        ));
+        hostile::assert_text_inert(&app.commander.status, "CommanderHashFailed");
+        assert_eq!(app.commander.status.matches(RETITLE_SHOWN).count(), 2);
+    }
+
+    /// Three sentences written by lower layers, each of which may quote the pathname it failed
+    /// on: the walker stops at a directory it cannot read and names it.
+    #[test]
+    fn an_error_from_a_lower_layer_is_escaped_whole() {
+        let quoted = format!("cannot read the directory /tank/{RETITLE}");
+
+        let (mut app, _rx) = test_app();
+        app.handle_event(AppEvent::ScanFinished(Err(quoted.clone())));
+        hostile::assert_text_inert(&app.status, "ScanFinished");
+        assert_eq!(
+            app.status,
+            format!("Scan error: cannot read the directory /tank/{RETITLE_SHOWN}")
+        );
+
+        let (mut app, _rx) = test_app();
+        app.handle_event(AppEvent::ScanDiffFailed(quoted.clone()));
+        hostile::assert_text_inert(&app.status, "ScanDiffFailed");
+        assert!(app.status.contains(RETITLE_SHOWN), "{:?}", app.status);
+
+        let (mut app, _rx) = test_app();
+        app.handle_event(AppEvent::ApplyFinished(Box::new(
+            crate::actions::ApplyOutcome::Failed(quoted),
+        )));
+        let status = format!("{}{}", app.status, app.commander.status);
+        hostile::assert_text_inert(&status, "ApplyFinished");
+        assert!(status.contains(RETITLE_SHOWN), "{status:?}");
+    }
+
+    /// The watch panel draws this detail as it is kept, so it is kept escaped.
+    #[test]
+    fn an_unreadable_watch_source_keeps_its_detail_escaped() {
+        use crate::tui::commander::state::{WatchEntry, WatchSubject};
+        let (mut app, _rx) = test_app();
+        app.commander.watch_cache = vec![WatchEntry::default()];
+        app.set_watch_unavailable(
+            0,
+            WatchSubject::FileGroup,
+            &format!("cannot read /tank/{RETITLE}"),
+        );
+        let failure = app.commander.watch_cache[0].unavailable.as_ref();
+        let message = failure.expect("the failure is recorded").message();
+        hostile::assert_text_inert(&message, "set_watch_unavailable");
+        assert_eq!(
+            message,
+            format!("file group unavailable: cannot read /tank/{RETITLE_SHOWN}")
+        );
+    }
+
+    #[test]
+    fn adding_a_folder_names_it_escaped_both_times() {
+        let (mut app, _rx) = test_app();
+        app.folder_picker.current_dir = hostile_path();
+        app.add_current_folder();
+        assert_eq!(app.status, format!("Folder added: /tank/{RETITLE_SHOWN}"));
+        app.add_current_folder();
+        assert_eq!(
+            app.status,
+            format!("Folder already in the list: /tank/{RETITLE_SHOWN}")
+        );
+    }
+
+    #[test]
+    fn the_file_info_lists_duplicate_peers_escaped() {
+        use crate::state::store::FileGroupInfo;
+        use crate::state::{FileInfoAnswer, FileMembership};
+        let (mut app, _rx) = test_app();
+        let peers: Vec<PathBuf> = hostile::NAMES
+            .iter()
+            .map(|name| PathBuf::from("/tank/peers").join(name))
+            .collect();
+        let answer = FileInfoAnswer::InScan {
+            hash_text: Some("ab".repeat(32)),
+            membership: Ok(FileMembership::InGroup(Box::new(FileGroupInfo {
+                id: GroupId {
+                    scan_id: 1,
+                    rank: 0,
+                    generation: 1,
+                },
+                total: peers.len() as u64 + 1,
+                truncated: false,
+                peers,
+            }))),
+        };
+        app.show_file_info(vec!["Name:     subject.bin".to_string()], answer);
+        for line in &app.commander.info_lines {
+            hostile::assert_text_inert(line, "the F3 peer list");
+        }
+        assert!(
+            app.commander
+                .info_lines
+                .contains(&format!("  · /tank/peers/{RETITLE_SHOWN}")),
+            "{:?}",
+            app.commander.info_lines
+        );
     }
 }

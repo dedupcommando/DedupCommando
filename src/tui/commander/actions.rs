@@ -499,4 +499,30 @@ mod tests {
             app.commander.status
         );
     }
+
+    /// A refusal is a sentence written by the plan, and it quotes the pathname. The file here
+    /// was scanned and marked under a name that holds a terminal sequence, and then removed — a
+    /// thing anybody who can write to the tree can do between the scan and F11.
+    #[test]
+    fn a_refused_plan_names_a_hostile_pathname_escaped() {
+        use crate::tui::hostile::{RETITLE, RETITLE_SHOWN};
+        let _role = role_guard();
+        let (_scenario, mut app, rx, paths) = commander_over(
+            "refused_hostile",
+            &[("keeper.bin", Mark::Keeper), (RETITLE, Mark::Delete)],
+            &[],
+        );
+        std::fs::remove_file(&paths[1]).unwrap();
+
+        prepare_and_settle(&mut app, &rx);
+
+        assert!(
+            matches!(app.commander.overlay, Overlay::None),
+            "the plan is refused: {}",
+            app.commander.status
+        );
+        let status = &app.commander.status;
+        assert!(!status.chars().any(char::is_control), "{status:?}");
+        assert!(status.contains(RETITLE_SHOWN), "{status:?}");
+    }
 }

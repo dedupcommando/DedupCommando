@@ -119,7 +119,10 @@ fn fail(out: &mut MoveBatchOutcome, src: &Path, err: &crate::error::AppError) {
     // may carry control bytes — we sanitize the whole string before logging.
     tracing::warn!(
         "{}",
-        crate::textsan::terminal(&format!("move failed: {} — {err}", src.display()))
+        crate::textsan::terminal(&format!(
+            "move failed: {} — {err}",
+            crate::textsan::path(src)
+        ))
     );
     out.failed += 1;
 }
@@ -152,7 +155,7 @@ fn merge_dir(
                 "{}",
                 crate::textsan::terminal(&format!(
                     "merge: {} could not be opened; nothing under it was moved — {err}",
-                    src.display()
+                    crate::textsan::path(src)
                 ))
             );
             out.failed += 1;
@@ -212,7 +215,7 @@ fn merge_dir(
             "{}",
             crate::textsan::terminal(&format!(
                 "merge: {} is still there after the merge — {err}",
-                src.display()
+                crate::textsan::path(src)
             ))
         );
         if out.failed == failed_before {
@@ -241,7 +244,7 @@ fn unreadable_child(out: &mut MoveBatchOutcome, src: &Path, err: &std::io::Error
         "{}",
         crate::textsan::terminal(&format!(
             "merge: listing {} stopped on an error; whatever it had not reached stays there — {err}",
-            src.display()
+            crate::textsan::path(src)
         ))
     );
     out.failed += 1;
@@ -262,7 +265,7 @@ fn undetermined_duplicate(out: &mut MoveBatchOutcome, what: &Path, err: &std::io
         "{}",
         crate::textsan::terminal(&format!(
             "move skipped: cannot tell whether it is a duplicate, {} could not be read — {err}",
-            what.display()
+            crate::textsan::path(what)
         ))
     );
     out.failed += 1;

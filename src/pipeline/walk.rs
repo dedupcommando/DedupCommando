@@ -878,8 +878,9 @@ fn take_special_entry_fault(path: &Path) -> bool {
 /// than inspecting or re-parsing its text. Deliberately not an omission: no file went missing, and
 /// calling it one would put a count on something that never happened.
 fn unverifiable_directory(path: &Path, cause: Option<&ignore::Error>) -> AppError {
+    // The cause names the same directory again, in its own words.
     let context = match cause {
-        Some(err) => format!(" ({err})"),
+        Some(err) => format!(" ({})", crate::textsan::terminal(&err.to_string())),
         None => String::new(),
     };
     AppError::msg(format!(
@@ -906,6 +907,27 @@ mod tests {
 
     fn key(path: &Path) -> PathKey {
         PathKey::new(path).expect("a keyable path")
+    }
+
+    /// The abort names the directory twice — once itself, once inside the cause — and it is
+    /// printed to stderr and drawn in the status line. Neither copy may carry the name's control
+    /// characters there.
+    #[test]
+    fn the_unverifiable_directory_abort_carries_no_control_characters() {
+        let dir = Path::new("/tank/\u{1b}]0;PWNED\u{7}dir");
+        let cause = ignore::Error::WithPath {
+            path: dir.to_path_buf(),
+            err: Box::new(ignore::Error::Io(std::io::Error::from_raw_os_error(
+                libc::EACCES,
+            ))),
+        };
+        let text = unverifiable_directory(dir, Some(&cause)).to_string();
+        assert!(!text.chars().any(char::is_control), "{text:?}");
+        assert_eq!(
+            text.matches("\\u{1b}]0;PWNED\\u{7}dir").count(),
+            2,
+            "both copies are there, escaped: {text}"
+        );
     }
 
     fn collect(config: &ScanConfig) -> WalkOutcome {

@@ -49,12 +49,13 @@ pub fn category_len(state: &ScanDiffState) -> usize {
 
 /// Human-readable line for a single change.
 fn change_line(change: &FileChange, width: usize) -> String {
-    let cut = |p: &std::path::Path| ellipsize_left(&p.display().to_string(), width);
+    // Escaped first: the cut counts characters and would leave half a sequence behind.
+    let cut = |p: &std::path::Path| ellipsize_left(&crate::textsan::path(p), width);
     match change {
         FileChange::NewDupCandidate { path, peers_in_old } => {
             let peer = peers_in_old
                 .first()
-                .map(|p| p.display().to_string())
+                .map(|p| crate::textsan::path(p))
                 .unwrap_or_default();
             format!("{}  ← duplicate of: {}", cut(path), peer)
         }
@@ -133,7 +134,7 @@ fn summary_text(report: &DiffReport) -> Text<'static> {
             "  Scans #{} ↔ #{} · root {}",
             report.old_scan_id,
             report.new_scan_id,
-            report.root.display()
+            crate::textsan::path(&report.root)
         )),
         Line::from(format!(
             "  Unchanged: {} · Moved: inode {} / hash {}",

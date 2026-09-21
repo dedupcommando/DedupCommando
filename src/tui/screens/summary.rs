@@ -62,11 +62,18 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     // The batch refused itself as a whole after the snapshots existed. Nothing ran, and the
     // snapshots listed below are what has to be cleaned up.
+    //
+    // The refusal here, the error of an action and the reason an allocation is unsettled below
+    // are sentences written by lower layers, and any of them may quote the pathname or the xattr
+    // name it was about. Each is escaped whole; text that is already safe comes through unchanged.
     if let Some(reason) = &result.aborted {
         lines.push(
-            Line::from(format!("  BATCH REFUSED before any change: {reason}"))
-                .bold()
-                .red(),
+            Line::from(format!(
+                "  BATCH REFUSED before any change: {}",
+                crate::textsan::terminal(reason)
+            ))
+            .bold()
+            .red(),
         );
     }
 
@@ -90,8 +97,8 @@ pub fn render(frame: &mut Frame, app: &App) {
                 Line::from(format!(
                     "    ✗ {} {} — {}",
                     outcome.kind.label(),
-                    outcome.target.display(),
-                    message,
+                    crate::textsan::path(&outcome.target),
+                    crate::textsan::terminal(message),
                 ))
                 .red(),
             );
@@ -108,7 +115,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     if !result.quarantine_dirs.is_empty() {
         lines.push(Line::from("  Files moved to quarantine:"));
         for dir in &result.quarantine_dirs {
-            lines.push(Line::from(format!("    {}", dir.display())));
+            lines.push(Line::from(format!("    {}", crate::textsan::path(dir))));
         }
     }
     // The exact pathnames, because that is what a recovery works from: one file among a batch of
@@ -117,7 +124,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     if !originals.is_empty() {
         lines.push(Line::from("  Originals, by their exact path:"));
         for path in originals.iter().take(QUARANTINE_LINES) {
-            lines.push(Line::from(format!("    {}", path.display())));
+            lines.push(Line::from(format!("    {}", crate::textsan::path(path))));
         }
         if originals.len() > QUARANTINE_LINES {
             lines.push(Line::from(format!(
@@ -152,8 +159,9 @@ pub fn render(frame: &mut Frame, app: &App) {
         human_bytes(result.bytes_read),
     )));
     for (reason, quarantine) in result.unknown_objects() {
+        let reason = crate::textsan::terminal(reason);
         let line = match quarantine {
-            Some(path) => format!("  unknown — check {}: {reason}", path.display()),
+            Some(path) => format!("  unknown — check {}: {reason}", crate::textsan::path(path)),
             None => format!("  unknown — {reason}"),
         };
         lines.push(Line::from(line).red());

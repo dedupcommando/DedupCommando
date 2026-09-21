@@ -59,8 +59,12 @@ pub struct Cli {
 impl Cli {
     /// Parse `std::env::args`. `--help` / `--version` print and terminate the process.
     pub fn parse() -> std::result::Result<Cli, String> {
+        Self::parse_from(std::env::args().skip(1))
+    }
+
+    /// The same over any argument list, so a refusal can be tested.
+    fn parse_from(mut args: impl Iterator<Item = String>) -> std::result::Result<Cli, String> {
         let mut cli = Cli::default();
-        let mut args = std::env::args().skip(1);
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -97,7 +101,16 @@ impl Cli {
                     let value = args.next().ok_or_else(|| {
                         "--storage-type requires a value (hdd|ssd|nvme)".to_string()
                     })?;
-                    cli.storage_type = Some(value.trim().to_ascii_lowercase());
+                    // The value is stored with the scan and printed back by `--stats`, so it is
+                    // one of the three words the help names and nothing else.
+                    let value = value.trim().to_ascii_lowercase();
+                    if !matches!(value.as_str(), "hdd" | "ssd" | "nvme") {
+                        return Err(format!(
+                            "--storage-type takes hdd, ssd or nvme, not «{}»",
+                            crate::textsan::terminal(&value)
+                        ));
+                    }
+                    cli.storage_type = Some(value);
                 }
                 "--stats" => cli.stats = true,
                 "--no-hash-reuse" => cli.no_hash_reuse = true,
@@ -120,7 +133,12 @@ impl Cli {
                     println!("dedcom {}", crate::version());
                     std::process::exit(0);
                 }
-                other => return Err(format!("unknown argument: {other}")),
+                other => {
+                    return Err(format!(
+                        "unknown argument: {}",
+                        crate::textsan::terminal(other)
+                    ))
+                }
             }
         }
 
@@ -202,5 +220,35 @@ mod help_tests {
             !help.contains("duplicates of the last scan"),
             "«the last scan» reads as «the last FINISHED scan», which is not the contract"
         );
+    }
+}
+
+#[cfg(test)]
+mod storage_type_tests {
+    use super::Cli;
+
+    fn parse(args: &[&str]) -> Result<Cli, String> {
+        Cli::parse_from(args.iter().map(|arg| arg.to_string()))
+    }
+
+    #[test]
+    fn the_three_documented_values_are_taken_in_any_case() {
+        for (given, stored) in [("hdd", "hdd"), ("SSD", "ssd"), (" NVMe ", "nvme")] {
+            let cli = parse(&["--storage-type", given]).expect(given);
+            assert_eq!(cli.storage_type.as_deref(), Some(stored));
+        }
+    }
+
+    /// The value goes into the checkpoint and `--stats` prints it back, so anything else is
+    /// refused at the door — and the refusal does not itself print what it refuses raw.
+    #[test]
+    fn anything_else_is_refused_without_being_echoed_raw() {
+        for given in ["", "sata", "hdd,ssd", "\u{1b}]0;PWNED\u{7}"] {
+            let refusal = parse(&["--storage-type", given]).expect_err(given);
+            assert!(refusal.contains("hdd, ssd or nvme"), "{refusal:?}");
+            assert!(!refusal.chars().any(char::is_control), "{refusal:?}");
+        }
+        let refusal = parse(&["--no-such-\u{1b}[2Jflag"]).expect_err("an unknown flag");
+        assert!(!refusal.chars().any(char::is_control), "{refusal:?}");
     }
 }

@@ -595,7 +595,8 @@ pub(crate) fn render_group_files(
                         (String::new(), Color::Reset)
                     };
 
-                    let path = file.path.display().to_string();
+                    // Escaped once, here; `name_palette` keys its colors by the same text.
+                    let path = crate::textsan::path(&file.path);
                     let (_, name) = split_path(&path);
                     let name_color = name_colors.get(name).copied();
 
@@ -694,7 +695,7 @@ fn member_prefix_spans(
     };
     vec![
         Span::styled(prefix, Style::new().fg(color).add_modifier(Modifier::BOLD)),
-        Span::raw(path.display().to_string()),
+        Span::raw(crate::textsan::path(path)),
     ]
 }
 
@@ -872,7 +873,8 @@ pub(crate) fn name_palette(group: &DuplicateGroup) -> HashMap<String, Color> {
     // map size at the moment of insertion.
     let mut colors: HashMap<String, Color> = HashMap::new();
     for file in &group.files {
-        let path = file.path.display().to_string();
+        // The key is the name as it is drawn, because that is what the row looks it up by.
+        let path = crate::textsan::path(&file.path);
         let (_, name) = split_path(&path);
         if !colors.contains_key(name) {
             let color = PALETTE[colors.len() % PALETTE.len()];
@@ -891,6 +893,7 @@ pub(crate) mod tests {
     use crate::model::duplicate::FileEntry;
     use crate::model::reclaim::{LinkCount, ReclaimEstimate};
     use crate::state::GroupLinks;
+    use crate::tui::hostile;
     use ratatui::{backend::TestBackend, Terminal};
     use std::path::PathBuf;
 
@@ -1642,5 +1645,173 @@ pub(crate) mod tests {
             rendered.contains("★?/t/one"),
             "an untrusted keeper carries both marks: {rendered}"
         );
+    }
+
+    // ---- Names that try to drive the terminal ----
+
+    /// Every fixture name, each in a directory of its own under `parent`.
+    fn hostile_group(parent: &str) -> DuplicateGroup {
+        DuplicateGroup {
+            id: 0,
+            size_bytes: 100,
+            hash: "h".into(),
+            files: hostile::NAMES
+                .iter()
+                .enumerate()
+                .map(|(n, name)| FileEntry {
+                    path: PathBuf::from(format!("{parent}/d{n}/{name}")),
+                    size: 100,
+                    inode: n as u64,
+                    nlink: 1,
+                    ..Default::default()
+                })
+                .collect(),
+        }
+    }
+
+    fn group_files_frame(
+        group: &DuplicateGroup,
+        style: PathStyle,
+        width: u16,
+    ) -> ratatui::buffer::Buffer {
+        let colors = name_palette(group);
+        let mut state = ListState::default();
+        hostile::frame_of(width, 12, |frame| {
+            render_group_files(
+                frame,
+                frame.area(),
+                Some(group),
+                None,
+                &colors,
+                &mut state,
+                style,
+                true,
+                " Group files ",
+            );
+        })
+    }
+
+    #[test]
+    fn group_files_show_a_hostile_path_escaped_in_every_path_style() {
+        let group = hostile_group(&format!("/tank/{}", hostile::CLEAR));
+        for style in [
+            PathStyle::DimDir,
+            PathStyle::NameFirst,
+            PathStyle::TreeGraded,
+        ] {
+            let buffer = group_files_frame(&group, style, 160);
+            hostile::assert_inert(&buffer, &format!("group files, {}", style.label()));
+            let shown = hostile::text(&buffer);
+            assert!(
+                shown.contains(hostile::RETITLE_SHOWN),
+                "{}: the name is printed escaped:\n{shown}",
+                style.label()
+            );
+            assert!(
+                shown.contains("wipe\\u{1b}[2Jme.txt"),
+                "{}: and so is the directory it sits in:\n{shown}",
+                style.label()
+            );
+        }
+    }
+
+    /// The palette is looked up by the same name it was built from. Escaping one side and not the
+    /// other would not fail anything: every name would just quietly lose its color.
+    #[test]
+    fn hostile_names_keep_the_colors_that_tell_them_apart() {
+        let group = hostile_group("/tank");
+        let buffer = group_files_frame(&group, PathStyle::NameFirst, 160);
+        let expected = [Color::Yellow, Color::Magenta, Color::Cyan, Color::Green];
+        let rows = hostile::rows(&buffer);
+        for (name, color) in hostile::NAMES.iter().zip(expected) {
+            let shown = crate::textsan::terminal(name);
+            let (y, at) = rows
+                .iter()
+                .enumerate()
+                .find_map(|(y, row)| row.find(&shown).map(|at| (y, at)))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{shown} is not on screen:\n{}",
+                        rows.join("\n").escape_debug()
+                    )
+                });
+            // Every symbol on these rows is one column wide, so characters count columns.
+            let x = rows[y][..at].chars().count();
+            assert_eq!(
+                buffer[(x as u16, y as u16)].fg,
+                color,
+                "{shown} at column {x} of row {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_path_is_shown_as_it_is_in_every_path_style() {
+        let group = DuplicateGroup {
+            id: 0,
+            size_bytes: 100,
+            hash: "h".into(),
+            files: vec![FileEntry {
+                path: PathBuf::from(format!("/tank/архив/{}", hostile::ORDINARY)),
+                size: 100,
+                nlink: 1,
+                ..Default::default()
+            }],
+        };
+        for style in [
+            PathStyle::DimDir,
+            PathStyle::NameFirst,
+            PathStyle::TreeGraded,
+        ] {
+            let shown = hostile::text(&group_files_frame(&group, style, 120));
+            assert!(
+                shown.contains(hostile::ORDINARY),
+                "{}:\n{shown}",
+                style.label()
+            );
+            assert!(shown.contains("архив"), "{}:\n{shown}", style.label());
+        }
+    }
+
+    #[test]
+    fn directory_group_members_are_shown_escaped() {
+        let mut group = attributed_group(
+            DirTrust::Trusted,
+            vec![DirTrust::Trusted; hostile::NAMES.len()],
+        );
+        group.group.paths = hostile::NAMES
+            .iter()
+            .map(|name| PathBuf::from("/tank").join(name))
+            .collect();
+
+        let buffer = hostile::frame_of(120, 8, |frame| {
+            let mut state = ListState::default();
+            render_dir_group_files(
+                frame,
+                frame.area(),
+                Some(&group.group),
+                Some(&group.member_trust),
+                &mut state,
+                true,
+                " members ",
+            );
+        });
+        hostile::assert_inert(&buffer, "directory group members");
+        assert!(hostile::text(&buffer).contains(hostile::RETITLE_SHOWN));
+
+        let buffer = hostile::frame_of(120, 8, |frame| {
+            let mut state = ListState::default();
+            render_dir_group_files_with_keeper(
+                frame,
+                frame.area(),
+                Some(&group),
+                0,
+                &mut state,
+                true,
+                " members ",
+            );
+        });
+        hostile::assert_inert(&buffer, "directory group members with a keeper");
+        assert!(hostile::text(&buffer).contains(hostile::RETITLE_SHOWN));
     }
 }

@@ -81,10 +81,11 @@ pub fn render(frame: &mut Frame, app: &App) {
             .iter()
             .map(|root| {
                 let mark = if root.selected { "[x]" } else { "[ ]" };
+                let path = crate::textsan::path(&root.path);
                 let text = if root.is_dataset {
-                    format!("{mark}  {}   →  {}", root.label, root.path.display())
+                    format!("{mark}  {}   →  {path}", root.label)
                 } else {
-                    format!("{mark}  [folder]  {}", root.path.display())
+                    format!("{mark}  [folder]  {path}")
                 };
                 ListItem::new(text)
             })

@@ -63,7 +63,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             let roots = session
                 .roots
                 .iter()
-                .map(|root| root.display().to_string())
+                .map(|root| crate::textsan::path(root))
                 .collect::<Vec<_>>()
                 .join(", ");
             let mut spans = vec![

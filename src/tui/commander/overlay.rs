@@ -106,11 +106,15 @@ pub fn render_confirm(
             scroll.clamp();
             // Only the visible window is formatted: the script of a large plan is thousands
             // of lines and this overlay redraws on every frame.
+            //
+            // The script quotes the real bytes of every name — inside `'…'` a control byte is a
+            // literal to the shell, and the saved file has to keep it. This is a display of that
+            // file, so here the same bytes are escaped.
             let body: Vec<Line> = script
                 .lines()
                 .skip(scroll.offset)
                 .take(body_rows as usize)
-                .map(|line| Line::from(format!(" {line}")))
+                .map(|line| Line::from(format!(" {}", crate::textsan::terminal(line))))
                 .collect();
             let title = match scroll.visible_range() {
                 Some((first, last)) => {
@@ -278,7 +282,7 @@ fn compose(digest: &PlanDigest, shed: Shed) -> Vec<String> {
             lines.push(format!(
                 "  {:9} {}",
                 kind.label(),
-                ellipsize_left(&target.display().to_string(), SUMMARY_PATH),
+                ellipsize_left(&crate::textsan::path(target), SUMMARY_PATH),
             ));
         }
     }
@@ -491,10 +495,28 @@ mod resume_tests {
 
 #[cfg(test)]
 mod info_overlay_size_tests {
+    use crate::tui::hostile;
     use ratatui::{backend::TestBackend, Terminal};
 
     fn lines(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("line {i}")).collect()
+    }
+
+    /// The box is as wide as its longest line, so the lines are escaped before they are measured:
+    /// the escaped name is the wider one, and a box measured on the raw text would cut its tail.
+    #[test]
+    fn the_box_is_measured_on_the_escaped_text() {
+        let lines = vec![
+            format!("Name:     {}{}", "x".repeat(30), hostile::RETITLE),
+            "Size:     4.0 KiB".to_string(),
+        ];
+        let buffer = hostile::frame_of(120, 10, |frame| super::render_info(frame, &lines));
+        hostile::assert_inert(&buffer, "F3");
+        let shown = hostile::text(&buffer);
+        assert!(
+            shown.contains(&format!("x{}", hostile::RETITLE_SHOWN)),
+            "the escaped name is there whole:\n{shown}"
+        );
     }
 
     /// A terminal can be any size the user drags it to, and the file-info overlay is the one
@@ -555,6 +577,13 @@ mod info_overlay_size_tests {
 /// then cut to what the screen actually has; on a screen shorter than 5 rows the overlay simply
 /// gets the rows there are. `centered` clips the width the same way.
 pub fn render_info(frame: &mut Frame, lines: &[String]) {
+    // The lines name the file, its path and its duplicates, and come from more than one place.
+    // Escaped before the box is measured: the escaped text is the wider one, and it is what the
+    // box has to hold.
+    let lines: Vec<String> = lines
+        .iter()
+        .map(|line| crate::textsan::terminal(line))
+        .collect();
     let height = (lines.len().saturating_add(2)).min(u16::MAX as usize) as u16;
     // NOT `clamp(5, frame.area().height)`, however much it reads like one: `clamp` panics when
     // min > max, and min > max is exactly the case here — a terminal shorter than five rows. This
@@ -593,6 +622,7 @@ mod confirm_summary_tests {
         ActionPlan, MarkIntent, PlanGroupInput, PlanMemberEvidence, PlanObjectKey,
     };
     use crate::model::reclaim::LinkCount;
+    use crate::tui::hostile;
     use ratatui::{backend::TestBackend, Terminal};
     use std::path::PathBuf;
 
@@ -976,5 +1006,86 @@ mod confirm_summary_tests {
             screen.contains("[Y] execute"),
             "the hint stays visible:\n{screen}"
         );
+    }
+
+    // ---- Names that try to drive the terminal ----
+
+    fn confirm_frame(
+        tab: ConfirmTab,
+        script: &ConfirmScript,
+        digest: &PlanDigest,
+        width: u16,
+    ) -> ratatui::buffer::Buffer {
+        let mut scroll = ConfirmScroll {
+            offset: 0,
+            total: script.ready().map_or(0, |text| text.lines().count()),
+            rows: 0,
+        };
+        hostile::frame_of(width, 30, |frame| {
+            render_confirm(frame, tab, script, digest, &mut scroll)
+        })
+    }
+
+    /// The quoted targets are cut on the left to a fixed 52 columns, so the fixture is short
+    /// enough to be read whole and the long one is there to be cut.
+    #[test]
+    fn the_confirmation_quotes_a_hostile_target_escaped() {
+        let long = format!(
+            "/tank/{}/{}/{}",
+            "d".repeat(40),
+            hostile::CLEAR,
+            hostile::EIGHT_BIT
+        );
+        let short = format!("/t/{}", hostile::RETITLE);
+        let digest = digest_of(&[
+            (ActionKind::Delete, short.as_str()),
+            (ActionKind::Hardlink, long.as_str()),
+            (ActionKind::Reflink, hostile::MOTION),
+        ]);
+        let buffer = confirm_frame(ConfirmTab::Summary, &ConfirmScript::None, &digest, 100);
+        hostile::assert_inert(&buffer, "F11 summary");
+        let shown = hostile::text(&buffer);
+        assert!(
+            shown.contains(&format!("/t/{}", hostile::RETITLE_SHOWN)),
+            "{shown}"
+        );
+        // The long one is cut, and cut as escaped text: escaping what the cut left would be
+        // inert too and would run past the box.
+        let cut = ellipsize_left(
+            &crate::textsan::path(std::path::Path::new(&long)),
+            SUMMARY_PATH,
+        );
+        assert!(
+            shown.contains(&format!("HARDLINK  {cut}")),
+            "{cut:?}:\n{shown}"
+        );
+    }
+
+    /// The script on the Commands tab is the real one, and the real one quotes the real bytes:
+    /// inside `'…'` a control byte is a literal to the shell. The tab is a display of it.
+    #[test]
+    fn the_commands_tab_shows_the_script_with_its_control_bytes_escaped() {
+        let digest = digest_of(&[(ActionKind::Delete, "/tank/dup.bin")]);
+        let script = ConfirmScript::Ready(format!(
+            "#!/bin/sh\nmv -n -- '/tank/{}' '/tank/q/{}'\nrm -- '/tank/{}'",
+            hostile::RETITLE,
+            hostile::EIGHT_BIT,
+            hostile::CLEAR,
+        ));
+        let buffer = confirm_frame(ConfirmTab::Commands, &script, &digest, 120);
+        hostile::assert_inert(&buffer, "F11 commands");
+        let shown = hostile::text(&buffer);
+        assert!(
+            shown.contains(&format!("mv -n -- '/tank/{}'", hostile::RETITLE_SHOWN)),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn the_confirmation_quotes_an_ordinary_target_as_it_is() {
+        let target = format!("/t/{}", hostile::ORDINARY);
+        let digest = digest_of(&[(ActionKind::Delete, target.as_str())]);
+        let buffer = confirm_frame(ConfirmTab::Summary, &ConfirmScript::None, &digest, 100);
+        assert!(hostile::text(&buffer).contains(&target));
     }
 }

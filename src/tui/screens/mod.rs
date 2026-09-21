@@ -3,6 +3,8 @@ pub mod action_review;
 pub mod applying;
 pub mod browser;
 pub mod folder_picker;
+#[cfg(test)]
+mod hostile_name_tests;
 pub mod resume;
 pub mod scan_config;
 pub mod scan_diff;

@@ -78,7 +78,7 @@ pub fn render_panel(
     let mut title_spans = vec![Span::raw(format!(
         " {} · {} · {} ",
         head,
-        ellipsize_left(&panel.cwd.display().to_string(), title_width),
+        ellipsize_left(&crate::textsan::path(&panel.cwd), title_width),
         panel.sort.label(),
     ))];
     // A failed dedup load is an error state: the rows below carry no statuses or signatures
@@ -406,15 +406,18 @@ fn entry_line(
         None => (' ', Color::Reset),
     };
 
+    // The name is whatever bytes the directory holds, so it is escaped before anything else:
+    // `fit` below cuts by character and would leave half a sequence, which is still a sequence.
+    let shown = crate::textsan::terminal(&entry.name);
     // Name and extension — as separate columns.
     let (display_name, extension) = match entry.kind {
-        EntryKind::File => match entry.name.rsplit_once('.') {
+        EntryKind::File => match shown.rsplit_once('.') {
             // Non-empty stem — otherwise it's a dot-file (.bashrc), not an extension.
             Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), ext.to_string()),
-            _ => (entry.name.clone(), String::new()),
+            _ => (shown.clone(), String::new()),
         },
-        EntryKind::Dir => (format!("{}/", entry.name), String::new()),
-        EntryKind::Parent => (entry.name.clone(), String::new()),
+        EntryKind::Dir => (format!("{shown}/"), String::new()),
+        EntryKind::Parent => (shown.clone(), String::new()),
     };
     let name = fit(&display_name, name_col);
     let extension = fit(&extension, ext_col);
@@ -792,7 +795,7 @@ fn render_inner_dupes(
     }
     let items: Vec<ListItem> = paths
         .iter()
-        .map(|p| ListItem::new(format!("  {}", p.display())))
+        .map(|p| ListItem::new(format!("  {}", crate::textsan::path(p))))
         .collect();
     let list = List::new(items)
         .block(block)
@@ -862,5 +865,187 @@ mod tests {
             assert!(!group_files_empty_message(variant).is_empty());
             assert!(!duplicates_of_cursor_empty_message(variant, Some(1)).is_empty());
         }
+    }
+}
+
+/// A file name is whatever bytes the directory holds. None of them may reach the terminal as a
+/// control character, from any part of the panel: the rows, the extension column, the title.
+#[cfg(test)]
+mod hostile_name_tests {
+    use super::*;
+    use crate::tui::hostile;
+    use ratatui::buffer::Buffer;
+
+    fn entry(name: &str, kind: EntryKind) -> PanelEntry {
+        hostile::entry(PathBuf::from("/tank").join(name), kind)
+    }
+
+    /// One panel over `cwd` holding `entries`, drawn whole: title, rows and borders.
+    fn drawn_panel(cwd: &str, entries: Vec<PanelEntry>, width: u16) -> Buffer {
+        let mut panel = Panel::empty(PathBuf::from(cwd));
+        panel.loading = false;
+        panel.entries = entries;
+        panel.select(0);
+        hostile::frame_of(width, 12, |frame| {
+            render_panel(
+                frame,
+                frame.area(),
+                &mut panel,
+                None,
+                None,
+                &HashSet::new(),
+                &HashMap::new(),
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                true,
+                None,
+            );
+        })
+    }
+
+    #[test]
+    fn a_hostile_name_is_listed_escaped_whether_it_is_a_file_or_a_directory() {
+        for kind in [EntryKind::File, EntryKind::Dir] {
+            let entries = hostile::NAMES
+                .iter()
+                .map(|name| entry(name, kind))
+                .collect();
+            let buffer = drawn_panel("/tank", entries, 120);
+            hostile::assert_inert(&buffer, "panel rows");
+            // `evil.bin` splits into the name column and the extension column.
+            let shown = hostile::text(&buffer);
+            assert!(
+                shown.contains("\\u{1b}]0;PWNED\\u{7}evil"),
+                "the escape is printed, not swallowed:\n{shown}"
+            );
+        }
+    }
+
+    /// The extension is the tail of the same untrusted name and has a column of its own.
+    #[test]
+    fn a_hostile_extension_is_escaped_too() {
+        let buffer = drawn_panel(
+            "/tank",
+            vec![entry("photo.\u{1b}[2J", EntryKind::File)],
+            120,
+        );
+        hostile::assert_inert(&buffer, "panel extension column");
+        assert!(hostile::text(&buffer).contains("photo"));
+    }
+
+    /// Cutting comes after escaping. Cut first and `fit` keeps `ESC ] 0` and drops the rest, which
+    /// is still a sequence, only not the one the name held; `ellipsize_left` drops the ESC and
+    /// keeps its tail. So across the narrow widths, where every row and the title are cut, nothing
+    /// the cut leaves may be a control character, and the title is the escaped path cut to its
+    /// budget. The same for a row is `the_cut_falls_on_the_escaped_text`.
+    #[test]
+    fn a_cut_leaves_nothing_a_terminal_would_act_on() {
+        for width in 30..=70 {
+            let entries = hostile::NAMES
+                .iter()
+                .map(|name| entry(name, EntryKind::File))
+                .collect();
+            let cwd = format!("/tank/{}/{}", hostile::CLEAR, hostile::EIGHT_BIT);
+            let buffer = drawn_panel(&cwd, entries, width);
+            hostile::assert_inert(&buffer, &format!("panel at {width} columns"));
+
+            // Escaping what is left after the cut would be just as inert and would not fit: the
+            // title gets `width - 24` columns, and it is the escaped text that has to fit them.
+            let title = ellipsize_left(
+                &crate::textsan::path(std::path::Path::new(&cwd)),
+                width as usize - 24,
+            );
+            let top = &hostile::rows(&buffer)[0];
+            assert!(
+                top.contains(&format!(" 1 · {title} · ")),
+                "at {width} columns the title is {title:?}: {top}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cut_falls_on_the_escaped_text() {
+        let line = entry_line(
+            &entry(hostile::RETITLE, EntryKind::Dir),
+            42,
+            DedupStatus::NotInScan,
+            None,
+            false,
+            None,
+            None,
+        );
+        let name = line.spans[2].content.to_string();
+        assert_eq!(name, "\\u{1b}]0;…", "ten columns of the escaped form");
+    }
+
+    #[test]
+    fn an_ordinary_name_is_listed_as_it_is() {
+        let cwd = format!("/tank/{}", hostile::ORDINARY);
+        let buffer = drawn_panel(&cwd, vec![entry(hostile::ORDINARY, EntryKind::Dir)], 120);
+        let shown = hostile::text(&buffer);
+        assert!(
+            shown.contains(&format!("{}/", hostile::ORDINARY)),
+            "the row:\n{shown}"
+        );
+        assert!(shown.contains(&cwd), "the title:\n{shown}");
+    }
+
+    /// From the directory itself: the names are on disk and are read the way the panel reads
+    /// them, the directory's own name included. One of them is not UTF-8 at all.
+    ///
+    /// The fixture needs a filesystem that takes any byte in a name, which the temporary
+    /// directory of every supported build is; one that does not is named in the panic rather than
+    /// left to look like a defect in the panel.
+    #[test]
+    fn names_read_from_a_real_directory_are_listed_escaped() {
+        use std::os::unix::ffi::OsStrExt;
+        let made = |what: std::io::Result<()>, name: &std::path::Path| {
+            what.unwrap_or_else(|err| {
+                panic!("the temporary directory refuses the name {name:?}: {err}")
+            })
+        };
+        let scratch = crate::testfixtures::ScratchDir::new("hostile_panel");
+        let dir = scratch.path().join(hostile::RETITLE);
+        made(std::fs::create_dir(&dir), &dir);
+        for name in hostile::NAMES {
+            made(std::fs::write(dir.join(name), b"x"), &dir.join(name));
+        }
+        let bytes = dir.join(std::ffi::OsStr::from_bytes(b"latin1-\xe9\x1b[2J.txt"));
+        made(std::fs::write(&bytes, b"x"), &bytes);
+        let inner = dir.join(hostile::CLEAR.replace(".txt", ".d"));
+        made(std::fs::create_dir(&inner), &inner);
+
+        let entries = super::super::state::read_panel_dir(&dir);
+        assert_eq!(
+            entries.len(),
+            hostile::NAMES.len() + 3,
+            "`..` and all of them"
+        );
+        let buffer = drawn_panel(dir.to_str().unwrap(), entries, 160);
+        hostile::assert_inert(&buffer, "a panel over a real directory");
+        let shown = hostile::text(&buffer);
+        assert!(shown.contains("\\u{1b}]0;PWNED\\u{7}evil"), "{shown}");
+        assert!(shown.contains("latin1-\u{fffd}\\u{1b}[2J"), "{shown}");
+        assert!(shown.contains("wipe\\u{1b}[2Jme.d/"), "{shown}");
+    }
+
+    #[test]
+    fn duplicates_inside_a_directory_are_listed_escaped() {
+        let paths: Vec<PathBuf> = hostile::NAMES
+            .iter()
+            .map(|name| PathBuf::from("/tank/inner").join(name))
+            .collect();
+        let mut state = ListState::default();
+        let buffer = hostile::frame_of(120, 10, |frame| {
+            render_inner_dupes(frame, frame.area(), &paths, &mut state, true, " 1 · dupes ");
+        });
+        hostile::assert_inert(&buffer, "duplicates inside a directory");
+        assert!(hostile::text(&buffer).contains(hostile::RETITLE_SHOWN));
     }
 }

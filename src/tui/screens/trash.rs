@@ -33,7 +33,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             let roots = session
                 .roots
                 .iter()
-                .map(|root| root.display().to_string())
+                .map(|root| crate::textsan::path(root))
                 .collect::<Vec<_>>()
                 .join(", ");
             ListItem::new(format!("{}  ·  {}", session.created_at, roots))

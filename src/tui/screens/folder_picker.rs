@@ -21,7 +21,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let header = Paragraph::new(Line::from(format!(
         " Current directory:  {} ",
-        picker.current_dir.display()
+        crate::textsan::path(&picker.current_dir)
     )))
     .block(
         Block::default()
@@ -39,8 +39,8 @@ pub fn render(frame: &mut Frame, app: &App) {
             .map(|path| {
                 let name = path
                     .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
+                    .map(crate::textsan::os_str)
+                    .unwrap_or_else(|| crate::textsan::path(path));
                 ListItem::new(format!("{name}/"))
             })
             .collect()

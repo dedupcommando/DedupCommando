@@ -27,6 +27,8 @@ use crate::state::GroupLinks;
 
 pub mod commander;
 pub mod event;
+#[cfg(test)]
+pub(crate) mod hostile;
 pub mod screens;
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -139,8 +141,180 @@ mod panic_hook_tests {
     }
 }
 
+/// Draws one frame: the screens, then the guard. The way in for `main`.
+pub fn draw(frame: &mut Frame, app: &mut App) {
+    render(frame, app);
+    let scrubbed = scrub_controls(frame.buffer_mut());
+    if scrubbed > 0 && !app.frame_guard_reported {
+        app.frame_guard_reported = true;
+        tracing::warn!(
+            cells = scrubbed,
+            mode = ?app.mode,
+            screen = ?app.screen,
+            overlay = ?app.commander.overlay,
+            "a screen drew a control character; it was taken out before the frame reached the \
+             terminal. That screen has a defect, please report it"
+        );
+    }
+}
+
+/// The last thing between a frame and the terminal: no cell leaves with a control character in
+/// it.
+///
+/// Every screen escapes what it shows through `textsan`, and shows it readable. This stands
+/// behind them for the screen that forgets, because what a terminal does with ESC out of a file
+/// name is execute it, and the operator is root. By now the cell is laid out and is one column
+/// wide, so it gets one `?` rather than the character spelled out. When the control character
+/// shares its cell with something printable, only the printable part stays: `\r\n` is a single
+/// grapheme and lands in one cell, and so does a letter with a control character appended.
+/// Returns how many cells it had to touch.
+fn scrub_controls(buffer: &mut ratatui::buffer::Buffer) -> usize {
+    let mut scrubbed = 0;
+    for cell in &mut buffer.content {
+        if cell.symbol().contains(char::is_control) {
+            let kept: String = cell
+                .symbol()
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .collect();
+            cell.set_symbol(if kept.is_empty() { "?" } else { &kept });
+            scrubbed += 1;
+        }
+    }
+    scrubbed
+}
+
+#[cfg(test)]
+mod frame_guard_tests {
+    use super::*;
+    use crate::tui::hostile::{self, RETITLE};
+    use ratatui::buffer::Buffer;
+
+    /// A cell stays one column wide: a control character alone becomes one `?`, and one that
+    /// shares its cell with something printable is dropped. `\r\n` is a single grapheme, so it is
+    /// the case where a replacement per character would have made the cell two columns wide.
+    #[test]
+    fn a_control_character_in_a_cell_is_replaced_and_nothing_else_is() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 1));
+        buffer[(0, 0)].set_symbol("\u{1b}");
+        buffer[(1, 0)].set_symbol("e\u{301}");
+        buffer[(2, 0)].set_symbol("a\u{9b}");
+        buffer[(3, 0)].set_symbol("\r\n");
+        buffer[(4, 0)].set_symbol("я");
+        assert_eq!(scrub_controls(&mut buffer), 3);
+        assert_eq!(hostile::rows(&buffer), ["?e\u{301}a?я"]);
+        assert_eq!(
+            scrub_controls(&mut buffer),
+            0,
+            "and then there is nothing left"
+        );
+    }
+
+    /// A dataset name is drawn as `zfs list` gave it, because ZFS itself admits no control
+    /// character into one — which makes it the stand-in here for any text a screen trusts and
+    /// should not have. Two things are proven at once: `render` lets it through, which is why
+    /// the tests of the screens draw through `render` and see what the screen itself did; and
+    /// `draw`, which is what `main` calls, does not.
+    #[test]
+    fn what_a_screen_lets_through_the_guard_stops() {
+        let (mut app, _rx) = crate::app::test_app();
+        app.show_disclaimer = false;
+        app.mode = AppMode::Wizard;
+        app.screen = Screen::ScanConfig;
+        app.config.roots = vec![crate::app::RootChoice {
+            label: RETITLE.to_string(),
+            path: std::path::PathBuf::from("/tank"),
+            selected: true,
+            is_dataset: true,
+        }];
+
+        let unguarded = hostile::frame_of(120, 24, |frame| render(frame, &mut app));
+        assert!(
+            !hostile::live_cells(&unguarded).is_empty(),
+            "the premise: a dataset name reaches the cells as it is. If it no longer does, this \
+             test needs another stand-in, not a weaker assertion"
+        );
+
+        assert!(!app.frame_guard_reported);
+        let guarded = hostile::frame_of(120, 24, |frame| draw(frame, &mut app));
+        hostile::assert_inert(&guarded, "the guarded frame");
+        assert!(hostile::text(&guarded).contains("?]0;PWNED?evil.bin"));
+        assert!(app.frame_guard_reported, "and the log was told, once");
+    }
+
+    #[test]
+    fn a_frame_with_nothing_to_stop_is_left_as_it_was() {
+        let (mut app, _rx) = crate::app::test_app();
+        app.show_disclaimer = false;
+        app.commander.status = hostile::ORDINARY.to_string();
+        let unguarded = hostile::frame_of(120, 24, |frame| render(frame, &mut app));
+        let guarded = hostile::frame_of(120, 24, |frame| draw(frame, &mut app));
+        assert_eq!(unguarded, guarded);
+        assert!(!app.frame_guard_reported);
+    }
+}
+
+#[cfg(test)]
+mod hostile_name_tests {
+    use super::*;
+    use crate::tui::hostile::{self, RETITLE, RETITLE_SHOWN};
+
+    /// The startup prompt prints a line of the lock file, and the lock file is whatever was found
+    /// under that name.
+    #[test]
+    fn the_concurrency_prompt_shows_the_lock_file_line_escaped() {
+        let (mut app, _rx) = crate::app::test_app();
+        app.show_disclaimer = false;
+        app.concurrency_prompt = Some(crate::lock::Holder {
+            pid: 4242,
+            since: RETITLE.to_string(),
+        });
+        let shown = hostile::inert_text(120, 30, "concurrency prompt", |frame| {
+            render(frame, &mut app)
+        });
+        assert!(
+            shown.contains(&format!("PID 4242, since {RETITLE_SHOWN}")),
+            "{shown}"
+        );
+    }
+
+    /// The status line passes on sentences written elsewhere, so it is escaped where it is drawn,
+    /// on every surface that draws one.
+    #[test]
+    fn a_status_nobody_here_wrote_is_drawn_escaped_on_every_surface() {
+        let quoted = format!("store error: cannot stat /tank/{RETITLE}");
+        let shown = format!("cannot stat /tank/{RETITLE_SHOWN}");
+
+        let (mut app, _rx) = crate::app::test_app();
+        app.show_disclaimer = false;
+        app.commander.status = quoted.clone();
+        let commander =
+            hostile::inert_text(200, 24, "commander status", |frame| render(frame, &mut app));
+        assert!(commander.contains(&shown), "{commander}");
+
+        app.commander.board = Some(commander::state::BoardState::new(
+            std::path::PathBuf::from("/nonexistent"),
+            [(); 4].map(|()| std::path::PathBuf::from("/nonexistent")),
+        ));
+        let board = hostile::inert_text(200, 40, "board status", |frame| {
+            commander::board::render(frame, &mut app)
+        });
+        assert!(board.contains(&shown), "{board}");
+
+        app.mode = AppMode::Wizard;
+        app.status = quoted;
+        for screen in [Screen::ScanConfig, Screen::Resume, Screen::ActionReview] {
+            app.screen = screen;
+            app.sessions_loading = false;
+            let wizard =
+                hostile::inert_text(200, 24, "wizard status", |frame| render(frame, &mut app));
+            assert!(wizard.contains(&shown), "{screen:?}:\n{wizard}");
+        }
+    }
+}
+
 /// Render dispatcher by current screen; on top — the help overlay.
-pub fn render(frame: &mut Frame, app: &mut App) {
+fn render(frame: &mut Frame, app: &mut App) {
     match app.mode {
         AppMode::Commander => commander::render(frame, app),
         AppMode::Wizard => match app.screen {
@@ -303,7 +477,12 @@ fn render_concurrency(frame: &mut Frame, app: &App) {
     let area = centered(frame.area(), 68, 15);
     frame.render_widget(Clear, area);
     let who = match &app.concurrency_prompt {
-        Some(h) => format!("PID {}, since {}", h.pid, h.since),
+        // `since` is a line read back from the lock file, whoever wrote it.
+        Some(h) => format!(
+            "PID {}, since {}",
+            h.pid,
+            crate::textsan::terminal(&h.since)
+        ),
         None => "unknown".to_string(),
     };
     let lines = vec![
@@ -867,10 +1046,20 @@ mod plan_surface_parity_tests {
     }
 }
 
+/// The status line as it is drawn.
+///
+/// It is written in well over a hundred places, and a good part of them pass on a sentence some
+/// lower layer wrote — a store error, a refused plan, a panic message — which may quote a
+/// pathname. The places that name a path themselves escape it as they write; this is for the
+/// sentence nobody here wrote. Escaping text that is already safe changes nothing.
+pub(crate) fn status_shown(status: &str) -> String {
+    crate::textsan::terminal(status)
+}
+
 /// Two-line footer: status (if non-empty) and the always-visible key hints.
 pub fn render_footer(frame: &mut Frame, area: Rect, status: &str, hints: &str) {
     let lines = Text::from(vec![
-        Line::from(status.to_string()),
+        Line::from(status_shown(status)),
         Line::from(hints.dim()),
     ]);
     frame.render_widget(
