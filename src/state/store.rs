@@ -210,6 +210,15 @@ pub struct ScanStore {
     /// `conn` for its transaction, so recording the verdict cannot also take `&mut self`. It
     /// keeps `membership_snapshot`'s public signature unchanged as well.
     membership_cache: std::cell::RefCell<Option<MembershipCacheEntry>>,
+    /// Directory sizes and signatures already worked out for the active scan, so a panel shown
+    /// again, or its parent, does not read the subtree again.
+    dir_memo: std::cell::RefCell<Option<DirMemo>>,
+    /// The directory cursors already answered for the active authority.
+    dir_group_memo: std::cell::RefCell<Option<DirGroupMemo>>,
+    /// Test-only: the size at which [`DirMemo`] starts over; [`DIR_MEMO_CAP`] unless a test
+    /// needs to see it happen.
+    #[cfg(test)]
+    dir_memo_cap: std::cell::Cell<usize>,
     /// Test-only: how many set-based digest-propagation statements this store has issued. The
     /// hashing phase must spend one per batch, never one per alias, and a counter on the store
     /// itself proves that without a dependency, rusqlite tracing, or a timing measurement. Per
@@ -241,6 +250,10 @@ pub struct ScanStore {
     export_rows_now: std::cell::Cell<u64>,
     #[cfg(test)]
     export_rows_max: std::cell::Cell<u64>,
+    /// Test-only: statements that read a directory's whole subtree, the unit a panel refresh
+    /// and a directory cursor are priced in. Per instance, like the counters above.
+    #[cfg(test)]
+    subtree_walks: std::cell::Cell<u64>,
 }
 
 /// One cached whole-authority validation, valid only while the connection still sees the same
@@ -258,6 +271,56 @@ struct MembershipCacheEntry {
     /// Either the completed integrity result, or a deterministic refusal — a verdict that is a
     /// pure function of the database state this key pins. Transient failures never land here.
     outcome: std::result::Result<AuthorityIntegrity, MembershipMiss>,
+}
+
+/// Directories remembered in [`DirMemo`] before it starts over — about 50 MB of facts.
+const DIR_MEMO_CAP: usize = 250_000;
+
+/// Directory cursors remembered in [`DirGroupMemo`] before it starts over.
+const DIR_GROUP_MEMO_CAP: usize = 256;
+
+/// What one directory's subtree holds, before the ledger has its say: the answer of the
+/// per-directory readers without the trust they attach at the moment of asking.
+#[derive(Debug, Clone, Default)]
+struct DirFacts {
+    /// `SUM(size)` over the directory's rows, 0 when it has none.
+    size: i64,
+    /// `Old`: the digest of the rows when every one is hashed and there is at least one.
+    /// `Merkle`: the signature the streaming build emits for the directory.
+    signature: Option<String>,
+}
+
+/// The directory facts this connection has worked out for one scan, valid for the database
+/// state they were read from. A single slot, like [`MembershipCacheEntry`], and kept current
+/// the same way: `data_version` for other connections, revocation by this one's writers.
+struct DirMemo {
+    scan_id: i64,
+    algo: DirSigAlgo,
+    data_version: i64,
+    /// Keyed by the directory's text as [`prefix_bounds`] spells it.
+    facts: HashMap<String, DirFacts>,
+    /// Directories a walk read whole: a child of one that `facts` does not name holds no rows.
+    swept: std::collections::HashSet<String>,
+    /// Walk roots that met a row the walk does not model: answered by the per-directory readers
+    /// from then on, without trying the walk first.
+    unmodelled: std::collections::HashSet<String>,
+}
+
+impl DirMemo {
+    fn knows(&self, key: &str) -> bool {
+        self.facts.contains_key(key)
+            || dir_key_parent(key).is_some_and(|parent| self.swept.contains(parent))
+    }
+}
+
+/// The `dir_group_at` answers this connection has given for one authority and database state.
+struct DirGroupMemo {
+    scan_id: i64,
+    mode: MembershipMode,
+    generation: i64,
+    data_version: i64,
+    /// Keyed by the directory's exact bytes: two spellings that print alike are two answers.
+    answers: HashMap<Vec<u8>, DirGroupAnswer>,
 }
 
 /// Process role. `false` — operator (may write), `true` — observer.
@@ -976,6 +1039,10 @@ impl ScanStore {
             conn,
             db_identity,
             membership_cache: std::cell::RefCell::new(None),
+            dir_memo: std::cell::RefCell::new(None),
+            dir_group_memo: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            dir_memo_cap: std::cell::Cell::new(DIR_MEMO_CAP),
             #[cfg(test)]
             propagations: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -988,6 +1055,8 @@ impl ScanStore {
             export_rows_now: std::cell::Cell::new(0),
             #[cfg(test)]
             export_rows_max: std::cell::Cell::new(0),
+            #[cfg(test)]
+            subtree_walks: std::cell::Cell::new(0),
         }
     }
 
@@ -995,6 +1064,18 @@ impl ScanStore {
     #[cfg(test)]
     pub fn export_buffered_rows_max(&self) -> u64 {
         self.export_rows_max.get()
+    }
+
+    /// Test-only: subtree walks spent so far (see the field).
+    #[cfg(test)]
+    pub(crate) fn subtree_walks(&self) -> u64 {
+        self.subtree_walks.get()
+    }
+
+    /// One more statement is about to read a whole subtree.
+    fn note_subtree_walk(&self) {
+        #[cfg(test)]
+        self.subtree_walks.set(self.subtree_walks.get() + 1);
     }
 
     /// Test-only: how many member rows the export is holding RIGHT NOW.
@@ -1057,6 +1138,38 @@ impl ScanStore {
     /// one of the concrete hooks instead.
     fn revoke_membership_cache(&self) {
         *self.membership_cache.borrow_mut() = None;
+        self.revoke_dir_memos();
+    }
+
+    /// Drops the remembered directory facts and cursor answers. Called with every membership
+    /// revocation, and by the omission-ledger writers too: the ledger decides a directory's trust
+    /// and, under `Merkle`, its signature, so the same rule applies to them.
+    fn revoke_dir_memos(&self) {
+        *self.dir_memo.borrow_mut() = None;
+        *self.dir_group_memo.borrow_mut() = None;
+    }
+
+    /// The size at which [`DirMemo`] starts over.
+    fn dir_memo_cap(&self) -> usize {
+        #[cfg(test)]
+        return self.dir_memo_cap.get();
+        #[cfg(not(test))]
+        DIR_MEMO_CAP
+    }
+
+    /// Test-only: lets a test see [`DirMemo`] start over without a quarter of a million rows.
+    #[cfg(test)]
+    pub(crate) fn set_dir_memo_cap(&self, cap: usize) {
+        self.dir_memo_cap.set(cap);
+    }
+
+    /// Test-only: how many directories [`DirMemo`] holds right now.
+    #[cfg(test)]
+    pub(crate) fn dir_memo_len(&self) -> usize {
+        self.dir_memo
+            .borrow()
+            .as_ref()
+            .map_or(0, |memo| memo.facts.len())
     }
 
     /// Test-only: apply-lease statements issued so far (see the field).
@@ -2400,6 +2513,7 @@ impl ScanStore {
 
     /// Writes the scan's duplicate-directory groups.
     pub fn record_dir_groups(&mut self, scan_id: i64, groups: &[DirGroup]) -> Result<()> {
+        self.revoke_dir_memos();
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
@@ -2433,6 +2547,7 @@ impl ScanStore {
     where
         F: FnOnce(&mut dyn FnMut(PathBuf, String, u64, u32) -> Result<()>) -> Result<()>,
     {
+        self.revoke_dir_memos();
         let tx = self.conn.transaction()?;
         // Per-connection temp table: created once; cleared before each run.
         tx.execute(
@@ -2929,13 +3044,27 @@ impl ScanStore {
     /// The total size of scan files strictly under each directory in `dirs`
     /// (a prefix range over the PK, without `LIKE%`). Directories with no scan files do not
     /// enter the map. A batch over the panel's visible subdirectories.
+    ///
+    /// Test-only: production asks [`Self::dir_aggregates`], which falls back to the same code.
+    /// Kept as the definition its answer is checked against.
+    #[cfg(test)]
     pub fn dir_sizes_under(&self, scan_id: i64, dirs: &[PathBuf]) -> Result<HashMap<PathBuf, u64>> {
+        self.dir_sizes_in(&self.conn, scan_id, dirs)
+    }
+
+    fn dir_sizes_in(
+        &self,
+        conn: &Connection,
+        scan_id: i64,
+        dirs: &[PathBuf],
+    ) -> Result<HashMap<PathBuf, u64>> {
         let mut out = HashMap::new();
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT COALESCE(SUM(size), 0) FROM file WHERE scan_id = ?1 AND path >= ?2 AND path < ?3",
         )?;
         for dir in dirs {
             let (lo, hi) = prefix_bounds(dir);
+            self.note_subtree_walk();
             let total: i64 = stmt.query_row(params![scan_id, lo, hi], |row| row.get(0))?;
             if total > 0 {
                 out.insert(dir.clone(), total as u64);
@@ -2960,6 +3089,9 @@ impl ScanStore {
     /// from the persisted — cross-panel highlight breaks. The old top-down (`Old`) and the new
     /// streaming-Merkle (`Merkle`) produce identical equivalence CLASSES (the group
     /// compositions are identical), but the per-row hex differs.
+    ///
+    /// Test-only, like [`Self::dir_sizes_under`] and for the same reason.
+    #[cfg(test)]
     pub fn dir_signatures_under(
         &self,
         scan_id: i64,
@@ -2973,12 +3105,22 @@ impl ScanStore {
             SnapshotOutcome::Bounded(snapshot) => snapshot,
             SnapshotOutcome::Unavailable(_) => &legacy,
         };
+        self.dir_signatures_in(&tx, scan_id, dirs, algo, ctx)
+    }
 
+    fn dir_signatures_in(
+        &self,
+        conn: &Connection,
+        scan_id: i64,
+        dirs: &[PathBuf],
+        algo: DirSigAlgo,
+        ctx: &dyn SignatureContext,
+    ) -> Result<HashMap<PathBuf, LiveDirSignature>> {
         let mut out = HashMap::new();
         // We take ALL files under the directory (not only `hash IS NOT NULL`).
         // An unhashed file (unique-size / failure) makes the directory INCOMPLETE — a live
         // signature for it is NOT produced (no false cross-panel «twin» highlighting).
-        let mut stmt = tx.prepare(
+        let mut stmt = conn.prepare(
             "SELECT path, hash FROM file
              WHERE scan_id = ?1 AND path >= ?2 AND path < ?3
              ORDER BY path",
@@ -2996,6 +3138,7 @@ impl ScanStore {
                 continue;
             }
             let (lo, hi) = prefix_bounds(dir);
+            self.note_subtree_walk();
             let rows = stmt.query_map(params![scan_id, lo, hi], |row| {
                 Ok((
                     PathBuf::from(row.get::<_, String>(0)?),
@@ -3049,6 +3192,155 @@ impl ScanStore {
             }
         }
         Ok(out)
+    }
+
+    /// The sizes and the signatures of the directories one panel shows: what the per-directory
+    /// readers (`dir_sizes_in`, `dir_signatures_in`) answer, without walking a subtree this
+    /// connection has already read in the same database state.
+    ///
+    /// Missing directories are walked together: one ordered pass over their parent's rows
+    /// answers the parent and every child, so going back up costs nothing either. The ledger
+    /// decides trust at the moment of asking, for each directory by its own path, as the
+    /// per-directory readers do. Rows of any shape the walk does not model are answered by those
+    /// readers themselves.
+    pub fn dir_aggregates(
+        &self,
+        scan_id: i64,
+        dirs: &[PathBuf],
+        algo: DirSigAlgo,
+    ) -> Result<(HashMap<PathBuf, u64>, HashMap<PathBuf, LiveDirSignature>)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let data_version: i64 = tx.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        let outcome = completeness_snapshot_tx(&tx, scan_id)?;
+        let legacy = LegacyContext;
+        let ctx: &dyn SignatureContext = match &outcome {
+            SnapshotOutcome::Bounded(snapshot) => snapshot,
+            SnapshotOutcome::Unavailable(_) => &legacy,
+        };
+
+        let mut slot = self.dir_memo.borrow_mut();
+        let current = slot.as_ref().is_some_and(|memo| {
+            memo.scan_id == scan_id
+                && memo.algo == algo
+                && memo.data_version == data_version
+                && memo.facts.len() <= self.dir_memo_cap()
+        });
+        if !current {
+            *slot = Some(DirMemo {
+                scan_id,
+                algo,
+                data_version,
+                facts: HashMap::new(),
+                swept: std::collections::HashSet::new(),
+                unmodelled: std::collections::HashSet::new(),
+            });
+        }
+        let memo = slot.as_mut().expect("the slot was just filled");
+
+        let mut missing: Vec<String> = Vec::new();
+        let mut asked: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for dir in dirs {
+            let key = dir_key(dir);
+            if memo.knows(&key) || !asked.insert(key.clone()) {
+                continue;
+            }
+            let (lo, hi) = prefix_bounds(dir);
+            let any: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM file WHERE scan_id = ?1 AND path >= ?2 AND path < ?3)",
+                params![scan_id, lo, hi],
+                |row| row.get(0),
+            )?;
+            if any {
+                missing.push(key);
+            } else {
+                memo.facts.insert(key, DirFacts::default());
+            }
+        }
+        for root in walk_roots(&missing) {
+            let walk = if memo.unmodelled.contains(&root) {
+                Walk::Unmodelled
+            } else {
+                self.walk_dir_facts(&tx, scan_id, &root, algo, ctx)
+            };
+            let found = match walk {
+                Walk::Facts(found) => found,
+                // Rows the walk does not model, or a read that failed: the per-directory readers
+                // answer the request, exactly as they always have. Only the first is a property
+                // of the data worth remembering.
+                Walk::Unmodelled | Walk::Failed => {
+                    if matches!(walk, Walk::Unmodelled) {
+                        memo.unmodelled.insert(root);
+                    }
+                    return Ok((
+                        self.dir_sizes_in(&tx, scan_id, dirs)?,
+                        self.dir_signatures_in(&tx, scan_id, dirs, algo, ctx)?,
+                    ));
+                }
+            };
+            memo.facts.extend(found);
+            memo.swept.insert(root);
+        }
+
+        let mut sizes = HashMap::new();
+        let mut signatures = HashMap::new();
+        for dir in dirs {
+            let key = dir_key(dir);
+            let facts = memo.facts.get(&key);
+            let size = facts.map_or(0, |facts| facts.size);
+            if size > 0 {
+                sizes.insert(dir.clone(), size as u64);
+            }
+            // The ledger's say, per directory and by its own path, in the per-directory
+            // reader's order.
+            let trust = match ctx.disposition(dir) {
+                DirDisposition::Suppressed => continue,
+                DirDisposition::Trusted => DirTrust::Trusted,
+                DirDisposition::Untrusted => DirTrust::Untrusted,
+            };
+            if matches!(ctx.scope(dir), DirScope::Outside) {
+                continue;
+            }
+            // Rows hold text: a path the text does not spell (a name that is not UTF-8) finds no
+            // row in the per-directory reader either.
+            if Path::new(&key) != dir.as_path() {
+                continue;
+            }
+            if let Some(signature) = facts.and_then(|facts| facts.signature.clone()) {
+                signatures.insert(dir.clone(), LiveDirSignature { signature, trust });
+            }
+        }
+        Ok((sizes, signatures))
+    }
+
+    /// One ordered pass over `root`'s rows: the facts of `root` and of each child that holds
+    /// rows.
+    fn walk_dir_facts(
+        &self,
+        conn: &Connection,
+        scan_id: i64,
+        root: &str,
+        algo: DirSigAlgo,
+        ctx: &dyn SignatureContext,
+    ) -> Walk {
+        if !ordinary_dir(root) {
+            return Walk::Unmodelled;
+        }
+        let (prefix, hi) = prefix_bounds(Path::new(root));
+        self.note_subtree_walk();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT path, size, hash FROM file
+              WHERE scan_id = ?1 AND path >= ?2 AND path < ?3
+              ORDER BY path",
+        ) else {
+            return Walk::Failed;
+        };
+        let Ok(rows) = stmt.query(params![scan_id, &prefix, hi]) else {
+            return Walk::Failed;
+        };
+        match algo {
+            DirSigAlgo::Old => walk_old(rows, root, &prefix),
+            DirSigAlgo::Merkle => walk_merkle(rows, root, &prefix, ctx),
+        }
     }
 
     /// Attributed summaries of all twin-directory groups for the browser tab `[2] Directories`
@@ -3650,6 +3942,270 @@ fn prefix_bounds(dir: &Path) -> (String, String) {
         return (String::from("/"), String::from("0"));
     }
     (format!("{s}/"), format!("{s}0"))
+}
+
+/// A directory as [`DirMemo`] knows it: the text [`prefix_bounds`] builds its range from.
+fn dir_key(dir: &Path) -> String {
+    dir.to_string_lossy().into_owned()
+}
+
+/// The parent of a [`dir_key`], as text; `None` for `/` and for a name without a separator.
+fn dir_key_parent(key: &str) -> Option<&str> {
+    if key == "/" {
+        return None;
+    }
+    key.rfind('/')
+        .map(|slash| if slash == 0 { "/" } else { &key[..slash] })
+}
+
+/// Where to walk for `missing`: their common parent, whose one pass answers it and every child,
+/// or each of them when they share none. `/` is never walked for itself: nothing asks for its
+/// size or signature, and its rows are the whole scan.
+fn walk_roots(missing: &[String]) -> Vec<String> {
+    let Some(parent) = missing.first().and_then(|first| dir_key_parent(first)) else {
+        return missing.to_vec();
+    };
+    if parent != "/"
+        && missing
+            .iter()
+            .all(|key| dir_key_parent(key) == Some(parent))
+    {
+        vec![parent.to_string()]
+    } else {
+        missing.to_vec()
+    }
+}
+
+/// An absolute directory spelled the one way the walk models: `/`, or components that are
+/// neither empty, `.` nor `..`, with no separator at the end.
+fn ordinary_dir(key: &str) -> bool {
+    key == "/"
+        || (key.len() > 1
+            && key.starts_with('/')
+            && key[1..]
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != ".."))
+}
+
+/// A row in the shape the walk models: a UTF-8 text path under `prefix` whose remainder is an
+/// ordinary relative path, a non-negative INTEGER size, and no digest or a 32-byte one. For
+/// such a row `strip_prefix` is the remainder and the byte ancestors are the path ancestors, so
+/// the walk sees what the per-directory readers see. `None` for any other shape.
+fn ordinary_row<'r>(
+    row: &'r rusqlite::Row<'_>,
+    prefix: &str,
+) -> Option<(&'r str, &'r str, i64, Option<&'r [u8]>)> {
+    use rusqlite::types::ValueRef;
+    let ValueRef::Text(path) = row.get_ref(0).ok()? else {
+        return None;
+    };
+    let path = std::str::from_utf8(path).ok()?;
+    let ValueRef::Integer(size) = row.get_ref(1).ok()? else {
+        return None;
+    };
+    if size < 0 {
+        return None;
+    }
+    let hash = match row.get_ref(2).ok()? {
+        ValueRef::Null => None,
+        ValueRef::Blob(bytes) if bytes.len() == 32 => Some(bytes),
+        _ => return None,
+    };
+    let rest = path.strip_prefix(prefix)?;
+    let ordinary = !rest.is_empty()
+        && rest
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..");
+    ordinary.then_some((path, rest, size, hash))
+}
+
+/// [`hex_encode`] of a 32-byte digest, without an allocation per row.
+fn hex32(bytes: &[u8]) -> [u8; 64] {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 64];
+    for (index, byte) in bytes.iter().enumerate() {
+        out[2 * index] = DIGITS[usize::from(byte >> 4)];
+        out[2 * index + 1] = DIGITS[usize::from(byte & 0x0f)];
+    }
+    out
+}
+
+/// How one walk ended.
+enum Walk {
+    /// The facts of the walk root and of each child that holds rows.
+    Facts(Vec<(String, DirFacts)>),
+    /// A row of a shape the walk does not model, or a build the per-directory reader could
+    /// answer differently: a property of the data, remembered.
+    Unmodelled,
+    /// A read failed: nothing learned about the data.
+    Failed,
+}
+
+/// One directory's running `Old` facts: the sum, and the digest [`signature_of`] would take of
+/// its rows. The rows arrive in path order, which is the order `signature_of` sorts them into.
+struct OldFacts {
+    size: i64,
+    complete: bool,
+    entries: bool,
+    hasher: blake3::Hasher,
+}
+
+impl OldFacts {
+    fn new() -> Self {
+        OldFacts {
+            size: 0,
+            complete: true,
+            entries: false,
+            hasher: blake3::Hasher::new(),
+        }
+    }
+
+    /// One row at `rel` below the directory; `None` when the sum leaves `i64`, where SQLite's
+    /// `SUM` fails instead.
+    fn add(&mut self, size: i64, rel: &str, hex: Option<&[u8; 64]>) -> Option<()> {
+        self.size = self.size.checked_add(size)?;
+        match hex {
+            Some(hex) => {
+                self.hasher.update(rel.as_bytes());
+                self.hasher.update(&[0]);
+                self.hasher.update(hex);
+                self.hasher.update(&[0]);
+                self.entries = true;
+            }
+            None => self.complete = false,
+        }
+        Some(())
+    }
+
+    fn finish(self) -> DirFacts {
+        let signature =
+            (self.complete && self.entries).then(|| self.hasher.finalize().to_hex().to_string());
+        DirFacts {
+            size: self.size,
+            signature,
+        }
+    }
+}
+
+/// The `Old` walk of `root`: its own facts and each child's, in one pass over its rows.
+fn walk_old(mut rows: rusqlite::Rows<'_>, root: &str, prefix: &str) -> Walk {
+    let mut whole = OldFacts::new();
+    let mut child: Option<(String, OldFacts)> = None;
+    let mut out = Vec::new();
+    loop {
+        let row = match rows.next() {
+            Ok(Some(row)) => row,
+            Ok(None) => break,
+            Err(_) => return Walk::Failed,
+        };
+        let Some((path, rest, size, hash)) = ordinary_row(row, prefix) else {
+            return Walk::Unmodelled;
+        };
+        let hex = hash.map(hex32);
+        if whole.add(size, rest, hex.as_ref()).is_none() {
+            return Walk::Unmodelled;
+        }
+        if let Some(slash) = rest.find('/') {
+            let name = &path[..prefix.len() + slash];
+            if child.as_ref().is_none_or(|(key, _)| key != name) {
+                if let Some((key, facts)) = child.take() {
+                    out.push((key, facts.finish()));
+                }
+                child = Some((name.to_string(), OldFacts::new()));
+            }
+            let Some((_, facts)) = child.as_mut() else {
+                return Walk::Failed;
+            };
+            if facts.add(size, &rest[slash + 1..], hex.as_ref()).is_none() {
+                return Walk::Unmodelled;
+            }
+        }
+    }
+    if let Some((key, facts)) = child.take() {
+        out.push((key, facts.finish()));
+    }
+    out.push((root.to_string(), whole.finish()));
+    Walk::Facts(out)
+}
+
+/// The `Merkle` walk of `root`: the same streaming build the per-directory reader runs, fed row
+/// by row, keeping what it emits for `root` and its children.
+fn walk_merkle(
+    mut rows: rusqlite::Rows<'_>,
+    root: &str,
+    prefix: &str,
+    ctx: &dyn SignatureContext,
+) -> Walk {
+    let mut whole: i64 = 0;
+    let mut sizes: Vec<(String, i64)> = Vec::new();
+    let mut unmodelled = false;
+    let mut failed = false;
+    let feed = std::iter::from_fn(|| {
+        let row = match rows.next() {
+            Ok(Some(row)) => row,
+            Ok(None) => return None,
+            Err(_) => {
+                failed = true;
+                return None;
+            }
+        };
+        let Some((path, rest, size, hash)) = ordinary_row(row, prefix) else {
+            unmodelled = true;
+            return None;
+        };
+        let Some(total) = whole.checked_add(size) else {
+            unmodelled = true;
+            return None;
+        };
+        whole = total;
+        if let Some(slash) = rest.find('/') {
+            let name = &path[..prefix.len() + slash];
+            if sizes.last().is_none_or(|(key, _)| key != name) {
+                sizes.push((name.to_string(), 0));
+            }
+            let last = sizes.last_mut().expect("just pushed");
+            let Some(total) = last.1.checked_add(size) else {
+                unmodelled = true;
+                return None;
+            };
+            last.1 = total;
+        }
+        Some((PathBuf::from(path), 0u64, hash.map(hex_encode)))
+    });
+    let root_path = Path::new(root);
+    let mut emitted: HashMap<String, String> = HashMap::new();
+    let built = build_dir_signatures_streaming_in_context(feed, ctx, |signature| {
+        if signature.path == root_path || signature.path.parent() == Some(root_path) {
+            emitted.insert(
+                signature.path.to_string_lossy().into_owned(),
+                signature.signature,
+            );
+        }
+        Ok(())
+    });
+    if failed {
+        return Walk::Failed;
+    }
+    // A build error is the per-directory reader's to report or not: a file outside every root
+    // that sits in this walk may lie outside every directory the panel asked about.
+    if built.is_err() || unmodelled {
+        return Walk::Unmodelled;
+    }
+    let mut out: Vec<(String, DirFacts)> = sizes
+        .into_iter()
+        .map(|(key, size)| {
+            let signature = emitted.remove(&key);
+            (key, DirFacts { size, signature })
+        })
+        .collect();
+    out.push((
+        root.to_string(),
+        DirFacts {
+            size: whole,
+            signature: emitted.remove(root),
+        },
+    ));
+    Walk::Facts(out)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4383,6 +4939,13 @@ pub struct MembershipSnapshot<'a> {
     integrity: AuthorityIntegrity,
     /// Test-only meter of the rows the export buffers; nothing in production.
     export_meter: ExportMeter<'a>,
+    /// `PRAGMA data_version` as this snapshot's transaction read it.
+    data_version: i64,
+    /// The store's remembered directory-cursor answers.
+    dir_group_memo: &'a std::cell::RefCell<Option<DirGroupMemo>>,
+    /// Test-only: the store's subtree-walk counter.
+    #[cfg(test)]
+    subtree_walks: &'a std::cell::Cell<u64>,
 }
 
 /// Test-only meter of the member rows an export holds at once; compiles to nothing in production.
@@ -5034,6 +5597,10 @@ impl ScanStore {
                 #[cfg(not(test))]
                 _phantom: std::marker::PhantomData,
             },
+            data_version,
+            dir_group_memo: &self.dir_group_memo,
+            #[cfg(test)]
+            subtree_walks: &self.subtree_walks,
         })
     }
 
@@ -6445,13 +7012,79 @@ impl MembershipSnapshot<'_> {
         Ok(out)
     }
 
+    /// One more statement is about to read a whole subtree (test-only count on the store).
+    fn note_subtree_walk(&self) {
+        #[cfg(test)]
+        self.subtree_walks.set(self.subtree_walks.get() + 1);
+    }
+
     /// What the directory watch surface can say about `dir`, as one value.
+    ///
+    /// The answer is a function of the authority and the database state, so it is remembered
+    /// for them: a cursor that comes back to a directory reads nothing again.
+    pub fn dir_group_at(&self, dir: &Path) -> std::result::Result<DirGroupAnswer, MembershipMiss> {
+        use std::os::unix::ffi::OsStrExt;
+        let key = dir.as_os_str().as_bytes();
+        if let Some(answer) = self.remembered_dir_group(key) {
+            return Ok(answer);
+        }
+        let answer = self.dir_group_at_fresh(dir)?;
+        self.remember_dir_group(key.to_vec(), &answer);
+        Ok(answer)
+    }
+
+    fn dir_group_memo_is_current(&self, memo: &DirGroupMemo) -> bool {
+        memo.scan_id == self.scan_id
+            && memo.mode == self.mode
+            && memo.generation == self.generation
+            && memo.data_version == self.data_version
+    }
+
+    fn remembered_dir_group(&self, key: &[u8]) -> Option<DirGroupAnswer> {
+        let slot = self.dir_group_memo.borrow();
+        let memo = slot.as_ref()?;
+        if !self.dir_group_memo_is_current(memo) {
+            return None;
+        }
+        memo.answers.get(key).cloned()
+    }
+
+    fn remember_dir_group(&self, key: Vec<u8>, answer: &DirGroupAnswer) {
+        // A twin group is not capped the way a listing is; one of thousands of directories is
+        // answered again rather than kept.
+        if let DirGroupAnswer::Group(group) = answer {
+            if group.group.paths.len() > DIR_INNER_CAP {
+                return;
+            }
+        }
+        let mut slot = self.dir_group_memo.borrow_mut();
+        let current = slot.as_ref().is_some_and(|memo| {
+            self.dir_group_memo_is_current(memo) && memo.answers.len() < DIR_GROUP_MEMO_CAP
+        });
+        if !current {
+            *slot = Some(DirGroupMemo {
+                scan_id: self.scan_id,
+                mode: self.mode,
+                generation: self.generation,
+                data_version: self.data_version,
+                answers: HashMap::new(),
+            });
+        }
+        if let Some(memo) = slot.as_mut() {
+            memo.answers.insert(key, answer.clone());
+        }
+    }
+
+    /// [`Self::dir_group_at`] read from the transaction.
     ///
     /// The inner-duplicates fallback is derived through THIS authority. The reader it replaces
     /// selected manifest rows whose digest appears anywhere in `file_group` and never consulted
     /// `file_group_member`, so under Explicit authority it returned pathnames byte verification
     /// had rejected — the exact defect this work exists to remove.
-    pub fn dir_group_at(&self, dir: &Path) -> std::result::Result<DirGroupAnswer, MembershipMiss> {
+    fn dir_group_at_fresh(
+        &self,
+        dir: &Path,
+    ) -> std::result::Result<DirGroupAnswer, MembershipMiss> {
         let store = |err: AppError| MembershipMiss::Store {
             detail: err.to_string(),
         };
@@ -6477,6 +7110,7 @@ impl MembershipSnapshot<'_> {
                   ORDER BY path LIMIT ?4",
                 objects = group_objects_sql()
             );
+            self.note_subtree_walk();
             let mut stmt = self.tx.prepare(&listing)?;
             let rows = stmt.query_map(params![self.scan_id, &lo, &hi, cap], |row| {
                 Ok(PathBuf::from(row.get::<_, String>(0)?))
@@ -6488,6 +7122,7 @@ impl MembershipSnapshot<'_> {
             if paths.is_empty() {
                 return self.dir_absence(dir, &lo, &hi);
             }
+            self.note_subtree_walk();
             let total: i64 = self.tx.query_row(
                 &format!(
                     "SELECT COUNT(*) FROM file
@@ -6542,6 +7177,7 @@ impl MembershipSnapshot<'_> {
         // and merely shorter. It is a separate statement rather than a wider listing because the
         // fix must not materialise every pathname of the directory to find its groups.
         {
+            self.note_subtree_walk();
             let mut stmt = self.tx.prepare(ranks_sql)?;
             let rows =
                 stmt.query_map(params![self.scan_id, &lo, &hi], |row| row.get::<_, i64>(0))?;
@@ -6557,6 +7193,7 @@ impl MembershipSnapshot<'_> {
             }
         }
 
+        self.note_subtree_walk();
         let mut stmt = self.tx.prepare(listing)?;
         let rows = stmt.query_map(params![self.scan_id, &lo, &hi, cap], |row| {
             Ok((
@@ -6576,6 +7213,7 @@ impl MembershipSnapshot<'_> {
                 },
             });
         }
+        self.note_subtree_walk();
         let total: i64 = self
             .tx
             .query_row(counting, params![self.scan_id, &lo, &hi], |row| row.get(0))?;
@@ -7971,6 +8609,7 @@ impl ScanStore {
     /// this standalone entry stays test-consumed — accepted API, deliberately unwired (D7).
     #[allow(dead_code)]
     pub fn ensure_scan_roots(&mut self, scan_id: i64) -> Result<RootRegistration> {
+        self.revoke_dir_memos();
         let tx = self.conn.transaction()?;
         let registration = ensure_roots_tx(&tx, scan_id)?;
         tx.commit()?;
@@ -8009,6 +8648,7 @@ impl ScanStore {
         scan_id: i64,
         per_root: &BTreeMap<PathKey, OmissionCounts>,
     ) -> Result<()> {
+        self.revoke_dir_memos();
         let tx = self.conn.transaction()?;
 
         // Three sets must agree before a new generation is published: what the scan is configured
@@ -8107,6 +8747,7 @@ impl ScanStore {
     /// rows as a complete answer. Unwired in R3D (D7): the only production re-walk is whole-scan.
     #[allow(dead_code)]
     pub fn clear_omissions_under(&mut self, scan_id: i64, directory: &Path) -> Result<()> {
+        self.revoke_dir_memos();
         let tx = self.conn.transaction()?;
         let key = PathKey::new(directory).ok_or_else(|| {
             AppError::msg(format!(
@@ -8141,6 +8782,7 @@ impl ScanStore {
     /// which is why the authority is per root at all. Unwired in R3D (D7), as above.
     #[allow(dead_code)]
     pub fn clear_root_omissions(&mut self, scan_id: i64, root: &Path) -> Result<()> {
+        self.revoke_dir_memos();
         let tx = self.conn.transaction()?;
         let key = PathKey::new(root).ok_or_else(|| {
             AppError::msg(format!(
@@ -8168,6 +8810,7 @@ impl ScanStore {
     /// test-consumed (it is how the bounded-generation-zero resume cases are seeded).
     #[allow(dead_code)]
     pub fn clear_scan_omissions(&mut self, scan_id: i64) -> Result<()> {
+        self.revoke_dir_memos();
         let tx = self.conn.transaction()?;
         delete_ledger_tx(&tx, scan_id, &ClearScope::WholeScan)?;
         zero_generations_tx(&tx, scan_id, None)?;
@@ -21081,5 +21724,986 @@ mod export_reader_tests {
             !plan.iter().any(|step| step.contains("TEMP B-TREE")),
             "the Explicit export must not sort the scan: {plan:#?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod dir_aggregate_tests {
+    use super::*;
+    use crate::model::omission::{OmissionCounts, PathKey};
+    use crate::model::scan::{ScanConfig, ScanStatus};
+    use std::collections::BTreeMap;
+    use std::os::unix::ffi::OsStringExt;
+
+    type Answer = (HashMap<PathBuf, u64>, HashMap<PathBuf, LiveDirSignature>);
+
+    /// Manifest rows `(path, size, digest byte)`.
+    type Rows = Vec<(String, u64, Option<u8>)>;
+
+    fn paths(list: &[&str]) -> Vec<PathBuf> {
+        list.iter().map(PathBuf::from).collect()
+    }
+
+    fn key(path: &str) -> PathKey {
+        PathKey::new(Path::new(path)).expect("a keyable path")
+    }
+
+    /// The digest a row labelled `d` carries: every byte different, both nibbles in play, so
+    /// the hex a signature is built from is exercised whole.
+    fn digest(d: u8) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = d
+                .wrapping_mul(0x9d)
+                .wrapping_add((index as u8).wrapping_mul(0x3b))
+                ^ 0xa5;
+        }
+        bytes
+    }
+
+    /// Manifest rows `(path, size, digest byte)`, `None` for a row that was never hashed.
+    /// Synthetic: none of these readers looks at the disk.
+    fn seed_rows(store: &mut ScanStore, scan_id: i64, rows: &[(String, u64, Option<u8>)]) {
+        let manifest: Vec<ManifestRow> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (path, size, _))| ManifestRow {
+                path: PathBuf::from(path),
+                size: *size,
+                mtime: 1_700_000_000,
+                ctime_sec: 1_700_000_000,
+                device: 9,
+                inode: 100_000 + i as u64,
+                nlink: 1,
+                ..ManifestRow::default()
+            })
+            .collect();
+        store.record_files(scan_id, &manifest).unwrap();
+        let hashed: Vec<(ManifestRow, [u8; 32])> = manifest
+            .iter()
+            .zip(rows)
+            .filter_map(|(row, (_, _, label))| label.map(|d| (row.clone(), digest(d))))
+            .collect();
+        store.record_hashes_verified(scan_id, &hashed).unwrap();
+    }
+
+    fn scan_of(roots: &[&str], rows: &[(&str, u64, Option<u8>)]) -> (ScanStore, i64) {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = store.begin_scan(&ScanConfig::new(paths(roots))).unwrap();
+        let rows: Vec<(String, u64, Option<u8>)> = rows
+            .iter()
+            .map(|(path, size, digest)| (path.to_string(), *size, *digest))
+            .collect();
+        seed_rows(&mut store, scan_id, &rows);
+        (store, scan_id)
+    }
+
+    /// `/tank` with twin directories, an unhashed file, a deep branch and a file of its own.
+    fn tree() -> (ScanStore, i64) {
+        scan_of(
+            &["/tank"],
+            &[
+                ("/tank/a/x/f1", 10, Some(1)),
+                ("/tank/a/x/f2", 20, Some(2)),
+                ("/tank/a/y/f1", 10, Some(1)),
+                ("/tank/b/x/f1", 10, Some(1)),
+                ("/tank/b/x/f2", 20, Some(2)),
+                ("/tank/b/z/u", 5, None),
+                ("/tank/c/deep/er/f", 7, Some(3)),
+                ("/tank/top.bin", 3, Some(4)),
+            ],
+        )
+    }
+
+    /// The per-directory readers, which stay the definition of the answer.
+    fn reference(
+        store: &ScanStore,
+        scan_id: i64,
+        dirs: &[PathBuf],
+        algo: DirSigAlgo,
+    ) -> Result<Answer> {
+        Ok((
+            store.dir_sizes_under(scan_id, dirs)?,
+            store.dir_signatures_under(scan_id, dirs, algo)?,
+        ))
+    }
+
+    /// A panel shown again reads nothing: its answer is remembered for this database state.
+    ///
+    /// Red on the parent: every refresh walked each subdirectory twice, once for the sizes and
+    /// once for the signatures.
+    #[test]
+    fn a_repeated_refresh_walks_no_subtree() {
+        let _role = role_guard();
+        let (store, scan_id) = tree();
+        let panel = paths(&["/tank/a", "/tank/b", "/tank/c"]);
+        let start = store.subtree_walks();
+        let first = store
+            .dir_aggregates(scan_id, &panel, DirSigAlgo::Old)
+            .unwrap();
+        assert_eq!(
+            store.subtree_walks() - start,
+            1,
+            "one walk answers the panel"
+        );
+        let again = store
+            .dir_aggregates(scan_id, &panel, DirSigAlgo::Old)
+            .unwrap();
+        assert_eq!(
+            store.subtree_walks() - start,
+            1,
+            "the same panel again walks nothing"
+        );
+        assert_eq!(first, again);
+    }
+
+    /// Going up reads nothing: the walk that answered a panel also answered the directory it
+    /// lists, and the other entries of the parent hold no scan rows.
+    #[test]
+    fn going_up_walks_no_subtree() {
+        let _role = role_guard();
+        let (store, scan_id) = tree();
+        store
+            .dir_aggregates(
+                scan_id,
+                &paths(&["/tank/a", "/tank/b", "/tank/c"]),
+                DirSigAlgo::Old,
+            )
+            .unwrap();
+        let start = store.subtree_walks();
+        let root = store
+            .dir_aggregates(
+                scan_id,
+                &paths(&["/bin", "/etc", "/tank", "/usr"]),
+                DirSigAlgo::Old,
+            )
+            .unwrap();
+        assert_eq!(
+            store.subtree_walks() - start,
+            0,
+            "/ after /tank walks nothing"
+        );
+        assert_eq!(root.0.get(Path::new("/tank")), Some(&85));
+        assert_eq!(root.0.len(), 1, "only /tank holds scan rows");
+    }
+
+    /// Entering a directory walks it once, since its subdirectories were not part of the walk
+    /// that answered its parent; after that neither it nor its parent is walked again.
+    #[test]
+    fn entering_a_directory_walks_it_once() {
+        let _role = role_guard();
+        let (store, scan_id) = tree();
+        let top = paths(&["/tank/a", "/tank/b", "/tank/c"]);
+        store
+            .dir_aggregates(scan_id, &top, DirSigAlgo::Old)
+            .unwrap();
+        let start = store.subtree_walks();
+        let inside = paths(&["/tank/a/x", "/tank/a/y"]);
+        store
+            .dir_aggregates(scan_id, &inside, DirSigAlgo::Old)
+            .unwrap();
+        assert_eq!(store.subtree_walks() - start, 1);
+        store
+            .dir_aggregates(scan_id, &inside, DirSigAlgo::Old)
+            .unwrap();
+        store
+            .dir_aggregates(scan_id, &top, DirSigAlgo::Old)
+            .unwrap();
+        assert_eq!(
+            store.subtree_walks() - start,
+            1,
+            "back and up again walk nothing"
+        );
+    }
+
+    /// A directory cursor shown again reads nothing.
+    ///
+    /// Red on the parent: every visit ran the rank, listing and count statements over the whole
+    /// subtree again.
+    #[test]
+    fn a_repeated_directory_cursor_walks_no_subtree() {
+        let _role = role_guard();
+        let (mut store, scan_id) = scan_of(
+            &["/tank"],
+            &[
+                ("/tank/a/p1", 10, Some(1)),
+                ("/tank/a/p2", 10, Some(1)),
+                ("/tank/b/q1", 20, Some(2)),
+                ("/tank/b/q2", 20, Some(2)),
+            ],
+        );
+        store.set_status(scan_id, ScanStatus::Complete).unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        let cursor = Path::new("/tank/a");
+        let start = store.subtree_walks();
+        let first = store
+            .membership_snapshot(scan_id)
+            .unwrap()
+            .dir_group_at(cursor)
+            .unwrap();
+        let spent = store.subtree_walks() - start;
+        assert_eq!(spent, 3, "ranks, listing and count, once");
+        assert!(
+            matches!(first, DirGroupAnswer::InnerDupes { .. }),
+            "{first:?}"
+        );
+        let again = store
+            .membership_snapshot(scan_id)
+            .unwrap()
+            .dir_group_at(cursor)
+            .unwrap();
+        assert_eq!(
+            store.subtree_walks() - start,
+            spent,
+            "the same cursor again walks nothing"
+        );
+        assert_eq!(first, again);
+    }
+
+    /// A small deterministic generator: the same seed, the same scan.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+
+        fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+            &items[(self.next() as usize) % items.len()]
+        }
+    }
+
+    /// Every directory the rows imply, by their spelling, plus a few that hold nothing.
+    fn directories(rows: &[(String, u64, Option<u8>)]) -> BTreeMap<PathBuf, Vec<PathBuf>> {
+        let mut children: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+        let mut note = |dir: &Path| {
+            if let Some(parent) = dir.parent() {
+                let list = children.entry(parent.to_path_buf()).or_default();
+                if !list.iter().any(|seen| seen == dir) {
+                    list.push(dir.to_path_buf());
+                }
+            }
+            children.entry(dir.to_path_buf()).or_default();
+        };
+        for (path, _, _) in rows {
+            let mut at = Path::new(path).parent();
+            while let Some(dir) = at {
+                note(dir);
+                at = dir.parent();
+            }
+        }
+        for extra in ["/nothing", "/tank/nothing", "/tank/one/nothing"] {
+            note(Path::new(extra));
+        }
+        for list in children.values_mut() {
+            list.sort();
+        }
+        children
+    }
+
+    /// One random scan: its roots, rows and ledger, and optionally odd spellings and a broken
+    /// row, all from `seed`.
+    fn random_scan(seed: u64) -> (ScanStore, i64, Rows) {
+        let mut rng = Lcg(seed);
+        let layouts: [&[&str]; 3] = [&["/tank"], &["/tank/one", "/tank/two"], &["/"]];
+        let roots = *rng.pick(&layouts);
+        let names = ["a", "a-", "a0", "ab", "A", "a b", "x"];
+        let files = ["f1", "f2", "a"];
+        let mut picked: BTreeMap<String, (u64, Option<u8>)> = BTreeMap::new();
+        for _ in 0..(40 + rng.next() % 80) {
+            let root = *rng.pick(roots);
+            let mut path = root.trim_end_matches('/').to_string();
+            for _ in 0..(1 + rng.next() % 4) {
+                path.push('/');
+                path.push_str(rng.pick(&names));
+            }
+            path.push('/');
+            path.push_str(rng.pick(&files));
+            let digest = if rng.next() % 7 == 0 {
+                None
+            } else {
+                Some(1 + (rng.next() % 3) as u8)
+            };
+            picked.insert(path, (rng.next() % 4 * 10, digest));
+        }
+        if rng.next() % 3 == 0 {
+            let base = roots[0].trim_end_matches('/');
+            for odd in [
+                format!("{base}//a/f1"),
+                format!("{base}/a/./b/f2"),
+                format!("{base}/a/../c/f3"),
+                format!("{base}/b/f1/"),
+                format!("{base}/\u{FFFD}/f1"),
+            ] {
+                if rng.next() % 2 == 0 {
+                    picked.insert(odd, (10, Some(1)));
+                }
+            }
+        }
+        let rows: Rows = picked
+            .into_iter()
+            .map(|(path, (size, digest))| (path, size, digest))
+            .collect();
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = store.begin_scan(&ScanConfig::new(paths(roots))).unwrap();
+        seed_rows(&mut store, scan_id, &rows);
+        if rng.next() % 2 == 0 {
+            let mut ledger = BTreeMap::new();
+            for root in roots {
+                let mut counts = OmissionCounts::default();
+                for (path, _, _) in &rows {
+                    if path.starts_with(root) && rng.next() % 11 == 0 {
+                        if let Some(dir) = Path::new(path).parent().and_then(PathKey::new) {
+                            counts.bump(dir, OmissionReason::MinSize).unwrap();
+                        }
+                    }
+                }
+                ledger.insert(key(root), counts);
+            }
+            store.commit_omissions(scan_id, &ledger).unwrap();
+        }
+        match rng.next() % 6 {
+            0 => {
+                store.corrupt_directly(
+                    "UPDATE file SET size = 'huge' WHERE scan_id = ?1 AND rowid =
+                        (SELECT MAX(rowid) FROM file WHERE scan_id = ?1)",
+                    params![scan_id],
+                );
+            }
+            1 => {
+                store.corrupt_directly(
+                    "UPDATE file SET hash = X'0102' WHERE scan_id = ?1 AND rowid =
+                        (SELECT MIN(rowid) FROM file WHERE scan_id = ?1)",
+                    params![scan_id],
+                );
+            }
+            _ => {}
+        }
+        (store, scan_id, rows)
+    }
+
+    /// The answer does not depend on how it is reached: first or remembered, top-down,
+    /// bottom-up or in any order, under either algorithm, with or without a ledger, with odd
+    /// spellings and broken rows. Whatever the per-directory readers answer, or refuse, is what
+    /// comes back.
+    #[test]
+    fn dir_aggregates_answers_what_the_per_directory_readers_answer() {
+        let _role = role_guard();
+        for seed in 1..=60u64 {
+            let (store, scan_id, rows) = random_scan(seed);
+            let tree = directories(&rows);
+            let mut panels: Vec<Vec<PathBuf>> = tree.values().cloned().collect();
+            panels.retain(|children| !children.is_empty());
+            // The odd directory spelled two ways: as UTF-8 and as the byte it stands for.
+            panels.push(vec![
+                PathBuf::from(std::ffi::OsString::from_vec(b"/tank/\xff".to_vec())),
+                PathBuf::from("/tank/\u{FFFD}"),
+            ]);
+            let mut rng = Lcg(seed ^ 0x5eed);
+            for algo in [DirSigAlgo::Old, DirSigAlgo::Merkle] {
+                let mut order: Vec<usize> = (0..panels.len()).collect();
+                let reversed: Vec<usize> = order.iter().rev().copied().collect();
+                let mut shuffled = order.clone();
+                for i in (1..shuffled.len()).rev() {
+                    shuffled.swap(i, (rng.next() as usize) % (i + 1));
+                }
+                order.extend(reversed);
+                order.extend(shuffled);
+                for index in order {
+                    let panel = &panels[index];
+                    let want = reference(&store, scan_id, panel, algo);
+                    let got = store.dir_aggregates(scan_id, panel, algo);
+                    match (&want, &got) {
+                        (Ok(want), Ok(got)) => {
+                            assert_eq!(got, want, "seed {seed}, {algo:?}, panel {panel:?}")
+                        }
+                        (Err(_), Err(_)) => {}
+                        _ => panic!(
+                            "seed {seed}, {algo:?}, panel {panel:?}: reference {want:?}, got {got:?}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A write through this connection is seen by the next refresh.
+    #[test]
+    fn a_write_through_this_connection_is_seen() {
+        let _role = role_guard();
+        let (mut store, scan_id) = tree();
+        let panel = paths(&["/tank/a", "/tank/b", "/tank/c"]);
+        store
+            .dir_aggregates(scan_id, &panel, DirSigAlgo::Old)
+            .unwrap();
+        store
+            .record_hashes(scan_id, &[(PathBuf::from("/tank/b/z/u"), digest(9))])
+            .unwrap();
+        let after = store
+            .dir_aggregates(scan_id, &panel, DirSigAlgo::Old)
+            .unwrap();
+        assert_eq!(
+            after,
+            reference(&store, scan_id, &panel, DirSigAlgo::Old).unwrap()
+        );
+        assert!(
+            after.1.contains_key(Path::new("/tank/b")),
+            "/tank/b is whole now"
+        );
+        store
+            .record_files(
+                scan_id,
+                &[ManifestRow {
+                    path: PathBuf::from("/tank/c/new"),
+                    size: 50,
+                    device: 9,
+                    inode: 7,
+                    nlink: 1,
+                    ..ManifestRow::default()
+                }],
+            )
+            .unwrap();
+        let after = store
+            .dir_aggregates(scan_id, &panel, DirSigAlgo::Old)
+            .unwrap();
+        assert_eq!(
+            after,
+            reference(&store, scan_id, &panel, DirSigAlgo::Old).unwrap()
+        );
+        assert_eq!(after.0.get(Path::new("/tank/c")), Some(&57));
+        assert!(
+            !after.1.contains_key(Path::new("/tank/c")),
+            "the new row is unhashed"
+        );
+    }
+
+    /// A ledger written through this connection is seen: trust is decided by the ledger of
+    /// the moment, and a Merkle signature depends on it too.
+    #[test]
+    fn a_ledger_write_through_this_connection_is_seen() {
+        let _role = role_guard();
+        for algo in [DirSigAlgo::Old, DirSigAlgo::Merkle] {
+            let (mut store, scan_id) = tree();
+            let panel = paths(&["/tank/a", "/tank/b", "/tank/c"]);
+            store
+                .commit_omissions(
+                    scan_id,
+                    &BTreeMap::from([(key("/tank"), OmissionCounts::default())]),
+                )
+                .unwrap();
+            let before = store.dir_aggregates(scan_id, &panel, algo).unwrap();
+            assert_eq!(before, reference(&store, scan_id, &panel, algo).unwrap());
+            assert_eq!(
+                before.1.get(Path::new("/tank/a")).map(|live| live.trust),
+                Some(DirTrust::Trusted),
+                "{algo:?}"
+            );
+            let mut counts = OmissionCounts::default();
+            counts
+                .bump(key("/tank/a/x"), OmissionReason::MinSize)
+                .unwrap();
+            store
+                .commit_omissions(scan_id, &BTreeMap::from([(key("/tank"), counts)]))
+                .unwrap();
+            let after = store.dir_aggregates(scan_id, &panel, algo).unwrap();
+            assert_eq!(after, reference(&store, scan_id, &panel, algo).unwrap());
+            assert!(
+                !after.1.contains_key(Path::new("/tank/a")),
+                "{algo:?}: an omission under /tank/a suppresses it"
+            );
+            // And back: with the omission gone /tank/a is whole again. A remembered Merkle fact
+            // from the suppressed state would still say «incomplete» here.
+            store
+                .commit_omissions(
+                    scan_id,
+                    &BTreeMap::from([(key("/tank"), OmissionCounts::default())]),
+                )
+                .unwrap();
+            let back = store.dir_aggregates(scan_id, &panel, algo).unwrap();
+            assert_eq!(back, reference(&store, scan_id, &panel, algo).unwrap());
+            assert_eq!(back, before, "{algo:?}");
+        }
+    }
+
+    /// The other ledger writers drop what is remembered too, in the direction that matters: a
+    /// cleared omission makes a directory whole again.
+    #[test]
+    fn clearing_omissions_through_this_connection_is_seen() {
+        let _role = role_guard();
+        let clears: [fn(&mut ScanStore, i64); 4] = [
+            |store, scan_id| {
+                store
+                    .commit_omissions(
+                        scan_id,
+                        &BTreeMap::from([(key("/tank"), OmissionCounts::default())]),
+                    )
+                    .unwrap()
+            },
+            |store, scan_id| {
+                store
+                    .clear_omissions_under(scan_id, Path::new("/tank/a"))
+                    .unwrap()
+            },
+            |store, scan_id| {
+                store
+                    .clear_root_omissions(scan_id, Path::new("/tank"))
+                    .unwrap()
+            },
+            |store, scan_id| store.clear_scan_omissions(scan_id).unwrap(),
+        ];
+        for clear in clears {
+            for algo in [DirSigAlgo::Old, DirSigAlgo::Merkle] {
+                let (mut store, scan_id) = tree();
+                let mut counts = OmissionCounts::default();
+                counts
+                    .bump(key("/tank/a/x"), OmissionReason::MinSize)
+                    .unwrap();
+                store
+                    .commit_omissions(scan_id, &BTreeMap::from([(key("/tank"), counts)]))
+                    .unwrap();
+                let panel = paths(&["/tank/a", "/tank/b", "/tank/c"]);
+                let suppressed = store.dir_aggregates(scan_id, &panel, algo).unwrap();
+                assert!(!suppressed.1.contains_key(Path::new("/tank/a")), "{algo:?}");
+                clear(&mut store, scan_id);
+                let cleared = store.dir_aggregates(scan_id, &panel, algo).unwrap();
+                assert_eq!(
+                    cleared,
+                    reference(&store, scan_id, &panel, algo).unwrap(),
+                    "{algo:?}"
+                );
+            }
+        }
+    }
+
+    /// A directory whose name is not UTF-8 gets its size and no signature, as the readers give
+    /// it; its UTF-8 look-alike, which is what the rows spell, gets both.
+    #[test]
+    fn a_name_that_is_not_utf8_is_answered_as_the_readers_answer_it() {
+        let _role = role_guard();
+        for algo in [DirSigAlgo::Old, DirSigAlgo::Merkle] {
+            let (store, scan_id) = scan_of(
+                &["/tank"],
+                &[
+                    ("/tank/\u{FFFD}/f1", 10, Some(1)),
+                    ("/tank/b/f1", 10, Some(1)),
+                ],
+            );
+            let raw = PathBuf::from(std::ffi::OsString::from_vec(b"/tank/\xff".to_vec()));
+            let spelled = PathBuf::from("/tank/\u{FFFD}");
+            let panel = vec![raw.clone(), spelled.clone(), PathBuf::from("/tank/b")];
+            let got = store.dir_aggregates(scan_id, &panel, algo).unwrap();
+            assert_eq!(
+                got,
+                reference(&store, scan_id, &panel, algo).unwrap(),
+                "{algo:?}"
+            );
+            assert_eq!(got.0.get(&raw), Some(&10), "{algo:?}");
+            assert!(!got.1.contains_key(&raw), "{algo:?}");
+            assert!(got.1.contains_key(&spelled), "{algo:?}");
+        }
+    }
+
+    /// A directory above every selected root gets its size and no signature, however whole its
+    /// rows are.
+    #[test]
+    fn a_directory_above_the_roots_gets_no_signature() {
+        let _role = role_guard();
+        for algo in [DirSigAlgo::Old, DirSigAlgo::Merkle] {
+            let (mut store, scan_id) = scan_of(
+                &["/tank/one", "/tank/two"],
+                &[("/tank/one/f1", 10, Some(1)), ("/tank/two/f1", 10, Some(1))],
+            );
+            store
+                .commit_omissions(
+                    scan_id,
+                    &BTreeMap::from([
+                        (key("/tank/one"), OmissionCounts::default()),
+                        (key("/tank/two"), OmissionCounts::default()),
+                    ]),
+                )
+                .unwrap();
+            let panel = paths(&["/etc", "/tank"]);
+            let got = store.dir_aggregates(scan_id, &panel, algo).unwrap();
+            assert_eq!(
+                got,
+                reference(&store, scan_id, &panel, algo).unwrap(),
+                "{algo:?}"
+            );
+            assert_eq!(got.0.get(Path::new("/tank")), Some(&20), "{algo:?}");
+            assert!(got.1.is_empty(), "{algo:?}: {:?}", got.1);
+        }
+    }
+
+    /// Past its cap the memo starts over instead of growing, and the answers stay the readers'.
+    #[test]
+    fn the_memo_starts_over_past_its_cap() {
+        let _role = role_guard();
+        let (store, scan_id) = tree();
+        store.set_dir_memo_cap(2);
+        let walk = [
+            paths(&["/tank/a", "/tank/b", "/tank/c"]),
+            paths(&["/tank/a/x", "/tank/a/y"]),
+            paths(&["/tank/b/x", "/tank/b/z"]),
+            paths(&["/tank/c/deep"]),
+            paths(&["/tank/c/deep/er"]),
+            paths(&["/bin", "/tank"]),
+        ];
+        for panel in walk.iter().cycle().take(18) {
+            let got = store
+                .dir_aggregates(scan_id, panel, DirSigAlgo::Old)
+                .unwrap();
+            assert_eq!(
+                got,
+                reference(&store, scan_id, panel, DirSigAlgo::Old).unwrap()
+            );
+            // Two remembered, then at most one walk's worth: the parent and its three children.
+            assert!(store.dir_memo_len() <= 2 + 4, "{}", store.dir_memo_len());
+        }
+    }
+
+    /// A row the walk does not model leaves the whole answer to the per-directory readers, and
+    /// the walk is not tried again for the same directory.
+    #[test]
+    fn an_unmodelled_row_leaves_the_answer_to_the_readers() {
+        let _role = role_guard();
+        let (store, scan_id) = scan_of(
+            &["/tank"],
+            &[
+                ("/tank/a/f1", 10, Some(1)),
+                ("/tank/a//f2", 20, Some(2)),
+                ("/tank/b/f1", 10, Some(1)),
+            ],
+        );
+        let panel = paths(&["/tank/a", "/tank/b"]);
+        for _ in 0..3 {
+            let before = store.subtree_walks();
+            let got = store
+                .dir_aggregates(scan_id, &panel, DirSigAlgo::Old)
+                .unwrap();
+            let spent = store.subtree_walks() - before;
+            assert_eq!(
+                got,
+                reference(&store, scan_id, &panel, DirSigAlgo::Old).unwrap()
+            );
+            assert!(spent >= 4, "the readers walk each directory: {spent}");
+        }
+        let before = store.subtree_walks();
+        store
+            .dir_aggregates(scan_id, &panel, DirSigAlgo::Old)
+            .unwrap();
+        assert_eq!(
+            store.subtree_walks() - before,
+            4,
+            "the readers only: the walk that met the row is not tried again"
+        );
+    }
+
+    /// A remembered directory cursor answers what a fresh read answers, under both authorities,
+    /// for directories with and without duplicates, covered and not; and a publication is seen.
+    #[test]
+    fn a_remembered_directory_cursor_answers_what_a_fresh_read_answers() {
+        let _role = role_guard();
+        let (mut store, scan_id) = scan_of(
+            &["/tank"],
+            &[
+                ("/tank/a/p1", 10, Some(1)),
+                ("/tank/a/p2", 10, Some(1)),
+                ("/tank/a/solo", 30, Some(3)),
+                ("/tank/b/q1", 20, Some(2)),
+                ("/tank/b/q2", 20, Some(2)),
+                ("/tank/b/new", 5, None),
+                ("/tank/c/only", 40, Some(4)),
+            ],
+        );
+        store.set_status(scan_id, ScanStatus::Complete).unwrap();
+        let cursors = [
+            "/tank",
+            "/tank/a",
+            "/tank/b",
+            "/tank/c",
+            "/elsewhere",
+            "/tank/a/p1",
+        ];
+        let fresh = |store: &ScanStore, dir: &str| {
+            store.corrupt_directly("UPDATE scan SET id = id WHERE 0", []);
+            store
+                .membership_snapshot(scan_id)
+                .unwrap()
+                .dir_group_at(Path::new(dir))
+        };
+        let check = |store: &ScanStore| {
+            for dir in cursors {
+                let first = store
+                    .membership_snapshot(scan_id)
+                    .unwrap()
+                    .dir_group_at(Path::new(dir));
+                let again = store
+                    .membership_snapshot(scan_id)
+                    .unwrap()
+                    .dir_group_at(Path::new(dir));
+                let read = fresh(store, dir);
+                assert_eq!(format!("{first:?}"), format!("{read:?}"), "{dir}");
+                assert_eq!(format!("{again:?}"), format!("{read:?}"), "{dir}");
+            }
+        };
+        check(&store);
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        check(&store);
+        let groups = store.duplicate_groups(scan_id).unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&groups))
+            .unwrap();
+        check(&store);
+    }
+
+    /// Sizes whose sum leaves `i64` are refused, as SQLite's `SUM` refuses them.
+    #[test]
+    fn a_sum_past_i64_is_refused_as_before() {
+        let _role = role_guard();
+        let (store, scan_id) = tree();
+        store.corrupt_directly(
+            "UPDATE file SET size = 9223372036854775807 WHERE scan_id = ?1 AND path LIKE '/tank/a/%'",
+            params![scan_id],
+        );
+        let panel = paths(&["/tank/a", "/tank/b"]);
+        assert!(reference(&store, scan_id, &panel, DirSigAlgo::Old).is_err());
+        assert!(store
+            .dir_aggregates(scan_id, &panel, DirSigAlgo::Old)
+            .is_err());
+    }
+
+    /// A file outside every root is the per-directory readers' to report: the panel's own
+    /// directories do not hold it, so the walk that meets it must not answer for them.
+    #[test]
+    fn a_file_outside_every_root_is_left_to_the_readers() {
+        let _role = role_guard();
+        for algo in [DirSigAlgo::Old, DirSigAlgo::Merkle] {
+            let (store, scan_id) = scan_of(
+                &["/tank/one", "/tank/two"],
+                &[
+                    ("/tank/a.bin", 1, Some(1)),
+                    ("/tank/one/f1", 10, Some(1)),
+                    ("/tank/two/f1", 10, Some(1)),
+                ],
+            );
+            let panel = paths(&["/tank/one", "/tank/two"]);
+            let want = reference(&store, scan_id, &panel, algo).unwrap();
+            assert_eq!(
+                store.dir_aggregates(scan_id, &panel, algo).unwrap(),
+                want,
+                "{algo:?}"
+            );
+            assert_eq!(want.1.len(), 2, "{algo:?}: both roots are signed");
+        }
+    }
+
+    /// A remembered directory cursor is dropped when the twin directories are written, and
+    /// when another connection writes.
+    #[test]
+    fn a_remembered_directory_cursor_sees_new_writes() {
+        let _role = role_guard();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("dedcom_dir_cursor_{}_{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let db = dir.join("dedcom.db");
+        let mut store = ScanStore::open_writable(&db).unwrap();
+        let scan_id = store
+            .begin_scan(&ScanConfig::new(paths(&["/tank"])))
+            .unwrap();
+        seed_rows(
+            &mut store,
+            scan_id,
+            &[
+                ("/tank/t1/f".to_string(), 10, Some(1)),
+                ("/tank/t2/f".to_string(), 10, Some(1)),
+                ("/tank/u/g".to_string(), 20, Some(2)),
+            ],
+        );
+        store.set_status(scan_id, ScanStatus::Complete).unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        let cursor = Path::new("/tank/t1");
+        let at = |store: &ScanStore| {
+            store
+                .membership_snapshot(scan_id)
+                .unwrap()
+                .dir_group_at(cursor)
+                .unwrap()
+        };
+        assert!(matches!(at(&store), DirGroupAnswer::InnerDupes { .. }));
+        store
+            .record_dir_groups(
+                scan_id,
+                &[DirGroup {
+                    id: 0,
+                    signature: "TWINS".to_string(),
+                    paths: paths(&["/tank/t1", "/tank/t2"]),
+                    file_count: 1,
+                    size_per_dir: 10,
+                }],
+            )
+            .unwrap();
+        assert!(
+            matches!(at(&store), DirGroupAnswer::Group(_)),
+            "the twin directories are the answer now"
+        );
+        let other = ScanStore::open_writable(&db).unwrap();
+        other
+            .conn
+            .execute("DELETE FROM dir_dedup WHERE scan_id = ?1", params![scan_id])
+            .unwrap();
+        assert!(
+            matches!(at(&store), DirGroupAnswer::InnerDupes { .. }),
+            "another connection took the twins away"
+        );
+        drop(other);
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The hex a signature is built from is `hex_encode`'s, byte for byte.
+    #[test]
+    fn hex32_is_hex_encode() {
+        for start in (0..=255u8).step_by(32) {
+            let bytes: Vec<u8> = (start..=start.saturating_add(31)).collect();
+            assert_eq!(&hex32(&bytes)[..], hex_encode(&bytes).as_bytes());
+        }
+    }
+
+    /// Facts remembered for one scan or one algorithm are never served for another.
+    #[test]
+    fn the_memo_belongs_to_one_scan_and_one_algorithm() {
+        let _role = role_guard();
+        let (mut store, first) = tree();
+        let second = store
+            .begin_scan(&ScanConfig::new(paths(&["/tank"])))
+            .unwrap();
+        let rows: Rows = vec![
+            ("/tank/a/x/f1".to_string(), 99, Some(7)),
+            ("/tank/b/x/f1".to_string(), 1, Some(8)),
+        ];
+        seed_rows(&mut store, second, &rows);
+        let panel = paths(&["/tank/a", "/tank/b", "/tank/c"]);
+        for _ in 0..2 {
+            for scan_id in [first, second, first] {
+                for algo in [DirSigAlgo::Old, DirSigAlgo::Merkle, DirSigAlgo::Old] {
+                    let got = store.dir_aggregates(scan_id, &panel, algo).unwrap();
+                    assert_eq!(
+                        got,
+                        reference(&store, scan_id, &panel, algo).unwrap(),
+                        "scan {scan_id}, {algo:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A remembered directory cursor is dropped when the twin directories are materialised.
+    #[test]
+    fn a_remembered_directory_cursor_sees_materialised_twins() {
+        let _role = role_guard();
+        let (mut store, scan_id) = scan_of(
+            &["/tank"],
+            &[("/tank/t1/f", 10, Some(1)), ("/tank/t2/f", 10, Some(1))],
+        );
+        store.set_status(scan_id, ScanStatus::Complete).unwrap();
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        let cursor = Path::new("/tank/t1");
+        let at = |store: &ScanStore| {
+            store
+                .membership_snapshot(scan_id)
+                .unwrap()
+                .dir_group_at(cursor)
+                .unwrap()
+        };
+        assert!(matches!(at(&store), DirGroupAnswer::InnerDupes { .. }));
+        store
+            .materialize_dir_groups(scan_id, |emit| {
+                emit(PathBuf::from("/tank/t1"), "TWINS".to_string(), 10, 1)?;
+                emit(PathBuf::from("/tank/t2"), "TWINS".to_string(), 10, 1)
+            })
+            .unwrap();
+        assert!(
+            matches!(at(&store), DirGroupAnswer::Group(_)),
+            "the materialised twins are the answer now"
+        );
+    }
+
+    /// A write through another connection is seen: the remembered answer belongs to one
+    /// database state, and `data_version` says when that state is gone.
+    #[test]
+    fn a_write_through_another_connection_is_seen() {
+        let _role = role_guard();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "dedcom_dir_aggregates_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let db = dir.join("dedcom.db");
+        let mut writer = ScanStore::open_writable(&db).unwrap();
+        let scan_id = writer
+            .begin_scan(&ScanConfig::new(paths(&["/tank"])))
+            .unwrap();
+        seed_rows(
+            &mut writer,
+            scan_id,
+            &[
+                ("/tank/a/f1".to_string(), 10, Some(1)),
+                ("/tank/b/f1".to_string(), 10, None),
+            ],
+        );
+        let reader = ScanStore::open_writable(&db).unwrap();
+        let panel = paths(&["/tank/a", "/tank/b"]);
+        let before = reader
+            .dir_aggregates(scan_id, &panel, DirSigAlgo::Old)
+            .unwrap();
+        assert!(!before.1.contains_key(Path::new("/tank/b")));
+        writer
+            .record_hashes(scan_id, &[(PathBuf::from("/tank/b/f1"), digest(1))])
+            .unwrap();
+        let after = reader
+            .dir_aggregates(scan_id, &panel, DirSigAlgo::Old)
+            .unwrap();
+        assert_eq!(
+            after,
+            reference(&reader, scan_id, &panel, DirSigAlgo::Old).unwrap()
+        );
+        assert_eq!(
+            after
+                .1
+                .get(Path::new("/tank/a"))
+                .map(|live| &live.signature),
+            after
+                .1
+                .get(Path::new("/tank/b"))
+                .map(|live| &live.signature),
+            "/tank/a and /tank/b are twins once the second file is hashed"
+        );
+        drop(reader);
+        drop(writer);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

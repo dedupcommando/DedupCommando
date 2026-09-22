@@ -1867,23 +1867,14 @@ mod guarded {
             self.inner.attributed_dir_group(scan_id, signature)
         }
 
-        pub(crate) fn dir_sizes_under(
-            &self,
-            scan_id: i64,
-            dirs: &[PathBuf],
-        ) -> Result<HashMap<PathBuf, u64>> {
-            self.inner.ensure_current_path()?;
-            self.inner.dir_sizes_under(scan_id, dirs)
-        }
-
-        pub(crate) fn dir_signatures_under(
+        pub(crate) fn dir_aggregates(
             &self,
             scan_id: i64,
             dirs: &[PathBuf],
             algo: DirSigAlgo,
-        ) -> Result<HashMap<PathBuf, LiveDirSignature>> {
+        ) -> Result<(HashMap<PathBuf, u64>, HashMap<PathBuf, LiveDirSignature>)> {
             self.inner.ensure_current_path()?;
-            self.inner.dir_signatures_under(scan_id, dirs, algo)
+            self.inner.dir_aggregates(scan_id, dirs, algo)
         }
 
         pub(crate) fn reconcile_marks_after_batch(
@@ -2748,9 +2739,8 @@ mod arms {
                         detail: err.to_string(),
                     },
                 };
-                let dir_sizes = door.dir_sizes_under(scan_id, &dirs).map_err(dir_fail)?;
-                let dir_signatures = door
-                    .dir_signatures_under(scan_id, &dirs, algo)
+                let (dir_sizes, dir_signatures) = door
+                    .dir_aggregates(scan_id, &dirs, algo)
                     .map_err(dir_fail)?;
                 Ok(PanelData {
                     files: file_answers,
@@ -6176,16 +6166,13 @@ mod tests {
         at = expect(&door, at, 1, "latest_scan_covering");
         door.attributed_dir_group(scan_id, "0000").unwrap();
         at = expect(&door, at, 1, "attributed_dir_group");
-        door.dir_sizes_under(scan_id, std::slice::from_ref(&dir))
-            .unwrap();
-        at = expect(&door, at, 1, "dir_sizes_under");
-        door.dir_signatures_under(
+        door.dir_aggregates(
             scan_id,
             std::slice::from_ref(&dir),
             crate::model::duplicate::DirSigAlgo::Old,
         )
         .unwrap();
-        at = expect(&door, at, 1, "dir_signatures_under");
+        at = expect(&door, at, 1, "dir_aggregates");
         door.reconcile_marks_after_batch(scan_id, &[], false)
             .unwrap();
         at = expect(&door, at, 1, "reconcile_marks_after_batch");
