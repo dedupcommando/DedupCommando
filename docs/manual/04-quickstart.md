@@ -72,7 +72,7 @@ Press **F9**:
 │  2. Configure and start a scan…                     ◀ select          │
 │  3. Sessions and scan results…                                        │
 │  4. Execute marked actions (F11 or x)                                 │
-│  5. Clear all marks of the active panel                               │
+│  5. Clear all marks                                                   │
 │  6. Reload scan data                                                  │
 │  7. Change panel mode (v)                                             │
 │  8. Synchronize panels (Shift+F1)                                     │

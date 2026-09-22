@@ -573,6 +573,9 @@ pub(crate) enum MarkOrigin {
         /// from this field.
         requested: Option<crate::tui::commander::state::Mark>,
     },
+    /// The commander's «Clear all marks». Nothing on screen changes before the acknowledgement,
+    /// so a refusal has nothing to restore.
+    CommanderClear,
 }
 
 /// How a durable mark reads to the operator — taken from what the database returned.
@@ -940,20 +943,25 @@ impl App {
                     self.request_shutdown(false);
                 }
             }
-            AppEvent::CommanderResumeProbe { roots, probe } => match probe {
-                // Only a checkpoint that actually opened and holds no history for these roots is
-                // permission to start scanning.
-                Ok((None, None)) => self.commander_scan_new(roots),
-                Ok((unfinished, complete)) => {
-                    self.commander.resume_unfinished = unfinished;
-                    self.commander.resume_complete = complete;
-                    self.commander.pending_scan_roots = roots;
-                    self.commander.overlay = crate::tui::commander::state::Overlay::ResumeScan;
+            AppEvent::CommanderResumeProbe { roots, probe } => {
+                self.commander.resume_probes_in_flight =
+                    self.commander.resume_probes_in_flight.saturating_sub(1);
+                match probe {
+                    // Only a checkpoint that actually opened and holds no history for these roots
+                    // is permission to start scanning.
+                    Ok((None, None)) => self.commander_scan_new(roots),
+                    Ok((unfinished, complete)) => {
+                        self.commander.resume_unfinished = unfinished;
+                        self.commander.resume_complete = complete;
+                        self.commander.pending_scan_roots = roots;
+                        self.commander.overlay = crate::tui::commander::state::Overlay::ResumeScan;
+                    }
+                    // The store refused. No worker starts, no pending roots, no resume choice and
+                    // no overlay change — a database we could not read is not a database without
+                    // history.
+                    Err(err) => self.commander.status = err,
                 }
-                // The store refused. No worker starts, no pending roots, no resume choice and no
-                // overlay change — a database we could not read is not a database without history.
-                Err(err) => self.commander.status = err,
-            },
+            }
             AppEvent::ScanDiffReady(report) => {
                 self.scan_diff.report = Some(*report);
                 self.scan_diff.loading = false;
@@ -1203,6 +1211,15 @@ impl App {
 
         self.status = self.completion_status(published, status);
         self.commander.status = self.status.clone();
+        // A «Clear all marks» question was about the scan this open replaces. It is not carried
+        // over to another scan: it closes, and the operator is told nothing was cleared.
+        if self.commander.overlay == crate::tui::commander::state::Overlay::ClearMarks {
+            self.commander.overlay = crate::tui::commander::state::Overlay::None;
+            self.commander.clear_marks_for = None;
+            self.commander.status =
+                "A scan was opened while Clear all marks was asking — nothing was cleared"
+                    .to_string();
+        }
 
         if published.is_some() && !self.browser.group_summaries.is_empty() {
             self.browser.group_state.select(Some(0));
@@ -1303,6 +1320,12 @@ impl App {
         self.commander.watch_dir_cache = Vec::new();
         self.commander.scan_coverage_cache.clear();
         self.invalidate_confirmation(REOPEN_REQUIRED);
+        // A «Clear all marks» question names the scan that is gone: it closes, and the status
+        // below says why.
+        if self.commander.overlay == crate::tui::commander::state::Overlay::ClearMarks {
+            self.commander.overlay = crate::tui::commander::state::Overlay::None;
+        }
+        self.commander.clear_marks_for = None;
         self.marks_gate = MarksGate::Blocked {
             act: self.installed_act,
             reason: format!("{REOPEN_REQUIRED} ({detail})"),
@@ -2329,13 +2352,27 @@ impl App {
                     }
                 }
             }
+            MarkOrigin::CommanderClear => {}
         }
     }
 
     fn on_mark_ack(&mut self, act: Activation, req: RequestId, outcome: MarkOutcome) {
         self.settle_ticket(req);
         let origin = self.pending_marks.remove(&req.0);
+        let clearing = matches!(origin, Some(MarkOrigin::CommanderClear));
         if !self.is_current(act) {
+            // A mark of another activation settles nothing on screen. A clear is still answered:
+            // the operator asked for it and is waiting to hear.
+            if clearing {
+                self.commander.status = match outcome {
+                    MarkOutcome::Cleared { count } => {
+                        format!("Marks cleared: {count}, in the scan that was open before")
+                    }
+                    _ => "The marks were not cleared: a scan was opened before the clear reached \
+                          it — ask again"
+                        .to_string(),
+                };
+            }
             return;
         }
         // What this keystroke asked for, kept for correlation only. The success line is built from
@@ -2353,18 +2390,19 @@ impl App {
                     self.report_commander_mark_settled(&path, requested, &after);
                 }
             }
+            MarkOutcome::Cleared { count } => self.settle_cleared_marks(count),
             // The write refused, but the database still told us what it holds for exactly these
             // pathnames: settle from that, not from the guess the window made.
             MarkOutcome::Failed { error, after } => {
                 self.apply_mark_image(&after);
-                self.report_mark_failure(&error);
+                self.report_mark_failure(&error, clearing);
             }
             // No authoritative image exists at all — the window goes back to what it showed.
             MarkOutcome::Unreadable { error } => {
                 if let Some(origin) = origin {
                     self.restore_mark_origin(origin);
                 }
-                self.report_mark_failure(&error);
+                self.report_mark_failure(&error, clearing);
             }
         }
         let _ = self.refresh_marked_count();
@@ -2403,15 +2441,46 @@ impl App {
         self.commander.status = format!("Mark saved: {shown} = {returned_meaning}");
     }
 
+    /// After «Clear all marks» the database holds no mark of the installed scan, so no window may
+    /// show one: every file of every group on screen — the classic browser's open group and the
+    /// file group of each watching panel — loses its mark, and every panel drops its durable marks,
+    /// another scan's left from before a switch included. The cost is the rows on screen, whatever
+    /// the number cleared. A triage selection is not a mark and stays.
+    fn settle_cleared_marks(&mut self, cleared: u64) {
+        use crate::tui::commander::state::{Mark, WatchResult};
+        let unmark = |files: &mut [FileEntry]| {
+            for file in files {
+                file.is_keeper = false;
+                file.action = None;
+            }
+        };
+        if let Some(open) = self.browser.open_group.as_mut() {
+            unmark(&mut open.files);
+        }
+        for entry in &mut self.commander.watch_cache {
+            if let Some(WatchResult::FileGroup(group, _)) = entry.result.as_mut() {
+                unmark(&mut group.files);
+            }
+        }
+        for panel in &mut self.commander.panels {
+            panel.marks.retain(|_, mark| *mark == Mark::Selected);
+        }
+        self.commander.status = format!("Marks cleared: {cleared}");
+    }
+
     /// One place turns a typed mark failure into what the operator sees — and uninstalls the
     /// view when the failure says the checkpoint itself was replaced.
-    fn report_mark_failure(&mut self, error: &crate::state::MarkWriteError) {
+    fn report_mark_failure(&mut self, error: &crate::state::MarkWriteError, clearing: bool) {
         if let crate::state::MarkWriteError::PathChanged { detail } = error {
             let detail = detail.clone();
             self.uninstall_browsing(&detail);
             return;
         }
         let message = match error {
+            crate::state::MarkWriteError::Store { detail } if clearing => {
+                format!("The marks were not cleared: the database refused — {detail}")
+            }
+            _ if clearing => format!("The marks were not cleared: {error:?}"),
             // Shown, such a path has U+FFFD for the bytes that are not UTF-8, and can read exactly
             // like a file the scan does hold: the sentence says which case this is, and says it
             // before the path, so a narrow status line clips the path and not the reason.
@@ -4820,6 +4889,27 @@ impl App {
         }
     }
 
+    /// Sends the commander's «Clear all marks». Nothing on screen changes until the database
+    /// answers how many marks it cleared.
+    pub(crate) fn send_commander_clear(&mut self) -> crate::error::Result<()> {
+        let act = self.installed_act;
+        let req = self.browse.next_request();
+        let Some(handle) = self.browse.live().cloned() else {
+            return Err(crate::error::AppError::msg("browsing is not available"));
+        };
+        match handle.send_clear_marks(act, req) {
+            Ok(()) => {
+                self.commander.status = "Clearing the saved marks…".to_string();
+                self.pending_marks.insert(req.0, MarkOrigin::CommanderClear);
+                Ok(())
+            }
+            Err(refused) => Err(crate::error::AppError::msg(format!(
+                "{:?}",
+                refused.reason()
+            ))),
+        }
+    }
+
     /// Opens a group for a commander watching panel, by identity.
     pub(crate) fn request_watch_group_open(&mut self, panel: usize, id: GroupId) {
         let act = self.installed_act;
@@ -5126,6 +5216,7 @@ impl App {
         // does not «stay silent». The decision (resume overlay / new scan) — via the
         // `CommanderResumeProbe` event.
         self.commander.status = "Checking saved scans…".to_string();
+        self.commander.resume_probes_in_flight += 1;
         let db_path = self.db_path.clone();
         let events = self.events.clone();
         std::thread::spawn(move || {
@@ -6543,6 +6634,85 @@ mod actor_route_tests {
             "a late reply may not resurrect the acknowledgement: {}",
             app.commander.status
         );
+    }
+
+    /// A «Clear all marks» the actor retires holding is found and reported like a mark: its ticket
+    /// is drained, nothing waits for an answer that cannot come, and planning stays blocked until a
+    /// fresh open says what the database holds.
+    #[test]
+    fn a_clear_the_actor_retires_holding_is_reported() {
+        let _role = crate::state::store::role_guard();
+        let scenario = PlanScenario::new("commander_clear_retired");
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper, twin]);
+        drop(store);
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        app.show_disclaimer = false;
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        drain(&mut app, &rx);
+
+        app.send_commander_clear().unwrap();
+        assert_eq!(app.pending_marks.len(), 1, "the clear is in flight");
+        let drained = app
+            .browse
+            .live()
+            .expect("the actor is live")
+            .drain_tickets();
+        assert_eq!(drained.tickets.len(), 1, "the clear holds a ticket");
+        app.settle_retired(drained, &CloseCause::Requested);
+        assert!(app.pending_marks.is_empty(), "nothing waits for the clear");
+        assert_eq!(app.commander.status, MARKS_STRANDED);
+        assert!(matches!(app.marks_gate, MarksGate::Blocked { .. }));
+    }
+
+    /// A «Clear all marks» question over a checkpoint that is then replaced closes with the view:
+    /// the scan it names is no longer installed, and the status keeps saying why — reopen.
+    #[test]
+    fn a_replaced_checkpoint_closes_the_clear_question_and_keeps_its_reason() {
+        use crate::tui::commander::state::Overlay;
+        let _role = crate::state::store::role_guard();
+        let scenario = PlanScenario::new("commander_clear_replaced");
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        drop(store);
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        app.show_disclaimer = false;
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        drain(&mut app, &rx);
+
+        let press = |app: &mut App, code: KeyCode| {
+            crate::tui::commander::on_key(app, KeyEvent::from(code));
+        };
+        press(&mut app, KeyCode::F(9));
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.commander.overlay,
+            Overlay::ClearMarks,
+            "the question is open"
+        );
+
+        std::fs::remove_file(&scenario.db_path).unwrap();
+        std::fs::create_dir(&scenario.db_path).unwrap();
+        app.refresh_marked_count();
+        pump_until(&mut app, &rx, "the typed refusal", |app| {
+            app.current_scan_id.is_none()
+        });
+        assert_eq!(app.commander.overlay, Overlay::None, "the question closes");
+        assert!(app.commander.clear_marks_for.is_none());
+        assert!(
+            app.commander.status.starts_with(REOPEN_REQUIRED),
+            "and the reason stays: {}",
+            app.commander.status
+        );
+        assert!(app.pending_marks.is_empty(), "nothing was sent");
     }
 
     /// Matrix 5 and 11 — class A preserves, class B uninstalls, and only a fresh open recovers.

@@ -485,15 +485,15 @@ impl BrowseHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
     }
 
-    /// Enqueues a request that carries no consumer-side settlement state. `SetMarks` and
-    /// `AutoSelect` are refused here by construction — they may only travel through the typed
-    /// entry points that register their settlement state first — and `Shutdown` belongs to
-    /// `begin_close` alone.
+    /// Enqueues a request that carries no consumer-side settlement state. `SetMarks`,
+    /// `ClearMarks` and `AutoSelect` are refused here by construction — they may only travel
+    /// through the typed entry points that register their settlement state first — and
+    /// `Shutdown` belongs to `begin_close` alone.
     pub fn send(&self, request: BrowseRequest) -> std::result::Result<(), SendRefusal> {
         match &request {
-            BrowseRequest::SetMarks { .. } | BrowseRequest::AutoSelect { .. } => {
-                return Err(SendRefusal::RequiresTicket)
-            }
+            BrowseRequest::SetMarks { .. }
+            | BrowseRequest::ClearMarks { .. }
+            | BrowseRequest::AutoSelect { .. } => return Err(SendRefusal::RequiresTicket),
             BrowseRequest::Shutdown => return Err(SendRefusal::ShutdownReserved),
             _ => {}
         }
@@ -542,6 +542,39 @@ impl BrowseHandle {
         {
             // Still inside the gate: the registration is removed before any drain can run,
             // and the sender's own original goes back whole.
+            let _ = self.inflight.settle(req);
+            return Err(RefusedMarkSend::Refused { reason, ticket });
+        }
+        Ok(())
+    }
+
+    /// Registers a ticket and enqueues `ClearMarks` under the same single gate acquisition and
+    /// rollback contract as `send_set_marks`. The ticket names no pathname: the request clears
+    /// whatever the scan holds, which the window cannot list, and it leaves nothing on screen to
+    /// restore if the actor dies holding it. So it locks no path either, and the order against
+    /// other writes is the queue's: a write queued after the clear lands after it — the classic
+    /// browser writing its open group back would bring those marks back. The commander sends a
+    /// clear only with no other mark write in flight, and the classic browser is reached only
+    /// through an open, which queues behind the clear and re-reads the group.
+    pub fn send_clear_marks(
+        &self,
+        act: Activation,
+        req: RequestId,
+    ) -> std::result::Result<(), RefusedMarkSend> {
+        let ticket = MarkTicket::new(act, req, Vec::new(), Vec::new())?;
+        let _linearized = self.gate_lock();
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(RefusedMarkSend::Refused {
+                reason: SendRefusal::Closing,
+                ticket,
+            });
+        }
+        self.inflight.register_marks(ticket.clone())?;
+        #[cfg(test)]
+        self.fire_typed_send_hook();
+        if let Err((reason, _request)) =
+            self.send_under_gate(BrowseRequest::ClearMarks { act, req })
+        {
             let _ = self.inflight.settle(req);
             return Err(RefusedMarkSend::Refused { reason, ticket });
         }
@@ -725,6 +758,12 @@ pub enum BrowseRequest {
         act: Activation,
         req: RequestId,
         entries: Vec<FileEntry>,
+    },
+    /// Every mark of the installed scan, cleared in one transaction. Travels like `SetMarks` —
+    /// through a typed entry point that registers a ticket — and settles with the same `MarkAck`.
+    ClearMarks {
+        act: Activation,
+        req: RequestId,
     },
     AutoSelect {
         act: Activation,
@@ -910,12 +949,18 @@ pub enum PanelFailure {
     },
 }
 
-/// How a `SetMarks` settled. `Settled`/`Failed` carry the durable after-image read inside the
-/// same transaction; `Unreadable` means no authoritative after-image exists at all.
+/// How a `SetMarks` or a `ClearMarks` settled. `Settled`/`Failed` carry the durable after-image
+/// read inside the same transaction; `Cleared` says the scan holds no mark any more; `Unreadable`
+/// means no authoritative after-image exists at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkOutcome {
     Settled {
         after: Vec<(PathBuf, Option<MarkIntent>)>,
+    },
+    /// A `ClearMarks` committed: the scan holds no mark, and `count` is how many it held. No list
+    /// of pathnames — the answer to clearing millions of marks would be as large as the marks.
+    Cleared {
+        count: u64,
     },
     /// A write that refused while an authoritative after-image WAS readable. The store's
     /// settled writer refuses before it writes, so today every refusal is `Unreadable`; the
@@ -1786,8 +1831,8 @@ mod guarded {
     ///
     /// Identity-probe ownership, per method class (this is the whole contract, and the tests
     /// pin it):
-    /// - `membership_snapshot`, `prepare_legacy_for_viewing` and `save_marks_settled` own
-    ///   their probe inside the store already — the door adds nothing;
+    /// - `membership_snapshot`, `prepare_legacy_for_viewing`, `save_marks_settled` and
+    ///   `clear_marks_settled` own their probe inside the store already — the door adds nothing;
     /// - every legacy store operation R4B-2a deliberately left unguarded gets exactly one
     ///   `ensure_current_path()` here, immediately before the call;
     /// - snapshot readers pay nothing — their snapshot already did;
@@ -1835,6 +1880,13 @@ mod guarded {
             files: &[FileEntry],
         ) -> std::result::Result<Vec<(PathBuf, Option<MarkIntent>)>, MarkWriteError> {
             self.inner.save_marks_settled(scan_id, files)
+        }
+
+        pub(crate) fn clear_marks_settled(
+            &mut self,
+            scan_id: i64,
+        ) -> std::result::Result<u64, MarkWriteError> {
+            self.inner.clear_marks_settled(scan_id)
         }
 
         // ---- legacy operations: the door pays their one probe ----
@@ -1984,7 +2036,7 @@ mod emit {
                 MarkOutcome::Failed { error, .. } | MarkOutcome::Unreadable { error } => {
                     error.path_mismatch().map(str::to_owned)
                 }
-                MarkOutcome::Settled { .. } => None,
+                MarkOutcome::Settled { .. } | MarkOutcome::Cleared { .. } => None,
             };
             if let Some(detail) = mismatch {
                 state.poison(&detail);
@@ -2167,6 +2219,7 @@ mod arms {
             BrowseRequest::SetMarks { act, req, entries } => {
                 set_marks(state, emitter, act, req, entries)
             }
+            BrowseRequest::ClearMarks { act, req } => clear_marks(state, emitter, act, req),
             BrowseRequest::AutoSelect { act, req, cancel } => {
                 auto_select(state, emitter, act, req, cancel)
             }
@@ -2249,16 +2302,18 @@ mod arms {
                     BrowseEvent::MarkedCount { act, req, result }
                 })
             }
-            BrowseRequest::SetMarks { act, req, .. } => emitter.mark_ack(
-                state,
-                act,
-                req,
-                MarkOutcome::Unreadable {
-                    error: MarkWriteError::Store {
-                        detail: "browsing stopped".to_string(),
+            BrowseRequest::SetMarks { act, req, .. } | BrowseRequest::ClearMarks { act, req } => {
+                emitter.mark_ack(
+                    state,
+                    act,
+                    req,
+                    MarkOutcome::Unreadable {
+                        error: MarkWriteError::Store {
+                            detail: "browsing stopped".to_string(),
+                        },
                     },
-                },
-            ),
+                )
+            }
             BrowseRequest::AutoSelect { act, req, .. } => emitter.auto_select_done(
                 state,
                 act,
@@ -2908,6 +2963,24 @@ mod arms {
             Ok(scan_id) => match state.slot {
                 Slot::Open(ref mut door) => match door.save_marks_settled(scan_id, &entries) {
                     Ok(after) => MarkOutcome::Settled { after },
+                    Err(error) => MarkOutcome::Unreadable { error },
+                },
+                Slot::Absent | Slot::Poisoned { .. } => MarkOutcome::Unreadable {
+                    error: miss_to_mark(StoreMiss::NotOpen),
+                },
+            },
+        };
+        emitter.mark_ack(state, act, req, outcome);
+    }
+
+    fn clear_marks(state: &mut ActorState, emitter: &Emitter, act: Activation, req: RequestId) {
+        let outcome = match state.scan_gate(act, true) {
+            Err(miss) => MarkOutcome::Unreadable {
+                error: miss_to_mark(miss),
+            },
+            Ok(scan_id) => match state.slot {
+                Slot::Open(ref mut door) => match door.clear_marks_settled(scan_id) {
+                    Ok(count) => MarkOutcome::Cleared { count },
                     Err(error) => MarkOutcome::Unreadable { error },
                 },
                 Slot::Absent | Slot::Poisoned { .. } => MarkOutcome::Unreadable {
@@ -3765,6 +3838,14 @@ mod tests {
                 digest: [7u8; 32],
             },
         );
+        // After the plan: clearing first would turn its reply into a refusal.
+        let req = rig.req();
+        push(
+            &mut rig,
+            "MarkAck",
+            req,
+            BrowseRequest::ClearMarks { act, req },
+        );
         let req = rig.req();
         push(
             &mut rig,
@@ -3805,6 +3886,7 @@ mod tests {
                 BrowseRequest::OpenDirGroup { .. } => "DirGroupOpened",
                 BrowseRequest::MarkedCount { .. } => "MarkedCount",
                 BrowseRequest::SetMarks { .. } => "MarkAck",
+                BrowseRequest::ClearMarks { .. } => "MarkAck",
                 BrowseRequest::AutoSelect { .. } => "AutoSelectDone",
                 BrowseRequest::BuildPlan { .. } => "PlanReady|PlanRefused",
                 BrowseRequest::ReconcileAfterBatch { .. } => "ReconcileAck",
@@ -3849,6 +3931,88 @@ mod tests {
             } => assert_eq!(found, rig.scan_id),
             other => panic!("the covering scan must be answerable before any Open: {other:?}"),
         }
+        rig.shutdown();
+    }
+
+    /// A clear travels only through `send_clear_marks`, which registers its ticket: the untyped
+    /// door refuses it, so an acknowledgement can never arrive for a ticket nobody holds.
+    #[test]
+    fn a_clear_request_travels_only_with_a_ticket() {
+        let mut rig = Rig::new("clear_ticket", BrowseRole::Operator);
+        let req = rig.req();
+        match rig.handle.send(BrowseRequest::ClearMarks {
+            act: Activation(0),
+            req,
+        }) {
+            Err(SendRefusal::RequiresTicket) => {}
+            other => panic!("expected RequiresTicket, got {other:?}"),
+        }
+        rig.shutdown();
+    }
+
+    /// A clear settles with the number it cleared — never a list of pathnames, whatever the count
+    /// — and leaves the scan without a mark.
+    #[test]
+    fn a_clear_is_acknowledged_with_the_number_it_cleared() {
+        let mut rig = Rig::new("clear_count", BrowseRole::Operator);
+        rig.open(1);
+        let (a1, a2) = (rig.files[0].clone(), rig.files[1].clone());
+        let req = rig.req();
+        assert!(rig.handle.send_raw(BrowseRequest::SetMarks {
+            act: Activation(1),
+            req,
+            entries: vec![keeper_entry(&a1), delete_entry(&a2)],
+        }));
+        match rig.recv() {
+            BrowseEvent::MarkAck {
+                outcome: MarkOutcome::Settled { .. },
+                ..
+            } => {}
+            other => panic!("the marks are saved first: {other:?}"),
+        }
+        let req = rig.req();
+        assert!(rig.handle.send_raw(BrowseRequest::ClearMarks {
+            act: Activation(1),
+            req,
+        }));
+        match rig.recv() {
+            BrowseEvent::MarkAck {
+                req: got,
+                outcome: MarkOutcome::Cleared { count: 2 },
+                ..
+            } => assert_eq!(got, req),
+            other => panic!("expected the clear of two marks: {other:?}"),
+        }
+        rig.shutdown();
+    }
+
+    /// The observer may not clear marks: the actor's own write gate refuses it, whatever a window
+    /// let through, and the marks stay.
+    #[test]
+    fn an_observer_may_not_clear_marks() {
+        let mut rig = Rig::new("clear_observer", BrowseRole::Observer);
+        ScanStore::open_writable(&rig.db)
+            .unwrap()
+            .save_marks_settled(rig.scan_id, &[delete_entry(&rig.files[1])])
+            .unwrap();
+        rig.open(1);
+        let req = rig.req();
+        assert!(rig.handle.send_raw(BrowseRequest::ClearMarks {
+            act: Activation(1),
+            req,
+        }));
+        match rig.recv() {
+            BrowseEvent::MarkAck {
+                outcome: MarkOutcome::Unreadable { error },
+                ..
+            } => assert!(format!("{error:?}").contains("observer"), "{error:?}"),
+            other => panic!("an observer must not clear marks: {other:?}"),
+        }
+        let left: i64 = rusqlite::Connection::open(&rig.db)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM file_mark", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(left, 1, "the mark stays");
         rig.shutdown();
     }
 
@@ -4996,6 +5160,13 @@ mod tests {
                 req,
                 entries: vec![keeper_entry(&a1), delete_entry(&a2)],
             },
+        );
+        let req = rig.req();
+        push(
+            &mut rig,
+            "MarkAck",
+            req,
+            BrowseRequest::ClearMarks { act, req },
         );
         let req = rig.req();
         push(
@@ -6155,6 +6326,8 @@ mod tests {
         door.save_marks_settled(scan_id, &[keeper_entry(&files[0])])
             .unwrap();
         at = expect(&door, at, 1, "save_marks_settled");
+        door.clear_marks_settled(scan_id).unwrap();
+        at = expect(&door, at, 1, "clear_marks_settled");
         // Legacy operations: exactly one door probe each. Since R4B-2c1 the payload readers
         // (`load_config`, `scan_status`, `scan_summary`, `scan_created_at` and
         // `attributed_dir_group_summaries`) are gone from this door — they are snapshot readers

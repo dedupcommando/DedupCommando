@@ -2767,6 +2767,45 @@ impl ScanStore {
         Ok(after)
     }
 
+    /// Clears every mark of the scan and says how many there were, after checking inside the same
+    /// transaction that none is left.
+    ///
+    /// The operator's «Clear all marks». A panel does not hold every saved mark — one from an
+    /// earlier session or from the classic browser was never loaded into it — and the F11 plan is
+    /// built from all of them, so the clear has to happen here, for the whole scan, and nowhere
+    /// else. Another scan's marks are not touched. The answer is a number, not the pathnames: a
+    /// scan can hold millions of marks, and every window can drop all of its own without a list.
+    pub fn clear_marks_settled(
+        &mut self,
+        scan_id: i64,
+    ) -> std::result::Result<u64, MarkWriteError> {
+        let store = |err: rusqlite::Error| MarkWriteError::Store {
+            detail: err.to_string(),
+        };
+        self.ensure_current_path()
+            .map_err(|err| MarkWriteError::PathChanged {
+                detail: err.to_string(),
+            })?;
+        let tx = self.conn.transaction().map_err(store)?;
+        let cleared = tx
+            .execute("DELETE FROM file_mark WHERE scan_id = ?1", params![scan_id])
+            .map_err(store)?;
+        let left: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM file_mark WHERE scan_id = ?1",
+                params![scan_id],
+                |row| row.get(0),
+            )
+            .map_err(store)?;
+        if left != 0 {
+            return Err(MarkWriteError::Store {
+                detail: format!("{left} marks remain after clearing"),
+            });
+        }
+        tx.commit().map_err(store)?;
+        Ok(cleared as u64)
+    }
+
     /// Settles the persisted marks with what a batch of actions actually did — the durable half
     /// of what each UI does with its own copy. `attempted` are the targets the batch reached.
     /// A cancelled batch clears only those, so everything it never got to stays marked and a
@@ -20496,6 +20535,49 @@ mod membership_staging_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// «Clear all marks» empties the scan's marks in one transaction and says how many it cleared.
+    /// Another scan's marks stay, and a replaced database is refused before anything goes.
+    #[test]
+    fn clear_marks_settled_clears_every_mark_of_its_scan_and_no_other() {
+        let _role = role_guard();
+        let dir = temp_dir("b7_clear_marks");
+        let (db, mut store) = file_store(&dir);
+        let (scan_id, x1, x2, _y1) = published_split(&dir, &mut store);
+        let keeper = FileEntry {
+            path: x1.clone(),
+            is_keeper: true,
+            ..Default::default()
+        };
+        let target = FileEntry {
+            path: x2.clone(),
+            action: Some(ActionKind::Delete),
+            ..Default::default()
+        };
+        store
+            .save_marks_settled(scan_id, &[keeper.clone(), target])
+            .unwrap();
+        let other = seed(&mut store, &dir, &[(x1.clone(), [0x5a; 32])]);
+        store
+            .save_marks_settled(other, std::slice::from_ref(&keeper))
+            .unwrap();
+
+        assert_eq!(store.clear_marks_settled(scan_id).unwrap(), 2);
+        assert!(mark_rows(&store, scan_id).is_empty(), "the scan holds none");
+        assert_eq!(mark_rows(&store, other).len(), 1, "another scan's stays");
+        assert_eq!(
+            store.clear_marks_settled(scan_id).unwrap(),
+            0,
+            "a scan with no marks clears none"
+        );
+
+        replace_db(&db);
+        match store.clear_marks_settled(other) {
+            Err(MarkWriteError::PathChanged { .. }) => {}
+            answer => panic!("expected PathChanged, got {answer:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The strict decoder itself, case by case.
     ///
     /// `save_marks_settled` can only reach `Contradictory` through its own writes — it never
@@ -21528,9 +21610,12 @@ mod membership_staging_tests {
         }
         callers.sort();
         callers.dedup();
+        // `clear_marks_settled` is the same kind of surface as `save_marks_settled`: its refusal
+        // reaches the operator through the same mark acknowledgement.
         assert_eq!(
             callers,
             vec![
+                "clear_marks_settled".to_string(),
                 "ensure_db_identity".to_string(),
                 "save_marks_settled".to_string()
             ],

@@ -143,6 +143,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 app.commander.resume_complete.as_ref(),
             );
         }
+        Overlay::ClearMarks => overlay::render_clear_marks(
+            frame,
+            app.commander.clear_marks_for.map(|(scan_id, _)| scan_id),
+            app.browser.marked_count,
+        ),
         Overlay::None => {}
     }
 }
@@ -1122,10 +1127,7 @@ const MENU: [(&str, MenuAction); 14] = [
     ("Configure and start a scan…", MenuAction::WizardScanConfig),
     ("Sessions and scan results…", MenuAction::WizardResume),
     ("Execute marked actions (F11 or x)", MenuAction::Execute),
-    (
-        "Clear all marks of the active panel",
-        MenuAction::ClearMarks,
-    ),
+    ("Clear all marks", MenuAction::ClearMarks),
     ("Reload scan data", MenuAction::ReloadDedup),
     ("Change panel mode (v)", MenuAction::CycleView),
     ("Synchronize panels (Shift+F1)", MenuAction::ShiftLayer(1)),
@@ -1151,7 +1153,91 @@ fn on_key_overlay(app: &mut App, key: KeyEvent) {
             }
         }
         Overlay::ResumeScan => on_key_resume_scan(app, key),
+        Overlay::ClearMarks => on_key_clear_marks(app, key),
         Overlay::None => {}
+    }
+}
+
+/// F9 → «Clear all marks». The F11 plan is built from every mark the database holds for the scan,
+/// and a files panel holds only the ones set while it was open, so the item clears them in the
+/// database — after a yes. Refused before the question to an observer, without a loaded scan, while
+/// a mark is still being saved, and while anything is still on its way that would put a window of
+/// its own over the question or install another scan under it.
+fn ask_clear_marks(app: &mut App) {
+    if app.deny_if_read_only("clearing marks") {
+        return;
+    }
+    let Some(scan_id) = app.commander.dedup_scan_id else {
+        app.commander.status =
+            "No scan is loaded — load one (F2/F12) before clearing marks".to_string();
+        return;
+    };
+    if let Some(waiting) = single_flight_refusal(app) {
+        app.commander.status = waiting;
+        return;
+    }
+    if let Some(busy) = clear_marks_busy(app) {
+        app.commander.status = format!("{busy} — clear the marks when it is done");
+        return;
+    }
+    app.commander.clear_marks_for = Some((scan_id, app.installed_act));
+    app.commander.overlay = Overlay::ClearMarks;
+}
+
+/// What is still on its way that the «Clear all marks» question must not be open under. A plan, an
+/// F2 check or an F3 answer opens a window of its own, which would take the question's Y or N; an
+/// open, a lookup of the panel's scan or an auto-select installs a scan the question was not about.
+fn clear_marks_busy(app: &App) -> Option<&'static str> {
+    if app.routes.open.is_some() {
+        Some("A scan is still opening")
+    } else if !app.routes.covering.is_empty() || app.routes.latest.is_some() {
+        Some("The scan of a panel is still being looked up")
+    } else if app.auto_select.is_some() {
+        Some("Auto-select is still running")
+    } else if app.routes.plan.is_some() {
+        Some("A plan is still being built (F11)")
+    } else if app.commander.resume_probes_in_flight > 0 {
+        Some("Saved scans are still being checked (F2)")
+    } else if app
+        .routes
+        .infos
+        .values()
+        .any(|purpose| matches!(purpose, crate::app::InfoPurpose::Overlay { .. }))
+    {
+        Some("File info is still loading (F3)")
+    } else {
+        None
+    }
+}
+
+/// Input in the «Clear all marks» question: Y clears, N and Esc keep everything. Enter is not an
+/// answer, as in the F11 confirmation: it is the key pressed to dismiss a window nobody read. A yes
+/// clears only the scan the question was asked about.
+fn on_key_clear_marks(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.commander.overlay = Overlay::None;
+            let asked = app.commander.clear_marks_for.take();
+            let now = app
+                .commander
+                .dedup_scan_id
+                .map(|scan_id| (scan_id, app.installed_act));
+            if asked.is_none() || asked != now {
+                app.commander.status =
+                    "The scan changed while the question was open — nothing was cleared"
+                        .to_string();
+                return;
+            }
+            if let Err(err) = app.send_commander_clear() {
+                app.commander.status = format!("The marks were not cleared: {err}");
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.commander.overlay = Overlay::None;
+            app.commander.clear_marks_for = None;
+            app.commander.status = "Nothing was cleared".to_string();
+        }
+        _ => {}
     }
 }
 
@@ -1327,10 +1413,7 @@ fn run_menu_action(app: &mut App, action: MenuAction) {
         MenuAction::WizardScanConfig => app.open_wizard(Screen::ScanConfig),
         MenuAction::WizardResume => app.open_wizard(Screen::Resume),
         MenuAction::Execute => actions::prepare_execution(app),
-        MenuAction::ClearMarks => {
-            app.commander.active_panel_mut().marks.clear();
-            app.commander.status = "Active panel marks cleared".to_string();
-        }
+        MenuAction::ClearMarks => ask_clear_marks(app),
         MenuAction::ReloadDedup => reload_dedup(app),
         MenuAction::CycleView => cycle_view(app),
         MenuAction::Help => app.show_help = true,
@@ -2869,6 +2952,15 @@ fn persist_mark(
 /// one they are waiting for — so the wait is a fence they can see rather than a duration they
 /// have to guess.
 fn single_flight_refusal(app: &App) -> Option<String> {
+    if app
+        .pending_marks
+        .values()
+        .any(|origin| matches!(origin, crate::app::MarkOrigin::CommanderClear))
+    {
+        return Some(
+            "Marks still clearing — wait for Marks cleared before marking again".to_string(),
+        );
+    }
     if !app.pending_marks.is_empty() {
         return Some("Mark still saving — wait for Mark saved before marking again".to_string());
     }
@@ -6334,6 +6426,418 @@ mod dir_watch_tests {
             }
         }
 
+        /// How many marks the database holds for `scan_id`.
+        fn saved_marks(db: &Path, scan_id: i64) -> i64 {
+            rusqlite::Connection::open(db)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM file_mark WHERE scan_id = ?1",
+                    [scan_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        }
+
+        /// Groups with the photos selected, «group files» beside them, and a files panel over
+        /// `/tank/old-copy` with the focus in it. One mark is already saved from an earlier
+        /// session: in the database, in no panel.
+        fn clear_marks_app() -> (
+            PathBuf,
+            i64,
+            App,
+            crossbeam_channel::Receiver<crate::tui::event::AppEvent>,
+        ) {
+            let (db, scan_id) = manual_scan(&[(
+                "/tank/backup/photo/IMG_3120.HEIC",
+                false,
+                Some(ActionKind::Hardlink),
+            )]);
+            let (mut app, events) = groups_app(&db, scan_id, 2);
+            let mut files = state::Panel::empty(PathBuf::from("/tank/old-copy"));
+            files.loading = false;
+            files.view = PanelView::Files;
+            files.entries = vec![panel_entry("/tank/old-copy/IMG_3120.HEIC", EntryKind::File)];
+            files.list.select(Some(0));
+            app.commander.panels.push(files);
+            app.commander
+                .scan_coverage_cache
+                .insert(PathBuf::from("/tank/old-copy"), Some(scan_id));
+            resolve_and_settle(&mut app, &events);
+            app.commander.active = 2;
+            (db, scan_id, app, events)
+        }
+
+        /// F9, the fifth item, Enter.
+        fn open_clear_marks(app: &mut App) {
+            press(app, KeyCode::F(9));
+            for _ in 0..4 {
+                press(app, KeyCode::Down);
+            }
+            press(app, KeyCode::Enter);
+        }
+
+        /// «Clear all marks» asks first, naming the scan, and after a yes the database holds no
+        /// mark of it — the one set here and the one saved before any panel was open — and no
+        /// window shows one. A triage selection is not a mark and stays.
+        #[test]
+        fn clear_all_marks_clears_every_saved_mark_after_a_yes() {
+            let _role = crate::state::store::role_guard();
+            let (db, scan_id, mut app, events) = clear_marks_app();
+            press(&mut app, KeyCode::F(7));
+            settle(&mut app, &events);
+            crate::app::pump_until(&mut app, &events, "the saved-mark count", |app| {
+                app.browser.marked_count.is_some()
+            });
+            crate::app::pump_until(&mut app, &events, "the classic open group", |app| {
+                app.browser.open_group.is_some()
+            });
+            assert!(app.commander.status.starts_with("Mark saved"));
+            assert_eq!(saved_marks(&db, scan_id), 2);
+
+            open_clear_marks(&mut app);
+            assert_ne!(
+                app.commander.overlay,
+                Overlay::None,
+                "the item asks first: {}",
+                app.commander.status
+            );
+            let (lines, _) = screen(&mut app, 160, 24);
+            let asked = lines.join("\n");
+            assert!(
+                asked.contains(&format!(
+                    "Clear every saved mark of scan #{scan_id}, keepers included?"
+                )) && asked.contains("1 file is marked for an action.")
+                    && asked.contains("[Y] yes"),
+                "{asked}"
+            );
+            assert_eq!(saved_marks(&db, scan_id), 2, "and nothing is cleared yet");
+
+            // A durable mark this scan's database never had — left from another scan — a mark
+            // the classic browser's open group shows, and two triage selections.
+            let stray = PathBuf::from("/elsewhere/other-scan.bin");
+            app.commander.panels[0]
+                .marks
+                .insert(stray.clone(), Mark::Delete);
+            if let Some(open) = app.browser.open_group.as_mut() {
+                open.files[0].action = Some(ActionKind::Delete);
+            }
+            let chosen = PathBuf::from("/tank/old-copy/chosen.bin");
+            for panel in [0usize, 2] {
+                app.commander.panels[panel]
+                    .marks
+                    .insert(chosen.clone(), Mark::Selected);
+            }
+
+            press(&mut app, KeyCode::Char('y'));
+            settle(&mut app, &events);
+            resolve_and_settle(&mut app, &events);
+            assert_eq!(app.commander.overlay, Overlay::None);
+            assert_eq!(app.commander.status, "Marks cleared: 2");
+            assert_eq!(saved_marks(&db, scan_id), 0, "the database holds none");
+            assert!(
+                app.commander
+                    .panels
+                    .iter()
+                    .all(|panel| panel.marks.values().all(|mark| *mark == Mark::Selected)),
+                "no panel keeps one, the stray included: {:?}",
+                app.commander.panels[0].marks
+            );
+            for panel in [0usize, 2] {
+                assert_eq!(
+                    app.commander.panels[panel].marks.get(&chosen),
+                    Some(&Mark::Selected),
+                    "panel {panel} keeps its selection"
+                );
+            }
+            assert!(
+                marks_shown(&app, 1)
+                    .iter()
+                    .all(|(_, keeper, action)| !keeper && action.is_none()),
+                "«group files» shows none: {:?}",
+                marks_shown(&app, 1)
+            );
+            assert!(
+                app.browser.open_group.as_ref().is_some_and(|open| open
+                    .files
+                    .iter()
+                    .all(|file| !file.is_keeper && file.action.is_none())),
+                "and neither does the classic browser's open group"
+            );
+        }
+
+        /// N and Esc leave every mark where it is; Enter does not answer the question.
+        #[test]
+        fn clear_all_marks_keeps_them_on_no_and_waits_on_enter() {
+            let _role = crate::state::store::role_guard();
+            let (db, scan_id, mut app, events) = clear_marks_app();
+            press(&mut app, KeyCode::F(7));
+            settle(&mut app, &events);
+            let marked = app.commander.panels[2].marks.clone();
+            assert_eq!(marked.len(), 1);
+
+            for answer in [KeyCode::Char('n'), KeyCode::Esc] {
+                open_clear_marks(&mut app);
+                press(&mut app, KeyCode::Enter);
+                assert_ne!(
+                    app.commander.overlay,
+                    Overlay::None,
+                    "Enter does not answer: {}",
+                    app.commander.status
+                );
+                press(&mut app, answer);
+                assert_eq!(app.commander.overlay, Overlay::None, "{answer:?} closes it");
+                assert_eq!(app.commander.status, "Nothing was cleared");
+                assert!(app.pending_marks.is_empty(), "{answer:?} sends nothing");
+                assert_eq!(saved_marks(&db, scan_id), 2);
+                assert_eq!(app.commander.panels[2].marks, marked);
+            }
+        }
+
+        /// An observer may not clear marks, and neither may a keystroke while a mark is still
+        /// being saved: both are refused before the question is asked.
+        #[test]
+        fn clear_all_marks_is_refused_to_an_observer_and_while_a_mark_is_saving() {
+            let _role = crate::state::store::role_guard();
+            let (db, scan_id, mut app, events) = clear_marks_app();
+            press(&mut app, KeyCode::F(7));
+            assert!(!app.pending_marks.is_empty(), "the mark is still in flight");
+            open_clear_marks(&mut app);
+            assert_eq!(app.commander.overlay, Overlay::None);
+            assert!(
+                app.commander.status.starts_with("Mark still saving"),
+                "{}",
+                app.commander.status
+            );
+            settle(&mut app, &events);
+            let marked = app.commander.panels[2].marks.clone();
+
+            app.read_only = true;
+            open_clear_marks(&mut app);
+            assert_eq!(app.commander.overlay, Overlay::None);
+            assert!(
+                app.commander.status.starts_with("Read-only:"),
+                "{}",
+                app.commander.status
+            );
+            assert_eq!(app.commander.panels[2].marks, marked);
+            assert_eq!(saved_marks(&db, scan_id), 2);
+        }
+
+        /// While the clear is out, a mark keystroke waits for it by name: what comes is «Marks
+        /// cleared», never the «Mark saved» a mark in flight would be waiting for.
+        #[test]
+        fn a_mark_while_the_marks_are_clearing_waits_for_marks_cleared() {
+            let _role = crate::state::store::role_guard();
+            let (db, scan_id, mut app, events) = clear_marks_app();
+            open_clear_marks(&mut app);
+            press(&mut app, KeyCode::Char('y'));
+            assert_eq!(app.commander.status, "Clearing the saved marks…");
+            press(&mut app, KeyCode::F(7));
+            assert_eq!(
+                app.commander.status,
+                "Marks still clearing — wait for Marks cleared before marking again"
+            );
+            settle(&mut app, &events);
+            assert_eq!(app.commander.status, "Marks cleared: 1");
+            assert_eq!(
+                saved_marks(&db, scan_id),
+                0,
+                "and the keeper was never sent"
+            );
+        }
+
+        /// The question waits for what is still on its way. A plan (F11), a check of saved scans
+        /// (F2) or a file's info (F3) would put a window of its own over it and take its Y or N; an
+        /// open, a lookup of a panel's scan or auto-select would install a scan it was not about.
+        #[test]
+        fn clear_all_marks_waits_for_what_is_still_loading() {
+            use crate::state::browse::{CancelToken, RequestId};
+            /// What sets one of the waits going, over the fixture's scan.
+            type Start<'a> = &'a dyn Fn(&mut App, i64);
+            let _role = crate::state::store::role_guard();
+            let cases: [(&str, Start); 6] = [
+                ("A scan is still opening", &|app, scan_id| {
+                    app.open_via_actor(scan_id, crate::app::OpenIntent::Commander)
+                }),
+                ("The scan of a panel is still being looked up", &|app, _| {
+                    app.routes.covering.insert(u64::MAX, PathBuf::from("/tank"));
+                }),
+                ("Auto-select is still running", &|app, _| {
+                    app.auto_select = Some((RequestId(u64::MAX), CancelToken::new()));
+                }),
+                ("A plan is still being built (F11)", &|app, _| {
+                    press(app, KeyCode::Char('x'))
+                }),
+                ("Saved scans are still being checked (F2)", &|app, _| {
+                    app.commander.resume_probes_in_flight = 1;
+                }),
+                ("File info is still loading (F3)", &|app, _| {
+                    press(app, KeyCode::F(3))
+                }),
+            ];
+            for (busy, start) in cases {
+                let (db, scan_id, mut app, events) = clear_marks_app();
+                press(&mut app, KeyCode::F(7));
+                settle(&mut app, &events);
+                start(&mut app, scan_id);
+                open_clear_marks(&mut app);
+                assert_ne!(app.commander.overlay, Overlay::ClearMarks, "{busy}");
+                assert_eq!(
+                    app.commander.status,
+                    format!("{busy} — clear the marks when it is done")
+                );
+                assert!(app.pending_marks.is_empty(), "{busy}: nothing is sent");
+                assert_eq!(saved_marks(&db, scan_id), 2, "{busy}");
+                crate::app::drain(&mut app, &events);
+            }
+
+            // Each F2 check keeps the question waiting until its own answer lands, whatever the
+            // answer: F2 pressed twice sends two checks, and the first answer is not the second.
+            let (_db, _scan_id, mut app, _events) = clear_marks_app();
+            let answer = || crate::tui::event::AppEvent::CommanderResumeProbe {
+                roots: vec![PathBuf::from("/tank")],
+                probe: Err("the check failed".to_string()),
+            };
+            app.commander_scan(vec![PathBuf::from("/tank")]);
+            app.commander_scan(vec![PathBuf::from("/tank")]);
+            app.handle_event(answer());
+            open_clear_marks(&mut app);
+            assert_ne!(
+                app.commander.overlay,
+                Overlay::ClearMarks,
+                "the second check is still out"
+            );
+            assert_eq!(
+                app.commander.status,
+                "Saved scans are still being checked (F2) — clear the marks when it is done"
+            );
+            app.handle_event(answer());
+            open_clear_marks(&mut app);
+            assert_eq!(
+                app.commander.overlay,
+                Overlay::ClearMarks,
+                "{}",
+                app.commander.status
+            );
+        }
+
+        /// A question is about the scan it was asked over. An open installing a scan under it closes
+        /// it with nothing cleared; a yes over another activation clears nothing; and a clear that
+        /// reaches the actor after a reopen is reported, not dropped in silence.
+        #[test]
+        fn clear_all_marks_is_not_carried_over_to_another_scan() {
+            let _role = crate::state::store::role_guard();
+            let (db, scan_id, mut app, events) = clear_marks_app();
+            press(&mut app, KeyCode::F(7));
+            settle(&mut app, &events);
+
+            open_clear_marks(&mut app);
+            assert_eq!(app.commander.overlay, Overlay::ClearMarks);
+            app.open_via_actor(scan_id, crate::app::OpenIntent::Commander);
+            crate::app::pump_until(&mut app, &events, "the reopen", |app| {
+                app.routes.open.is_none()
+            });
+            assert_eq!(app.commander.overlay, Overlay::None);
+            assert_eq!(
+                app.commander.status,
+                "A scan was opened while Clear all marks was asking — nothing was cleared"
+            );
+            press(&mut app, KeyCode::Char('y'));
+            assert!(app.pending_marks.is_empty(), "a late Y sends nothing");
+            assert_eq!(saved_marks(&db, scan_id), 2);
+
+            crate::app::drain(&mut app, &events);
+            open_clear_marks(&mut app);
+            assert_eq!(app.commander.overlay, Overlay::ClearMarks);
+            app.commander.clear_marks_for =
+                Some((scan_id, crate::state::browse::Activation(u64::MAX)));
+            press(&mut app, KeyCode::Char('y'));
+            assert_eq!(
+                app.commander.status,
+                "The scan changed while the question was open — nothing was cleared"
+            );
+            assert!(app.pending_marks.is_empty());
+            assert_eq!(saved_marks(&db, scan_id), 2);
+
+            // Past the window's own gate: an open already queued, then the clear behind it.
+            app.open_via_actor(scan_id, crate::app::OpenIntent::Commander);
+            app.send_commander_clear().unwrap();
+            crate::app::pump_until(&mut app, &events, "the open and the clear", |app| {
+                app.routes.open.is_none() && app.pending_marks.is_empty()
+            });
+            assert_eq!(
+                app.commander.status,
+                "The marks were not cleared: a scan was opened before the clear reached it — ask \
+                 again"
+            );
+            assert_eq!(saved_marks(&db, scan_id), 2);
+        }
+
+        /// Without a loaded scan the item is refused before the question: after a switch into a
+        /// directory no scan covers, the actor can still hold a scan the operator no longer sees,
+        /// and a yes must not clear that one.
+        #[test]
+        fn clear_all_marks_is_refused_without_a_scan() {
+            let _role = crate::state::store::role_guard();
+            let (db, scan_id, mut app, _events) = clear_marks_app();
+            app.commander.dedup_scan_id = None;
+            open_clear_marks(&mut app);
+            assert_eq!(app.commander.overlay, Overlay::None);
+            assert_eq!(
+                app.commander.status,
+                "No scan is loaded — load one (F2/F12) before clearing marks"
+            );
+            assert!(app.pending_marks.is_empty());
+            assert_eq!(saved_marks(&db, scan_id), 1);
+        }
+
+        /// A clear the database refuses says so in its own words, and no window changes: every
+        /// mark it showed is still there, as in the database.
+        #[test]
+        fn a_refused_clear_says_so_and_changes_no_window() {
+            let _role = crate::state::store::role_guard();
+            let (db, scan_id, mut app, events) = clear_marks_app();
+            press(&mut app, KeyCode::F(7));
+            settle(&mut app, &events);
+            resolve_and_settle(&mut app, &events);
+            let panels: Vec<_> = app
+                .commander
+                .panels
+                .iter()
+                .map(|panel| panel.marks.clone())
+                .collect();
+            let shown = marks_shown(&app, 1);
+            assert!(shown.iter().any(|(_, keeper, _)| *keeper), "{shown:?}");
+
+            open_clear_marks(&mut app);
+            rusqlite::Connection::open(&db)
+                .unwrap()
+                .execute_batch(
+                    "CREATE TRIGGER refuse_clear BEFORE DELETE ON file_mark
+                     BEGIN SELECT RAISE(ABORT, 'clearing refused'); END;",
+                )
+                .unwrap();
+            press(&mut app, KeyCode::Char('y'));
+            settle(&mut app, &events);
+            assert!(
+                app.commander
+                    .status
+                    .starts_with("The marks were not cleared: the database refused — ")
+                    && app.commander.status.contains("clearing refused"),
+                "{}",
+                app.commander.status
+            );
+            let after: Vec<_> = app
+                .commander
+                .panels
+                .iter()
+                .map(|panel| panel.marks.clone())
+                .collect();
+            assert_eq!(after, panels, "the panels keep their marks");
+            assert_eq!(marks_shown(&app, 1), shown, "and «group files» its own");
+            assert_eq!(saved_marks(&db, scan_id), 2);
+        }
+
         /// A panel as the manual quotes it: its rectangle cut out of the screen, without the empty
         /// rows between the last line of content and the bottom border.
         fn panel_block(lines: &[String], rect: Rect) -> Vec<String> {
@@ -6403,6 +6907,44 @@ mod dir_watch_tests {
                 }
             }
             blocks
+        }
+
+        /// The «Clear all marks» question in chapter 05 is a render, not a drawing: the box the
+        /// commander draws for a scan with one file marked for an action.
+        #[test]
+        fn the_manual_shows_the_clear_marks_question_the_commander_draws() {
+            let _role = crate::state::store::role_guard();
+            let (_db, scan_id, mut app, _events) = clear_marks_app();
+            app.browser.marked_count = Some(1);
+            app.commander.clear_marks_for = Some((scan_id, app.installed_act));
+            app.commander.overlay = Overlay::ClearMarks;
+            let (lines, _) = screen(&mut app, 120, 24);
+            let top = lines
+                .iter()
+                .position(|line| line.contains("┌ Clear all marks — F9"))
+                .expect("the question is drawn");
+            let left = lines[top].chars().position(|c| c == '┌').unwrap();
+            let right = left
+                + lines[top]
+                    .chars()
+                    .skip(left)
+                    .position(|c| c == '┐')
+                    .unwrap();
+            let mut drawn = Vec::new();
+            for line in &lines[top..] {
+                let cut: String = line.chars().skip(left).take(right - left + 1).collect();
+                let bottom = cut.starts_with('└');
+                drawn.push(cut);
+                if bottom {
+                    break;
+                }
+            }
+            let chapter = crate::testfixtures::manual("05-commando.md");
+            assert!(
+                text_blocks(&chapter).contains(&drawn),
+                "05-commando.md must show the question the commander draws:\n{}",
+                drawn.join("\n")
+            );
         }
 
         /// The group panels in chapters 04 and 05 are renders, not drawings: a block that opens

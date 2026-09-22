@@ -553,6 +553,10 @@ pub enum Overlay {
     /// scan) + selection. The data is in `CommanderState.resume_unfinished/resume_complete`
     /// (earlier the variant carried scan_id/percent itself).
     ResumeScan,
+    /// F9 → «Clear all marks»: the question asked before every saved mark of the scan goes. The
+    /// scan it is about is `CommanderState.clear_marks_for`; the count it states is read from the
+    /// saved-mark count when drawn.
+    ClearMarks,
 }
 
 /// Comparison mode of neighbouring panels.
@@ -856,6 +860,12 @@ pub struct CommanderState {
     /// completed scan of these roots — for showing dates/progress and a recommendation.
     pub resume_unfinished: Option<ResumeInfo>,
     pub resume_complete: Option<ResumeInfo>,
+    /// F2's checks of saved scans still out: each F2 sends one to the background, and each answer
+    /// opens a window of its own.
+    pub resume_probes_in_flight: u32,
+    /// The scan and activation a «Clear all marks» question was asked about, while it is open.
+    /// A yes clears only that scan: if another one was installed meanwhile, nothing is cleared.
+    pub clear_marks_for: Option<(i64, crate::state::browse::Activation)>,
     /// A pending "o" jump — for checking the "not found" status
     /// after the async load. See `PendingJump`.
     pub pending_jump: Option<PendingJump>,
@@ -913,6 +923,8 @@ impl CommanderState {
             pending_scan_roots: Vec::new(),
             resume_unfinished: None,
             resume_complete: None,
+            resume_probes_in_flight: 0,
+            clear_marks_for: None,
             pending_jump: None,
         }
     }

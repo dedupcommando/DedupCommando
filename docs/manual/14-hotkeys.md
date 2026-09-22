@@ -125,7 +125,7 @@ Execute is also available from the F9 menu; see
 
 Overlay title ` Menu — F9 `. The 14 items: 1 `Scan the active panel's
 directory` · 2 `Configure and start a scan…` · 3 `Sessions and scan results…` ·
-4 `Execute marked actions (F11 or x)` · 5 `Clear all marks of the active panel` ·
+4 `Execute marked actions (F11 or x)` · 5 `Clear all marks` ·
 6 `Reload scan data` · 7 `Change panel mode (v)` · 8 `Synchronize panels
 (Shift+F1)` · 9 `Compare panels (Shift+F2)` · 10 `Add a panel (Shift+F3)` ·
 11 `Remove a panel (Shift+F4)` · 12 `Change panel root (Shift+F5)` ·
@@ -176,6 +176,21 @@ Overlay title ` Scan roots — F2 `. Options: `[R]/[Enter] resume` ·
 | **Enter**    | R, otherwise O                                       |
 | **N**        | New scan (ignore the sessions)                        |
 | **Esc**      | Cancel                                                |
+
+#### ClearMarks (F9, item 5)
+
+Overlay title ` Clear all marks — F9 `. Clears every saved mark of the scan it
+names, keepers and marks no panel shows included; the Space/Insert selection
+stays.
+Hint `[Y] yes · [N] no`. Not opened while a mark is saving or while a plan, an F2
+check, an F3 answer, a scan opening, the lookup of a panel's scan or auto-select
+is still on its way.
+
+| Key          | Action                                                |
+|--------------|-------------------------------------------------------|
+| **Y**        | Clear every saved mark of the scan                    |
+| **N** / **Esc** | Close; nothing is cleared                          |
+| **Enter**    | Ignored — clearing costs a deliberate **Y**           |
 
 ## Triage Board (Shift+F12 from Commando)
 

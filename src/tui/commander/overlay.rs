@@ -614,6 +614,52 @@ pub fn render_info(frame: &mut Frame, lines: &[String]) {
     );
 }
 
+/// Draws the «Clear all marks» question (F9). `scan_id` is the scan the question is about — a yes
+/// clears that one and no other; `marked` is how many of its files are marked for an action, when
+/// it is known — keepers are not counted in it, so the question says they go too, and says that
+/// marks no panel shows go with them.
+pub fn render_clear_marks(frame: &mut Frame, scan_id: Option<i64>, marked: Option<usize>) {
+    let scan = match scan_id {
+        Some(scan_id) => format!("scan #{scan_id}"),
+        None => "this scan".to_string(),
+    };
+    let mut lines = vec![format!(
+        "Clear every saved mark of {scan}, keepers included?"
+    )];
+    match marked {
+        Some(0) => lines.push("No file is marked for an action.".to_string()),
+        Some(1) => lines.push("1 file is marked for an action.".to_string()),
+        Some(count) => lines.push(format!("{count} files are marked for an action.")),
+        None => {}
+    }
+    lines.push("Marks no panel shows go too: the F11 plan is built from all of them.".to_string());
+    lines.push(String::new());
+    lines.push("[Y] yes · [N] no".to_string());
+    // As in `render_info`: raise to the minimum first, then cut to what the screen has.
+    #[allow(clippy::manual_clamp)]
+    let height = (lines.len() as u16 + 2).max(5).min(frame.area().height);
+    let width = lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(40) as u16
+        + 4;
+    let area = centered(frame.area(), width, height);
+    frame.render_widget(Clear, area);
+    let text: Vec<Line> = lines
+        .iter()
+        .map(|line| Line::from(format!(" {line}")))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(Text::from(text)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Clear all marks — F9 "),
+        ),
+        area,
+    );
+}
+
 #[cfg(test)]
 mod confirm_summary_tests {
     use super::*;

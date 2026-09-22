@@ -344,7 +344,7 @@ Execute also has the letter alias **x**. See
 │  2. Configure and start a scan…                                        │
 │  3. Sessions and scan results…                                         │
 │  4. Execute marked actions (F11 or x)                                  │
-│  5. Clear all marks of the active panel                                │
+│  5. Clear all marks                                                    │
 │  6. Reload scan data                                                   │
 │  7. Change panel mode (v)                                              │
 │  8. Synchronize panels (Shift+F1)                                      │
@@ -366,13 +366,14 @@ Execute also has the letter alias **x**. See
 | **Esc** or **F9** | Close the menu without an action    |
 
 Item 2 = `Shift+F9`, item 3 = `F12`, **item 4 executes the marked actions**
-(`F11` or `x`), item 5 = clear all marks in bulk. Items 7–13 duplicate the
-hotkeys named in their own labels (for those who do not yet remember them);
-item 6 has no key of its own, and item 14 is the help screen.
+(`F11` or `x`), item 5 clears every saved mark of the scan after a question
+(see "Clear all marks" below). Items 7–13 duplicate the hotkeys named in their
+own labels (for those who do not yet remember them); item 6 has no key of its
+own, and item 14 is the help screen.
 
 ## Overlays
 
-Besides the menu there are three more modal overlays:
+Besides the menu there are four more modal overlays:
 
 ### F11 confirmation (Overlay::Confirm)
 
@@ -488,6 +489,45 @@ finished session, it asks what to do with it:
 | **Enter** | Equivalent to R, or O if there is no unfinished session             |
 | **N**   | Ignore everything, start a new scan                                   |
 | **Esc** | Cancel (return to the commander without a scan)                       |
+
+### Clear all marks — F9, item 5 (Overlay::ClearMarks)
+
+The F11 plan is built from every mark the database holds for the scan, marks
+set in an earlier session or in the classic interface included, and a files
+panel shows only the marks set while it was open. So item 5 clears them in the
+database, all of them, after a question that names the scan:
+
+```text
+┌ Clear all marks — F9 ────────────────────────────────────────────────┐
+│ Clear every saved mark of scan #1, keepers included?                 │
+│ 1 file is marked for an action.                                      │
+│ Marks no panel shows go too: the F11 plan is built from all of them. │
+│                                                                      │
+│ [Y] yes · [N] no                                                     │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+The count is of the files marked for an action; keepers are not in it and go
+too. When that count is not known yet, the line is left out. On **Y** the
+status line reads `Marks cleared: N`, N being the marks the database held, and
+no panel or group shows a mark of that scan any more. Marks of other scans stay
+in the database; a panel that still held one drops it. The selection made with
+**Space** or **Insert** is not a mark and stays.
+
+The item is refused in read-only mode, without a loaded scan, while a mark is
+still being saved or the marks are still being cleared, and while something
+that would open a window over the question or install another scan under it
+is still on its way — a plan being built (F11), a check of saved scans (F2), a
+file's info (F3), a scan opening, the lookup of a panel's scan, auto-select.
+The status line says which; ask again when it is done. If a scan is opened
+while the question is open, the same one again or another, or the database
+file is replaced under it, the question closes and nothing is cleared.
+
+| Key     | Action                                                   |
+|---------|----------------------------------------------------------|
+| **Y**   | Clear every saved mark of the scan                       |
+| **N** / **Esc** | Close; nothing is cleared                        |
+| **Enter** | Nothing — as in F11, it costs a deliberate **Y**       |
 
 ## Side-by-side comparison (`,`)
 
