@@ -189,74 +189,87 @@ v ...   → cursor duplicates / twin folders / ...
 When the panel shows groups:
 
 ```text
-┌─ groups · /tank (12,437 groups total, frees 145 GiB) ──────────────────┐
-│ #1 ●●●●●●●  72.4 MiB × 23  /tank/media/photo/2022-08/IMG_4421.HEIC    │
-│ #2 ●●●●●●   45.0 MiB × 18  /tank/backup/2023/proxmox.tar              │
-│ #3 ●●●●     32.1 MiB × 12  /tank/media/video/test.mp4                 │
-│ #4 ●●●●     28.3 MiB × 11  /tank/old/iso/ubuntu.iso                   │
-│ ▸ #5 ●●●●   25.7 MiB × 10  /tank/media/photo/2021-11/IMG_3120.HEIC    │
-│ #6 ●●●     18.9 MiB × 8   /tank/media/photo/2024-03/IMG_7891.HEIC    │
-│ ...                                                                     │
-└─────────────────────────────────────────────────────────────────────────┘
+┌ 1 · groups (by savings) ─────────────────────────────────────────────┐
+│▶ #0    2 files · 2 objects · 4.0 GiB                                 │
+│    guaranteed after quarantine purge: 4.0 GiB                        │
+│  #1    2 files · 2 objects · 700.0 MiB                               │
+│    guaranteed after quarantine purge: 700.0 MiB                      │
+│  #2    3 files · 3 objects · 24.0 MiB                                │
+│    guaranteed after quarantine purge: 48.0 MiB                       │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-Sorting is by reclaim payoff (how much deduplicating the group would free) by
-default.
+Each group takes two lines. The first gives its rank (counting from `#0`), how many
+files it has, how many separate copies of the data those files are (`objects`: files
+that are already hardlinks of one another count once) and the size of one file. The
+second is the space you are guaranteed to get back once the copies are dealt with and
+the quarantine is purged ([§08](08-actions.md)). The largest figure comes first.
 
 ## Step 7. Switch the adjacent panel to "group files"
 
-In commando the adjacent panel on the right automatically shows the files of the
-group under the cursor — if its view is set to **"group files"** (watch mode).
-Switch focus to the adjacent panel (**Tab**) and cycle **v** to that view:
+In commando the adjacent panel on the right shows the files of the group under the
+cursor — if its view is set to **"group files"** (a watch mode). Put the cursor on a
+group, switch focus to the adjacent panel (**Tab**) and cycle **v** to that view.
+With the cursor on `#2`:
 
 ```text
-┌─ groups ────────────────────────┬─ group files #5 (10 of 10) ───────────┐
-│ #1 ●●●●●●●  72.4 MiB × 23      │   /tank/media/photo/2021-11/IMG_3120.HEIC│
-│ #2 ●●●●●●   45.0 MiB × 18      │   /tank/media/photo/2022-03/IMG_9876.HEIC│
-│ #3 ●●●●     32.1 MiB × 12      │ ▸ /tank/backup/photo/IMG_3120.HEIC      │
-│ #4 ●●●●     28.3 MiB × 11      │   /tank/old-copy/IMG_3120.HEIC          │
-│ ▸ #5 ●●●●   25.7 MiB × 10      │   /tank/media/photo/2021-11/dup.HEIC    │
-│ #6 ●●●     18.9 MiB × 8       │   /tank/old-copy-2/IMG_3120.HEIC        │
-│ ...                              │   ...                                  │
-└─────────────────────────────────┴────────────────────────────────────────┘
+┌ 2 · group files ─────────────────────────────────────────────────────┐
+│guaranteed after quarantine purge: 48.0 MiB · links seen 3/unrecorded │
+│▶   IMG_3120.HEIC  ·  /tank/backup/photo                              │
+│    IMG_3120.HEIC  ·  /tank/media/photo/2021-11                       │
+│    IMG_3120.HEIC  ·  /tank/old-copy                                  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-The adjacent panel on the right switches automatically as the cursor moves in
-the left panel ("watch" modes). More in [§05 Commando](05-commando.md).
+The first line repeats the group's figure. Each file is shown by its name, then its
+directory. The panel follows the cursor
+in the groups panel ("watch" modes). More in [§05 Commando](05-commando.md).
 
-> On very large groups (millions of files) the files panel shows the **first
-> 200** — a visual cap to keep navigation from freezing. The cap does **not**
-> affect mass actions (F11): the plan is built from the database over the full
-> group. See [§13](13-troubleshooting.md).
+> On very large groups the files panel shows the **first 200** files — a visual cap
+> to keep navigation from freezing. The cap does **not** affect mass actions (F11):
+> the plan is built from the database over the full group. See
+> [§13](13-troubleshooting.md).
 
 ## Step 8. Mark a keeper and hardlinks
 
-The cursor is in the right panel (focus on "group files"). On the file that
-**stays** (typically the most "canonical" path, e.g. the first alphabetically):
+Marks are set in a files panel. In "group files" the marking keys are refused with
+`Row commands need «files» or «directories» view (press v)`; the **o** key takes you
+from a file of the group to the file itself:
 
-- **F7** — mark as **keeper** (`K` at the start of the line).
+1. In "group files", put the cursor on the file that **stays** (typically the most
+   "canonical" path) and press **o**. Its directory opens in a third panel on the
+   right, with the cursor on that file and the focus in that panel. Three panels need
+   a window at least 108 columns wide.
+2. Once the file is under the cursor there, press **F7** — mark it as the **keeper**
+   (`K` in the files panel).
+3. Go back with **←**, put the cursor on a copy and press **o** again. The third panel
+   now shows that copy's directory while the focus stays in "group files"; move there
+   with **→** and, once the copy is under the cursor, press **F5** — **hardlink to the
+   keeper** (`H`).
+4. Repeat step 3 for each remaining copy.
 
-On the rest of the files in the group:
-
-- **F5** — mark as **hardlink to the keeper** (`H` at the start of the line).
+"group files" reads the group when the cursor in the groups panel lands on it and does
+not reread it after a mark. To see the marks you have set, go to the groups panel
+(**←** twice), move the cursor to another group and back:
 
 ```text
-┌─ group files #5 ───────────────────────────────────────────────────────┐
-│ K /tank/media/photo/2021-11/IMG_3120.HEIC                              │
-│ H /tank/media/photo/2022-03/IMG_9876.HEIC                              │
-│ H /tank/backup/photo/IMG_3120.HEIC                                      │
-│ H /tank/old-copy/IMG_3120.HEIC                                          │
-│ H /tank/media/photo/2021-11/dup.HEIC                                    │
-│ H /tank/old-copy-2/IMG_3120.HEIC                                        │
-│ ...                                                                     │
-└─────────────────────────────────────────────────────────────────────────┘
+┌ 2 · group files ─────────────────────────────────────────────────────┐
+│guaranteed after quarantine purge: 48.0 MiB · links seen 3/unrecorded │
+│▶ h IMG_3120.HEIC  ·  /tank/backup/photo  -> HARDLINK                 │
+│  ★ IMG_3120.HEIC  ·  /tank/media/photo/2021-11  (keeper)             │
+│  h IMG_3120.HEIC  ·  /tank/old-copy  -> HARDLINK                     │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-Alternatives:
+Here `★` is the keeper and `h` a hardlink; a reflink shows as `c`, a delete as `x`, and
+`=` marks a file that is already the same file on disk as the keeper.
 
-- **F8** on non-keepers → delete to quarantine (not a hardlink); marked `D`.
+Alternatives, in the files panel:
+
+- **F8** on a copy → delete to quarantine (not a hardlink); marked `D`, shown as `x`
+  in "group files".
 - **F6** → reflink (only if `block_cloning: active` for the dataset — see the
-  scan-configuration header); marked `C`.
+  scan-configuration header); marked `C`, shown as `c`.
 - **Space** on a marked file — clear the mark.
 
 How `delete` differs from `hardlink` and which to pick when are in

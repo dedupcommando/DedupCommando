@@ -312,18 +312,34 @@ to `rm` expecting it to name the same file.
 
 ## 11.5. `--purge-quarantine` — clearing the quarantine
 
+Without `--yes` it only counts. It lists the `.dedcom-quarantine/` directory of every
+detected dataset with the regular files inside and their total size, and deletes
+nothing:
+
 ```text
 $ dedcom --purge-quarantine
-Quarantine cleared: /tank/.dedcom-quarantine (87 files, 145678 bytes)
-Quarantine cleared: /rpool/.dedcom-quarantine (12 files, 4567 bytes)
-Total freed: 99 files, 150245 bytes
+=== Quarantine to purge ===
+  /tank/.dedcom-quarantine (87 files, 145678 bytes)
+  /rpool/.dedcom-quarantine (12 files, 4567 bytes)
+Total: 99 files, 150245 bytes
+
+Nothing deleted. To confirm, re-run the command with the --yes flag.
 ```
 
-Deletes the `.dedcom-quarantine/` directories in ALL detected datasets. Before
-deleting, it does a recursive count.
+With `--yes` it deletes those directories and reports what went:
 
-By default it **only reports the size** and deletes nothing. Deletion happens
-only when `--yes` is also given.
+```text
+$ dedcom --purge-quarantine --yes
+=== Quarantine to purge ===
+  /tank/.dedcom-quarantine (87 files, 145678 bytes)
+  /rpool/.dedcom-quarantine (12 files, 4567 bytes)
+Total: 99 files, 150245 bytes
+Reclaimed: 99 files, 150245 bytes
+```
+
+A directory that cannot be deleted is named on stderr (`ERROR: trash not deleted: …`),
+is not counted in `Reclaimed`, and makes the command exit with an error. With no quarantine
+anywhere it prints `The quarantine is empty — nothing to purge.` and exits 0.
 
 > ⚠️ **Irreversible.** With `--yes`, every file in every timestamp subdirectory
 > is gone. This is a final `rm -rf`. Before running it, make sure the result of

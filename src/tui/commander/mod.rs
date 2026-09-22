@@ -5802,6 +5802,408 @@ mod dir_watch_tests {
             "the subject survives the floor whole — `unavailable` is never truncated: {narrow}"
         );
     }
+
+    /// The screens the manual shows in chapters 04 and 05, drawn by the real commander over a
+    /// scan of three duplicate groups under `/tank`.
+    mod manual_screens {
+        use super::*;
+        use crate::model::action::ActionKind;
+        use crate::model::duplicate::FileEntry;
+
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+
+        /// Path, size and the byte its group's digest is made of.
+        const FILES: [(&str, u64, u8); 7] = [
+            ("/tank/iso/ubuntu-24.04.iso", 4 * GIB, 1),
+            ("/tank/backup/iso/ubuntu-24.04.iso", 4 * GIB, 1),
+            ("/tank/media/video/holiday.mp4", 700 * MIB, 2),
+            ("/tank/backup/2023/holiday.mp4", 700 * MIB, 2),
+            ("/tank/media/photo/2021-11/IMG_3120.HEIC", 24 * MIB, 3),
+            ("/tank/backup/photo/IMG_3120.HEIC", 24 * MIB, 3),
+            ("/tank/old-copy/IMG_3120.HEIC", 24 * MIB, 3),
+        ];
+
+        fn manual_scan(marks: &[(&str, bool, Option<ActionKind>)]) -> (PathBuf, i64) {
+            let db = db_path("manual");
+            let mut store = ScanStore::open(&db).unwrap();
+            let scan_id = store
+                .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank")]))
+                .unwrap();
+            let rows: Vec<_> = FILES
+                .iter()
+                .enumerate()
+                .map(|(i, (path, size, _))| crate::state::ManifestRow {
+                    path: PathBuf::from(path),
+                    size: *size,
+                    mtime: 0,
+                    device: 1,
+                    inode: i as u64 + 1,
+                    nlink: 1,
+                    ..Default::default()
+                })
+                .collect();
+            store.record_files(scan_id, &rows).unwrap();
+            let hashes: Vec<_> = FILES
+                .iter()
+                .map(|(path, _, group)| (PathBuf::from(path), [*group; 32]))
+                .collect();
+            store.record_hashes(scan_id, &hashes).unwrap();
+            store
+                .publish_results(scan_id, crate::state::PublishMode::Derived)
+                .unwrap();
+            store.set_status(scan_id, ScanStatus::Complete).unwrap();
+            let entries: Vec<FileEntry> = marks
+                .iter()
+                .map(|(path, is_keeper, action)| FileEntry {
+                    path: PathBuf::from(path),
+                    is_keeper: *is_keeper,
+                    action: *action,
+                    ..Default::default()
+                })
+                .collect();
+            store.save_marks(scan_id, entries.iter()).unwrap();
+            (db, scan_id)
+        }
+
+        /// Groups on the left with row `pick` selected, the group's files on the right.
+        fn groups_app(
+            db: &Path,
+            scan_id: i64,
+            pick: usize,
+        ) -> (
+            App,
+            crossbeam_channel::Receiver<crate::tui::event::AppEvent>,
+        ) {
+            let (mut app, events) = app_over_watched_db(db, scan_id, "/tank/media");
+            app.commander.panels[0].view = PanelView::GroupList;
+            app.commander.panels[0].list.select(Some(pick));
+            app.commander.panels[1].view = PanelView::GroupFiles;
+            app.commander.active = 0;
+            resolve_and_settle(&mut app, &events);
+            app.commander.status.clear();
+            (app, events)
+        }
+
+        fn screen(app: &mut App, width: u16, height: u16) -> (Vec<String>, Vec<Rect>) {
+            let buffer = crate::tui::hostile::frame_of(width, height, |frame| render(frame, app));
+            let regions = layout::regions(Rect::new(0, 0, width, height));
+            let rects = layout::panel_rects(regions.panels, visible_panel_count(app, width));
+            (crate::tui::hostile::rows(&buffer), rects)
+        }
+
+        fn press(app: &mut App, code: KeyCode) {
+            on_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+        }
+
+        /// Pumps until a jump has landed and every mark write is acknowledged.
+        fn settle(
+            app: &mut App,
+            events: &crossbeam_channel::Receiver<crate::tui::event::AppEvent>,
+        ) {
+            crate::app::pump_until(app, events, "the jump and the marks", |app| {
+                app.commander.pending_jump.is_none() && app.pending_marks.is_empty()
+            });
+        }
+
+        /// What «group files» shows for the files of the group in panel 1.
+        fn group_files_shown(app: &App) -> Vec<(PathBuf, bool, Option<ActionKind>)> {
+            app.commander
+                .watch_cache
+                .get(1)
+                .and_then(|entry| entry.as_file_group())
+                .map(|group| {
+                    group
+                        .files
+                        .iter()
+                        .map(|file| (file.path.clone(), file.is_keeper, file.action))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        /// Step 8 of the quickstart with the keys it names, over real files: in «group files» F7
+        /// is refused, `o` opens the file's directory in the next panel with the cursor on the file,
+        /// F7 there marks the keeper and F5 the copies. «group files» shows marks as it read them
+        /// when the group was selected; the cursor off the group and back shows the ones set since.
+        #[test]
+        fn the_quickstart_marks_a_group_with_the_keys_it_names() {
+            use std::os::unix::fs::MetadataExt;
+            let _role = crate::state::store::role_guard();
+            let db = db_path("manual_flow");
+            let root = db.parent().unwrap().join("tank");
+            let paths: Vec<PathBuf> = [
+                "backup/photo/IMG_3120.HEIC",
+                "media/photo/2021-11/IMG_3120.HEIC",
+                "old-copy/IMG_3120.HEIC",
+                "backup/2023/holiday.mp4",
+                "media/video/holiday.mp4",
+            ]
+            .iter()
+            .map(|file| root.join(file))
+            .collect();
+            // Two groups: the three photos first (the larger saving), then the two videos.
+            for (at, path) in paths.iter().enumerate() {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let (byte, size) = if at < 3 { (7u8, 4096) } else { (8u8, 2048) };
+                std::fs::write(path, vec![byte; size]).unwrap();
+            }
+            let mut store = ScanStore::open(&db).unwrap();
+            let scan_id = store
+                .begin_scan(&ScanConfig::new(vec![root.clone()]))
+                .unwrap();
+            let rows: Vec<_> = paths
+                .iter()
+                .map(|path| {
+                    let meta = std::fs::metadata(path).unwrap();
+                    crate::state::ManifestRow {
+                        path: path.clone(),
+                        size: meta.len(),
+                        mtime: meta.mtime(),
+                        mtime_nsec: meta.mtime_nsec(),
+                        ctime_sec: meta.ctime(),
+                        ctime_nsec: meta.ctime_nsec(),
+                        device: meta.dev(),
+                        inode: meta.ino(),
+                        nlink: meta.nlink(),
+                    }
+                })
+                .collect();
+            store.record_files(scan_id, &rows).unwrap();
+            let hashes: Vec<_> = paths
+                .iter()
+                .enumerate()
+                .map(|(at, path)| (path.clone(), [if at < 3 { 9u8 } else { 10u8 }; 32]))
+                .collect();
+            store.record_hashes(scan_id, &hashes).unwrap();
+            store
+                .publish_results(scan_id, crate::state::PublishMode::Derived)
+                .unwrap();
+            // The root on record, as a real scan leaves it: every directory under it is then
+            // covered by this scan, and moving between panels switches nothing.
+            store
+                .commit_omissions(scan_id, &one_root(&root.to_string_lossy(), &[]))
+                .unwrap();
+            store.set_status(scan_id, ScanStatus::Complete).unwrap();
+            drop(store);
+
+            let (mut app, events) =
+                app_watching(&db, scan_id, &root.join("media").to_string_lossy());
+            app.commander
+                .scan_coverage_cache
+                .insert(root.clone(), Some(scan_id));
+            app.commander.term_width = 120;
+            app.commander.panels[0].view = PanelView::GroupList;
+            app.commander.panels[0].list.select(Some(0));
+            app.commander.panels[1].view = PanelView::GroupFiles;
+            resolve_and_settle(&mut app, &events);
+
+            // One key, then one frame: the commander resolves its watching panels on every frame.
+            let key = |app: &mut App, code: KeyCode| {
+                press(app, code);
+                settle(app, &events);
+                resolve_and_settle(app, &events);
+            };
+            let unmarked: Vec<_> = paths[..3]
+                .iter()
+                .map(|path| (path.clone(), false, None))
+                .collect();
+
+            // Tab to «group files», the cursor on the file that stays. F7 is refused there.
+            key(&mut app, KeyCode::Tab);
+            assert_eq!(app.commander.active, 1);
+            app.commander.panels[1].list.select(Some(1));
+            key(&mut app, KeyCode::F(7));
+            assert_eq!(
+                app.commander.status,
+                "Row commands need «files» or «directories» view (press v)"
+            );
+            // o: a third panel with the file's directory, the focus and the cursor on the file.
+            key(&mut app, KeyCode::Char('o'));
+            assert_eq!(app.commander.panels.len(), 3, "o adds the third panel");
+            assert_eq!(app.commander.active, 2, "and moves the focus into it");
+            assert_eq!(
+                app.commander.panels[2]
+                    .selected()
+                    .map(|entry| entry.path.clone()),
+                Some(paths[1].clone())
+            );
+            key(&mut app, KeyCode::F(7));
+            assert!(app.commander.status.starts_with("Mark saved"));
+
+            // Each copy: ← back to «group files», o, → into the files panel, F5.
+            for row in [0usize, 2] {
+                key(&mut app, KeyCode::Left);
+                assert_eq!(app.commander.active, 1);
+                app.commander.panels[1].list.select(Some(row));
+                key(&mut app, KeyCode::Char('o'));
+                assert_eq!(
+                    app.commander.active, 1,
+                    "with a third panel, o leaves the focus"
+                );
+                key(&mut app, KeyCode::Right);
+                assert_eq!(
+                    app.commander.panels[2]
+                        .selected()
+                        .map(|entry| entry.path.clone()),
+                    Some(paths[row].clone())
+                );
+                key(&mut app, KeyCode::F(5));
+                assert!(app.commander.status.starts_with("Mark saved"));
+            }
+            assert_eq!(
+                app.commander.dedup_scan_id,
+                Some(scan_id),
+                "moving between panels switched no scan"
+            );
+
+            // «group files» still shows the group as it read it, before any mark.
+            assert_eq!(
+                group_files_shown(&app),
+                unmarked,
+                "«group files» does not reread the group after a mark"
+            );
+            // The cursor in the groups panel off the group and back (← ←, ↓ ↑) shows the marks.
+            key(&mut app, KeyCode::Left);
+            key(&mut app, KeyCode::Left);
+            assert_eq!(app.commander.active, 0);
+            key(&mut app, KeyCode::Down);
+            key(&mut app, KeyCode::Up);
+            assert_eq!(
+                group_files_shown(&app),
+                vec![
+                    (paths[0].clone(), false, Some(ActionKind::Hardlink)),
+                    (paths[1].clone(), true, None),
+                    (paths[2].clone(), false, Some(ActionKind::Hardlink)),
+                ],
+                "«group files» must show the marks set in the files panel"
+            );
+        }
+
+        /// A panel as the manual quotes it: its rectangle cut out of the screen, without the empty
+        /// rows between the last line of content and the bottom border.
+        fn panel_block(lines: &[String], rect: Rect) -> Vec<String> {
+            let top = usize::from(rect.y);
+            let mut block: Vec<String> = lines[top..top + usize::from(rect.height)]
+                .iter()
+                .map(|line| {
+                    line.chars()
+                        .skip(usize::from(rect.x))
+                        .take(usize::from(rect.width))
+                        .collect()
+                })
+                .collect();
+            while block.len() > 2
+                && block[block.len() - 2]
+                    .trim_matches(|c| c == '│' || c == ' ')
+                    .is_empty()
+            {
+                block.remove(block.len() - 2);
+            }
+            block
+        }
+
+        /// The group screens the manual shows, at 144 columns (two panels of 72): the groups with
+        /// the cursor on the top one, the files of the third group, and the same files once marked.
+        fn manual_group_screens() -> Vec<(&'static str, Vec<String>)> {
+            let marks = [
+                ("/tank/media/photo/2021-11/IMG_3120.HEIC", true, None),
+                (
+                    "/tank/backup/photo/IMG_3120.HEIC",
+                    false,
+                    Some(ActionKind::Hardlink),
+                ),
+                (
+                    "/tank/old-copy/IMG_3120.HEIC",
+                    false,
+                    Some(ActionKind::Hardlink),
+                ),
+            ];
+            let mut screens = Vec::new();
+            for (name, pick, marked, panel) in [
+                ("groups", 0usize, false, 0usize),
+                ("group files", 2, false, 1),
+                ("marked group files", 2, true, 1),
+            ] {
+                let (db, scan_id) = manual_scan(if marked { &marks } else { &[] });
+                let (mut app, _events) = groups_app(&db, scan_id, pick);
+                let (lines, rects) = screen(&mut app, 144, 18);
+                screens.push((name, panel_block(&lines, rects[panel])));
+            }
+            screens
+        }
+
+        /// The ```text blocks of a chapter, as lines.
+        fn text_blocks(chapter: &str) -> Vec<Vec<String>> {
+            let mut blocks = Vec::new();
+            let mut open: Option<Vec<String>> = None;
+            for line in chapter.lines() {
+                match (open.take(), line) {
+                    (None, "```text") => open = Some(Vec::new()),
+                    (Some(block), "```") => blocks.push(block),
+                    (Some(mut block), line) => {
+                        block.push(line.to_string());
+                        open = Some(block);
+                    }
+                    (None, _) => {}
+                }
+            }
+            blocks
+        }
+
+        /// The group panels in chapters 04 and 05 are renders, not drawings: a block that opens
+        /// with a group panel's frame must be one of the screens the commander draws above, and
+        /// the quickstart must show the groups, the files of a group and the files once marked.
+        #[test]
+        fn the_manual_shows_the_group_panels_the_commander_draws() {
+            let _role = crate::state::store::role_guard();
+            let screens = manual_group_screens();
+            let drawn = screens
+                .iter()
+                .map(|(name, lines)| format!("-- {name}\n{}", lines.join("\n")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for (chapter, wanted) in [
+                (
+                    "04-quickstart.md",
+                    &["groups", "group files", "marked group files"][..],
+                ),
+                ("05-commando.md", &["groups", "marked group files"][..]),
+            ] {
+                let mut found = Vec::new();
+                for block in text_blocks(&crate::testfixtures::manual(chapter)) {
+                    let frame = block.first().map(String::as_str).unwrap_or("");
+                    let group_panel = frame.starts_with('┌')
+                        && [
+                            "groups (by",
+                            "· groups",
+                            "groups ·",
+                            "group files",
+                            "Group files",
+                        ]
+                        .iter()
+                        .any(|title| frame.contains(title));
+                    if !group_panel {
+                        continue;
+                    }
+                    let Some((name, _)) = screens.iter().find(|(_, lines)| *lines == block) else {
+                        panic!(
+                            "{chapter}: this group panel is not what the commander draws:\n{}\n\n\
+                             The commander draws:\n{drawn}",
+                            block.join("\n")
+                        );
+                    };
+                    found.push(*name);
+                }
+                for name in wanted {
+                    assert!(
+                        found.contains(name),
+                        "{chapter} must show the «{name}» screen:\n{drawn}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// A name is data on every commander surface that is not a panel row: the header, the status

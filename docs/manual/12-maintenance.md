@@ -236,21 +236,24 @@ marks (but not files!). A backup makes sense if:
 - You keep many completed sessions for analytics (ScanDiff).
 - You are about to upgrade `dedcom` across a schema change and want the option to go
   back. Schema v6 (the move journal stores pathnames as raw bytes) has no downgrade
-  migration: an older build refuses a newer database and leaves it untouched, so the only
-  way back to the older build is a copy taken before the upgrade.
+  migration, so the only way back to an older build is a copy taken before the upgrade.
+  0.9.0-beta.2 and beta.3 refuse a newer database and leave it untouched; 0.9.0-beta.1
+  does not check the schema at all and writes its scans into the newer database.
 
 A plain `cp dedcom.db` is not enough. `dedcom` runs the database in WAL mode: committed
 transactions can sit in `dedcom.db-wal` until a checkpoint, and a copy of the main file
 alone silently loses them. Take the copy with SQLite's own `.backup`, and only while no
-`dedcom` process is running — the two scripts below check that first, and refuse when
-they cannot tell. Both set `umask 077`: the copy and the set-aside directory hold every
-pathname of the pool and stay readable by the owner alone (`0600` for files, `0700` for
-the directory).
+`dedcom` process is running and no `sqlite3` shell of yours has the database open — the
+two scripts below check for `dedcom` first, and refuse when they cannot tell. Both set
+`umask 077`: the copy and the set-aside directory hold every pathname of the pool and stay
+readable by the owner alone (`0600` for files, `0700` for the directory).
 
 ### Backup (before the upgrade)
 
-The version check pins the copy to the schema before the v6 upgrade; a copy of a v6
-database is not a way back, because the older build cannot open it.
+Run it before the first start of the new build: that start is what upgrades the database.
+It copies `dedcom.db` only while the database is older than schema v6 — v0 written by
+0.9.0-beta.1, v2 by beta.2, v5 by beta.3 — and stops before copying anything once it is
+v6: beta.2 and beta.3 cannot open a v6 database, so a copy of one is no way back.
 
 ```bash
 #!/usr/bin/env bash
@@ -263,8 +266,10 @@ cd "$S"
 
 # pgrep exit codes: 0 = a dedcom process exists, 1 = none, anything else (2, 3, 127 when pgrep
 # itself is missing) = we could not tell. Only "none" may continue. `|| rc=$?` keeps set -e quiet
-# for the check itself; an `if pgrep` would have read every failure as "no process".
-rc=0; pgrep -a dedcom || rc=$?
+# for the check itself; an `if pgrep` would have read every failure as "no process". `-x` matches
+# the process name exactly, so a script or a wrapper with "dedcom" in its name is not taken for it
+# (if you run the binary under another name, put that name here and in the restore script).
+rc=0; pgrep -ax dedcom || rc=$?
 case "$rc" in
   0) echo "dedcom is running — exit it first (do not use --force to bypass its lock)" >&2; exit 1 ;;
   1) ;;
@@ -277,10 +282,20 @@ command -v sqlite3 >/dev/null || {
   exit 1
 }
 
-BAK="dedcom.db.v5-$(date +%Y%m%d-%H%M%S).bak"
+[ -f dedcom.db ] || { echo "no dedcom.db in $S" >&2; exit 1; }
+[ -n "$(sqlite3 dedcom.db "SELECT 1 FROM sqlite_master WHERE type='table' AND name='scan';")" ] \
+  || { echo "dedcom.db has no scan table — not a dedcom checkpoint" >&2; exit 1; }
+
+# Only a schema older than v6 is a way back — checked before anything is copied.
+V="$(sqlite3 dedcom.db "PRAGMA user_version;")"
+case "$V" in ''|*[!0-9]*) echo "cannot read the schema version of dedcom.db" >&2; exit 1 ;; esac
+[ "$V" -lt 6 ] || { echo "dedcom.db is already schema v$V — a copy of it is no way back" >&2; exit 1; }
+
+BAK="dedcom.db.v$V-$(date +%Y%m%d-%H%M%S).bak"
 if [ -e "$BAK" ] || [ -L "$BAK" ]; then echo "$BAK already exists" >&2; exit 1; fi
 
-# -wal/-shm present with dedcom stopped = unclean exit; .backup reads through the WAL correctly.
+# Reading the version has already folded a leftover -wal into dedcom.db, as starting dedcom would;
+# .backup reads through any WAL still in use.
 ls -l dedcom.db*
 sqlite3 dedcom.db ".backup '$BAK'"
 
@@ -288,21 +303,24 @@ sqlite3 dedcom.db ".backup '$BAK'"
 [ -f "$BAK" ] && [ ! -L "$BAK" ] || { echo "$BAK is not a regular file" >&2; exit 1; }
 chmod 600 "$BAK"
 
-# The copy must be sound and must be the OLD schema (5) — verify before trusting it.
+# The copy must be sound and of the schema it was taken from — verify before trusting it.
 sqlite3 "$BAK" "PRAGMA integrity_check;" | grep -qx ok || { echo "$BAK fails integrity_check" >&2; exit 1; }
-V="$(sqlite3 "$BAK" "PRAGMA user_version;")"
-[ "$V" = 5 ] || { echo "$BAK is schema v$V, not v5 — not a pre-upgrade copy" >&2; exit 1; }
-echo "verified backup: $S/$BAK (schema v5)"
+[ "$(sqlite3 "$BAK" "PRAGMA user_version;")" = "$V" ] || { echo "$BAK is not schema v$V" >&2; exit 1; }
+echo "verified backup: $S/$BAK (schema v$V)"
 ```
 
 ### Restore (going back to the older build)
 
-The v6 files are set aside into a new directory, never overwritten; the copy is verified
-before anything is moved and nothing is copied onto a name that is still taken.
+First put back the build you ran before the upgrade; the `vN` in the copy's name tells
+which: v0 is 0.9.0-beta.1, v2 is beta.2, v5 is beta.3. With APT that is
+`apt-get install dedcom=0.9.0~beta.1` or `dedcom=0.9.0~beta.2`; beta.3 exists only as a
+release archive. Restore the copy before that build starts. The files in place are set
+aside into a new directory, never overwritten; the copy is verified before anything is
+moved and nothing is copied onto a name that is still taken.
 
 ```bash
 #!/usr/bin/env bash
-# restore-dedcom-db.sh <verified .bak> — put a v5 copy back; sets the v6 files aside, never over them.
+# restore-dedcom-db.sh <verified .bak> — put a pre-v6 copy back; sets the current files aside, never over them.
 set -euo pipefail
 # The set-aside directory and everything in it stay private to the owner.
 umask 077
@@ -311,7 +329,7 @@ BAK="${1:?usage: restore-dedcom-db.sh <verified .bak>}"
 cd "$S"
 
 # Same three-way pgrep check as in the backup script: only exit code 1 ("no process") continues.
-rc=0; pgrep -a dedcom || rc=$?
+rc=0; pgrep -ax dedcom || rc=$?
 case "$rc" in
   0) echo "dedcom is running — exit it first" >&2; exit 1 ;;
   1) ;;
@@ -320,20 +338,24 @@ esac
 
 # 1. The backup is verified BEFORE anything is moved.
 [ -f "$BAK" ] || { echo "backup not found: $BAK" >&2; exit 1; }
+[ ! "$BAK" -ef dedcom.db ] || { echo "$BAK is dedcom.db itself — name the copy" >&2; exit 1; }
 sqlite3 "$BAK" "PRAGMA integrity_check;" | grep -qx ok || { echo "$BAK fails integrity_check" >&2; exit 1; }
-[ "$(sqlite3 "$BAK" "PRAGMA user_version;")" = 5 ] || { echo "$BAK is not a v5 checkpoint" >&2; exit 1; }
+[ -n "$(sqlite3 "$BAK" "SELECT 1 FROM sqlite_master WHERE type='table' AND name='scan';")" ] \
+  || { echo "$BAK has no scan table — not a dedcom checkpoint" >&2; exit 1; }
+V="$(sqlite3 "$BAK" "PRAGMA user_version;")"
+case "$V" in ''|*[!0-9]*) echo "cannot read the schema version of $BAK" >&2; exit 1 ;; esac
+[ "$V" -lt 6 ] || { echo "$BAK is schema v$V — not a copy from before the v6 upgrade" >&2; exit 1; }
 
-# 2. A NEW directory, mode 0700. No -p: an existing one is an error, and the script stops here.
-ASIDE="aside-v6-$(date +%Y%m%d-%H%M%S)"
+# 2. The main file must be here. Then a NEW directory, mode 0700. No -p: an existing one is an
+#    error, and the script stops there.
+[ -e dedcom.db ] || [ -L dedcom.db ] \
+  || { echo "dedcom.db is not here — nothing to set aside; look before restoring" >&2; exit 1; }
+ASIDE="aside-$(date +%Y%m%d-%H%M%S)"
 mkdir -m 700 "$ASIDE"
 
-# 3. The main file must exist and must move; the sidecars move only if present.
+# 3. The main file must move; the sidecars move only if present.
 #    "Absent sidecar" is normal after a clean exit; "cannot move" is an error (set -e stops).
-if [ -e dedcom.db ] || [ -L dedcom.db ]; then
-  mv dedcom.db "$ASIDE/"
-else
-  echo "dedcom.db is not here — nothing to set aside; look before restoring" >&2; exit 1
-fi
+mv dedcom.db "$ASIDE/"
 for f in dedcom.db-wal dedcom.db-shm; do
   if [ -e "$f" ] || [ -L "$f" ]; then mv "$f" "$ASIDE/"; fi
 done
@@ -346,7 +368,7 @@ cp -p "$BAK" dedcom.db
 [ -f dedcom.db ] && [ ! -L dedcom.db ] || { echo "dedcom.db is not a regular file" >&2; exit 1; }
 chmod 600 dedcom.db
 sqlite3 dedcom.db "PRAGMA integrity_check;" | grep -qx ok
-echo "restored $BAK as dedcom.db (schema $(sqlite3 dedcom.db 'PRAGMA user_version;')); v6 files kept in $S/$ASIDE"
+echo "restored $BAK as dedcom.db (schema $(sqlite3 dedcom.db 'PRAGMA user_version;')); the previous files are in $S/$ASIDE"
 ```
 
 ### What restoring does not do
@@ -356,7 +378,7 @@ Board put them. Their journal stays in the set-aside v6 file and can be read wit
 `sqlite3`:
 
 ```text
-sqlite3 aside-v6-<stamp>/dedcom.db \
+sqlite3 aside-<stamp>/dedcom.db \
   "SELECT id, created_at, hex(source_path), hex(target_path), duplicate, path_fidelity
      FROM move_event ORDER BY id;"
 ```

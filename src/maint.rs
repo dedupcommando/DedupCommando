@@ -165,6 +165,36 @@ mod tests {
         );
     }
 
+    /// The backup and restore scripts in §12 exist for the way back to a build that wrote an older
+    /// schema, so the number they compare with is the schema this build writes. Pinned to the
+    /// constant: a schema bump the manual did not follow fails here, not on a user's upgrade.
+    #[test]
+    fn the_manual_backup_scripts_accept_every_schema_before_the_current_one() {
+        let chapter = crate::testfixtures::manual("12-maintenance.md");
+        let check = format!("[ \"$V\" -lt {} ]", crate::state::schema::SCHEMA_VERSION);
+        for script in ["# backup-dedcom-db.sh", "# restore-dedcom-db.sh"] {
+            let body = chapter
+                .lines()
+                .skip_while(|line| !line.starts_with(script))
+                .take_while(|line| !line.starts_with("```"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!body.is_empty(), "12-maintenance.md has no {script}");
+            assert_eq!(
+                body.matches(&check).count(),
+                1,
+                "{script} must compare the schema as {check} exactly once"
+            );
+            let fixed = body
+                .match_indices("\" = ")
+                .any(|(at, sep)| body[at + sep.len()..].starts_with(|c: char| c.is_ascii_digit()));
+            assert!(
+                !fixed,
+                "{script} must not compare the schema with a fixed number"
+            );
+        }
+    }
+
     #[test]
     fn due_when_never_run() {
         assert!(vacuum_due(120, None, 1_000_000));

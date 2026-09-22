@@ -1137,8 +1137,6 @@ fn run_purge_quarantine(cli: &cli::Cli) -> Result<()> {
 
     // Estimate across all trash dirs — without deleting anything.
     let mut targets: Vec<(PathBuf, u64, u64)> = Vec::new();
-    let mut total_bytes = 0u64;
-    let mut total_files = 0u64;
     for pool in &zfs.pools {
         for dataset in &pool.datasets {
             let root = actions::quarantine::quarantine_root(&dataset.mountpoint);
@@ -1146,41 +1144,29 @@ fn run_purge_quarantine(cli: &cli::Cli) -> Result<()> {
                 continue;
             }
             let (bytes, files) = dir_stats(&root);
-            total_bytes += bytes;
-            total_files += files;
             targets.push((root, bytes, files));
         }
     }
 
     if targets.is_empty() {
-        println!("The quarantine is empty — nothing to purge.");
+        println!("{PURGE_EMPTY}");
         return Ok(());
     }
 
-    println!("=== Quarantine to purge ===");
-    for (root, bytes, files) in &targets {
-        println!(
-            "  {} ({} files, {} bytes)",
-            textsan::terminal(&root.display().to_string()),
-            files,
-            bytes
-        );
+    for line in purge_listing(&targets) {
+        println!("{line}");
     }
-    println!("Total: {total_files} files, {total_bytes} bytes");
 
     // Gate: apply_purge performs the deletion only with assume_yes (single source).
     let report = apply_purge(&targets, cli.assume_yes);
 
     if !cli.assume_yes {
         println!();
-        println!("Nothing deleted. To confirm, re-run the command with the --yes flag.");
+        println!("{PURGE_NOTHING_DELETED}");
         return Ok(());
     }
 
-    println!(
-        "Reclaimed: {} files, {} bytes",
-        report.deleted_files, report.deleted_bytes
-    );
+    println!("{}", purge_reclaimed(&report));
     if !report.errors.is_empty() {
         for (root, err) in &report.errors {
             eprintln!(
@@ -1196,6 +1182,40 @@ fn run_purge_quarantine(cli: &cli::Cli) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// What `--purge-quarantine` prints when no dataset has a quarantine.
+const PURGE_EMPTY: &str = "The quarantine is empty — nothing to purge.";
+
+/// What it prints after the listing when `--yes` is absent.
+const PURGE_NOTHING_DELETED: &str =
+    "Nothing deleted. To confirm, re-run the command with the --yes flag.";
+
+/// The listing `--purge-quarantine` prints before anything is deleted: one line per quarantine
+/// root, then the total. The manual (§11.5) shows it, and a test holds the two to each other.
+fn purge_listing(targets: &[(PathBuf, u64, u64)]) -> Vec<String> {
+    let mut lines = vec!["=== Quarantine to purge ===".to_string()];
+    let (mut total_files, mut total_bytes) = (0u64, 0u64);
+    for (root, bytes, files) in targets {
+        lines.push(format!(
+            "  {} ({} files, {} bytes)",
+            textsan::terminal(&root.display().to_string()),
+            files,
+            bytes
+        ));
+        total_files += files;
+        total_bytes += bytes;
+    }
+    lines.push(format!("Total: {total_files} files, {total_bytes} bytes"));
+    lines
+}
+
+/// The line `--purge-quarantine --yes` prints for what it deleted.
+fn purge_reclaimed(report: &PurgeReport) -> String {
+    format!(
+        "Reclaimed: {} files, {} bytes",
+        report.deleted_files, report.deleted_bytes
+    )
 }
 
 /// The outcome of deleting the quarantine trash dirs. Per-root errors are
@@ -1294,6 +1314,62 @@ mod purge_tests {
         let root = temp_dir("empty");
         assert_eq!(dir_stats(&root), (0, 0));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// §11.5 shows both runs of `--purge-quarantine` line for line. The expected lines come from
+    /// the functions the command prints with, so the sample cannot drift from the output again.
+    #[test]
+    fn the_manual_shows_the_purge_output_the_code_prints() {
+        use super::{
+            purge_listing, purge_reclaimed, PurgeReport, PURGE_EMPTY, PURGE_NOTHING_DELETED,
+        };
+        let chapter = crate::testfixtures::manual("11-headless.md");
+        let section: Vec<&str> = chapter
+            .lines()
+            .skip_while(|line| !line.starts_with("## 11.5."))
+            .enumerate()
+            .take_while(|(at, line)| *at == 0 || !line.starts_with("## "))
+            .map(|(_, line)| line)
+            .collect();
+        let mut blocks: Vec<Vec<String>> = Vec::new();
+        let mut open: Option<Vec<String>> = None;
+        for line in &section {
+            match (open.take(), *line) {
+                (None, "```text") => open = Some(Vec::new()),
+                (Some(block), "```") => blocks.push(block),
+                (Some(mut block), line) => {
+                    block.push(line.to_string());
+                    open = Some(block);
+                }
+                (None, _) => {}
+            }
+        }
+
+        let targets = [
+            (PathBuf::from("/tank/.dedcom-quarantine"), 145_678, 87),
+            (PathBuf::from("/rpool/.dedcom-quarantine"), 4_567, 12),
+        ];
+        let listing = purge_listing(&targets);
+        let mut dry_run = vec!["$ dedcom --purge-quarantine".to_string()];
+        dry_run.extend_from_slice(&listing);
+        dry_run.push(String::new());
+        dry_run.push(PURGE_NOTHING_DELETED.to_string());
+        let mut with_yes = vec!["$ dedcom --purge-quarantine --yes".to_string()];
+        with_yes.extend(listing);
+        with_yes.push(purge_reclaimed(&PurgeReport {
+            deleted_files: 99,
+            deleted_bytes: 150_245,
+            errors: Vec::new(),
+        }));
+        assert_eq!(
+            blocks,
+            vec![dry_run, with_yes],
+            "11-headless.md §11.5 must show what --purge-quarantine prints"
+        );
+        assert!(
+            section.iter().any(|line| line.contains(PURGE_EMPTY)),
+            "§11.5 must quote the empty-quarantine line: {PURGE_EMPTY}"
+        );
     }
 
     #[test]

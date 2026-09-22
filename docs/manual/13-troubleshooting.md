@@ -271,8 +271,9 @@ supported; workarounds:
 
 - `dedcom --export-csv` → grep for the file of interest.
 - `dedcom --stats` shows a summary, but not group members.
-- Sorting GroupFiles (the `s` key) changes which 200 are visible (by size, by name,
-  by date).
+
+The `s` key does not change which 200 are shown: it sorts a files panel, and GroupFiles
+always takes a group's first 200 files in path order.
 
 Scrolling the full group is on the roadmap.
 

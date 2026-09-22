@@ -136,37 +136,45 @@ After a scan, a panel can be switched to **GroupList** — showing all the
 duplicate groups of the loaded scan:
 
 ```text
-┌─ /tank · groups (12,437 groups, frees 145 GiB) ───────────────────┐
-│ #1 ●●●●●●●  72.4 MiB × 23  /tank/media/photo/2022-08/IMG_4421.HEIC │
-│ #2 ●●●●●●   45.0 MiB × 18  /tank/backup/2023/proxmox.tar           │
-│ ▸ #5 ●●●●    25.7 MiB × 10  /tank/media/photo/2021-11/IMG_3120.HEIC │
-│ #6 ●●●     18.9 MiB × 8   /tank/media/photo/2024-03/IMG_7891.HEIC │
-│ ...                                                                  │
+┌ 1 · groups (by savings) ─────────────────────────────────────────────┐
+│▶ #0    2 files · 2 objects · 4.0 GiB                                 │
+│    guaranteed after quarantine purge: 4.0 GiB                        │
+│  #1    2 files · 2 objects · 700.0 MiB                               │
+│    guaranteed after quarantine purge: 700.0 MiB                      │
+│  #2    3 files · 3 objects · 24.0 MiB                                │
+│    guaranteed after quarantine purge: 48.0 MiB                       │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-- The left column is the benefit (visual dots), then size × file count.
-- The name is the path of the most "representative" file of the group.
+- The first line of a group: its rank (from `#0`), the number of files, the number
+  of separate copies of the data (`objects`; files already hardlinked to one
+  another count once) and the size of one file.
+- The second line: the space guaranteed to come back once the copies are dealt with
+  and the quarantine is purged. Groups are ordered by it, largest first.
 
 The neighbouring panel on the right, switched to **GroupFiles**, automatically
-shows the files of the selected group:
+shows the files of the selected group — name first, then directory — with the marks
+saved for them when the group was selected:
 
 ```text
-┌─ Group files #5 (10 of 10) ─────────────────────────────────────────┐
-│   /tank/media/photo/2021-11/IMG_3120.HEIC                           │
-│ K /tank/media/photo/2021-11/IMG_canon.HEIC                          │
-│ H /tank/backup/photo/IMG_3120.HEIC                                   │
-│ H /tank/old-copy/IMG_3120.HEIC                                       │
-│ ▸ /tank/media/photo/2021-11/dup.HEIC                                 │
-│ ...                                                                  │
+┌ 2 · group files ─────────────────────────────────────────────────────┐
+│guaranteed after quarantine purge: 48.0 MiB · links seen 3/unrecorded │
+│▶ h IMG_3120.HEIC  ·  /tank/backup/photo  -> HARDLINK                 │
+│  ★ IMG_3120.HEIC  ·  /tank/media/photo/2021-11  (keeper)             │
+│  h IMG_3120.HEIC  ·  /tank/old-copy  -> HARDLINK                     │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-The glyphs in the first column are marks (K/H/C/D/*), see "Marks" below.
+The first column shows a file's saved mark: `★` keeper, `h` hardlink, `c` reflink,
+`x` delete, `=` the same file on disk as the keeper. The marks themselves are set in
+a Files panel (see "File marks" below); in GroupFiles the marking keys are refused,
+and **`o`** opens the file's directory next to it (see below). GroupFiles does not
+reread the group after a mark: to see new marks, move the cursor in the GroupList
+panel to another group and back.
 
 > On very large groups, GroupFiles shows the first **200** files (a visual cap
-> against freezes). The header reads `(200 of X)`. This does not affect the bulk
-> F11 actions. See [§13](13-troubleshooting.md).
+> against freezes). This does not affect the bulk F11 actions. See
+> [§13](13-troubleshooting.md).
 
 ### The "duplicates of the cursor" view: DuplicatesOfCursor
 
@@ -220,24 +228,14 @@ Which algorithm builds the signatures (default vs `--merkle-dirs`) — see
 
 In the **GroupFiles** and **DuplicatesOfCursor** views, the **`o`** / **`O`**
 key opens the directory of the file under the cursor in the adjacent panel on the
-right, and the cursor there lands on that file immediately:
+right, in Files view, and the cursor there lands on that file immediately. This is
+the way from a group to its files for marking ([§04 Step 8](04-quickstart.md)).
 
-```text
-cursor on /tank/old-copy/IMG_3120.HEIC in GroupFiles
-        │ o ↓
-┌─ Group files #5 ──────────┐  ┌─ /tank/old-copy · files ────────────┐
-│   /tank/media/IMG_3120.HEIC│  │ ..                                   │
-│ K /tank/media/IMG_canon... │  │ ▸ IMG_3120.HEIC                      │
-│ H /tank/backup/IMG_3120... │→ │ IMG_3119.HEIC                        │
-│ ▸ /tank/old-copy/IMG_3120 │  │ IMG_3121.HEIC                        │
-│ ...                        │  │ ...                                  │
-└────────────────────────────┘  └──────────────────────────────────────┘
-```
-
-If there is no right panel, `o` tries to add one; a narrow terminal or the panel
-limit puts the error text into the status line. In other views, `o` is a silent
-no-op with the status message "The «o» key works in the «group files» and
-«duplicates» modes".
+If there is no right panel, `o` adds one, and the new panel takes the focus; a
+narrow terminal or the panel limit puts the error text into the status line
+instead. When the panel on the right already exists, the focus stays where it was.
+In other views, `o` does nothing but set the status message "The «o» key works in
+the «group files» and «duplicates» modes".
 
 ## Watch modes: how panels "follow" one another
 
