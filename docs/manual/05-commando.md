@@ -154,7 +154,7 @@ duplicate groups of the loaded scan:
 
 The neighbouring panel on the right, switched to **GroupFiles**, automatically
 shows the files of the selected group — name first, then directory — with the marks
-saved for them when the group was selected:
+saved for them:
 
 ```text
 ┌ 2 · group files ─────────────────────────────────────────────────────┐
@@ -168,9 +168,7 @@ saved for them when the group was selected:
 The first column shows a file's saved mark: `★` keeper, `h` hardlink, `c` reflink,
 `x` delete, `=` the same file on disk as the keeper. The marks themselves are set in
 a Files panel (see "File marks" below); in GroupFiles the marking keys are refused,
-and **`o`** opens the file's directory next to it (see below). GroupFiles does not
-reread the group after a mark: to see new marks, move the cursor in the GroupList
-panel to another group and back.
+and **`o`** opens the file's directory next to it (see below).
 
 > On very large groups, GroupFiles shows the first **200** files (a visual cap
 > against freezes). This does not affect the bulk F11 actions. See

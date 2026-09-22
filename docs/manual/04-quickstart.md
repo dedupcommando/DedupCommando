@@ -248,9 +248,7 @@ from a file of the group to the file itself:
    keeper** (`H`).
 4. Repeat step 3 for each remaining copy.
 
-"group files" reads the group when the cursor in the groups panel lands on it and does
-not reread it after a mark. To see the marks you have set, go to the groups panel
-(**←** twice), move the cursor to another group and back:
+"group files" shows the marks as they are saved:
 
 ```text
 ┌ 2 · group files ─────────────────────────────────────────────────────┐

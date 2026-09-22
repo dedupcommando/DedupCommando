@@ -5906,11 +5906,11 @@ mod dir_watch_tests {
             });
         }
 
-        /// What «group files» shows for the files of the group in panel 1.
-        fn group_files_shown(app: &App) -> Vec<(PathBuf, bool, Option<ActionKind>)> {
+        /// The files of the group a watching panel shows, with the marks it draws for them.
+        fn marks_shown(app: &App, panel: usize) -> Vec<(PathBuf, bool, Option<ActionKind>)> {
             app.commander
                 .watch_cache
-                .get(1)
+                .get(panel)
                 .and_then(|entry| entry.as_file_group())
                 .map(|group| {
                     group
@@ -5924,8 +5924,8 @@ mod dir_watch_tests {
 
         /// Step 8 of the quickstart with the keys it names, over real files: in «group files» F7
         /// is refused, `o` opens the file's directory in the next panel with the cursor on the file,
-        /// F7 there marks the keeper and F5 the copies. «group files» shows marks as it read them
-        /// when the group was selected; the cursor off the group and back shows the ones set since.
+        /// F7 there marks the keeper and F5 the copies. «group files» shows each mark as soon as it
+        /// is saved, with its own cursor still on the row it was on.
         #[test]
         fn the_quickstart_marks_a_group_with_the_keys_it_names() {
             use std::os::unix::fs::MetadataExt;
@@ -6004,7 +6004,7 @@ mod dir_watch_tests {
                 settle(app, &events);
                 resolve_and_settle(app, &events);
             };
-            let unmarked: Vec<_> = paths[..3]
+            let mut expected: Vec<_> = paths[..3]
                 .iter()
                 .map(|path| (path.clone(), false, None))
                 .collect();
@@ -6030,6 +6030,17 @@ mod dir_watch_tests {
             );
             key(&mut app, KeyCode::F(7));
             assert!(app.commander.status.starts_with("Mark saved"));
+            expected[1].1 = true;
+            assert_eq!(
+                marks_shown(&app, 1),
+                expected,
+                "«group files» shows the keeper as soon as it is saved"
+            );
+            assert_eq!(
+                app.commander.panels[1].list.selected(),
+                Some(1),
+                "and its cursor stays on the row it was on"
+            );
 
             // Each copy: ← back to «group files», o, → into the files panel, F5.
             for row in [0usize, 2] {
@@ -6050,34 +6061,222 @@ mod dir_watch_tests {
                 );
                 key(&mut app, KeyCode::F(5));
                 assert!(app.commander.status.starts_with("Mark saved"));
+                expected[row].2 = Some(ActionKind::Hardlink);
+                assert_eq!(
+                    marks_shown(&app, 1),
+                    expected,
+                    "«group files» shows the hardlink as soon as it is saved"
+                );
+                assert_eq!(
+                    app.commander.panels[1].list.selected(),
+                    Some(row),
+                    "and its cursor stays on the row it was on"
+                );
             }
             assert_eq!(
                 app.commander.dedup_scan_id,
                 Some(scan_id),
                 "moving between panels switched no scan"
             );
+        }
 
-            // «group files» still shows the group as it read it, before any mark.
+        /// «duplicates of the cursor» draws the marks of the file group it shows as well. After a
+        /// mark on the last row the cursor has nowhere to go: the file under it, and so the panel's
+        /// source, stay the same, and the panel must still show what was just saved.
+        #[test]
+        fn duplicates_of_the_cursor_show_a_mark_on_the_last_row() {
+            let _role = crate::state::store::role_guard();
+            let (db, scan_id) = manual_scan(&[]);
+            let (mut app, events) = app_over_watched_db(&db, scan_id, "/tank/old-copy");
+            let file = "/tank/old-copy/IMG_3120.HEIC";
+            app.commander.panels[0].view = PanelView::Files;
+            app.commander.panels[0].entries = vec![panel_entry(file, EntryKind::File)];
+            app.commander.panels[0].list.select(Some(0));
+            resolve_and_settle(&mut app, &events);
+            let mut expected: Vec<_> = [
+                "/tank/backup/photo/IMG_3120.HEIC",
+                "/tank/media/photo/2021-11/IMG_3120.HEIC",
+                file,
+            ]
+            .iter()
+            .map(|path| (PathBuf::from(path), false, None))
+            .collect();
             assert_eq!(
-                group_files_shown(&app),
-                unmarked,
-                "«group files» does not reread the group after a mark"
+                marks_shown(&app, 1),
+                expected,
+                "the group of the file under the cursor"
             );
-            // The cursor in the groups panel off the group and back (← ←, ↓ ↑) shows the marks.
-            key(&mut app, KeyCode::Left);
-            key(&mut app, KeyCode::Left);
-            assert_eq!(app.commander.active, 0);
-            key(&mut app, KeyCode::Down);
-            key(&mut app, KeyCode::Up);
+
+            press(&mut app, KeyCode::F(7));
+            settle(&mut app, &events);
+            resolve_and_settle(&mut app, &events);
+            assert!(
+                app.commander.status.starts_with("Mark saved"),
+                "{}",
+                app.commander.status
+            );
             assert_eq!(
-                group_files_shown(&app),
-                vec![
-                    (paths[0].clone(), false, Some(ActionKind::Hardlink)),
-                    (paths[1].clone(), true, None),
-                    (paths[2].clone(), false, Some(ActionKind::Hardlink)),
-                ],
-                "«group files» must show the marks set in the files panel"
+                app.commander.panels[0].list.selected(),
+                Some(0),
+                "the cursor stayed on the last row"
             );
+            expected[2].1 = true;
+            assert_eq!(
+                marks_shown(&app, 1),
+                expected,
+                "«duplicates of the cursor» shows the keeper as soon as it is saved"
+            );
+        }
+
+        /// A directory under the cursor is answered with directories or bare paths, which carry no
+        /// marks: a mark saved in another panel leaves that answer alone and asks nothing again.
+        #[test]
+        fn a_directory_cursor_keeps_its_answer_after_a_mark() {
+            let _role = crate::state::store::role_guard();
+            let (db, scan_id) = seeded_db("manual_dir_keeps");
+            let (mut app, events) = app_over_watched_db(&db, scan_id, "/tank/t1");
+            let mut files = state::Panel::empty(PathBuf::from("/tank/t2"));
+            files.loading = false;
+            files.view = PanelView::Files;
+            files.entries = vec![panel_entry("/tank/t2/f", EntryKind::File)];
+            files.list.select(Some(0));
+            app.commander.panels.push(files);
+            resolve_and_settle(&mut app, &events);
+            assert!(
+                matches!(
+                    app.commander.watch_cache[1].result,
+                    Some(state::WatchResult::DirGroup(_))
+                ),
+                "the directory's twins: {:?}",
+                app.commander.watch_cache[1]
+            );
+
+            app.commander.active = 2;
+            press(&mut app, KeyCode::F(7));
+            settle(&mut app, &events);
+            assert!(
+                app.commander.status.starts_with("Mark saved"),
+                "{}",
+                app.commander.status
+            );
+            resolve_watch_groups(&mut app);
+            assert!(
+                app.routes.dirs_at.is_empty(),
+                "the directory cursor is not asked again after a mark"
+            );
+            assert!(
+                matches!(
+                    app.commander.watch_cache[1].result,
+                    Some(state::WatchResult::DirGroup(_))
+                ),
+                "and keeps its twins: {:?}",
+                app.commander.watch_cache[1]
+            );
+        }
+
+        /// The first frame the commander draws after a mark is acknowledged: «group files» already
+        /// shows the mark, asks the database nothing, and its cursor answers the next key as usual.
+        #[test]
+        fn the_frame_after_a_mark_shows_it_and_keeps_the_cursor() {
+            let _role = crate::state::store::role_guard();
+            let (db, scan_id) = manual_scan(&[]);
+            let (mut app, events) = groups_app(&db, scan_id, 2);
+            let file = "/tank/old-copy/IMG_3120.HEIC";
+            let mut files = state::Panel::empty(PathBuf::from("/tank/old-copy"));
+            files.loading = false;
+            files.view = PanelView::Files;
+            files.entries = vec![panel_entry(file, EntryKind::File)];
+            files.list.select(Some(0));
+            app.commander.panels.push(files);
+            app.commander
+                .scan_coverage_cache
+                .insert(PathBuf::from("/tank/old-copy"), Some(scan_id));
+            resolve_and_settle(&mut app, &events);
+            app.commander.panels[1].list.select(Some(1));
+            app.commander.active = 2;
+
+            press(&mut app, KeyCode::F(7));
+            settle(&mut app, &events);
+            assert!(app.commander.status.starts_with("Mark saved"));
+            let (lines, rects) = screen(&mut app, 160, 12);
+            let shown = panel_block(&lines, rects[1]).join("\n");
+            assert!(
+                shown.contains("★ IMG_3120.HEIC  ·  /tank/old-copy  (keeper)"),
+                "the keeper on the first frame:\n{shown}"
+            );
+            assert!(
+                app.routes.groups.is_empty() && app.routes.infos.is_empty(),
+                "and nothing asked again"
+            );
+
+            press(&mut app, KeyCode::Left);
+            assert_eq!(app.commander.active, 1);
+            press(&mut app, KeyCode::Down);
+            assert_eq!(
+                app.commander.panels[1].list.selected(),
+                Some(2),
+                "the cursor in «group files» moves on"
+            );
+        }
+
+        /// A mark that changes or goes away reaches both watching panels on the first frame, as a
+        /// new one does: F7, then F5 on the same file, then Space.
+        #[test]
+        fn a_changed_or_cleared_mark_reaches_both_watching_panels_at_once() {
+            let _role = crate::state::store::role_guard();
+            let (db, scan_id) = manual_scan(&[]);
+            let (mut app, events) = groups_app(&db, scan_id, 2);
+            let file = "/tank/old-copy/IMG_3120.HEIC";
+            let mut files = state::Panel::empty(PathBuf::from("/tank/old-copy"));
+            files.loading = false;
+            files.view = PanelView::Files;
+            files.entries = vec![panel_entry(file, EntryKind::File)];
+            files.list.select(Some(0));
+            app.commander.panels.push(files);
+            let mut duplicates = state::Panel::empty(PathBuf::from("/tank/old-copy"));
+            duplicates.loading = false;
+            duplicates.view = PanelView::DuplicatesOfCursor;
+            app.commander.panels.push(duplicates);
+            app.commander
+                .scan_coverage_cache
+                .insert(PathBuf::from("/tank/old-copy"), Some(scan_id));
+            resolve_and_settle(&mut app, &events);
+            app.commander.active = 2;
+            for (code, shows, hides) in [
+                (KeyCode::F(7), "★ IMG_3120.HEIC", "->"),
+                (KeyCode::F(5), "h IMG_3120.HEIC", "★"),
+                (KeyCode::Char(' '), "IMG_3120.HEIC", "->"),
+            ] {
+                press(&mut app, code);
+                settle(&mut app, &events);
+                assert!(
+                    app.commander.status.starts_with("Mark saved"),
+                    "{}",
+                    app.commander.status
+                );
+                let (lines, rects) = screen(&mut app, 200, 12);
+                for panel in [1usize, 3] {
+                    let row = panel_block(&lines, rects[panel])
+                        .into_iter()
+                        .find(|line| line.contains("/tank/old-copy"))
+                        .unwrap_or_default();
+                    assert!(
+                        row.contains(shows),
+                        "{code:?}, panel {panel}: «{shows}» in {row}"
+                    );
+                    assert!(
+                        !row.contains(hides),
+                        "{code:?}, panel {panel}: no «{hides}» in {row}"
+                    );
+                    if code == KeyCode::Char(' ') {
+                        assert!(!row.contains('★'), "Space clears, panel {panel}: {row}");
+                    }
+                }
+                assert!(
+                    app.routes.groups.is_empty() && app.routes.infos.is_empty(),
+                    "nothing is asked again"
+                );
+            }
         }
 
         /// A panel as the manual quotes it: its rectangle cut out of the screen, without the empty

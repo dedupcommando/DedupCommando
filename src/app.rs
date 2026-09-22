@@ -2249,16 +2249,26 @@ impl App {
     /// Writes the durable after-image the store returned into every window that shows those
     /// pathnames. This is the authoritative state — never the optimistic one the UI guessed.
     fn apply_mark_image(&mut self, after: &[(PathBuf, Option<MarkIntent>)]) {
-        use crate::tui::commander::state::Mark;
-        if let Some(open) = self.browser.open_group.as_mut() {
+        use crate::tui::commander::state::{Mark, WatchResult};
+        // A group on screen shows each member's mark: the classic browser's open group, and the
+        // file group of a commander watching panel («group files», «duplicates of the cursor»).
+        let settle = |files: &mut [FileEntry]| {
             for (path, intent) in after {
-                if let Some(file) = open.files.iter_mut().find(|file| &file.path == path) {
+                if let Some(file) = files.iter_mut().find(|file| &file.path == path) {
                     file.is_keeper = matches!(intent, Some(MarkIntent::Keeper));
                     file.action = match intent {
                         Some(MarkIntent::Act(kind)) => Some(*kind),
                         _ => None,
                     };
                 }
+            }
+        };
+        if let Some(open) = self.browser.open_group.as_mut() {
+            settle(&mut open.files);
+        }
+        for entry in &mut self.commander.watch_cache {
+            if let Some(WatchResult::FileGroup(group, _)) = entry.result.as_mut() {
+                settle(&mut group.files);
             }
         }
         for panel in &mut self.commander.panels {
