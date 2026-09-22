@@ -5340,6 +5340,7 @@ mod dir_watch_tests {
     /// at all — the survivors are not «duplicates of this cursor».
     #[test]
     fn the_watch_panel_obeys_the_current_ledger() {
+        let _role = crate::state::store::role_guard();
         let (db, scan_id) = seeded_db("ledger");
         let (mut app, events) = app_watching(&db, scan_id, "/tank/t1");
 
@@ -5398,6 +5399,7 @@ mod dir_watch_tests {
     /// neither the inner-dupes fallback nor either empty verdict.
     #[test]
     fn a_hard_snapshot_failure_is_visible_and_enters_no_fallback() {
+        let _role = crate::state::store::role_guard();
         let (db, scan_id) = seeded_db("corrupt");
         // A real ledger row first — an empty ledger has nothing to corrupt.
         let mut store = ScanStore::open(&db).unwrap();
@@ -5459,6 +5461,7 @@ mod dir_watch_tests {
     /// of answering «no dupes at the cursor».
     #[test]
     fn a_failed_inner_dupes_read_is_visible_too() {
+        let _role = crate::state::store::role_guard();
         let (db, scan_id) = seeded_db("inner");
         // The cursor is a directory of the scan that is in NO dir_dedup group, so the branch
         // reaches the inner-dupes fallback; the manifest read it makes is then broken — after
@@ -5484,6 +5487,7 @@ mod dir_watch_tests {
     /// The trusted rendering above it is left byte for byte as it was.
     #[test]
     fn an_unverified_watch_group_claims_nothing_on_screen() {
+        let _role = crate::state::store::role_guard();
         let (db, scan_id) = seeded_db("render");
         let (mut app, events) = app_watching(&db, scan_id, "/tank/t1");
         resolve_and_settle(&mut app, &events);
@@ -5535,6 +5539,7 @@ mod dir_watch_tests {
     /// keeps both facts inside the floor.
     #[test]
     fn the_unverified_remedy_survives_the_narrow_panel() {
+        let _role = crate::state::store::role_guard();
         let (db, scan_id) = seeded_db("narrow");
         let (mut app, events) = app_watching(&db, scan_id, "/tank/t1");
         let mut store = ScanStore::open(&db).unwrap();
@@ -5609,6 +5614,7 @@ mod dir_watch_tests {
     /// still exists.
     #[test]
     fn a_failed_directory_group_read_is_visible_for_a_directory_cursor() {
+        let _role = crate::state::store::role_guard();
         let (db, scan_id) = seeded_db("dir_read");
         let (mut app, events) = app_over_watched_db(&db, scan_id, "/tank/t1");
         break_column(&db, "dir_dedup", "size_per_dir");
@@ -5654,6 +5660,7 @@ mod dir_watch_tests {
     /// unchanged, by the member/claim/hash sinks below.
     #[test]
     fn an_unopenable_checkpoint_is_refused_at_the_open_and_claims_nothing() {
+        let _role = crate::state::store::role_guard();
         let (db, scan_id) = unopenable_db("open_refused");
         let (mut app, events) = panels_only(&db, "/tank/t1");
         app.commander
@@ -5823,6 +5830,7 @@ mod dir_watch_tests {
     /// Sink 2 — `Group`, failed member read. Only that statement joins `file_mark`.
     #[test]
     fn a_failed_group_member_read_is_visible() {
+        let _role = crate::state::store::role_guard();
         let (db, scan_id) = file_group_db("grp_files");
         let (mut app, events) = app_watching_group(&db, scan_id);
         break_column(&db, "file_mark", "is_keeper");
@@ -5833,6 +5841,7 @@ mod dir_watch_tests {
     /// Sink 3 — `Group`, failed claim read. Only that statement reads `file_group`.
     #[test]
     fn a_failed_group_claim_read_is_visible() {
+        let _role = crate::state::store::role_guard();
         let (db, scan_id) = file_group_db("grp_claim");
         let (mut app, events) = app_watching_group(&db, scan_id);
         break_column(&db, "file_group", "reclaim");
@@ -5843,6 +5852,7 @@ mod dir_watch_tests {
     /// Sink 4 — `DupOf`, failed cursor-hash read, the first read of the branch.
     #[test]
     fn a_failed_cursor_hash_read_is_visible() {
+        let _role = crate::state::store::role_guard();
         let (db, scan_id) = file_group_db("dup_hash");
         let (mut app, events) = app_watching_file(&db, scan_id);
         break_column(&db, "file", "hash");
@@ -5853,6 +5863,7 @@ mod dir_watch_tests {
     /// Sink 5 — `DupOf`, failed claim read, after a successful hash read.
     #[test]
     fn a_failed_cursor_claim_read_is_visible() {
+        let _role = crate::state::store::role_guard();
         let (db, scan_id) = file_group_db("dup_claim");
         let (mut app, events) = app_watching_file(&db, scan_id);
         break_column(&db, "file_group", "reclaim");
@@ -5863,6 +5874,7 @@ mod dir_watch_tests {
     /// Sink 6 — `DupOf`, failed member read, after hash and claim both succeeded.
     #[test]
     fn a_failed_cursor_member_read_is_visible() {
+        let _role = crate::state::store::role_guard();
         let (db, scan_id) = file_group_db("dup_files");
         let (mut app, events) = app_watching_file(&db, scan_id);
         break_column(&db, "file_mark", "is_keeper");
@@ -5874,6 +5886,7 @@ mod dir_watch_tests {
     /// about them may acquire an unavailable state.
     #[test]
     fn legitimate_absences_keep_their_own_meaning() {
+        let _role = crate::state::store::role_guard();
         // A hashed file that belongs to no published group → NoDuplicates.
         let (db, scan_id) = file_group_db("ok_none_claim");
         let (mut app, events) = app_watching_file(&db, scan_id);
@@ -5901,6 +5914,7 @@ mod dir_watch_tests {
     /// answer, so the panel does not flicker back to a clean empty message.
     #[test]
     fn a_file_failure_stays_cached_across_a_re_resolve() {
+        let _role = crate::state::store::role_guard();
         let (db, scan_id) = file_group_db("cached");
         let (mut app, events) = app_watching_file(&db, scan_id);
         break_column(&db, "file_mark", "is_keeper");
@@ -5914,6 +5928,7 @@ mod dir_watch_tests {
     /// subject phrase, never truncated away, and never the directory wording.
     #[test]
     fn a_file_failure_names_its_subject_at_every_supported_width() {
+        let _role = crate::state::store::role_guard();
         let (db, scan_id) = file_group_db("render_file");
         let (mut app, events) = app_watching_file(&db, scan_id);
         break_column(&db, "file_mark", "is_keeper");

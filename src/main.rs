@@ -3960,6 +3960,7 @@ mod boot_session_load_is_fail_closed_tests {
 
     #[test]
     fn a_readable_checkpoint_returns_its_real_list() {
+        let _role = crate::state::store::role_guard();
         let dir = scratch("ok");
         let list = boot_session_load(&current_db(dir.path()), false, false)
             .expect("a current checkpoint opens");
@@ -3968,6 +3969,7 @@ mod boot_session_load_is_fail_closed_tests {
 
     #[test]
     fn a_newer_checkpoint_returns_the_exact_error_instead_of_an_empty_list() {
+        let _role = crate::state::store::role_guard();
         let dir = scratch("future");
         let db = future_db(dir.path());
         let before = census(&db);
@@ -4412,6 +4414,7 @@ mod boot_session_load_is_fail_closed_tests {
 
     #[test]
     fn commander_and_no_resume_skip_only_this_eager_load() {
+        let _role = crate::state::store::role_guard();
         let dir = scratch("skip");
         let db = future_db(dir.path());
 

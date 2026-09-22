@@ -471,6 +471,7 @@ mod tests {
     /// saying the question had never been answered. Now the file is not moved at all.
     #[test]
     fn an_unreadable_destination_does_not_pass_for_no_duplicates() {
+        let _role = crate::state::store::role_guard();
         let (root, file, dest) = one_and_its_twin("undetermined");
         let db = root.join("scan.db");
 
@@ -504,6 +505,7 @@ mod tests {
     /// same direction as the real defect, not merely somewhere.
     #[test]
     fn an_entry_that_vanishes_mid_scan_is_skipped_not_fatal() {
+        let _role = crate::state::store::role_guard();
         let (root, file, dest) = one_and_its_twin("vanishing");
         let db = root.join("scan.db");
         let decoy = dest.join("decoy.bin");
@@ -540,6 +542,7 @@ mod tests {
     /// turn here fails in the direction of the real defect, not merely somewhere.
     #[test]
     fn an_entry_whose_stat_is_refused_is_fatal_not_skipped() {
+        let _role = crate::state::store::role_guard();
         let (root, file, dest) = one_and_its_twin("refused");
         let db = root.join("scan.db");
 
@@ -579,6 +582,7 @@ mod tests {
     /// the file moved under its own name with `duplicate = false` journalled for it.
     #[test]
     fn a_file_that_cannot_be_hashed_is_not_moved_as_a_fresh_file() {
+        let _role = crate::state::store::role_guard();
         let (root, file, dest) = one_and_its_twin("unhashable_src");
         let db = root.join("scan.db");
 
@@ -608,6 +612,7 @@ mod tests {
     /// the absence of one leaves it open.
     #[test]
     fn an_unreadable_candidate_does_not_hide_a_readable_twin() {
+        let _role = crate::state::store::role_guard();
         let (root, file, dest) = one_and_its_twin("decoy");
         let db = root.join("scan.db");
         // Same 35 bytes as the twin, so the size filter keeps it, and byte-lower than "twin.bin".
@@ -644,6 +649,7 @@ mod tests {
     /// the one above because it is a separate branch: the source hashed perfectly well here.
     #[test]
     fn a_candidate_that_cannot_be_hashed_leaves_the_question_open() {
+        let _role = crate::state::store::role_guard();
         let (root, file, dest) = one_and_its_twin("unhashable_cand");
         let db = root.join("scan.db");
         let twin = dest.join("twin.bin");
@@ -673,6 +679,7 @@ mod tests {
     /// over a directory that is still there with something inside it.
     #[test]
     fn a_source_that_survives_the_merge_is_counted() {
+        let _role = crate::state::store::role_guard();
         let root = temp_dir("leftover");
         let db = root.join("scan.db");
         let src_photos = root.join("src").join("photos");
@@ -704,6 +711,7 @@ mod tests {
     /// across the children, and this is what fails if that guard is dropped.
     #[test]
     fn a_failed_child_is_not_counted_a_second_time_by_the_removal() {
+        let _role = crate::state::store::role_guard();
         let root = temp_dir("nodouble");
         let db = root.join("scan.db");
         let src_photos = root.join("src").join("photos");
@@ -744,6 +752,7 @@ mod tests {
     /// it. Swapping to `fs::metadata(entry.path())` would change both halves of this at once.
     #[test]
     fn symlinks_in_the_destination_are_not_duplicate_candidates() {
+        let _role = crate::state::store::role_guard();
         let (root, file, dest) = one_and_its_twin("symlinks");
         let db = root.join("scan.db");
         // The twin leaves the destination and stays reachable there only through a link.
@@ -774,6 +783,7 @@ mod tests {
 
     #[test]
     fn dir_into_existing_name_merges_contents() {
+        let _role = crate::state::store::role_guard();
         let root = temp_dir("merge");
         let db = root.join("scan.db");
         let src_foto = root.join("src").join("foto");
@@ -830,6 +840,7 @@ mod tests {
     /// because it names the expected outcome instead of comparing two runs against each other.
     #[test]
     fn merge_moves_children_in_file_name_order() {
+        let _role = crate::state::store::role_guard();
         let forward: Vec<&OsStr> = [
             "a.bin", "b.bin", "c.bin", "d.bin", "e.bin", "f.bin", "g.bin", "h.bin",
         ]
@@ -879,6 +890,7 @@ mod tests {
     /// by filesystem, mount option and kernel, and nothing here depends on it.
     #[test]
     fn merge_order_is_total_over_non_utf8_names() {
+        let _role = crate::state::store::role_guard();
         use std::os::unix::ffi::OsStrExt;
         let invalid = OsStr::from_bytes(b"\x80.bin");
         let accented = OsStr::new("À.bin");
@@ -905,6 +917,7 @@ mod tests {
     /// is the other's duplicate and both keep their own names.
     #[test]
     fn a_batch_journals_the_exact_bytes_of_the_names_it_put_on_disk() {
+        let _role = crate::state::store::role_guard();
         use crate::model::action::PathFidelity;
         use std::collections::BTreeSet;
         use std::os::unix::ffi::OsStrExt;
@@ -959,6 +972,7 @@ mod tests {
     /// had never moved.
     #[test]
     fn unreadable_child_is_counted_not_dropped() {
+        let _role = crate::state::store::role_guard();
         let root = temp_dir("unreadable");
         let db = root.join("scan.db");
         let src_photos = root.join("src").join("photos");
@@ -1001,6 +1015,7 @@ mod tests {
 
     #[test]
     fn dir_without_collision_moves_whole() {
+        let _role = crate::state::store::role_guard();
         let root = temp_dir("whole");
         let db = root.join("scan.db");
         let src_x = root.join("src").join("x");

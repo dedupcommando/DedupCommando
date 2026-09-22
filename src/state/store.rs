@@ -344,14 +344,17 @@ pub fn is_observer_role() -> bool {
 /// Serialises everything that touches the process role or a file-backed store. The role is
 /// process-wide by design, so a test that flips it would otherwise hand a read-only connection to
 /// a test running in parallel. Lives here rather than in the test module because the callers that
-/// open a store go well beyond this file.
+/// open a store go well beyond this file. Every holder starts as the operator: a test that failed
+/// as the observer, before it set the role back, does not hand that role to the next one.
 #[cfg(test)]
 pub(crate) fn role_guard() -> std::sync::MutexGuard<'static, ()> {
     static ROLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // A panicking test poisons the lock; that must not cascade into unrelated failures.
-    ROLE_LOCK
+    let guard = ROLE_LOCK
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    set_observer_role(false);
+    guard
 }
 
 /// Test seam: every open of ONE checkpoint, in order, with the schema version its opener found.
@@ -12546,6 +12549,18 @@ mod tests {
             .is_ok());
         drop(store);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Each holder of the role guard starts as the operator, whatever the one before it left: a test
+    /// that fails as the observer, before it sets the role back, does not fail the tests after it.
+    #[test]
+    fn every_holder_of_the_role_guard_starts_as_the_operator() {
+        {
+            let _role = role_guard();
+            set_observer_role(true);
+        }
+        let _role = role_guard();
+        assert!(!is_observer_role());
     }
 
     #[test]

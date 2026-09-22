@@ -7302,6 +7302,7 @@ mod session_store_failures_are_never_empty_data_tests {
 
     #[test]
     fn f12_installs_the_real_list_when_the_store_opens() {
+        let _role = crate::state::store::role_guard();
         let dir = scratch("f12-ok");
         let (mut app, rx) = test_app_with_db(current_db(dir.path()));
         app.spawn_sessions_load();
@@ -7314,6 +7315,7 @@ mod session_store_failures_are_never_empty_data_tests {
 
     #[test]
     fn f12_refusal_shows_the_exact_error_and_installs_nothing() {
+        let _role = crate::state::store::role_guard();
         let dir = scratch("f12-future");
         let db = future_db(dir.path());
         let before = census(&db);
@@ -7367,6 +7369,7 @@ mod session_store_failures_are_never_empty_data_tests {
 
     #[test]
     fn f2_starts_a_new_scan_only_on_a_real_empty_history() {
+        let _role = crate::state::store::role_guard();
         let dir = scratch("f2-ok");
         let roots = scratch("f2-ok-root");
         std::fs::write(roots.path().join("a.bin"), b"a").unwrap();
@@ -7448,6 +7451,7 @@ mod session_store_failures_are_never_empty_data_tests {
 
     #[test]
     fn f2_refusal_starts_no_worker_and_moves_no_resume_state() {
+        let _role = crate::state::store::role_guard();
         let dir = scratch("f2-future");
         let roots = scratch("f2-future-root");
         std::fs::write(roots.path().join("a.bin"), b"a").unwrap();
@@ -7493,6 +7497,7 @@ mod session_store_failures_are_never_empty_data_tests {
 
     #[test]
     fn trash_opens_the_real_list_when_the_store_opens() {
+        let _role = crate::state::store::role_guard();
         let dir = scratch("trash-ok");
         let (mut app, _rx) = test_app_with_db(current_db(dir.path()));
         app.open_trash();
@@ -7502,6 +7507,7 @@ mod session_store_failures_are_never_empty_data_tests {
 
     #[test]
     fn trash_refusal_never_prints_an_empty_trash() {
+        let _role = crate::state::store::role_guard();
         let dir = scratch("trash-future");
         let db = future_db(dir.path());
         let before = census(&db);
@@ -7682,6 +7688,7 @@ mod session_load_error_ownership_tests {
 
     #[test]
     fn a_repaired_checkpoint_clears_the_refusal_it_caused() {
+        let _role = crate::state::store::role_guard();
         let scratch = Scratch::new("clears");
         let db = scratch.path().join("dedcom.db");
         make_current(&db);
@@ -7725,6 +7732,7 @@ mod session_load_error_ownership_tests {
 
     #[test]
     fn a_later_unrelated_status_survives_the_retry() {
+        let _role = crate::state::store::role_guard();
         let scratch = Scratch::new("unrelated");
         let db = scratch.path().join("dedcom.db");
         make_current(&db);
@@ -7751,6 +7759,7 @@ mod session_load_error_ownership_tests {
 
     #[test]
     fn a_second_refusal_replaces_the_owned_error_rather_than_losing_it() {
+        let _role = crate::state::store::role_guard();
         let scratch = Scratch::new("replaces");
         let db = scratch.path().join("dedcom.db");
         make_current(&db);
@@ -7887,6 +7896,7 @@ mod session_load_request_scoping_tests {
     /// as current, which is exactly the confusion the counter removes.
     #[test]
     fn an_exhausted_request_counter_panics_before_anything_is_started() {
+        let _role = crate::state::store::role_guard();
         let scratch = Scratch::new("exhausted");
         let db = current(scratch.path());
         let (mut app, rx) = test_app_with_db(db);
@@ -7950,6 +7960,7 @@ mod session_load_request_scoping_tests {
 
     #[test]
     fn a_stale_error_cannot_undo_the_new_success() {
+        let _role = crate::state::store::role_guard();
         let scratch = Scratch::new("stale-err");
         let db = current(scratch.path());
         let (mut app, rx) = test_app_with_db(db);
@@ -8001,6 +8012,7 @@ mod session_load_request_scoping_tests {
 
     #[test]
     fn a_stale_success_cannot_erase_the_new_refusal() {
+        let _role = crate::state::store::role_guard();
         let scratch = Scratch::new("stale-ok");
         let db = future(scratch.path());
         let (mut app, rx) = test_app_with_db(db);
@@ -8040,6 +8052,7 @@ mod session_load_request_scoping_tests {
 
     #[test]
     fn a_stale_reply_does_not_clear_the_spinner_of_the_active_request() {
+        let _role = crate::state::store::role_guard();
         let scratch = Scratch::new("spinner");
         let db = current(scratch.path());
         let (mut app, rx) = test_app_with_db(db);
