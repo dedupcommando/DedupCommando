@@ -2643,10 +2643,12 @@ impl ScanStore {
     /// commit would describe a second database state, and the caller would settle its screen from
     /// a state it never wrote — the defect class this work has already rejected three times.
     ///
-    /// Three refusals happen before anything is written: a replaced database file, one pathname
-    /// requested twice with two different meanings, and a pathname with no manifest row. The
-    /// fourth is the strict decoder on the way back out, which is why a row that ends up both
-    /// keeper and action fails here rather than in a plan the operator has already confirmed.
+    /// Four refusals happen before anything is written: a replaced database file, a name that is
+    /// not UTF-8 (no walk records one, and its lossy spelling can be another file's name), one
+    /// pathname requested twice with two different meanings, and a pathname with no manifest
+    /// row. The fifth is the strict decoder on the way back out, which is why a row that ends
+    /// up both keeper and action fails here rather than in a plan the operator has already
+    /// confirmed.
     ///
     /// Staged by R4B-2a with no production caller; R4B-2b's mark acknowledgement carries the
     /// returned image, and R4B-2c settles the UI from it instead of from its own before-image.
@@ -2671,6 +2673,14 @@ impl ScanStore {
         let mut wanted: Vec<(&Path, bool, Option<ActionKind>)> = Vec::with_capacity(files.len());
         for file in files {
             let path = file.path.as_path();
+            // A name that is not UTF-8 is never in the manifest: the walk leaves it out. Marks are
+            // stored under the path as text, and the text of such a name is its lossy spelling,
+            // which can be the name of another file in the manifest.
+            if path.to_str().is_none() {
+                return Err(MarkWriteError::NameNotUtf8 {
+                    path: file.path.clone(),
+                });
+            }
             match wanted.iter().find(|(seen, _, _)| *seen == path) {
                 Some((_, keeper, action))
                     if *keeper != file.is_keeper || *action != file.action =>
@@ -4661,6 +4671,9 @@ pub enum MarkWriteError {
     RequestContradictsItself { path: PathBuf },
     /// A requested pathname has no manifest row in this scan.
     NotInManifest { path: PathBuf },
+    /// A requested pathname is not valid UTF-8. No walk records one, and marks are stored under
+    /// the path as text, which for such a path is a lossy spelling that can name another file.
+    NameNotUtf8 { path: PathBuf },
     /// The after-image did not decode.
     Decode(MarkDecodeError),
     /// The database file at the configured path was replaced. Nothing was written.
@@ -20404,6 +20417,82 @@ mod membership_staging_tests {
             before,
             "a refused read-back rolls the write back"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The walk leaves a name that is not UTF-8 out of the manifest, and its lossy spelling is the
+    /// real name of another file. A mark on it is refused, alone or in a batch, and nothing is
+    /// written — least of all on that other file.
+    #[test]
+    fn save_marks_settled_refuses_a_name_that_is_not_utf8() {
+        let _role = role_guard();
+        let dir = temp_dir("b9_marks_not_utf8");
+        let (_db, mut store) = file_store(&dir);
+        // U+FFFD is what `to_string_lossy` makes of the byte 0x80.
+        let twin = write(&dir, "a\u{FFFD}.bin", b"XXXX");
+        let scan_id = seed(&mut store, &dir, &[(twin.clone(), [0x5a; 32])]);
+        let raw = dir.join(std::ffi::OsStr::from_bytes(b"a\x80.bin"));
+        let before = mark_rows(&store, scan_id);
+
+        let delete = FileEntry {
+            path: raw.clone(),
+            action: Some(ActionKind::Delete),
+            ..Default::default()
+        };
+        match store.save_marks_settled(scan_id, std::slice::from_ref(&delete)) {
+            Err(MarkWriteError::NameNotUtf8 { path }) => assert_eq!(path, raw),
+            other => panic!("expected NameNotUtf8, got {other:?}"),
+        }
+        assert_eq!(mark_rows(&store, scan_id), before, "nothing on {twin:?}");
+
+        // Beside a mark that would be accepted, the whole request is refused.
+        let keeper = FileEntry {
+            path: twin.clone(),
+            is_keeper: true,
+            ..Default::default()
+        };
+        match store.save_marks_settled(scan_id, &[keeper, delete]) {
+            Err(MarkWriteError::NameNotUtf8 { path }) => assert_eq!(path, raw),
+            other => panic!("expected NameNotUtf8, got {other:?}"),
+        }
+        assert_eq!(
+            mark_rows(&store, scan_id),
+            before,
+            "and nothing of the batch"
+        );
+
+        // A keeper on the name is refused the same way, and so is a clear: written under the lossy
+        // spelling, it would remove the mark the other file holds.
+        let twin_keeper = FileEntry {
+            path: twin.clone(),
+            is_keeper: true,
+            ..Default::default()
+        };
+        store
+            .save_marks_settled(scan_id, std::slice::from_ref(&twin_keeper))
+            .unwrap();
+        let held = mark_rows(&store, scan_id);
+        for entry in [
+            FileEntry {
+                path: raw.clone(),
+                is_keeper: true,
+                ..Default::default()
+            },
+            FileEntry {
+                path: raw.clone(),
+                ..Default::default()
+            },
+        ] {
+            match store.save_marks_settled(scan_id, std::slice::from_ref(&entry)) {
+                Err(MarkWriteError::NameNotUtf8 { path }) => assert_eq!(path, raw),
+                other => panic!("expected NameNotUtf8 for {entry:?}, got {other:?}"),
+            }
+            assert_eq!(
+                mark_rows(&store, scan_id),
+                held,
+                "the mark on {twin:?} stays"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

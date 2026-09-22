@@ -3440,6 +3440,61 @@ mod mark_is_fail_closed_tests {
         );
     }
 
+    /// A files panel lists a path that is not UTF-8, a scan never records it, and its lossy
+    /// spelling can be another file's real name. The mark is refused with a reason that names the
+    /// case — shown, the path reads like that other file's — nothing is written on that other file,
+    /// and the next mark, on a file of the scan, is saved as usual.
+    #[test]
+    fn a_mark_on_a_name_that_is_not_utf8_is_refused_not_moved() {
+        use std::os::unix::ffi::OsStrExt;
+        let _role = crate::state::store::role_guard();
+        let scenario = PlanScenario::new("commander_mark_not_utf8");
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("a\u{FFFD}.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin]);
+        drop(store);
+        let (mut app, rx) = commander_on(&scenario, scan_id);
+        let raw = scenario
+            .root
+            .join(std::ffi::OsStr::from_bytes(b"a\x80.bin"));
+        panel_over(&mut app, &raw);
+
+        mark_cursor(&mut app, Mark::Delete);
+        settle_mark(&mut app, &rx);
+
+        assert!(
+            app.commander.status.starts_with(
+                "The mark was not saved: the path is not UTF-8, and a scan never records such a \
+                 path — "
+            ),
+            "the reason comes before the path: {}",
+            app.commander.status
+        );
+        let marks = || -> i64 {
+            rusqlite::Connection::open(&scenario.db_path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM file_mark", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            marks(),
+            0,
+            "no mark lands on the file the lossy spelling names"
+        );
+
+        // The refusal leaves browsing at work: a file of the scan is marked next.
+        panel_over(&mut app, &keeper);
+        mark_cursor(&mut app, Mark::Keeper);
+        settle_mark(&mut app, &rx);
+        assert!(
+            app.commander.status.starts_with("Mark saved"),
+            "{}",
+            app.commander.status
+        );
+        assert_eq!(marks(), 1);
+    }
+
     /// The `Unreadable` acknowledgement in full — the refusal an operator actually meets, since
     /// the settled writer refuses before it writes and so carries no after-image at all.
     ///

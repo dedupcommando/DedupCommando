@@ -1097,6 +1097,7 @@ impl PathMismatch for MarkWriteError {
             MarkWriteError::PathChanged { detail } => Some(detail),
             MarkWriteError::RequestContradictsItself { .. }
             | MarkWriteError::NotInManifest { .. }
+            | MarkWriteError::NameNotUtf8 { .. }
             | MarkWriteError::Decode(_)
             | MarkWriteError::Store { .. } => None,
         }

@@ -2412,6 +2412,13 @@ impl App {
             return;
         }
         let message = match error {
+            // Shown, such a path has U+FFFD for the bytes that are not UTF-8, and can read exactly
+            // like a file the scan does hold: the sentence says which case this is, and says it
+            // before the path, so a narrow status line clips the path and not the reason.
+            crate::state::MarkWriteError::NameNotUtf8 { path } => format!(
+                "The mark was not saved: the path is not UTF-8, and a scan never records such a path — {}",
+                crate::textsan::path(path)
+            ),
             // The one refusal an operator meets by ordinary navigation — marking a file the scan
             // never walked — keeps the sentence it has always had. A `Debug` rendering of the
             // variant would tell them the shape of an enum instead of what is wrong.
