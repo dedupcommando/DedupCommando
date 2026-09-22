@@ -6252,6 +6252,91 @@ impl MembershipSnapshot<'_> {
         })
     }
 
+    /// Statement 1 of `panel_files`: whether each asked pathname is in the scan, and its digest.
+    ///
+    /// `hex(NULL)` is the empty string in SQLite, not NULL — so «no digest» has to be asked for
+    /// explicitly, or an unhashed row would carry a digest of «».
+    pub(crate) const PANEL_MANIFEST_SQL: &'static str =
+        "WITH want(path) AS (SELECT value FROM json_each(?2))
+         SELECT want.path, f.rowid IS NOT NULL,
+                CASE WHEN f.hash IS NULL THEN NULL ELSE lower(hex(f.hash)) END
+           FROM want
+           LEFT JOIN file f ON f.scan_id = ?1 AND f.path = want.path";
+
+    /// Statement 2 of `panel_files` under an explicit authority.
+    ///
+    /// `CROSS JOIN` keeps the loop order: SQLite never moves the table on its right outside the
+    /// one on its left. With a plain join the planner, pricing `json_each` as nearly free, put it
+    /// innermost and read every member row of the scan on each refresh. The aggregate is pinned
+    /// the same way, from the ranks just found.
+    pub(crate) const PANEL_MEMBERSHIP_EXPLICIT_SQL: &'static str =
+        "WITH want(path) AS (SELECT value FROM json_each(?2)),
+              hit(path, rank) AS (
+                  SELECT want.path, mm.group_rank
+                    FROM want
+                    CROSS JOIN file_group_member mm
+                      ON mm.scan_id = ?1 AND mm.path = want.path),
+              agg(rank, members, devices) AS (
+                  SELECT mm.group_rank, COUNT(*), COUNT(DISTINCT f.device)
+                    FROM file_group_member mm
+                    CROSS JOIN file f ON f.scan_id = mm.scan_id AND f.path = mm.path
+                   WHERE mm.scan_id = ?1
+                     AND mm.group_rank IN (SELECT rank FROM hit)
+                   GROUP BY mm.group_rank)
+         SELECT hit.path, hit.rank, agg.members, agg.devices
+           FROM hit JOIN agg ON agg.rank = hit.rank";
+
+    /// Statement 2 of `panel_files` under a derived authority.
+    ///
+    /// Both joins of `hit` are `CROSS JOIN`s, pinning `want`, then `file`, then `file_group`: two
+    /// indexed lookups per pathname, and the aggregate reads only the groups found. With plain
+    /// joins every group of the scan was run against every hashed row, seconds per refresh on a
+    /// 20,340-file test scan, whatever the panel held.
+    pub(crate) const PANEL_MEMBERSHIP_DERIVED_SQL: &'static str =
+        "WITH want(path) AS (SELECT value FROM json_each(?2)),
+              hit(path, rank) AS (
+                  SELECT want.path, g.rank
+                    FROM want
+                    CROSS JOIN file f
+                      ON f.scan_id = ?1 AND f.path = want.path
+                     AND f.hash IS NOT NULL
+                    CROSS JOIN file_group g
+                      ON g.scan_id = ?1 AND g.hash = lower(hex(f.hash))),
+              agg(rank, members, devices) AS (
+                  SELECT g.rank, COUNT(*), COUNT(DISTINCT f.device)
+                    FROM file_group g
+                    CROSS JOIN file f ON f.scan_id = g.scan_id AND f.hash = unhex(g.hash)
+                   WHERE g.scan_id = ?1 AND g.rank IN (SELECT rank FROM hit)
+                   GROUP BY g.rank)
+         SELECT hit.path, hit.rank, agg.members, agg.devices
+           FROM hit JOIN agg ON agg.rank = hit.rank";
+
+    /// Statement 3 of `panel_files`: how many rows share the size and mtime of each asked
+    /// pathname that was never hashed. `CROSS JOIN` as in statement 2: with a plain join every
+    /// never-hashed row of the scan was read on each refresh.
+    pub(crate) const PANEL_CANDIDATE_SQL: &'static str =
+        "WITH want(path) AS (SELECT value FROM json_each(?2)),
+              un(path, size, mtime) AS (
+                  SELECT want.path, f.size, f.mtime
+                    FROM want
+                    CROSS JOIN file f ON f.scan_id = ?1 AND f.path = want.path
+                   WHERE f.hash IS NULL)
+         SELECT un.path,
+                (SELECT COUNT(*) FROM file p
+                  WHERE p.scan_id = ?1 AND p.size = un.size AND p.mtime = un.mtime)
+           FROM un";
+
+    /// The pathnames of a panel as the one JSON array its statements bind.
+    pub(crate) fn panel_batch(paths: &[&Path]) -> String {
+        serde_json::Value::Array(
+            paths
+                .iter()
+                .map(|path| serde_json::Value::String(path.to_string_lossy().into_owned()))
+                .collect(),
+        )
+        .to_string()
+    }
+
     /// Dedup evidence for a whole panel of pathnames, in a bounded number of statements.
     ///
     /// Three statements regardless of how many pathnames are asked for — the batch travels as one
@@ -6263,28 +6348,14 @@ impl MembershipSnapshot<'_> {
         &self,
         paths: &[&Path],
     ) -> std::result::Result<HashMap<PathBuf, PanelFile>, MembershipMiss> {
-        let want = serde_json::Value::Array(
-            paths
-                .iter()
-                .map(|path| serde_json::Value::String(path.to_string_lossy().into_owned()))
-                .collect(),
-        )
-        .to_string();
+        let want = Self::panel_batch(paths);
         let mut out: HashMap<PathBuf, PanelFile> = HashMap::with_capacity(paths.len());
 
         // 1. The manifest half: is the pathname in the scan at all, and does its row carry a
         //    digest yet. `f.rowid` is the row-presence bit — a LEFT JOIN renders «no row» and
         //    «row with NULL columns» identically without it.
         {
-            // `hex(NULL)` is the empty string in SQLite, not NULL — so «no digest» has to be
-            // asked for explicitly, or an unhashed row would carry a digest of «».
-            let mut stmt = self.tx.prepare(
-                "WITH want(path) AS (SELECT value FROM json_each(?2))
-                 SELECT want.path, f.rowid IS NOT NULL,
-                        CASE WHEN f.hash IS NULL THEN NULL ELSE lower(hex(f.hash)) END
-                   FROM want
-                   LEFT JOIN file f ON f.scan_id = ?1 AND f.path = want.path",
-            )?;
+            let mut stmt = self.tx.prepare(Self::PANEL_MANIFEST_SQL)?;
             let rows = stmt.query_map(params![self.scan_id, &want], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -6313,42 +6384,8 @@ impl MembershipSnapshot<'_> {
         //    and the bind count does not grow with the batch.
         if self.mode != MembershipMode::Unknown {
             let sql = match self.mode {
-                MembershipMode::Explicit => {
-                    "WITH want(path) AS (SELECT value FROM json_each(?2)),
-                          hit(path, rank) AS (
-                              SELECT want.path, mm.group_rank
-                                FROM want
-                                JOIN file_group_member mm
-                                  ON mm.scan_id = ?1 AND mm.path = want.path),
-                          agg(rank, members, devices) AS (
-                              SELECT mm.group_rank, COUNT(*), COUNT(DISTINCT f.device)
-                                FROM file_group_member mm
-                                JOIN file f ON f.scan_id = mm.scan_id AND f.path = mm.path
-                               WHERE mm.scan_id = ?1
-                                 AND mm.group_rank IN (SELECT rank FROM hit)
-                               GROUP BY mm.group_rank)
-                     SELECT hit.path, hit.rank, agg.members, agg.devices
-                       FROM hit JOIN agg ON agg.rank = hit.rank"
-                }
-                _ => {
-                    "WITH want(path) AS (SELECT value FROM json_each(?2)),
-                          hit(path, rank) AS (
-                              SELECT want.path, g.rank
-                                FROM want
-                                JOIN file f
-                                  ON f.scan_id = ?1 AND f.path = want.path
-                                 AND f.hash IS NOT NULL
-                                JOIN file_group g
-                                  ON g.scan_id = ?1 AND g.hash = lower(hex(f.hash))),
-                          agg(rank, members, devices) AS (
-                              SELECT g.rank, COUNT(*), COUNT(DISTINCT f.device)
-                                FROM file_group g
-                                JOIN file f ON f.scan_id = g.scan_id AND f.hash = unhex(g.hash)
-                               WHERE g.scan_id = ?1 AND g.rank IN (SELECT rank FROM hit)
-                               GROUP BY g.rank)
-                     SELECT hit.path, hit.rank, agg.members, agg.devices
-                       FROM hit JOIN agg ON agg.rank = hit.rank"
-                }
+                MembershipMode::Explicit => Self::PANEL_MEMBERSHIP_EXPLICIT_SQL,
+                _ => Self::PANEL_MEMBERSHIP_DERIVED_SQL,
             };
             let mut stmt = self.tx.prepare(sql)?;
             let rows = stmt.query_map(params![self.scan_id, &want], |row| {
@@ -6391,18 +6428,7 @@ impl MembershipSnapshot<'_> {
         // 3. The candidate half: an unhashed row whose size and mtime another row shares is a
         //    likely duplicate the scan has not proved yet. Nothing here claims membership.
         {
-            let mut stmt = self.tx.prepare(
-                "WITH want(path) AS (SELECT value FROM json_each(?2)),
-                      un(path, size, mtime) AS (
-                          SELECT want.path, f.size, f.mtime
-                            FROM want
-                            JOIN file f ON f.scan_id = ?1 AND f.path = want.path
-                           WHERE f.hash IS NULL)
-                 SELECT un.path,
-                        (SELECT COUNT(*) FROM file p
-                          WHERE p.scan_id = ?1 AND p.size = un.size AND p.mtime = un.mtime)
-                   FROM un",
-            )?;
+            let mut stmt = self.tx.prepare(Self::PANEL_CANDIDATE_SQL)?;
             let rows = stmt.query_map(params![self.scan_id, &want], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
             })?;
@@ -20304,6 +20330,301 @@ mod membership_staging_tests {
         assert!(rows[&a].hash_text.is_some());
         drop(snapshot);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The pathnames the panel cost tests ask about: one of each kind a panel shows.
+    struct PanelAsk {
+        member: PathBuf,
+        single: PathBuf,
+        unique: PathBuf,
+        likely: PathBuf,
+        absent: PathBuf,
+    }
+
+    impl PanelAsk {
+        fn paths(&self) -> Vec<&Path> {
+            vec![
+                self.member.as_path(),
+                self.single.as_path(),
+                self.unique.as_path(),
+                self.likely.as_path(),
+                self.absent.as_path(),
+            ]
+        }
+
+        /// The batch as `panel_files` binds it.
+        fn want(&self) -> String {
+            MembershipSnapshot::panel_batch(&self.paths())
+        }
+    }
+
+    /// A completed, unpublished scan of `scale` × (100 two-file groups, 300 hashed singletons,
+    /// 300 never-hashed rows of distinct sizes, a 50-row size cluster) around the fixed pathnames
+    /// of `PanelAsk`: a larger `scale` grows only what the panel does not ask about.
+    ///
+    /// The groups are real files, so byte verification can publish them explicitly; the rest are
+    /// manifest rows, which is all the panel statements read.
+    fn panel_scan(tag: &str, scale: u32) -> (PathBuf, ScanStore, i64, PanelAsk) {
+        let dir = temp_dir(tag);
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let digest = |n: u32| {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&n.to_le_bytes());
+            bytes
+        };
+        let mut pairs: Vec<(PathBuf, [u8; 32])> = Vec::new();
+        for i in 0..100 * scale {
+            let body = format!("pair {i}");
+            pairs.push((
+                write(&dir, &format!("p{i}a.bin"), body.as_bytes()),
+                digest(i),
+            ));
+            pairs.push((
+                write(&dir, &format!("p{i}b.bin"), body.as_bytes()),
+                digest(i),
+            ));
+        }
+        let scan_id = seed_verified(&mut store, &dir, &pairs);
+        let row = |name: &str, size: u64, inode: u64| ManifestRow {
+            path: dir.join(name),
+            size,
+            mtime: 1_700_000_000,
+            ctime_sec: 1_700_000_000,
+            device: 7,
+            inode,
+            nlink: 1,
+            ..ManifestRow::default()
+        };
+        let many = u64::from(scale);
+        let singles: Vec<ManifestRow> = (0..300 * many)
+            .map(|i| row(&format!("s{i}.bin"), 1_000_000 + i, 1_000_000 + i))
+            .collect();
+        let mut never: Vec<ManifestRow> = (0..300 * many)
+            .map(|i| row(&format!("u{i}.bin"), 2_000_000 + i, 2_000_000 + i))
+            .collect();
+        never.extend((0..50 * many).map(|i| row(&format!("c{i}.bin"), 4096, 3_000_000 + i)));
+        never.push(row("likely_a.bin", 5_000_000, 5_000_000));
+        never.push(row("likely_b.bin", 5_000_000, 5_000_001));
+        store.record_files(scan_id, &singles).unwrap();
+        store.record_files(scan_id, &never).unwrap();
+        let hashed: Vec<(ManifestRow, [u8; 32])> = singles
+            .iter()
+            .zip(1_000_000u32..)
+            .map(|(single, n)| (single.clone(), digest(n)))
+            .collect();
+        store.record_hashes_verified(scan_id, &hashed).unwrap();
+        store
+            .set_status(scan_id, crate::model::scan::ScanStatus::Complete)
+            .unwrap();
+        let ask = PanelAsk {
+            member: pairs[0].0.clone(),
+            single: dir.join("s0.bin"),
+            unique: dir.join("u0.bin"),
+            likely: dir.join("likely_a.bin"),
+            absent: dir.join("absent.bin"),
+        };
+        (dir, store, scan_id, ask)
+    }
+
+    /// The VM steps one panel statement spends on `want`, and the plan it chose for the message.
+    fn panel_statement_cost(
+        store: &ScanStore,
+        scan_id: i64,
+        want: &str,
+        sql: &str,
+    ) -> (i32, String) {
+        let mut stmt = store.conn.prepare(sql).unwrap();
+        let rows = stmt
+            .query_map(params![scan_id, want], |_| Ok(()))
+            .unwrap()
+            .collect::<std::result::Result<Vec<()>, _>>()
+            .unwrap()
+            .len();
+        let steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+        let plan: Vec<String> = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(params![scan_id, want], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        (steps, format!("{rows} rows, plan:\n{}", plan.join("\n")))
+    }
+
+    /// Every statement of a panel refresh costs the same however much of the scan the panel did
+    /// not ask about, and next to nothing for a panel with no files.
+    ///
+    /// Red on the parent for three of the four: priced as nearly free, `json_each` was put
+    /// innermost and the loops around it walked the scan, every group times every hashed row
+    /// under a derived authority, every member row under an explicit one, every never-hashed row
+    /// in the candidate half. An empty panel paid the same.
+    ///
+    /// What these statements may still grow with is what the panel lands in: the members of each
+    /// group it shows, and the rows sharing the size of a file that was never hashed.
+    #[test]
+    fn panel_statements_cost_the_same_in_a_larger_scan() {
+        let _role = role_guard();
+        let mut costs: Vec<Vec<(String, i32, i32, String)>> = Vec::new();
+        for scale in [1, 4] {
+            let (dir, mut store, scan_id, ask) = panel_scan(&format!("panel_cost_{scale}"), scale);
+            let batches = [
+                ("no pathname", "[]".to_string(), 100),
+                ("five pathnames", ask.want(), 1_000),
+            ];
+            let mut at_scale = Vec::new();
+            let mut measure = |store: &ScanStore, authority: &str, statement: &str, sql: &str| {
+                for (batch, want, limit) in &batches {
+                    let (steps, plan) = panel_statement_cost(store, scan_id, want, sql);
+                    at_scale.push((
+                        format!("{authority} {statement}, {batch}"),
+                        steps,
+                        *limit,
+                        plan,
+                    ));
+                }
+            };
+            measure(
+                &store,
+                "unknown",
+                "manifest",
+                MembershipSnapshot::PANEL_MANIFEST_SQL,
+            );
+            measure(
+                &store,
+                "unknown",
+                "candidate",
+                MembershipSnapshot::PANEL_CANDIDATE_SQL,
+            );
+
+            store
+                .publish_results(scan_id, PublishMode::Derived)
+                .unwrap();
+            assert_eq!(
+                store.membership_snapshot(scan_id).unwrap().mode(),
+                MembershipMode::Derived
+            );
+            measure(
+                &store,
+                "derived",
+                "manifest",
+                MembershipSnapshot::PANEL_MANIFEST_SQL,
+            );
+            measure(
+                &store,
+                "derived",
+                "membership",
+                MembershipSnapshot::PANEL_MEMBERSHIP_DERIVED_SQL,
+            );
+            measure(
+                &store,
+                "derived",
+                "candidate",
+                MembershipSnapshot::PANEL_CANDIDATE_SQL,
+            );
+
+            let verified =
+                crate::pipeline::verify::verify_groups(store.duplicate_groups(scan_id).unwrap())
+                    .unwrap();
+            assert_eq!(
+                verified.len(),
+                100 * scale as usize,
+                "every pair survives verification"
+            );
+            store
+                .publish_results(scan_id, PublishMode::Explicit(&verified))
+                .unwrap();
+            assert_eq!(
+                store.membership_snapshot(scan_id).unwrap().mode(),
+                MembershipMode::Explicit
+            );
+            measure(
+                &store,
+                "explicit",
+                "manifest",
+                MembershipSnapshot::PANEL_MANIFEST_SQL,
+            );
+            measure(
+                &store,
+                "explicit",
+                "membership",
+                MembershipSnapshot::PANEL_MEMBERSHIP_EXPLICIT_SQL,
+            );
+            measure(
+                &store,
+                "explicit",
+                "candidate",
+                MembershipSnapshot::PANEL_CANDIDATE_SQL,
+            );
+            costs.push(at_scale);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+        let mut wrong = Vec::new();
+        for ((label, small, limit, _), (_, large, _, plan)) in costs[0].iter().zip(&costs[1]) {
+            if small >= limit || *large > small + small / 4 {
+                wrong.push(format!(
+                    "{label}: {small} VM steps, {large} in a scan 4x larger; {plan}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
+    /// What a panel is told about each pathname does not depend on the rest of the scan, under
+    /// any authority.
+    #[test]
+    fn panel_files_answers_the_same_in_a_larger_scan() {
+        let _role = role_guard();
+        for scale in [1, 4] {
+            let (dir, mut store, scan_id, ask) =
+                panel_scan(&format!("panel_answers_{scale}"), scale);
+            let check = |store: &mut ScanStore, authority: MembershipMode| {
+                let snapshot = store.membership_snapshot(scan_id).unwrap();
+                assert_eq!(snapshot.mode(), authority);
+                let rows = snapshot.panel_files(&ask.paths()).unwrap();
+                let at = format!("{authority:?} at {scale}x");
+                assert_eq!(rows.len(), 5, "{at}");
+                match &rows[&ask.member].status {
+                    PanelFileStatus::Unavailable(PanelMiss::Unknown)
+                        if authority == MembershipMode::Unknown => {}
+                    PanelFileStatus::InGroup {
+                        id,
+                        members: 2,
+                        distinct_devices: 1,
+                    } if authority != MembershipMode::Unknown => assert_eq!(id.scan_id, scan_id),
+                    other => panic!("{at}: the group member reads {other:?}"),
+                }
+                let single = if authority == MembershipMode::Unknown {
+                    PanelFileStatus::Unavailable(PanelMiss::Unknown)
+                } else {
+                    PanelFileStatus::NotGrouped
+                };
+                assert_eq!(rows[&ask.single].status, single, "{at}");
+                assert_eq!(rows[&ask.unique].status, PanelFileStatus::NotHashed, "{at}");
+                assert_eq!(
+                    rows[&ask.likely].status,
+                    PanelFileStatus::LikelyBySizeMtime { peers: 2 },
+                    "{at}"
+                );
+                assert_eq!(rows[&ask.absent].status, PanelFileStatus::NotInScan, "{at}");
+                assert!(rows[&ask.member].hash_text.is_some(), "{at}");
+                assert!(rows[&ask.single].hash_text.is_some(), "{at}");
+                assert!(rows[&ask.unique].hash_text.is_none(), "{at}");
+            };
+            check(&mut store, MembershipMode::Unknown);
+            store
+                .publish_results(scan_id, PublishMode::Derived)
+                .unwrap();
+            check(&mut store, MembershipMode::Derived);
+            let verified =
+                crate::pipeline::verify::verify_groups(store.duplicate_groups(scan_id).unwrap())
+                    .unwrap();
+            store
+                .publish_results(scan_id, PublishMode::Explicit(&verified))
+                .unwrap();
+            check(&mut store, MembershipMode::Explicit);
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// `plan_members` is strict where `group_page` is deliberately lenient: a corrupt link count
