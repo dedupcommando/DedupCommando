@@ -707,6 +707,9 @@ pub enum WatchEmpty {
     /// Covered by a scan, but no duplicates were found — neither in `dir_dedup` (for a directory),
     /// nor in `file_group` (for a file or files inside a directory).
     NoDuplicates,
+    /// The name under the cursor is not UTF-8. No scan records such a name, and its lossy
+    /// spelling belongs to another file or directory, whose duplicates this panel must not show.
+    NameNotUtf8,
 }
 
 /// Cache entry of a "watching" panel: the source key + the resolved result +

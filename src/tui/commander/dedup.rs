@@ -448,4 +448,43 @@ mod tests {
             "but it stays inspectable, with its trust beside it"
         );
     }
+
+    /// B10 — a panel row whose name is not UTF-8 is «not in the scan», even though the batch
+    /// answered under its lossy spelling with the namesake's state. What separates them is that
+    /// the panel looks its rows up by the raw pathname, and no key built from text can equal one.
+    #[test]
+    fn a_panel_row_whose_name_is_not_utf8_is_not_in_the_scan() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = PathBuf::from(std::ffi::OsStr::from_bytes(b"/tank/a\x80.bin"));
+        let raw_dir = PathBuf::from(std::ffi::OsStr::from_bytes(b"/tank/d\x80"));
+        let namesake = PathBuf::from("/tank/a\u{FFFD}.bin");
+        let mut files = HashMap::new();
+        files.insert(
+            namesake.clone(),
+            PanelFile {
+                status: PanelFileStatus::InGroup {
+                    id: gid(0),
+                    members: 2,
+                    distinct_devices: 1,
+                },
+                hash_text: Some("aa".repeat(32)),
+            },
+        );
+        let mut dir_sizes = HashMap::new();
+        dir_sizes.insert(PathBuf::from("/tank/d\u{FFFD}"), 4096);
+        let dir = DirDedup::from_panel(PanelData {
+            files,
+            dir_sizes,
+            dir_signatures: HashMap::new(),
+        });
+        assert_eq!(dir.status_for(&raw), DedupStatus::NotInScan);
+        assert_eq!(dir.hash_for(&raw), None);
+        assert_eq!(dir.group_of(&raw), None);
+        assert_eq!(dir.dir_size(&raw_dir), None);
+        // The namesake keeps every answer of its own.
+        assert_ne!(dir.status_for(&namesake), DedupStatus::NotInScan);
+        assert!(dir.hash_for(&namesake).is_some());
+        assert!(dir.group_of(&namesake).is_some());
+        assert_eq!(dir.dir_size(Path::new("/tank/d\u{FFFD}")), Some(4096));
+    }
 }

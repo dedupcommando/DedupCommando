@@ -1859,6 +1859,15 @@ impl App {
             FileInfoAnswer::NotInScan => {
                 lines.push("Not part of the loaded scan".to_string());
             }
+            // Same sentence the refused mark gives (`describe_mark_write_error`): the operator
+            // can see the name on the screen, so «not in the scan» alone invites a rescan that
+            // would change nothing.
+            FileInfoAnswer::NameNotUtf8 => {
+                lines.push("Not part of the loaded scan:".to_string());
+                lines.push(
+                    "the path is not UTF-8, and a scan never records such a path".to_string(),
+                );
+            }
             FileInfoAnswer::InScan {
                 hash_text,
                 membership,
@@ -1900,6 +1909,7 @@ impl App {
         use crate::tui::commander::state::{WatchEmpty, WatchSubject};
         match answer {
             FileInfoAnswer::NotInScan => self.set_watch_empty(panel, WatchEmpty::NotInScan),
+            FileInfoAnswer::NameNotUtf8 => self.set_watch_empty(panel, WatchEmpty::NameNotUtf8),
             FileInfoAnswer::InScan { membership, .. } => match membership {
                 Ok(FileMembership::NotGrouped) => {
                     self.set_watch_empty(panel, WatchEmpty::NoDuplicates)
@@ -1994,6 +2004,7 @@ impl App {
                 self.set_watch_empty(panel, WatchEmpty::NoDuplicates)
             }
             Ok(DirGroupAnswer::NotInScan) => self.set_watch_empty(panel, WatchEmpty::NotInScan),
+            Ok(DirGroupAnswer::NameNotUtf8) => self.set_watch_empty(panel, WatchEmpty::NameNotUtf8),
             Err(miss) => {
                 if !self.fatal_store_miss(&miss) {
                     self.set_watch_unavailable(
@@ -8204,5 +8215,49 @@ mod hostile_name_tests {
             "{:?}",
             app.commander.info_lines
         );
+    }
+
+    /// B10 — F3 on a name that is not UTF-8 says why the scan does not hold it, in the same words
+    /// a refused mark uses. «Not part of the loaded scan» alone invites a rescan that would
+    /// change nothing, and the answer must never be the namesake's digest.
+    #[test]
+    fn the_file_info_says_why_a_name_that_is_not_utf8_is_not_in_the_scan() {
+        use crate::state::FileInfoAnswer;
+        let (mut app, _rx) = test_app();
+        app.show_file_info(
+            vec!["Name:     a\u{FFFD}.bin".to_string()],
+            FileInfoAnswer::NameNotUtf8,
+        );
+        let text = app.commander.info_lines.join(" ");
+        assert!(text.contains("not UTF-8"), "{text:?}");
+        assert!(text.contains("never records such a path"), "{text:?}");
+        assert!(!text.contains("No duplicates found"), "{text:?}");
+        assert!(!text.contains("Hash:"), "{text:?}");
+    }
+
+    /// The same answer on «duplicates of the cursor»: its own emptiness, so the panel does not
+    /// read as «this directory of the scan has no duplicates».
+    #[test]
+    fn the_watch_panel_says_a_name_that_is_not_utf8_was_never_scanned() {
+        use crate::state::{DirGroupAnswer, FileInfoAnswer};
+        use crate::tui::commander::panel::duplicates_of_cursor_empty_message;
+        use crate::tui::commander::state::{WatchEmpty, WatchEntry};
+        let (mut app, _rx) = test_app();
+        app.commander.watch_cache = vec![WatchEntry::default()];
+        app.watch_from_file_info(0, FileInfoAnswer::NameNotUtf8);
+        assert_eq!(app.commander.watch_cache[0].empty, WatchEmpty::NameNotUtf8);
+
+        app.commander.watch_cache = vec![WatchEntry::default()];
+        app.routes.dirs_at.insert(1, 0);
+        app.on_dir_group_at(
+            app.installed_act,
+            RequestId(1),
+            Ok(DirGroupAnswer::NameNotUtf8),
+        );
+        assert_eq!(app.commander.watch_cache[0].empty, WatchEmpty::NameNotUtf8);
+
+        let message = duplicates_of_cursor_empty_message(WatchEmpty::NameNotUtf8, Some(7));
+        assert!(message.contains("not UTF-8"), "{message:?}");
+        assert!(!message.contains("no dupes"), "{message:?}");
     }
 }

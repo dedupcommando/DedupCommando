@@ -698,6 +698,13 @@ pub(crate) fn duplicates_of_cursor_empty_message(
             None => "under the cursor — no scan data".to_string(),
         },
         WatchEmpty::NoDuplicates => "no dupes at the cursor".to_string(),
+        // The reason leads, as the unverified title below does: this fallback is drawn without
+        // wrapping, and at the supported floor (`layout::MIN_PANEL_WIDTH`) only the first 32
+        // cells survive. «under the cursor — the path is…» would cut off exactly the part that
+        // explains the panel.
+        WatchEmpty::NameNotUtf8 => {
+            "not UTF-8 under the cursor — a scan never records such a path".to_string()
+        }
     }
 }
 
@@ -709,6 +716,9 @@ pub(crate) fn group_files_empty_message(empty: WatchEmpty) -> &'static str {
         WatchEmpty::NoSource => "no source — need a «groups» panel on the left",
         WatchEmpty::NotInScan => "group selected, but it's not in the scan",
         WatchEmpty::NoDuplicates => "group has no files",
+        // Theoretical here, like the two above it: a GroupFiles source is a group index, never a
+        // pathname. It exists so every variant keeps its own text.
+        WatchEmpty::NameNotUtf8 => "the path is not UTF-8, and a scan never records such a path",
     }
 }
 
@@ -861,6 +871,7 @@ mod tests {
             WatchEmpty::NoSource,
             WatchEmpty::NotInScan,
             WatchEmpty::NoDuplicates,
+            WatchEmpty::NameNotUtf8,
         ] {
             assert!(!group_files_empty_message(variant).is_empty());
             assert!(!duplicates_of_cursor_empty_message(variant, Some(1)).is_empty());

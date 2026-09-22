@@ -3115,6 +3115,11 @@ impl ScanStore {
             "SELECT COALESCE(SUM(size), 0) FROM file WHERE scan_id = ?1 AND path >= ?2 AND path < ?3",
         )?;
         for dir in dirs {
+            // The range below is built from the lossy spelling of the name, which for a name
+            // that is not UTF-8 belongs to another directory. No scan holds such a name.
+            if dir.to_str().is_none() {
+                continue;
+            }
             let (lo, hi) = prefix_bounds(dir);
             self.note_subtree_walk();
             let total: i64 = stmt.query_row(params![scan_id, lo, hi], |row| row.get(0))?;
@@ -3178,6 +3183,12 @@ impl ScanStore {
              ORDER BY path",
         )?;
         for dir in dirs {
+            // No predicate against a name that is not UTF-8 here, unlike the size reader above:
+            // the rows this reads belong to whatever directory the lossy spelling names, and
+            // both algorithms then compare them with `dir` AS A PATH — `strip_prefix` below,
+            // and the emitted pathname under Merkle. Neither matches, so no signature is
+            // produced. A predicate would be one no test could kill; the comparisons are what
+            // hold, and a mutation of either is caught.
             // The ledger gate, before any row is read: a suppressed directory emits nothing, and
             // a bounded scan emits nothing above or outside its selected roots — the same
             // above-root loss the materialized path accepted.
@@ -3337,6 +3348,13 @@ impl ScanStore {
         let mut signatures = HashMap::new();
         for dir in dirs {
             let key = dir_key(dir);
+            // Rows hold text: a path the text does not spell (a name that is not UTF-8) finds no
+            // row in the per-directory reader either. Ahead of the size as well as the
+            // signature — the facts behind this key belong to whatever directory the text does
+            // spell, and its size is as wrong an answer here as its signature.
+            if Path::new(&key) != dir.as_path() {
+                continue;
+            }
             let facts = memo.facts.get(&key);
             let size = facts.map_or(0, |facts| facts.size);
             if size > 0 {
@@ -3350,11 +3368,6 @@ impl ScanStore {
                 DirDisposition::Untrusted => DirTrust::Untrusted,
             };
             if matches!(ctx.scope(dir), DirScope::Outside) {
-                continue;
-            }
-            // Rows hold text: a path the text does not spell (a name that is not UTF-8) finds no
-            // row in the per-directory reader either.
-            if Path::new(&key) != dir.as_path() {
                 continue;
             }
             if let Some(signature) = facts.and_then(|facts| facts.signature.clone()) {
@@ -4645,6 +4658,10 @@ pub enum DirGroupAnswer {
     NoDuplicates,
     /// The scan does not cover this directory at all.
     NotInScan,
+    /// The name is not UTF-8, so no scan covers it and none ever will: the walk leaves such a
+    /// name out of the manifest. Its own answer, because its lossy spelling can be the real name
+    /// of another directory, whose duplicates would otherwise be shown as this one's.
+    NameNotUtf8,
 }
 
 /// One inner duplicate: the pathname and the identity of the group that vouches for it.
@@ -4663,6 +4680,10 @@ pub struct InnerDupe {
 pub enum FileInfoAnswer {
     /// No manifest row for this pathname in this scan.
     NotInScan,
+    /// The name is not UTF-8: the walk leaves such a name out of the manifest, so no scan holds
+    /// it. Its own answer, because its lossy spelling can be the real name of another file,
+    /// whose digest and duplicates would otherwise be shown as this one's.
+    NameNotUtf8,
     InScan {
         /// `None` means only that this manifest row carries no digest yet.
         hash_text: Option<String>,
@@ -6492,6 +6513,15 @@ impl MembershipSnapshot<'_> {
         path: &Path,
     ) -> std::result::Result<Option<GroupId>, MembershipMiss> {
         use rusqlite::OptionalExtension;
+        // A name that is not UTF-8 is in no scan: the walk leaves it out of the manifest
+        // (`pipeline::walk`, the same predicate). Paths are stored as text, and the text of such
+        // a name is its lossy spelling — which can be the real name of another file, whose
+        // group the lookup below would return for it. Before the authority gate, because this
+        // is a fact about the name, not about what may vouch for it, and `file_info` decides it
+        // in that order too.
+        if path.to_str().is_none() {
+            return Ok(None);
+        }
         self.require_authority()?;
         let text = path.to_string_lossy();
         match self.mode {
@@ -7079,6 +7109,12 @@ impl MembershipSnapshot<'_> {
     /// for them: a cursor that comes back to a directory reads nothing again.
     pub fn dir_group_at(&self, dir: &Path) -> std::result::Result<DirGroupAnswer, MembershipMiss> {
         use std::os::unix::ffi::OsStrExt;
+        // Before the memo, so a namesake's answer cannot be remembered under these bytes: the
+        // range this would read is built from the lossy spelling of the name, which belongs to
+        // another directory.
+        if dir.to_str().is_none() {
+            return Ok(DirGroupAnswer::NameNotUtf8);
+        }
         let key = dir.as_os_str().as_bytes();
         if let Some(answer) = self.remembered_dir_group(key) {
             return Ok(answer);
@@ -7324,6 +7360,10 @@ impl MembershipSnapshot<'_> {
     /// could not be read.
     pub fn file_info(&self, path: &Path) -> std::result::Result<FileInfoAnswer, MembershipMiss> {
         use rusqlite::OptionalExtension;
+        // Not in the manifest, and its lossy spelling names another file — see `group_of_path`.
+        if path.to_str().is_none() {
+            return Ok(FileInfoAnswer::NameNotUtf8);
+        }
         let text = path.to_string_lossy();
         // `hex(NULL)` is «» in SQLite, so the absence of a digest is asked for by name.
         let row: Option<Option<String>> = self
@@ -21066,6 +21106,107 @@ mod membership_staging_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// B10 — a lookup of a name that is not UTF-8 answers for itself, never for its namesake.
+    ///
+    /// No walk records such a name: it goes to the omissions with `NonUtf8`. Paths are stored as
+    /// text, so the text of such a name is its lossy spelling — which can be the real name of
+    /// another file in the same directory. Red on the parent: F3 showed that other file's digest
+    /// and duplicates — the subject even among them — and «duplicates of the cursor» answered
+    /// with its namesake's group, for a directory too. The write side already refuses such a
+    /// name (`save_marks_settled`).
+    #[test]
+    fn lookups_of_a_name_that_is_not_utf8_find_nothing() {
+        let _role = role_guard();
+        let dir = temp_dir("b10_lossy_lookups");
+        let digest = [0x63u8; 32];
+        // U+FFFD is what `to_string_lossy` makes of the byte 0x80, so these are exactly the names
+        // a lookup of the raw spelling used to resolve to.
+        let twin = write(&dir, "a\u{FFFD}.bin", b"SAME");
+        let peer = write(&dir, "peer.bin", b"SAME");
+        let sub = dir.join("d\u{FFFD}");
+        std::fs::create_dir_all(&sub).unwrap();
+        let inner_digest = [0x64u8; 32];
+        let inner_a = write(&sub, "x1.bin", b"INNER");
+        let inner_b = write(&sub, "x2.bin", b"INNER");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(
+            &mut store,
+            &dir,
+            &[
+                (twin.clone(), digest),
+                (peer.clone(), digest),
+                (inner_a.clone(), inner_digest),
+                (inner_b.clone(), inner_digest),
+            ],
+        );
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+
+        let raw_file = dir.join(std::ffi::OsStr::from_bytes(b"a\x80.bin"));
+        let raw_dir = dir.join(std::ffi::OsStr::from_bytes(b"d\x80"));
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+
+        // The namesake really is in the scan and really is in a group — this is the answer the
+        // raw name must NOT be given.
+        assert!(matches!(
+            snapshot.file_info(&twin).unwrap(),
+            FileInfoAnswer::InScan { .. }
+        ));
+        assert!(snapshot.group_of_path(&twin).unwrap().is_some());
+
+        assert!(
+            matches!(
+                snapshot.file_info(&raw_file).unwrap(),
+                FileInfoAnswer::NameNotUtf8
+            ),
+            "F3 answers for the name it was asked for, not for its namesake"
+        );
+        assert!(
+            snapshot.group_of_path(&raw_file).unwrap().is_none(),
+            "and it belongs to no group"
+        );
+        assert!(
+            matches!(
+                snapshot.dir_group_at(&raw_dir).unwrap(),
+                DirGroupAnswer::NameNotUtf8
+            ),
+            "a directory whose name is not UTF-8 is not its namesake either"
+        );
+        // The memo is keyed on the raw bytes, so the namesake still answers for itself.
+        assert!(matches!(
+            snapshot.dir_group_at(&sub).unwrap(),
+            DirGroupAnswer::InnerDupes { .. }
+        ));
+
+        // The panel batch needs no predicate of its own, and not for the reason the shape of its
+        // answer suggests: `PANEL_MANIFEST_SQL` returns the text it was ASKED with, so the map
+        // does hold an entry under the lossy spelling, carrying the namesake's state. What keeps
+        // that off the screen is that the panel looks its rows up by their raw pathname, which no
+        // key built from text can equal. The panel's own half is pinned by
+        // `dedup::tests::a_panel_row_whose_name_is_not_utf8_is_not_in_the_scan`.
+        let refs: Vec<&Path> = vec![raw_file.as_path(), twin.as_path()];
+        let panel = snapshot.panel_files(&refs).unwrap();
+        assert_eq!(
+            PathBuf::from(raw_file.to_string_lossy().into_owned()),
+            twin,
+            "the lossy spelling of the raw name IS the namesake"
+        );
+        assert!(
+            !panel.contains_key(&raw_file),
+            "no entry under the raw name"
+        );
+        let namesake = panel.get(&twin).expect("the namesake answers for itself");
+        assert!(
+            matches!(namesake.status, PanelFileStatus::InGroup { .. }),
+            "{:?}",
+            namesake.status
+        );
+
+        drop(snapshot);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The panel batch: membership under authority, candidacy without it, and a fixed statement
     /// shape either way.
     #[test]
@@ -22470,8 +22611,13 @@ mod dir_aggregate_tests {
         }
     }
 
-    /// A directory whose name is not UTF-8 gets its size and no signature, as the readers give
-    /// it; its UTF-8 look-alike, which is what the rows spell, gets both.
+    /// A directory whose name is not UTF-8 gets neither a size nor a signature, and the readers
+    /// say the same; its UTF-8 look-alike, which is what the rows spell, gets both.
+    ///
+    /// Until this change the size went the other way: the rows of the look-alike were summed
+    /// under the raw name and the panel printed that total for a directory no scan holds. The
+    /// parity below stayed green throughout — both sides were wrong together, which is why a
+    /// reader needs an answer of its own to be checked against, not only an agreement.
     #[test]
     fn a_name_that_is_not_utf8_is_answered_as_the_readers_answer_it() {
         let _role = role_guard();
@@ -22492,8 +22638,9 @@ mod dir_aggregate_tests {
                 reference(&store, scan_id, &panel, algo).unwrap(),
                 "{algo:?}"
             );
-            assert_eq!(got.0.get(&raw), Some(&10), "{algo:?}");
+            assert_eq!(got.0.get(&raw), None, "{algo:?}");
             assert!(!got.1.contains_key(&raw), "{algo:?}");
+            assert_eq!(got.0.get(&spelled), Some(&10), "{algo:?}");
             assert!(got.1.contains_key(&spelled), "{algo:?}");
         }
     }
