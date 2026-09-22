@@ -5,8 +5,8 @@ ask that you report them **privately**.
 
 ## Supported versions
 
-DedupCommando is in public beta. Security fixes target the latest **`0.9.0-beta.x`** release; older
-pre-releases are not maintained.
+DedupCommando is in public beta. Security fixes target the latest release; older releases are not
+maintained. With the release of 0.9.1, 0.9.0-beta.1 to 0.9.0-beta.4 are no longer supported.
 
 ## Reporting a vulnerability
 

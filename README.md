@@ -1,7 +1,11 @@
 # DedupCommando
 
-> **⚠️ Beta (v0.9.0-beta.4).** DedupCommando performs destructive operations (delete, hardlink, reflink)
+> **⚠️ Beta (v0.9.1).** DedupCommando performs destructive operations (delete, hardlink, reflink)
 > on real files. Read **[docs/SAFETY.md](docs/SAFETY.md)** before applying any action, and keep backups.
+
+> **With the release of 0.9.1, 0.9.0-beta.1 to 0.9.0-beta.4 are no longer supported.** If you run one of
+> them, upgrade: `apt update && apt upgrade`, or the new release tarball (see [Install](#install)). Back up
+> `dedcom.db` first, as the [manual](docs/manual/12-maintenance.md) describes in §12.
 
 **DedupCommando** is a Linux terminal UI for finding and safely deduplicating byte-for-byte identical
 files, built for ZFS pools and tested on Proxmox VE 9.1 (OpenZFS 2.3). The command is **`dedcom`**.
