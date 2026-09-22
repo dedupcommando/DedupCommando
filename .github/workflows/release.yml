@@ -2,10 +2,11 @@
 #
 # Triggered by a `v*` tag. REQUIRES the owner's minisign signing secret
 # (MINISIGN_SECRET_KEY): the `guard` job fails the whole run early when it is unset, so the
-# workflow can never publish an unsigned release. Builds release binaries (amd64 + arm64),
-# packages each with the license artifacts, computes SHA-256 checksums, generates a CycloneDX
-# SBOM, signs each tarball with minisign, attaches SLSA build provenance, and publishes a
-# signed (pre-)release.
+# workflow can never publish an unsigned release. The same job stops the run when the tag has
+# no release notes, or when VERSION, Cargo.toml or Cargo.lock name another version. Builds
+# release binaries (amd64 + arm64), packages each with the license artifacts, computes SHA-256
+# checksums, generates a CycloneDX SBOM, signs each tarball with minisign, attaches SLSA build
+# provenance, and publishes a signed (pre-)release.
 #
 # minisign key is the owner's secret (MINISIGN_SECRET_KEY).
 name: Release
@@ -42,10 +43,21 @@ jobs:
           NOTES: docs/release-notes/${{ github.ref_name }}.md
         run: |
           if [ ! -s "$NOTES" ]; then
-            echo "::error::$NOTES is missing or empty — refusing to build a release nobody described. Write the notes, push them, then push the tag."
+            echo "::error::$NOTES is missing or empty — refusing to build a release nobody described. Write the notes, push them, then delete the tag and push it again."
             exit 1
           fi
           echo "release notes present: $NOTES"
+      - name: Fail early if the tag, VERSION, Cargo.toml and Cargo.lock disagree
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          file="$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' VERSION)"
+          cargo="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+          lock="$(sed -n '/^name = "dedupcommando"$/{n;s/^version = "\(.*\)"$/\1/p;}' Cargo.lock)"
+          if [ -z "$tag" ] || [ "$tag" != "$file" ] || [ "$tag" != "$cargo" ] || [ "$tag" != "$lock" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, VERSION '$file', Cargo.toml '$cargo' and Cargo.lock '$lock' disagree — refusing to build a release that reports another version. Bump VERSION and Cargo.toml, build once so Cargo.lock follows, push, then delete the tag and push it again."
+            exit 1
+          fi
+          echo "tag, VERSION, Cargo.toml and Cargo.lock agree: $tag"
       - name: Record whether the APT signing key is available
         id: aptkey
         env:

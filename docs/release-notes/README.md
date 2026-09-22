@@ -9,13 +9,16 @@ subject since the previous tag, and a list of subjects cannot say what a release
 
 ## Order of work
 
-1. Write `docs/release-notes/<tag>.md`.
-2. Commit and push it.
-3. Push the tag.
+1. Set the new number in `VERSION`, in `Cargo.toml` and in the banner at the top of
+   `README.md`; `cargo build` carries it into `Cargo.lock`.
+2. Write `docs/release-notes/<tag>.md`.
+3. Commit `VERSION`, `Cargo.toml`, `Cargo.lock`, `README.md` and the notes, and push.
+4. Push the tag.
 
-The release run refuses to start if the file is missing or empty, before anything is
-compiled or signed. A tag pushed ahead of its notes fails that check; write the notes,
-push them, then delete the tag and push it again.
+The release run refuses to start if the notes file is missing or empty, or if the tag,
+`VERSION`, `Cargo.toml` and `Cargo.lock` name different versions, before anything is
+compiled or signed. A tag pushed ahead of its notes or its version fails that check; fix
+and push them, then delete the tag and push it again.
 
 ## What a release note covers
 
