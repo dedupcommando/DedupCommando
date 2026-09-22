@@ -115,7 +115,7 @@ pub struct Startup {
     pub prompt: Option<Holder>,
 }
 
-fn lock_path(state_dir: &Path) -> PathBuf {
+pub(crate) fn lock_path(state_dir: &Path) -> PathBuf {
     state_dir.join(LOCK_FILE)
 }
 

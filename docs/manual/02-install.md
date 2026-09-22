@@ -103,6 +103,14 @@ All runtime state lives in `~/.local/state/dedcom/`:
 To move it elsewhere: `dedcom --state-dir /var/lib/dedcom`. This is useful when `~` is on a
 thin root and the database can grow to hundreds of MB on large pools.
 
+dedcom creates a missing state directory with mode `0700` and sets an existing one to `0700`,
+but it takes an existing directory only if it already holds dedcom's database or lock, or is
+empty and not directly under `/` — dedcom's own logs aside. Its settings files alone do not
+count. Any other directory — `--state-dir /etc` typed by mistake, or an empty `/home` — is
+refused before anything in it changes, and the error names it. To keep the state somewhere of
+your choosing, name a directory that does not exist yet, or make an empty one with `mkdir`
+first. `--stats` and `--export-csv` never create the state directory or change its mode.
+
 ## First run
 
 ### 1. Startup notice (one time)

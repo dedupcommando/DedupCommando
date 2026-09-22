@@ -90,7 +90,18 @@ fn main() {
         }
     };
 
-    let _log_guards = logging::init(&paths::log_file(&cli), &paths::bench_file(&cli));
+    std::process::exit(run(&cli));
+}
+
+/// Everything after the arguments are parsed, ending in the exit code. Apart from `main` so a
+/// test can run it whole in a child process: the log, the mode and its errors, as dedcom does.
+fn run(cli: &cli::Cli) -> i32 {
+    let mode = Mode::of(cli);
+    let _log_guards = logging::init(
+        &paths::log_file(cli),
+        &paths::bench_file(cli),
+        mode.state_access(),
+    );
     tracing::info!("dedcom v{} starting", version());
 
     // Signal handlers are installed per mode, NOT here: a mode that catches a signal without
@@ -102,27 +113,388 @@ fn main() {
     // otherwise a write race with a second process or with a running TUI operator.
     // Read-only modes (--stats/--export-csv) do not take the lock. The guard (_lock) lives
     // until the end of the closure → released after the operation completes.
-    let result = if cli.stats {
-        run_stats(&cli)
-    } else if cli.compact_db {
-        acquire_write_lock(&cli).and_then(|_lock| run_compact(&cli))
-    } else if let Some(out) = &cli.export_csv {
-        run_export_csv(&cli, out)
-    } else if cli.purge_quarantine {
-        acquire_write_lock(&cli).and_then(|_lock| run_purge_quarantine(&cli))
-    } else if !cli.scan_roots.is_empty() {
-        acquire_write_lock(&cli).and_then(|_lock| run_headless_scan(&cli))
-    } else {
-        run_tui(&cli)
+    let result = match mode {
+        Mode::Stats => run_stats(cli),
+        Mode::CompactDb => acquire_write_lock(cli).and_then(|_lock| run_compact(cli)),
+        Mode::ExportCsv(out) => run_export_csv(cli, out),
+        Mode::PurgeQuarantine => {
+            acquire_write_lock(cli).and_then(|_lock| run_purge_quarantine(cli))
+        }
+        Mode::HeadlessScan => acquire_write_lock(cli).and_then(|_lock| run_headless_scan(cli)),
+        Mode::Tui => run_tui(cli),
     };
 
-    if let Err(err) = result {
-        // Whatever layer wrote the sentence, it may quote a pathname, and both of these end up on
-        // a terminal: stderr now, the log at the next `cat`.
-        let shown = textsan::terminal(&err.to_string());
-        tracing::error!("exiting with error: {shown}");
-        eprintln!("dedcom: error: {shown}");
-        std::process::exit(1);
+    match result {
+        Ok(()) => 0,
+        Err(err) => {
+            // Whatever layer wrote the sentence, it may quote a pathname, and both of these end up
+            // on a terminal: stderr now, the log at the next `cat`.
+            let shown = textsan::terminal(&err.to_string());
+            tracing::error!("exiting with error: {shown}");
+            eprintln!("dedcom: error: {shown}");
+            1
+        }
+    }
+}
+
+/// The one thing a run does, decided once from the flags. The dispatch in `run` and the way the
+/// state directory is reached both follow it, so the two cannot disagree about the mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode<'a> {
+    Stats,
+    CompactDb,
+    ExportCsv(&'a Path),
+    PurgeQuarantine,
+    HeadlessScan,
+    Tui,
+}
+
+impl<'a> Mode<'a> {
+    /// A fixed precedence among the mode flags, whatever order they were typed in: `--stats`,
+    /// `--compact-db`, `--export-csv`, `--purge-quarantine`, `--scan`, then the interface.
+    fn of(cli: &'a cli::Cli) -> Self {
+        if cli.stats {
+            Mode::Stats
+        } else if cli.compact_db {
+            Mode::CompactDb
+        } else if let Some(out) = &cli.export_csv {
+            Mode::ExportCsv(out)
+        } else if cli.purge_quarantine {
+            Mode::PurgeQuarantine
+        } else if !cli.scan_roots.is_empty() {
+            Mode::HeadlessScan
+        } else {
+            Mode::Tui
+        }
+    }
+
+    /// `--stats` and `--export-csv` only report on the state directory and leave it as they found
+    /// it; every other mode writes to it. No wildcard: a new mode has to say which it is.
+    fn state_access(self) -> paths::StateAccess {
+        match self {
+            Mode::Stats | Mode::ExportCsv(_) => paths::StateAccess::ReadOnly,
+            Mode::CompactDb | Mode::PurgeQuarantine | Mode::HeadlessScan | Mode::Tui => {
+                paths::StateAccess::Writing
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::{cli, paths, Mode};
+    use std::path::{Path, PathBuf};
+
+    const OUT: &str = "/tmp/groups.csv";
+
+    fn flags(set: &[&str]) -> cli::Cli {
+        let mut cli = cli::Cli::default();
+        for flag in set {
+            match *flag {
+                "--stats" => cli.stats = true,
+                "--compact-db" => cli.compact_db = true,
+                "--export-csv" => cli.export_csv = Some(PathBuf::from(OUT)),
+                "--purge-quarantine" => cli.purge_quarantine = true,
+                "--scan" => cli.scan_roots.push(PathBuf::from("/tank")),
+                other => panic!("not a mode flag: {other}"),
+            }
+        }
+        cli
+    }
+
+    /// The precedence the dispatch has always had: `--stats`, `--compact-db`, `--export-csv`,
+    /// `--purge-quarantine`, `--scan`, then the interface. Flags that do not combine are not
+    /// refused (yet), so the order is what decides which mode runs.
+    #[test]
+    fn the_first_mode_flag_in_precedence_wins() {
+        let out = Path::new(OUT);
+        let cases: &[(&[&str], Mode<'_>)] = &[
+            (&[], Mode::Tui),
+            (&["--scan"], Mode::HeadlessScan),
+            (&["--purge-quarantine"], Mode::PurgeQuarantine),
+            (&["--export-csv"], Mode::ExportCsv(out)),
+            (&["--compact-db"], Mode::CompactDb),
+            (&["--stats"], Mode::Stats),
+            (&["--purge-quarantine", "--scan"], Mode::PurgeQuarantine),
+            (
+                &["--export-csv", "--purge-quarantine"],
+                Mode::ExportCsv(out),
+            ),
+            (&["--compact-db", "--export-csv"], Mode::CompactDb),
+            (&["--stats", "--compact-db"], Mode::Stats),
+            (&["--stats", "--scan"], Mode::Stats),
+        ];
+        for &(set, expected) in cases {
+            let cli = flags(set);
+            assert_eq!(Mode::of(&cli), expected, "{set:?}");
+        }
+    }
+
+    /// `--stats` and `--export-csv` only report on the state directory; every other mode writes
+    /// to it. `--compact-db --export-csv` is a compaction, so it writes.
+    #[test]
+    fn only_the_reporting_modes_reach_the_state_directory_read_only() {
+        use paths::StateAccess::{ReadOnly, Writing};
+        let cases: &[(&[&str], paths::StateAccess)] = &[
+            (&["--stats"], ReadOnly),
+            (&["--export-csv"], ReadOnly),
+            (&["--stats", "--compact-db"], ReadOnly),
+            (&["--compact-db"], Writing),
+            (&["--compact-db", "--export-csv"], Writing),
+            (&["--purge-quarantine"], Writing),
+            (&["--scan"], Writing),
+            (&[], Writing),
+        ];
+        for &(set, access) in cases {
+            let cli = flags(set);
+            assert_eq!(Mode::of(&cli).state_access(), access, "{set:?}");
+        }
+    }
+}
+
+/// `run` whole — the log, the mode, its error — in a child process, as the binary runs it. The
+/// logging subscriber is global and installed once per process, so a child is the only way a
+/// test reaches `logging::init` itself, and with it the access `run` hands it.
+#[cfg(test)]
+mod run_tests {
+    use super::{cli, run};
+    use crate::state::ScanStore;
+    use crate::testfixtures::{mode_bits as mode_of, names_in};
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+
+    const STATE_ENV: &str = "DEDCOM_RUN_TEST_STATE_DIR";
+    const MODE_ENV: &str = "DEDCOM_RUN_TEST_MODE";
+    /// The path the mode takes: the CSV destination, the scan root.
+    const ARG_ENV: &str = "DEDCOM_RUN_TEST_ARG";
+
+    /// The child's side of `dedcom`: returns at once in the ordinary test run, where the variables
+    /// are not set.
+    #[test]
+    fn the_child_runs_what_it_is_given() {
+        let (Some(state), Some(mode)) = (std::env::var_os(STATE_ENV), std::env::var_os(MODE_ENV))
+        else {
+            return;
+        };
+        let arg = std::env::var_os(ARG_ENV).map(PathBuf::from);
+        let mut cli = cli::Cli {
+            state_dir: Some(PathBuf::from(state)),
+            ..Default::default()
+        };
+        match mode.to_str() {
+            Some("--stats") => cli.stats = true,
+            Some("--export-csv") => cli.export_csv = arg,
+            Some("--compact-db") => cli.compact_db = true,
+            Some("--purge-quarantine") => cli.purge_quarantine = true,
+            Some("--scan") => cli.scan_roots.extend(arg),
+            Some("interface") => {}
+            other => panic!("the child does not know {other:?}"),
+        }
+        std::process::exit(run(&cli));
+    }
+
+    /// Runs `run` with `mode` over `state` in a child process: its exit code and its stderr.
+    fn dedcom(mode: &str, state: &Path, arg: &Path) -> (Option<i32>, String) {
+        use std::os::unix::process::CommandExt;
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "run_tests::the_child_runs_what_it_is_given";
+        let exe = std::env::current_exe().expect("current_exe");
+        let spool = temp_base("child");
+        let (out, err) = (spool.join("stdout"), spool.join("stderr"));
+        let mut command = Command::new(exe);
+        command
+            // `--exact`, so no other test whose name holds this one runs in the child;
+            // `--nocapture`, because the harness otherwise keeps a test's stderr and drops it at
+            // `process::exit` — and stderr is what the operator reads.
+            .args([CHILD, "--exact", "--nocapture", "--test-threads=1"])
+            .env(STATE_ENV, state)
+            .env(MODE_ENV, mode)
+            .env(ARG_ENV, arg)
+            .env_remove("DEDCOM_LOG")
+            .stdin(Stdio::null())
+            // Files rather than pipes: the child is waited for against a deadline below, and a pipe
+            // nobody drains meanwhile could stall it.
+            .stdout(std::fs::File::create(&out).unwrap())
+            .stderr(std::fs::File::create(&err).unwrap());
+        // The child needs no terminal, and a build that failed to refuse would go on to start the
+        // interface: in a session of its own it has no controlling terminal to take over.
+        // SAFETY: `setsid` is async-signal-safe and touches nothing but the child.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("the child starts");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("the child can be waited for") {
+                break status;
+            }
+            if Instant::now() > deadline {
+                child.kill().ok();
+                child.wait().ok();
+                panic!("{mode} over {} ran for two minutes", state.display());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let stdout = String::from_utf8_lossy(&std::fs::read(&out).unwrap_or_default()).into_owned();
+        let stderr = String::from_utf8_lossy(&std::fs::read(&err).unwrap_or_default()).into_owned();
+        std::fs::remove_dir_all(&spool).ok();
+        // A filter that matched nothing would exit 0 having run nothing, and every caller would
+        // fail on a consequence of that rather than on this.
+        assert!(
+            stdout.contains("running 1 test"),
+            "the child ran no test — {CHILD} no longer names it:\n{stdout}"
+        );
+        (status.code(), stderr)
+    }
+
+    fn temp_base(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("dedcom_run_{tag}_{}_{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `/etc` in miniature: 0755, one file of somebody else's.
+    fn foreign_dir(base: &Path) -> PathBuf {
+        let dir = base.join("etc");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("passwd"), b"root:x:0:0\n").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    /// `--stats` and `--export-csv` over a state directory that is not there: nothing to report
+    /// on, and nothing created — not the directory, not a parent of it, not the CSV.
+    #[test]
+    fn a_reporting_run_creates_no_state_directory() {
+        let base = temp_base("missing");
+        let state = base.join("missing").join("state");
+        let csv = base.join("groups.csv");
+        for mode in ["--stats", "--export-csv"] {
+            let (code, stderr) = dedcom(mode, &state, &csv);
+            assert_eq!(code, Some(1), "{mode}: nothing to report on: {stderr}");
+            assert!(
+                !base.join("missing").exists(),
+                "{mode} created the state directory"
+            );
+        }
+        assert!(!csv.exists());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// `--state-dir /etc --stats` by a slip of the finger: `/etc` keeps its mode and gains nothing.
+    #[test]
+    fn a_reporting_run_leaves_a_foreign_directory_as_it_was() {
+        let base = temp_base("ro_foreign");
+        let dir = foreign_dir(&base);
+        let csv = base.join("groups.csv");
+        for mode in ["--stats", "--export-csv"] {
+            let (code, stderr) = dedcom(mode, &dir, &csv);
+            assert_eq!(code, Some(1), "{mode}: {stderr}");
+            assert_eq!(mode_of(&dir), 0o755, "{mode} changed the directory's mode");
+            assert_eq!(names_in(&dir), [OsString::from("passwd")], "{mode}");
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// An empty directory — made with `mkdir` for dedcom and not used yet — stays empty under a
+    /// reporting mode: no log is started there, and its mode is left for the mode that writes.
+    #[test]
+    fn a_reporting_run_leaves_an_empty_directory_empty() {
+        let base = temp_base("ro_empty");
+        let dir = base.join("state");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for mode in ["--stats", "--export-csv"] {
+            let (code, stderr) = dedcom(mode, &dir, &base.join("groups.csv"));
+            assert_eq!(code, Some(1), "{mode}: nothing to report on: {stderr}");
+            assert_eq!(mode_of(&dir), 0o755, "{mode}");
+            assert!(names_in(&dir).is_empty(), "{mode}: {:?}", names_in(&dir));
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The same slip in every mode that writes — the interface first: `dedcom --state-dir /etc` is
+    /// what starts it — is refused before anything is written, with the directory named on stderr.
+    #[test]
+    fn a_writing_run_refuses_a_foreign_directory_and_says_so() {
+        let base = temp_base("rw_foreign");
+        let root = base.join("root");
+        std::fs::create_dir(&root).unwrap();
+        let dir = foreign_dir(&base);
+        for mode in ["interface", "--scan", "--compact-db", "--purge-quarantine"] {
+            let (code, stderr) = dedcom(mode, &dir, &root);
+            assert_eq!(code, Some(1), "{mode}: {stderr}");
+            assert!(stderr.contains("dedcom: error: "), "{mode}: {stderr}");
+            assert!(
+                stderr.contains(&dir.display().to_string()),
+                "{mode}: {stderr}"
+            );
+            assert!(
+                stderr.contains("no dedcom database or lock"),
+                "{mode}: {stderr}"
+            );
+            assert_eq!(mode_of(&dir), 0o755, "{mode}");
+            assert_eq!(names_in(&dir), [OsString::from("passwd")], "{mode}");
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// In its own directory `--stats` works and logs as before, and leaves the mode alone.
+    #[test]
+    fn a_reporting_run_in_our_own_directory_logs_and_keeps_the_mode() {
+        let base = temp_base("ro_ours");
+        let state = base.join("state");
+        crate::paths::establish_state_dir(&state).unwrap();
+        drop(ScanStore::open_writable(&state.join("dedcom.db")).unwrap());
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        let (code, stderr) = dedcom("--stats", &state, &base.join("unused.csv"));
+        assert_eq!(code, Some(0), "{stderr}");
+        assert_eq!(mode_of(&state), 0o750, "--stats tightened the directory");
+        let log = std::fs::read_to_string(state.join("dedcom.log")).unwrap();
+        assert!(log.contains("starting"), "the run is logged: {log}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A run that fails in dedcom's own directory says so in its log as well as on stderr: the
+    /// log's guards go out of scope inside `run`, so the last line is written before the exit.
+    #[test]
+    fn a_failed_run_is_logged_in_its_own_directory() {
+        let base = temp_base("logged");
+        let state = base.join("state");
+        crate::paths::establish_state_dir(&state).unwrap();
+        drop(ScanStore::open_writable(&state.join("dedcom.db")).unwrap());
+
+        let csv = base.join("missing").join("groups.csv");
+        let (code, stderr) = dedcom("--export-csv", &state, &csv);
+        assert_eq!(code, Some(1), "no finished scan to export: {stderr}");
+        let log = std::fs::read_to_string(state.join("dedcom.log")).unwrap();
+        assert!(log.contains("exiting with error"), "{log}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A mode that writes still makes its missing directory, at 0700, as before.
+    #[test]
+    fn a_writing_run_creates_a_missing_state_directory() {
+        let base = temp_base("rw_missing");
+        let state = base.join("new").join("state");
+        let (code, stderr) = dedcom("--compact-db", &state, &base.join("unused.csv"));
+        assert_eq!(code, Some(0), "{stderr}");
+        assert_eq!(mode_of(&state), 0o700);
+        for name in ["dedcom.db", "dedcom.lock", "dedcom.log"] {
+            assert!(state.join(name).exists(), "{name}");
+        }
+        std::fs::remove_dir_all(&base).ok();
     }
 }
 
@@ -155,8 +527,8 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
     let state_dir = paths::state_dir(cli);
     // The state directory may not exist on the first run — we create it ahead at 0700
     // (for the lock file and consent.json) with a check of the whole parent chain.
-    // Fail-closed: on an untrusted chain (foreign/group-writable ancestor) we refuse to
-    // operate.
+    // Fail-closed: on an untrusted chain (foreign/group-writable ancestor) or a directory that is
+    // not dedcom's (`--state-dir /etc`) we refuse to operate, before the terminal is touched.
     paths::establish_state_dir(&state_dir)?;
 
     // Single-instance lock: acquiring the advisory flock = the OPERATOR role;
@@ -1084,6 +1456,35 @@ mod acquire_write_lock_tests {
         };
         assert!(guard.is_some(), "the guard must be held for the write");
         drop(guard);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A state directory holding somebody else's files is refused before the lock file is created
+    /// in it and before its mode is changed, and `--force` — which is about a held lock, not about
+    /// whose directory this is — does not change that.
+    #[test]
+    fn a_foreign_state_directory_is_refused_before_anything_is_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_state_dir("foreign");
+        std::fs::write(dir.join("notes.txt"), b"somebody's\n").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mode = || std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+
+        for force in [false, true] {
+            let err = match acquire_write_lock(&cli_for(&dir, force)) {
+                Ok(_) => panic!("force={force}: a foreign directory became the state directory"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                err.contains(&dir.display().to_string()),
+                "force={force}: the message names the directory: {err}"
+            );
+            assert!(
+                !dir.join("dedcom.lock").exists(),
+                "force={force}: a lock file was created in it"
+            );
+            assert_eq!(mode(), 0o755, "force={force}: its mode was changed");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

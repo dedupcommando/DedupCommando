@@ -53,6 +53,27 @@ pub fn manual(name: &str) -> String {
         .unwrap_or_else(|err| panic!("cannot read the manual at {}: {err}", path.display()))
 }
 
+/// Every permission bit of `path` — set-id and sticky included, not only the nine of `0o777`. A
+/// test that promises to leave a directory as it was compares these, before and after.
+pub fn mode_bits(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .unwrap_or_else(|err| panic!("cannot stat {}: {err}", path.display()))
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+/// The names in `dir`, sorted — what a test compares to say nothing was created there.
+pub fn names_in(dir: &Path) -> Vec<std::ffi::OsString> {
+    let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("cannot list {}: {err}", dir.display()))
+        .map(|entry| entry.expect("a directory entry").file_name())
+        .collect();
+    names.sort();
+    names
+}
+
 /// Size of the duplicated payload. Big enough that a read is a real read, small enough to be free.
 const DUP_SIZE: usize = 4096;
 /// How many pathnames point at the shared inode.

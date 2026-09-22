@@ -27,7 +27,57 @@ const APP_DIR: &str = "dedcom";
 /// Residual risk: an attacker with the SAME uid (another of our processes) — outside the
 /// "one admin per their own pool" model. An untrusted chain (`--state-dir` to a
 /// foreign/shared path) → fail-closed.
+///
+/// A final directory that already exists is taken only when it holds dedcom's live state (a name
+/// from [`PROTECTED_STATE_ENTRIES`]) or is empty — dedcom's own logs aside ([`DEDCOMS_LOGS`]) — and
+/// not directly under `/`. Anything else is somebody else's directory named by mistake —
+/// `--state-dir /etc`, `--state-dir /home` — and is refused before its mode is changed or a file is
+/// created in it.
+///
+/// It runs where the operator's choice of directory comes in — the log, the interface, the
+/// headless modes that write. A store opening its checkpoint later only verifies
+/// ([`verify_db_dir`]): whose directory it is is decided here and nowhere else.
 pub fn establish_state_dir(dir: &Path) -> io::Result<()> {
+    walk_state_dir(dir, Walk::Establish)
+}
+
+/// How a mode reaches the state directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateAccess {
+    /// A mode that writes to the state directory: [`establish_state_dir`].
+    Writing,
+    /// A mode that only reports on it — `--stats`, `--export-csv`: [`verify_state_dir`].
+    ReadOnly,
+}
+
+/// The reporting modes' way into the state directory: the same walk from `/` and the same checks
+/// of owner and permissions as [`establish_state_dir`], but nothing is created and no mode is
+/// changed. The directory must exist and hold dedcom's live state; an empty one has nothing to
+/// report on and is not dedcom's until a mode that writes adopts it.
+pub fn verify_state_dir(dir: &Path) -> io::Result<()> {
+    walk_state_dir(dir, Walk::Report)
+}
+
+/// The directory of a checkpoint about to be opened for writing: the same walk and checks, but
+/// nothing is created or changed, and whose directory it is is not asked again — that was settled
+/// by [`establish_state_dir`] where the directory was chosen.
+pub fn verify_db_dir(dir: &Path) -> io::Result<()> {
+    walk_state_dir(dir, Walk::OpenDb)
+}
+
+/// What a walk may do on its way and to the directory it ends in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    /// Create what is missing; take an existing directory only if it is ours or empty; tighten
+    /// it to 0700.
+    Establish,
+    /// Create and change nothing; the directory must hold something of ours.
+    Report,
+    /// Create and change nothing.
+    OpenDb,
+}
+
+fn walk_state_dir(dir: &Path, walk: Walk) -> io::Result<()> {
     if !dir.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -55,43 +105,97 @@ pub fn establish_state_dir(dir: &Path) -> io::Result<()> {
     }
     let euid = unsafe { libc::geteuid() };
     let root_c = CString::new("/").expect("\"/\" without NUL");
-    let root = open_verified_dir(None, &root_c, euid, false)?;
-    establish_chain(root, &names, euid)
+    open_verified_dir(None, &root_c, euid, None)
+        .and_then(|root| establish_chain(root, &names, euid, walk, dir, true))
+        .map_err(|err| naming_the_directory(err, dir))
+}
+
+/// An error from the system names no directory — «No such file or directory» alone does not say
+/// which one. The walk's own refusals name it already and pass unchanged.
+fn naming_the_directory(err: io::Error, dir: &Path) -> io::Error {
+    match err.raw_os_error() {
+        Some(_) => io::Error::new(
+            err.kind(),
+            format!("the state directory {}: {err}", crate::textsan::path(dir)),
+        ),
+        None => err,
+    }
 }
 
 /// The core of the walk: from a trusted `base`, creates/verifies the components `names` (see
 /// [`establish_state_dir`]). Factored out so tests can run the component check from their own
-/// base, without tripping over world-writable `/tmp` ancestors.
-fn establish_chain(base: OwnedFd, names: &[&OsStr], euid: libc::uid_t) -> io::Result<()> {
+/// base, without tripping over world-writable `/tmp` ancestors. `shown` is the whole directory as
+/// the operator named it, for a refusal; `from_root` says `base` is `/`, which is what makes a
+/// one-component walk end in a top-level directory.
+fn establish_chain(
+    base: OwnedFd,
+    names: &[&OsStr],
+    euid: libc::uid_t,
+    walk: Walk,
+    shown: &Path,
+    from_root: bool,
+) -> io::Result<()> {
     let mut parent = base;
     let last = names.len().saturating_sub(1);
     for (i, name) in names.iter().enumerate() {
         let cname = CString::new(name.as_bytes()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "a component name contains NUL")
         })?;
-        // Create the missing component at 0700; EEXIST is normal (already exists), other errors propagate out.
-        let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), cname.as_ptr(), 0o700) };
-        if rc != 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::EEXIST) {
-                return Err(err);
+        // Only a walk that establishes creates: the missing component at 0700, other errors than
+        // EEXIST propagate out. EEXIST is normal, and for the final component it is kept: a
+        // directory that was already there may hold somebody else's files, one created just now
+        // holds nothing. The other walks create nothing, so a missing component fails the open
+        // below.
+        let existed = match walk {
+            Walk::Establish => {
+                let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), cname.as_ptr(), 0o700) };
+                if rc == 0 {
+                    false
+                } else {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(err);
+                    }
+                    true
+                }
             }
-        }
-        parent = open_verified_dir(Some(&parent), &cname, euid, i == last)?;
+            Walk::Report | Walk::OpenDb => true,
+        };
+        let leaf = (i == last).then_some(Leaf {
+            walk,
+            existed,
+            top_level: from_root && names.len() == 1,
+            shown,
+        });
+        parent = open_verified_dir(Some(&parent), &cname, euid, leaf)?;
     }
     Ok(())
 }
 
+/// What [`open_verified_dir`] needs to know about the final component, the state directory.
+#[derive(Clone, Copy)]
+struct Leaf<'a> {
+    walk: Walk,
+    /// It was there before this walk (`mkdirat` answered `EEXIST`, or the walk creates nothing).
+    existed: bool,
+    /// It sits directly under `/`: `/home`, `/srv` and `/mnt` come empty on a fresh system.
+    top_level: bool,
+    /// The directory as the operator named it, for a refusal.
+    shown: &'a Path,
+}
+
 /// Opens the directory `name` (`openat` from `parent`, or absolute when `parent=None`) with
 /// `O_NOFOLLOW|O_DIRECTORY` and verifies the owner (euid|root) and the absence of write
-/// access for group/others. When `tighten`, additionally tightens to 0700. Returns the
+/// access for group/others. For the final component (`leaf`), additionally checks whose
+/// directory it is, as its walk asks, and — when establishing — tightens it to 0700. Returns the
 /// descriptor.
 fn open_verified_dir(
     parent: Option<&OwnedFd>,
     name: &CStr,
     euid: libc::uid_t,
-    is_final: bool,
+    leaf: Option<Leaf<'_>>,
 ) -> io::Result<OwnedFd> {
+    let is_final = leaf.is_some();
     // O_RDONLY (=0) is implied; no need to list it explicitly (and this is not an identity_op).
     let flags = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     let fd = match parent {
@@ -132,20 +236,171 @@ fn open_verified_dir(
             "the state directory is writable by group/others — refusal (entries may have been planted)",
         ));
     }
-    if is_final && (st.st_mode & 0o777) != 0o700 {
-        let rc = unsafe { libc::fchmod(owned.as_raw_fd(), 0o700) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
+    if let Some(leaf) = leaf {
+        // Before anything is changed: a directory that was already there becomes the state
+        // directory only if it is ours, or empty and not a top-level one; it is reported on only
+        // if it is ours. The names are read through this descriptor — the very directory the chmod
+        // below would change — never through the path again.
+        match leaf.walk {
+            Walk::Establish if leaf.existed => match held_by(&owned)? {
+                Held::Ours => {}
+                Held::Nothing if !leaf.top_level => {}
+                Held::Nothing => return Err(top_level_and_empty(leaf.shown, st.st_mode)),
+                Held::Foreign(example) => return Err(not_ours(leaf.shown, &example, st.st_mode)),
+            },
+            Walk::Report => {
+                if held_by(&owned)? != Held::Ours {
+                    return Err(nothing_to_report(leaf.shown));
+                }
+            }
+            Walk::Establish | Walk::OpenDb => {}
+        }
+        if leaf.walk == Walk::Establish && (st.st_mode & 0o777) != 0o700 {
+            let rc = unsafe { libc::fchmod(owned.as_raw_fd(), 0o700) };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
     }
     Ok(owned)
 }
 
+/// What an existing directory holds, as far as taking it for the state directory goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Held {
+    /// Nothing but `.` and `..` — and [`DEDCOMS_LOGS`], if any.
+    Nothing,
+    /// dedcom's live state: at least one of [`PROTECTED_STATE_ENTRIES`].
+    Ours,
+    /// Other entries and no live state — the first such entry read, to show in the refusal.
+    Foreign(OsString),
+}
+
+/// dedcom's two logs, which count neither way. Not against a directory: every run opens its log
+/// first, so the mode's own look at a directory it has just created finds them there. Not for it
+/// either: they are what an older dedcom left in any directory `--stats` was pointed at, `/etc`
+/// among them. A directory holding them and nothing else is treated as empty; beside anything
+/// else, the rest decides.
+const DEDCOMS_LOGS: [&str; 2] = ["dedcom.log", "benchmarks.log"];
+
+/// Reads the names in the directory open at `dir`, up to the first one of dedcom's live state.
+fn held_by(dir: &OwnedFd) -> io::Result<Held> {
+    // `fdopendir` takes over the descriptor it is given and `closedir` closes it, so it is given a
+    // duplicate. SAFETY: `dir` is an open descriptor; the call only makes a second one.
+    let dup = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `dup` is a descriptor of ours; on success the stream owns it.
+    let stream = unsafe { libc::fdopendir(dup) };
+    if stream.is_null() {
+        let err = io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, so `dup` is still ours to close.
+        unsafe { libc::close(dup) };
+        return Err(err);
+    }
+    // The duplicate shares its read position with `dir`. Nothing has read `dir` before this, so
+    // the rewind is defensive: it keeps the listing whole if that ever changes.
+    // SAFETY: `stream` is the open stream from `fdopendir`.
+    unsafe { libc::rewinddir(stream) };
+    let mut held = Held::Nothing;
+    let outcome = loop {
+        // `readdir` answers both the end and a failure with NULL; only errno tells them apart.
+        // SAFETY: the calling thread's errno, then the open stream from `fdopendir`.
+        unsafe { *libc::__errno_location() = 0 };
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let err = io::Error::last_os_error();
+            break match err.raw_os_error() {
+                Some(0) => Ok(held),
+                _ => Err(err),
+            };
+        }
+        // SAFETY: `d_name` is NUL-terminated inside the entry `readdir` just returned, which stays
+        // valid until the next call on `stream`.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        if PROTECTED_STATE_ENTRIES
+            .iter()
+            .any(|live| live.as_bytes() == name)
+        {
+            break Ok(Held::Ours);
+        }
+        let a_log = DEDCOMS_LOGS.iter().any(|log| log.as_bytes() == name);
+        if held == Held::Nothing && !a_log {
+            held = Held::Foreign(OsStr::from_bytes(name).to_os_string());
+        }
+    };
+    // SAFETY: `stream` came from `fdopendir` and is closed once; that closes `dup` as well.
+    unsafe { libc::closedir(stream) };
+    outcome
+}
+
+/// What taking a directory with `mode` for the state directory would do to it, for a refusal.
+fn what_taking_would_do(mode: libc::mode_t) -> &'static str {
+    if mode & 0o777 == 0o700 {
+        "keep dedcom's database, lock and log in it"
+    } else {
+        "set its mode to 0700 and keep dedcom's database, lock and log in it"
+    }
+}
+
+/// The refusal to take `shown` — an existing directory holding entries but no live state of
+/// dedcom's — for the state directory. `example` is one of those entries: a dot-file does not show
+/// in a plain `ls`, and a directory someone thinks is empty may not be.
+fn not_ours(shown: &Path, example: &OsStr, mode: libc::mode_t) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "{} already exists and holds entries such as «{}» but no dedcom database or lock. \
+             Making it the state directory would {}, so dedcom refuses. Point --state-dir at a \
+             directory that does not exist yet (dedcom creates it) or at an empty one made with \
+             mkdir.",
+            crate::textsan::path(shown),
+            crate::textsan::os_str(example),
+            what_taking_would_do(mode),
+        ),
+    )
+}
+
+/// The refusal to take `shown`, an empty directory directly under `/`. `/home`, `/srv` and `/mnt`
+/// come empty on a fresh system, and setting one of them to 0700 cuts every other user off from
+/// what is later put in it — so an empty top-level directory is taken only if dedcom makes it.
+fn top_level_and_empty(shown: &Path, mode: libc::mode_t) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "{} is an empty directory directly under /. Making it the state directory would {}, \
+             so dedcom refuses. Point --state-dir at a new directory inside it, such as {} \
+             (dedcom creates it).",
+            crate::textsan::path(shown),
+            what_taking_would_do(mode),
+            crate::textsan::path(&shown.join("dedcom")),
+        ),
+    )
+}
+
+/// The refusal to report on `shown`, an existing directory holding no live state of dedcom's.
+///
+/// Today nobody reads it: the only caller, the log, turns any refusal into «log nowhere». It is
+/// worded for the next caller of [`verify_state_dir`], and the tests read it.
+fn nothing_to_report(shown: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "{} holds nothing of dedcom's; a mode that only reports creates nothing there",
+            crate::textsan::path(shown)
+        ),
+    )
+}
+
 /// Prepares the DB file: refuses if it is a symlink (opening via the link would write the
 /// target OUTSIDE the protected state-dir), and creates the file at 0600 if absent.
-/// `O_NOFOLLOW` on the final component; the ancestors are already verified by
-/// [`establish_state_dir`] on entry into write mode, so there is no path race. `fchmod` 0600
-/// is applied to an already-existing file too.
+/// `O_NOFOLLOW` on the final component; the ancestors were walked by [`verify_db_dir`] just
+/// before, in `ScanStore::open_writable`, and are not writable by anyone else, so there is no
+/// path race. `fchmod` 0600 is applied to an already-existing file too.
 pub fn prepare_db_file(db_path: &Path) -> io::Result<()> {
     let c = cstring(db_path)?;
     let fd = unsafe {
@@ -332,6 +587,15 @@ pub fn checkpoint_db(cli: &Cli) -> PathBuf {
 ///
 /// Deliberately short. Other names in the state directory — including a CSV the operator chose to
 /// keep there — are ordinary destinations and stay writable.
+///
+/// The same names mark a directory as dedcom's when a mode is about to take it for its state
+/// ([`establish_state_dir`]): every mode that writes creates the lock and never removes it, so a
+/// directory dedcom has worked in holds at least that. Its other names do not mark it:
+/// `config.json`, `plans` and the like are names anybody's directory may have (and dedcom rewrites
+/// `config.json`), and the logs count neither way ([`DEDCOMS_LOGS`]). There these are matched
+/// exactly, case included, unlike `protected_state_entry_name` below: both lean the safe way —
+/// «not sure» means «refuse to overwrite» there and «do not take» here — and the spelling dedcom
+/// writes is the only one it can vouch for.
 pub const PROTECTED_STATE_ENTRIES: [&str; 5] = [
     "dedcom.db",
     "dedcom.db-wal",
@@ -617,6 +881,7 @@ pub fn presets_file(cli: &Cli) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testfixtures::{mode_bits, names_in};
 
     fn temp_path(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -650,7 +915,17 @@ mod tests {
     fn establish_creates_components_0700() {
         let base = temp_path("new");
         let euid = unsafe { libc::geteuid() };
-        establish_chain(open_base(&base), &[OsStr::new("a"), OsStr::new("b")], euid).unwrap();
+        let leaf = base.join("a/b");
+        let names = [OsStr::new("a"), OsStr::new("b")];
+        establish_chain(
+            open_base(&base),
+            &names,
+            euid,
+            Walk::Establish,
+            &leaf,
+            false,
+        )
+        .unwrap();
         assert_eq!(mode_of(&base.join("a")), 0o700);
         assert_eq!(mode_of(&base.join("a/b")), 0o700);
         std::fs::remove_dir_all(&base).ok();
@@ -664,7 +939,8 @@ mod tests {
         // 0750: not group/other-writable (passes the check), but not 0700 → must be tightened.
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o750)).unwrap();
         let euid = unsafe { libc::geteuid() };
-        establish_chain(open_base(&base), &[OsStr::new("a")], euid).unwrap();
+        let names = [OsStr::new("a")];
+        establish_chain(open_base(&base), &names, euid, Walk::Establish, &sub, false).unwrap();
         assert_eq!(
             mode_of(&sub),
             0o700,
@@ -681,7 +957,16 @@ mod tests {
         std::os::unix::fs::symlink(&target, base.join("a")).unwrap();
         let euid = unsafe { libc::geteuid() };
         // openat(O_NOFOLLOW) on a symlink component → ELOOP → refusal.
-        let r = establish_chain(open_base(&base), &[OsStr::new("a"), OsStr::new("b")], euid);
+        let names = [OsStr::new("a"), OsStr::new("b")];
+        let leaf = base.join("a/b");
+        let r = establish_chain(
+            open_base(&base),
+            &names,
+            euid,
+            Walk::Establish,
+            &leaf,
+            false,
+        );
         assert!(r.is_err(), "a symlink component must be rejected");
         std::fs::remove_dir_all(&base).ok();
     }
@@ -693,8 +978,9 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o777)).unwrap();
         let euid = unsafe { libc::geteuid() };
+        let names = [OsStr::new("a")];
         assert!(
-            establish_chain(open_base(&base), &[OsStr::new("a")], euid).is_err(),
+            establish_chain(open_base(&base), &names, euid, Walk::Establish, &sub, false).is_err(),
             "a group/other-writable ancestor must be rejected"
         );
         std::fs::remove_dir_all(&base).ok();
@@ -709,7 +995,17 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o1777)).unwrap();
         let euid = unsafe { libc::geteuid() };
-        establish_chain(open_base(&base), &[OsStr::new("a"), OsStr::new("b")], euid).unwrap();
+        let names = [OsStr::new("a"), OsStr::new("b")];
+        let leaf = base.join("a/b");
+        establish_chain(
+            open_base(&base),
+            &names,
+            euid,
+            Walk::Establish,
+            &leaf,
+            false,
+        )
+        .unwrap();
         assert_eq!(mode_of(&base.join("a/b")), 0o700);
         std::fs::remove_dir_all(&base).ok();
     }
@@ -729,7 +1025,15 @@ mod tests {
         std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o1777)).unwrap();
         let euid = unsafe { libc::geteuid() };
         // 'state' is the final component (i == last), 1777 → strict refusal (sticky doesn't save it).
-        let r = establish_chain(open_base(&base), &[OsStr::new("state")], euid);
+        let names = [OsStr::new("state")];
+        let r = establish_chain(
+            open_base(&base),
+            &names,
+            euid,
+            Walk::Establish,
+            &evil,
+            false,
+        );
         assert!(
             r.is_err(),
             "a world-writable final directory must be rejected"
@@ -748,6 +1052,585 @@ mod tests {
     fn establish_state_dir_rejects_root() {
         // "/" — an empty component list: no final 0700 directory, refusal.
         assert!(establish_state_dir(Path::new("/")).is_err());
+    }
+
+    // --- an existing directory becomes the state directory only if it is dedcom's ---
+
+    /// A directory `name` under `base` holding `entries` (a trailing `/` makes a directory), then
+    /// set to `mode`.
+    fn existing_dir(base: &Path, name: &str, mode: u32, entries: &[&str]) -> PathBuf {
+        let dir = base.join(name);
+        std::fs::create_dir(&dir).unwrap();
+        for entry in entries {
+            match entry.strip_suffix('/') {
+                Some(sub) => std::fs::create_dir(dir.join(sub)).unwrap(),
+                None => std::fs::write(dir.join(entry), b"not dedcom's\n").unwrap(),
+            }
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        dir
+    }
+
+    /// The walk for the one component `leaf` under `base`, the way a mode reaches its directory.
+    fn settle(base: &Path, leaf: &str, walk: Walk) -> io::Result<()> {
+        let euid = unsafe { libc::geteuid() };
+        let names = [OsStr::new(leaf)];
+        establish_chain(open_base(base), &names, euid, walk, &base.join(leaf), false)
+    }
+
+    /// The same for a mode that writes, as if `base` were `/`: `leaf` is then a top-level
+    /// directory. The real `/` is not a place for a test to make directories in.
+    fn settle_at_the_top(base: &Path, leaf: &str) -> io::Result<()> {
+        let euid = unsafe { libc::geteuid() };
+        let names = [OsStr::new(leaf)];
+        let shown = base.join(leaf);
+        establish_chain(open_base(base), &names, euid, Walk::Establish, &shown, true)
+    }
+
+    fn refusal_of(result: io::Result<()>, what: &str) -> String {
+        match result {
+            Ok(()) => panic!("{what} was taken for the state directory"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    /// `--state-dir /etc` by a slip of the finger: the directory exists and holds somebody else's
+    /// files and no live state of dedcom's. It is refused before anything is changed — its mode to
+    /// the bit, its listing, what it holds — and the refusal names it, says why, shows one of the
+    /// entries and names the chmod it would have done.
+    #[test]
+    fn a_foreign_directory_is_refused_and_left_exactly_as_it_was() {
+        let base = temp_path("foreign");
+        for (i, mode) in [0o755, 0o750, 0o711, 0o2750].into_iter().enumerate() {
+            let name = format!("srv{i}");
+            let dir = existing_dir(&base, &name, mode, &["notes.txt"]);
+            let before = (mode_bits(&dir), names_in(&dir));
+
+            let refusal = refusal_of(settle(&base, &name, Walk::Establish), &format!("{mode:o}"));
+
+            assert_eq!(
+                (mode_bits(&dir), names_in(&dir)),
+                before,
+                "{mode:o}: the refused directory must be left as it was"
+            );
+            assert_eq!(
+                std::fs::read(dir.join("notes.txt")).unwrap(),
+                b"not dedcom's\n"
+            );
+            assert!(
+                refusal.contains(&dir.display().to_string()),
+                "names the directory: {refusal}"
+            );
+            assert!(
+                refusal.contains("no dedcom database or lock"),
+                "says why: {refusal}"
+            );
+            assert!(
+                refusal.contains("«notes.txt»"),
+                "shows what is there: {refusal}"
+            );
+            assert!(
+                refusal.contains("set its mode to 0700"),
+                "says what taking it would do: {refusal}"
+            );
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The rule does not lean on the mode. A foreign directory that is already 0700 — `/root` —
+    /// loses nothing to a chmod, but it would still become the home of the database and the lock;
+    /// and the refusal does not promise a chmod that would not have happened.
+    #[test]
+    fn a_foreign_directory_that_is_already_0700_is_refused_too() {
+        let base = temp_path("foreign700");
+        let dir = existing_dir(&base, "home", 0o700, &[".profile"]);
+        let refusal = refusal_of(
+            settle(&base, "home", Walk::Establish),
+            "a 0700 foreign directory",
+        );
+        assert_eq!(mode_bits(&dir), 0o700);
+        assert_eq!(
+            names_in(&dir),
+            [OsString::from(".profile")],
+            "nothing was created in it"
+        );
+        assert!(refusal.contains("«.profile»"), "{refusal}");
+        assert!(!refusal.contains("set its mode"), "{refusal}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// dedcom's live state, spelled out rather than taken from the constant: a test iterating the
+    /// constant would pass whatever the constant is narrowed to.
+    const LIVE_STATE: [&str; 5] = [
+        "dedcom.db",
+        "dedcom.db-wal",
+        "dedcom.db-shm",
+        "dedcom.db-journal",
+        "dedcom.lock",
+    ];
+
+    /// Any one of them makes an existing directory dedcom's — beside files of the operator's, too.
+    /// Those are made both before and after it, so a listing that gave up at the first name that
+    /// is not live state would miss it: always where the filesystem lists entries in the order
+    /// they were made or in the reverse, and in all five directories at once only by a small
+    /// chance where it lists them by hash.
+    #[test]
+    fn any_one_name_of_the_live_state_makes_a_directory_dedcoms() {
+        let base = temp_path("ours");
+        for (i, entry) in LIVE_STATE.into_iter().enumerate() {
+            let name = format!("state{i}");
+            let around = ["a.txt", "b.txt", "c.txt", entry, "x.txt", "y.txt", "z.txt"];
+            let dir = existing_dir(&base, &name, 0o750, &around);
+            settle(&base, &name, Walk::Establish)
+                .unwrap_or_else(|err| panic!("{entry} makes the directory dedcom's: {err}"));
+            assert_eq!(
+                mode_bits(&dir),
+                0o700,
+                "{entry}: dedcom's, and tightened as before"
+            );
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The constants against the names the writers use: the checkpoint with its SQLite
+    /// companions, the lock, and the two logs. All are named through functions, and a rename
+    /// there would otherwise leave every existing state directory unrecognized — or refuse the
+    /// very directory a run's own log has just been opened in.
+    #[test]
+    fn the_names_that_count_are_the_ones_dedcom_writes() {
+        assert_eq!(PROTECTED_STATE_ENTRIES, LIVE_STATE);
+        let dir = Path::new("/state");
+        let cli = Cli {
+            state_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        };
+        let db = checkpoint_db(&cli);
+        let db_name = db.file_name().and_then(OsStr::to_str).unwrap();
+        let lock = crate::lock::lock_path(dir);
+        let lock_name = lock.file_name().and_then(OsStr::to_str).unwrap();
+        for name in [
+            db_name.to_string(),
+            format!("{db_name}-wal"),
+            format!("{db_name}-shm"),
+            format!("{db_name}-journal"),
+            lock_name.to_string(),
+        ] {
+            assert!(PROTECTED_STATE_ENTRIES.contains(&name.as_str()), "{name}");
+        }
+        let logs = [log_file(&cli), bench_file(&cli)];
+        let logs: Vec<&str> = logs
+            .iter()
+            .map(|path| path.file_name().and_then(OsStr::to_str).unwrap())
+            .collect();
+        assert_eq!(DEDCOMS_LOGS.as_slice(), logs.as_slice());
+    }
+
+    /// dedcom's settings and saved plans, which do not make a directory dedcom's.
+    const SETTINGS_OF_DEDCOMS: [&str; 5] = [
+        "consent.json",
+        "config.json",
+        "board.json",
+        "presets.json",
+        "plans/",
+    ];
+
+    /// `config.json`, `plans` and the like are names anybody's directory may have — and dedcom
+    /// rewrites `config.json` on its first auto-vacuum. Each one alone is refused, and all of them
+    /// together with the logs are still no database and no lock.
+    #[test]
+    fn dedcoms_other_names_do_not_make_a_directory_dedcoms() {
+        let base = temp_path("others");
+        for (i, entry) in SETTINGS_OF_DEDCOMS.into_iter().enumerate() {
+            let name = format!("state{i}");
+            let dir = existing_dir(&base, &name, 0o755, &[entry]);
+            let before = names_in(&dir);
+            assert!(settle(&base, &name, Walk::Establish).is_err(), "{entry}");
+            assert_eq!(
+                (mode_bits(&dir), names_in(&dir)),
+                (0o755, before),
+                "{entry}"
+            );
+        }
+        let mut all = SETTINGS_OF_DEDCOMS.to_vec();
+        all.extend(DEDCOMS_LOGS);
+        let dir = existing_dir(&base, "all", 0o755, &all);
+        let before = names_in(&dir);
+        let refusal = refusal_of(
+            settle(&base, "all", Walk::Establish),
+            "a directory of logs and settings",
+        );
+        assert_eq!((mode_bits(&dir), names_in(&dir)), (0o755, before));
+        assert!(refusal.contains("no dedcom database or lock"), "{refusal}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The logs count neither way. A directory holding them and nothing else is taken like an empty
+    /// one — that is what a run's own log leaves in a directory it has just created, before the
+    /// mode looks again, and what an older dedcom's `--stats` left. Beside somebody else's file
+    /// they save nothing: that is `/etc` after such a run, refused, and the refusal shows the file
+    /// rather than a log. At the top level they are an empty directory there, refused as one; and
+    /// a reporting mode finds no state in them to report on.
+    #[test]
+    fn dedcoms_logs_count_neither_way() {
+        let base = temp_path("logs");
+        let dir = existing_dir(&base, "state", 0o755, &DEDCOMS_LOGS);
+        settle(&base, "state", Walk::Establish).expect("a directory holding only dedcom's logs");
+        assert_eq!(mode_bits(&dir), 0o700);
+
+        let etc = existing_dir(
+            &base,
+            "etc",
+            0o755,
+            &["passwd", "dedcom.log", "benchmarks.log"],
+        );
+        let before = names_in(&etc);
+        let refusal = refusal_of(settle(&base, "etc", Walk::Establish), "/etc after --stats");
+        assert_eq!((mode_bits(&etc), names_in(&etc)), (0o755, before));
+        assert!(refusal.contains("«passwd»"), "{refusal}");
+
+        existing_dir(&base, "srv", 0o755, &DEDCOMS_LOGS);
+        let refusal = refusal_of(
+            settle_at_the_top(&base, "srv"),
+            "a top-level directory of logs",
+        );
+        assert!(refusal.contains("directly under /"), "{refusal}");
+
+        existing_dir(&base, "report", 0o755, &DEDCOMS_LOGS);
+        assert!(settle(&base, "report", Walk::Report).is_err());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Adoption is the case where «not sure» means «no», so a name counts only as dedcom spells
+    /// it: another case, a suffix, a prefix or a backup copy is somebody else's file.
+    #[test]
+    fn a_name_that_only_resembles_the_live_state_does_not_count() {
+        let base = temp_path("lookalike");
+        let lookalikes = [
+            "DEDCOM.DB",
+            "Dedcom.Lock",
+            "dedcom.db.bak",
+            "old-dedcom.db",
+            ".dedcom.lock",
+            "dedcom.db ",
+            "dedcom",
+            "dedcom.lock~",
+        ];
+        for (i, entry) in lookalikes.into_iter().enumerate() {
+            let name = format!("state{i}");
+            let dir = existing_dir(&base, &name, 0o755, &[entry]);
+            assert!(
+                settle(&base, &name, Walk::Establish).is_err(),
+                "{entry:?} counted as dedcom's"
+            );
+            assert_eq!(mode_bits(&dir), 0o755, "{entry:?}");
+            assert_eq!(names_in(&dir), [OsString::from(entry)], "{entry:?}");
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Everything but `.` and `..` counts: a dot-file or a directory is somebody's too — a freshly
+    /// made ext4 filesystem holds `lost+found` and nothing else.
+    #[test]
+    fn a_dot_file_or_a_lone_subdirectory_is_somebody_elses() {
+        let base = temp_path("dotfile");
+        for (i, entry) in [".profile", "lost+found/", ".cache/"]
+            .into_iter()
+            .enumerate()
+        {
+            let name = format!("state{i}");
+            let dir = existing_dir(&base, &name, 0o755, &[entry]);
+            assert!(settle(&base, &name, Walk::Establish).is_err(), "{entry:?}");
+            assert_eq!(mode_bits(&dir), 0o755, "{entry:?}");
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// `/home`, `/srv` and `/mnt` come empty on a fresh system, and `--state-dir /home` would set
+    /// it to 0700 and cut every other user off from what is later made in it. An empty directory
+    /// directly under `/` is refused, the refusal pointing inside it; one this walk makes there, or
+    /// one holding dedcom's live state, is taken as before, and so is an empty one anywhere else.
+    #[test]
+    fn an_empty_directory_directly_under_the_root_is_not_taken() {
+        let base = temp_path("toplevel");
+        let empty = existing_dir(&base, "home", 0o755, &[]);
+        let refusal = refusal_of(
+            settle_at_the_top(&base, "home"),
+            "an empty top-level directory",
+        );
+        assert_eq!(mode_bits(&empty), 0o755);
+        assert!(names_in(&empty).is_empty());
+        assert!(refusal.contains("directly under /"), "{refusal}");
+        assert!(
+            refusal.contains(&empty.join("dedcom").display().to_string()),
+            "points at a directory inside it: {refusal}"
+        );
+        assert!(refusal.contains("set its mode to 0700"), "{refusal}");
+
+        let used = existing_dir(&base, "dedcom", 0o750, &["dedcom.lock"]);
+        settle_at_the_top(&base, "dedcom").expect("a top-level directory dedcom has worked in");
+        assert_eq!(mode_bits(&used), 0o700);
+
+        settle_at_the_top(&base, "fresh").expect("a top-level directory the walk makes itself");
+        assert_eq!(mode_bits(&base.join("fresh")), 0o700);
+
+        existing_dir(&base, "below", 0o755, &[]);
+        settle(&base, "below", Walk::Establish).expect("an empty directory below the top");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Only the directory itself is adopted. `--state-dir /etc/dedcom` creates `dedcom` inside a
+    /// foreign `/etc` and leaves `/etc` alone.
+    #[test]
+    fn a_new_directory_inside_a_foreign_one_is_created_and_the_foreign_one_left_alone() {
+        let base = temp_path("under");
+        let etc = existing_dir(&base, "etc", 0o755, &["passwd"]);
+        let euid = unsafe { libc::geteuid() };
+        let names = [OsStr::new("etc"), OsStr::new("dedcom")];
+        let leaf = etc.join("dedcom");
+        establish_chain(
+            open_base(&base),
+            &names,
+            euid,
+            Walk::Establish,
+            &leaf,
+            false,
+        )
+        .unwrap();
+        assert_eq!(mode_bits(&leaf), 0o700);
+        assert_eq!(mode_bits(&etc), 0o755);
+        assert_eq!(
+            names_in(&etc),
+            [OsString::from("dedcom"), OsString::from("passwd")]
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The refusal quotes the operator's path and one of the entries it found, and either can
+    /// carry an escape sequence.
+    #[test]
+    fn the_refusal_shows_the_directory_and_the_entry_without_raw_control_characters() {
+        let base = temp_path("ctlname");
+        let name = "srv\u{1b}]0;PWNED\u{7}";
+        existing_dir(&base, name, 0o755, &["wipe\u{1b}[2Jme"]);
+        let refusal = refusal_of(settle(&base, name, Walk::Establish), "a foreign directory");
+        assert!(!refusal.chars().any(char::is_control), "{refusal:?}");
+        assert!(
+            refusal.contains("srv\\u{1b}]0;PWNED\\u{7}"),
+            "the directory is spelled out: {refusal:?}"
+        );
+        assert!(
+            refusal.contains("wipe\\u{1b}[2Jme"),
+            "so is the entry: {refusal:?}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A symlink in place of the directory is refused as before, whichever way the mode reaches
+    /// it, and nothing looks through it: the directory it points to keeps its mode.
+    #[test]
+    fn a_symlink_in_place_of_the_directory_is_refused_and_its_target_left_alone() {
+        let base = temp_path("leaflink");
+        let real = existing_dir(&base, "real", 0o755, &["dedcom.db"]);
+        std::os::unix::fs::symlink(&real, base.join("state")).unwrap();
+        for walk in [Walk::Establish, Walk::Report, Walk::OpenDb] {
+            assert!(settle(&base, "state", walk).is_err(), "{walk:?}");
+            assert_eq!(mode_bits(&real), 0o755, "{walk:?}");
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The same through the public entry, walked from `/` — what `--state-dir` reaches.
+    #[test]
+    fn establish_state_dir_refuses_a_foreign_directory() {
+        let base = temp_path("public");
+        let dir = existing_dir(&base, "srv", 0o755, &["notes.txt"]);
+        let refusal = refusal_of(establish_state_dir(&dir), "a foreign directory");
+        assert!(refusal.contains(&dir.display().to_string()), "{refusal}");
+        assert_eq!(mode_bits(&dir), 0o755);
+        assert_eq!(names_in(&dir), [OsString::from("notes.txt")]);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// An error from the system names the directory — «No such file or directory» alone does not
+    /// say which one. A store opening its checkpoint meets it when the state directory has gone.
+    #[test]
+    fn a_system_error_names_the_directory() {
+        let base = temp_path("named");
+        let missing = base.join("missing/state");
+        for err in [
+            verify_state_dir(&missing).unwrap_err(),
+            verify_db_dir(&missing).unwrap_err(),
+        ] {
+            assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+            assert!(
+                err.to_string().contains(&missing.display().to_string()),
+                "{err}"
+            );
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The manual says what the refusal says, and both say what the code does: an existing
+    /// directory is taken only when it holds dedcom's live state or is empty and not at the top, a
+    /// new or an empty one is the way past the refusal, and the reporting modes create and change
+    /// nothing (their tests are below).
+    #[test]
+    fn the_manual_states_what_the_state_directory_refuses() {
+        let manual = crate::testfixtures::manual("02-install.md");
+        let flat = manual.split_whitespace().collect::<Vec<_>>().join(" ");
+        for claim in [
+            "it takes an existing directory only if it already holds dedcom's database or lock, \
+             or is empty and not directly under `/` — dedcom's own logs aside",
+            "Its settings files alone do not count",
+            "is refused before anything in it changes, and the error names it",
+            "name a directory that does not exist yet, or make an empty one with `mkdir` first",
+            "`--stats` and `--export-csv` never create the state directory or change its mode",
+        ] {
+            assert!(
+                flat.contains(claim),
+                "02-install.md no longer says: {claim}"
+            );
+        }
+
+        let base = temp_path("manual");
+        existing_dir(&base, "etc", 0o755, &["passwd"]);
+        let refusal = refusal_of(settle(&base, "etc", Walk::Establish), "a foreign directory");
+        for advice in ["does not exist yet", "mkdir"] {
+            assert!(
+                refusal.contains(advice),
+                "the refusal gives the manual's way past it: {refusal}"
+            );
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // --- a reporting mode reaches the state directory without changing anything ---
+
+    /// Neither a missing directory nor a missing parent of it is created.
+    #[test]
+    fn verify_refuses_a_missing_directory_and_creates_nothing() {
+        let base = temp_path("ro_missing");
+        assert!(settle(&base, "state", Walk::Report).is_err());
+        assert!(!base.join("state").exists());
+
+        let euid = unsafe { libc::geteuid() };
+        let names = [OsStr::new("a"), OsStr::new("b")];
+        let leaf = base.join("a/b");
+        assert!(
+            establish_chain(open_base(&base), &names, euid, Walk::Report, &leaf, false).is_err()
+        );
+        assert!(!base.join("a").exists(), "not even the parent");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn verify_refuses_a_foreign_directory_and_changes_nothing() {
+        let base = temp_path("ro_foreign");
+        let dir = existing_dir(&base, "srv", 0o755, &["notes.txt"]);
+        assert!(settle(&base, "srv", Walk::Report).is_err());
+        assert_eq!(mode_bits(&dir), 0o755);
+        assert_eq!(names_in(&dir), [OsString::from("notes.txt")]);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// dedcom's own directory is taken as it is: a reporting mode does not tighten it.
+    #[test]
+    fn verify_takes_our_directory_without_changing_its_mode() {
+        let base = temp_path("ro_ours");
+        let dir = existing_dir(&base, "state", 0o750, &["dedcom.db"]);
+        settle(&base, "state", Walk::Report).unwrap();
+        assert_eq!(mode_bits(&dir), 0o750);
+        assert_eq!(names_in(&dir), [OsString::from("dedcom.db")]);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// An empty directory has nothing to report on and is nobody's state yet. A mode that writes
+    /// would adopt it; a reporting mode does not start one there. Nor does it take the logs an
+    /// older run left as a state directory to report on.
+    #[test]
+    fn verify_refuses_an_empty_directory_and_one_of_old_logs() {
+        let base = temp_path("ro_empty");
+        let dir = existing_dir(&base, "state", 0o755, &[]);
+        assert!(settle(&base, "state", Walk::Report).is_err());
+        assert_eq!(mode_bits(&dir), 0o755);
+        assert!(names_in(&dir).is_empty());
+
+        let logs = existing_dir(&base, "logs", 0o700, &["dedcom.log", "benchmarks.log"]);
+        assert!(settle(&base, "logs", Walk::Report).is_err());
+        assert_eq!(names_in(&logs).len(), 2);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The checks that do not write stay: dedcom's directory writable by others is still refused.
+    #[test]
+    fn verify_keeps_the_permission_check() {
+        let base = temp_path("ro_perm");
+        for (i, mode) in [0o770, 0o757, 0o1777].into_iter().enumerate() {
+            let name = format!("state{i}");
+            let dir = existing_dir(&base, &name, mode, &["dedcom.db"]);
+            let before = mode_bits(&dir);
+            assert!(settle(&base, &name, Walk::Report).is_err(), "{mode:o}");
+            assert_eq!(mode_bits(&dir), before, "{mode:o}");
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The public entry, walked from `/`.
+    #[test]
+    fn verify_state_dir_leaves_a_missing_path_missing() {
+        let base = temp_path("ro_public");
+        assert!(verify_state_dir(&base.join("missing/state")).is_err());
+        assert!(!base.join("missing").exists());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // --- a store opening its checkpoint verifies the directory and changes nothing ---
+
+    /// The directory was chosen, created and taken where the mode began; a store opening the
+    /// checkpoint does not make a missing one — which would be a state directory nobody checked.
+    #[test]
+    fn a_store_creates_no_directory() {
+        let base = temp_path("db_missing");
+        assert!(settle(&base, "state", Walk::OpenDb).is_err());
+        assert!(!base.join("state").exists());
+        assert!(verify_db_dir(&base.join("missing/state")).is_err());
+        assert!(!base.join("missing").exists());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Nor changes the mode of the directory it opens in, whoever's it is, and whatever it holds.
+    #[test]
+    fn a_store_changes_no_mode() {
+        let base = temp_path("db_mode");
+        for (i, (mode, entries)) in [
+            (0o750, &["dedcom.db"][..]),
+            (0o755, &[][..]),
+            (0o755, &["notes.txt", "root/"][..]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("state{i}");
+            let dir = existing_dir(&base, &name, mode, entries);
+            let before = (mode_bits(&dir), names_in(&dir));
+            settle(&base, &name, Walk::OpenDb).unwrap_or_else(|err| panic!("{entries:?}: {err}"));
+            assert_eq!((mode_bits(&dir), names_in(&dir)), before, "{entries:?}");
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The checks that do not write stay for a store as well.
+    #[test]
+    fn a_store_keeps_the_permission_check() {
+        let base = temp_path("db_perm");
+        for (i, mode) in [0o770, 0o757, 0o1777].into_iter().enumerate() {
+            let name = format!("state{i}");
+            let dir = existing_dir(&base, &name, mode, &["dedcom.db"]);
+            let before = mode_bits(&dir);
+            assert!(settle(&base, &name, Walk::OpenDb).is_err(), "{mode:o}");
+            assert_eq!(mode_bits(&dir), before, "{mode:o}");
+        }
+        std::fs::remove_dir_all(&base).ok();
     }
 
     // --- xdg_state_base: equivalence to `dirs` behavior on Linux (we dropped the `dirs` crate) ---

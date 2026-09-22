@@ -1107,10 +1107,12 @@ impl ScanStore {
     /// Opens (creates) the DB, enables WAL, applies the schema.
     pub fn open_writable(db_path: &Path) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
-            // store::open is also called by read-only modes (--stats/--export-csv) WITHOUT the entry-point
-            // establish — so we protect the chain here ourselves (no-follow, 0700, fail-closed),
-            // not via create_dir_all (it would follow a symlink ancestor). Idempotent.
-            crate::paths::establish_state_dir(parent)?;
+            // The chain to the checkpoint's directory is walked again (no-follow, owner,
+            // permissions, fail-closed) before a file is created in it, but nothing is created or
+            // changed here: the state directory was created and taken — or refused as somebody
+            // else's — where the mode chose it (`establish_state_dir`). A store deciding that
+            // again, for whatever directory it is handed, would be a second way in around it.
+            crate::paths::verify_db_dir(parent)?;
         }
         // Refuse if the DB file is a symlink (opening by the link would write the target outside
         // the state-dir), and create with 0600. O_NOFOLLOW on the final component.
@@ -12135,6 +12137,39 @@ mod tests {
             "a symlink at the DB file must be rejected"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Opening the checkpoint creates no directory and changes no mode: the state directory is
+    /// created and taken where the mode chose it (`establish_state_dir`), and nowhere else — a
+    /// store that did it again for whatever directory it was handed would be a way around the
+    /// check of whose directory it is.
+    #[test]
+    fn open_creates_no_directory_and_changes_no_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let _role = role_guard();
+        let base = temp_state_dir("no_mkdir");
+        let missing = base.join("state");
+        assert!(ScanStore::open(&missing.join("dedcom.db")).is_err());
+        assert!(!missing.exists(), "the store created a directory");
+
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o750)).unwrap();
+        drop(ScanStore::open(&base.join("dedcom.db")).unwrap());
+        let mode = std::fs::metadata(&base).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o750, "the store changed the directory's mode");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// It still walks the chain before creating the file: a directory others may write to is
+    /// refused, and the checkpoint is not created in it.
+    #[test]
+    fn open_refuses_a_directory_others_may_write_to() {
+        use std::os::unix::fs::PermissionsExt;
+        let _role = role_guard();
+        let base = temp_state_dir("shared");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(ScanStore::open(&base.join("dedcom.db")).is_err());
+        assert!(!base.join("dedcom.db").exists());
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// Group summaries are read in "by benefit" order with correct fields.
