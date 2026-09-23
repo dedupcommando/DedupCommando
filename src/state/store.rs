@@ -6507,6 +6507,21 @@ impl MembershipSnapshot<'_> {
         Ok(out)
     }
 
+    /// The group of one pathname under derived authority: its digest, looked up among the scan's
+    /// summaries through `file_group_hash`.
+    ///
+    /// No `ORDER BY`: with one, SQLite walks the scan's summaries in rank order to spare itself a
+    /// sort and compares every digest with the file's — 73 ms a cursor step on a million-file
+    /// scan, where the index answers in microseconds. The order is not needed: one rank is the
+    /// answer, two are a refusal, and the central validation already refuses a derived scan whose
+    /// digest names two summaries.
+    pub(crate) const GROUP_OF_PATH_DERIVED_SQL: &'static str = "SELECT g.rank
+           FROM file f
+           JOIN file_group g ON g.scan_id = f.scan_id
+                            AND g.hash = lower(hex(f.hash))
+          WHERE f.scan_id = ?1 AND f.path = ?2
+          LIMIT 2";
+
     /// Which group holds this exact pathname, if any.
     pub fn group_of_path(
         &self,
@@ -6551,14 +6566,7 @@ impl MembershipSnapshot<'_> {
                 }
             }
             _ => {
-                let mut stmt = self.tx.prepare(
-                    "SELECT g.rank
-                       FROM file f
-                       JOIN file_group g ON g.scan_id = f.scan_id
-                                        AND g.hash = lower(hex(f.hash))
-                      WHERE f.scan_id = ?1 AND f.path = ?2
-                      ORDER BY g.rank LIMIT 2",
-                )?;
+                let mut stmt = self.tx.prepare(Self::GROUP_OF_PATH_DERIVED_SQL)?;
                 let rows =
                     stmt.query_map(params![self.scan_id, &*text], |row| row.get::<_, i64>(0))?;
                 let ranks: Vec<i64> = rows.collect::<rusqlite::Result<_>>()?;
@@ -6788,17 +6796,36 @@ impl MembershipSnapshot<'_> {
         }
     }
 
+    /// Member order: the pathname, from the relation the group is read by. Under Explicit that
+    /// is the member row, whose key already holds a group in pathname order; ordered by the
+    /// manifest's copy of the same name, SQLite walks the whole scan's manifest in path order and
+    /// looks every file up among the members — 115 ms a cursor step on a million-file scan,
+    /// where the key answers in microseconds. The join makes the two columns equal, both are
+    /// TEXT compared BINARY, so the order is the same.
+    fn member_order(&self) -> &'static str {
+        match self.mode {
+            MembershipMode::Explicit => "mm.path",
+            _ => "f.path",
+        }
+    }
+
+    /// The statement `member_paths` runs.
+    fn member_paths_sql(&self) -> String {
+        format!(
+            "SELECT f.path FROM {source} WHERE {filter} ORDER BY {order} LIMIT ?3",
+            source = self.member_source(),
+            filter = self.member_filter(),
+            order = self.member_order(),
+        )
+    }
+
     /// The member pathnames of one group, in member order, optionally capped.
     fn member_paths(
         &self,
         id: &GroupId,
         limit: Option<usize>,
     ) -> std::result::Result<Vec<PathBuf>, MembershipMiss> {
-        let mut stmt = self.tx.prepare(&format!(
-            "SELECT f.path FROM {source} WHERE {filter} ORDER BY f.path LIMIT ?3",
-            source = self.member_source(),
-            filter = self.member_filter(),
-        ))?;
+        let mut stmt = self.tx.prepare(&self.member_paths_sql())?;
         // SQLite reads a negative limit as «no limit».
         let cap = limit.map_or(-1i64, |n| n as i64);
         let rows = stmt.query_map(params![id.scan_id, id.rank, cap], |row| {
@@ -6809,6 +6836,22 @@ impl MembershipSnapshot<'_> {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// The statement `plan_members` runs.
+    fn plan_members_sql(&self) -> String {
+        format!(
+            "SELECT f.path, f.size, f.mtime, f.mtime_nsec, f.ctime_sec, f.ctime_nsec,
+                    f.device, f.inode, f.nlink, f.identity_version,
+                    m.is_keeper, m.action, m.rowid
+               FROM {source}
+               LEFT JOIN file_mark m ON m.scan_id = f.scan_id AND m.path = f.path
+              WHERE {filter}
+              ORDER BY {order}",
+            source = self.member_source(),
+            filter = self.member_filter(),
+            order = self.member_order(),
+        )
     }
 
     /// Every persisted member of one group, as the destructive plan is allowed to read it.
@@ -6824,17 +6867,7 @@ impl MembershipSnapshot<'_> {
         let inconsistent = |err: String| {
             PlanEvidenceMiss::Membership(MembershipMiss::Inconsistent { detail: err })
         };
-        let mut stmt = self.tx.prepare(&format!(
-            "SELECT f.path, f.size, f.mtime, f.mtime_nsec, f.ctime_sec, f.ctime_nsec,
-                    f.device, f.inode, f.nlink, f.identity_version,
-                    m.is_keeper, m.action, m.rowid
-               FROM {source}
-               LEFT JOIN file_mark m ON m.scan_id = f.scan_id AND m.path = f.path
-              WHERE {filter}
-              ORDER BY f.path",
-            source = self.member_source(),
-            filter = self.member_filter(),
-        ))?;
+        let mut stmt = self.tx.prepare(&self.plan_members_sql())?;
         let rows = stmt.query_map(params![id.scan_id, id.rank], |row| {
             Ok((
                 PathBuf::from(row.get::<_, String>(0)?),
@@ -17610,6 +17643,146 @@ mod membership_staging_tests {
         let page = explicit.group_page(&explicit_group.id, 1, 1).unwrap();
         assert_eq!(member_paths(&page), vec![b]);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// B8 — «duplicates of the cursor» asks for the group of the file under the cursor on every
+    /// step. Under derived authority that lookup has to go through the digest index: searched by
+    /// scan alone, `file_group` is walked group by group, and on a million-file scan that is 333
+    /// thousand groups and 73 ms a step. The plan of the statement `group_of_path` runs says which.
+    #[test]
+    fn the_group_of_a_path_is_looked_up_through_the_digest_index() {
+        let dir = temp_dir("digest_index");
+        let digest = [13u8; 32];
+        let a = write(&dir, "a.bin", b"twins");
+        let b = write(&dir, "b.bin", b"twins");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let scan_id = seed(
+            &mut store,
+            &dir,
+            &[(a.clone(), digest), (b.clone(), digest)],
+        );
+        store
+            .publish_results(scan_id, PublishMode::Derived)
+            .unwrap();
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        assert_eq!(snapshot.mode(), MembershipMode::Derived);
+        let text = b.to_string_lossy().to_string();
+        let plan: Vec<String> = snapshot
+            .tx
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                MembershipSnapshot::GROUP_OF_PATH_DERIVED_SQL
+            ))
+            .unwrap()
+            .query_map(params![scan_id, text], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|step| step.unwrap())
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("USING INDEX file_group_hash (scan_id=? AND hash=?)")),
+            "the groups are found by digest: {plan:?}"
+        );
+        // And the answer is the one it always was.
+        assert_eq!(
+            snapshot.group_of_path(&b).unwrap().map(|id| id.rank),
+            Some(0)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// B8 under explicit authority, which every scan with `--verify` publishes: «duplicates of
+    /// the cursor» reads the member pathnames of the group under the cursor on every step, and
+    /// the F11 plan reads them for every group it holds. Ordered by the manifest's copy of the
+    /// pathname, that read walks the whole scan's manifest in path order and looks every file up
+    /// among the members — 115 ms a step on a million-file scan, 270 ms in a group of 200. The
+    /// plans of the statements `member_paths` and `plan_members` run say where the read starts.
+    #[test]
+    fn explicit_members_are_read_from_the_group_not_across_the_scan() {
+        let dir = temp_dir("explicit_member_order");
+        let digest = [17u8; 32];
+        // Recorded out of pathname order, so the order the answers come in is the statements'.
+        let c = write(&dir, "c.bin", b"triplets");
+        let a = write(&dir, "a.bin", b"triplets");
+        let b = write(&dir, "b.bin", b"triplets");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        // Verified digests: the plan's evidence refuses any other kind.
+        let scan_id = seed_verified(
+            &mut store,
+            &dir,
+            &[
+                (c.clone(), digest),
+                (a.clone(), digest),
+                (b.clone(), digest),
+            ],
+        );
+        let verified =
+            crate::pipeline::verify::verify_groups(store.duplicate_groups(scan_id).unwrap())
+                .unwrap();
+        assert_eq!(verified.len(), 1);
+        store
+            .publish_results(scan_id, PublishMode::Explicit(&verified))
+            .unwrap();
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        assert_eq!(snapshot.mode(), MembershipMode::Explicit);
+        let id = snapshot.group_of_path(&b).unwrap().expect("b is a member");
+
+        let explain = |sql: String, args: &[&dyn rusqlite::ToSql]| -> Vec<String> {
+            snapshot
+                .tx
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(args, |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(|step| step.unwrap())
+                .collect()
+        };
+        for (statement, plan) in [
+            (
+                "member_paths",
+                explain(
+                    snapshot.member_paths_sql(),
+                    params![id.scan_id, id.rank, -1i64],
+                ),
+            ),
+            (
+                "plan_members",
+                explain(snapshot.plan_members_sql(), params![id.scan_id, id.rank]),
+            ),
+        ] {
+            assert!(
+                plan[0].contains("(scan_id=? AND group_rank=?)"),
+                "{statement} starts at the group's member rows: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("(scan_id=? AND path=?)")),
+                "{statement} finds each member's manifest row by its key: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|step| step.ends_with("(scan_id=?)") || step.starts_with("SCAN")),
+                "{statement} walks nothing across the scan: {plan:?}"
+            );
+        }
+
+        // And the answers are the ones they always were, in pathname order.
+        let names = vec![a.clone(), b.clone(), c.clone()];
+        assert_eq!(snapshot.member_paths(&id, None).unwrap(), names);
+        assert_eq!(
+            snapshot.member_paths(&id, Some(2)).unwrap(),
+            names[..2].to_vec()
+        );
+        let evidence: Vec<PathBuf> = snapshot
+            .plan_members(&id)
+            .unwrap()
+            .iter()
+            .map(|member| member.path().to_path_buf())
+            .collect();
+        assert_eq!(evidence, names);
+        assert_eq!(snapshot.witness_of(&[id]).unwrap().groups[0].members, names);
         std::fs::remove_dir_all(&dir).ok();
     }
 
