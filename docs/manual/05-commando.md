@@ -498,6 +498,12 @@ opens nothing and starts no scan. Close what is in front and press the same key
 again. The status line says what arrived, except while a move waits for its
 panel: that line is the move's prompt then.
 
+Opening a result with O (or Enter, when nothing is left to resume) takes a moment
+as well. If a window, the Triage Board or a waiting move is in front when it is
+ready, or you have left the commander, the scan opens but the screen stays where
+it is, and the status line names the scan: F12, then Enter on it in the list of
+scans shows its groups. Help does not hold it back — the groups open under it.
+
 ### Clear all marks — F9, item 5 (Overlay::ClearMarks)
 
 The F11 plan is built from every mark the database holds for the scan, marks

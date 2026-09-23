@@ -147,6 +147,11 @@ Entries are sorted newest to oldest. The status column shows `walking`,
 > to tens of seconds for old ones (materialized once into `file_group`).
 > For fresh data, start a new scan (N).
 
+While a result opens you can keep using the list. If by then you have gone to
+another screen, or the trash question is open, the result opens without taking
+you to it, and the status line names it: Enter on it in the list opens it again.
+Help does not hold it back — the groups open under it.
+
 ## 6.4. Scanning — scan progress
 
 ```text
@@ -233,7 +238,8 @@ a single layout, nothing drifts apart.
 ## 6.6. ActionReview — action review
 
 From the Browser, the **r** key opens the list of **planned** actions — what
-exactly will happen on apply:
+exactly will happen on apply. The plan is built in the background; if you leave
+the Browser before it is ready, it is dropped, and **r** builds it again:
 
 ```text
 ┌ Action review — dry-run, nothing executed yet · 1 of 9 ─────────────────┐

@@ -484,9 +484,11 @@ impl BrowseSink for AppBrowseSink {
 /// Why a scan is being opened — what the reply should switch to once it installs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenIntent {
-    /// The classic browser: switch to Wizard/Browser when the payload installs.
+    /// The classic browser: switch to Wizard/Browser when the payload installs, if the operator
+    /// is still where they asked (`App::still_where_asked`).
     Wizard,
-    /// The commander overlay: stay where the operator is.
+    /// Stay where the operator is: the commander overlay, and a reopen of the scan already on
+    /// screen.
     Commander,
 }
 
@@ -496,6 +498,9 @@ pub(crate) struct OpenRoute {
     pub(crate) act: Activation,
     pub(crate) scan_id: i64,
     pub(crate) intent: OpenIntent,
+    /// Where the operator was when they asked. An open meant to be shown switches to the group
+    /// view only if they are still there when it installs.
+    pub(crate) asked_from: (AppMode, Screen),
 }
 
 /// What an in-flight `GroupOpen` is for.
@@ -1096,12 +1101,19 @@ impl App {
     /// the actor serves the one the UI threw away, and every later request is stale until
     /// something opens again. So a request that arrives while one is in flight is either the same
     /// scan — which the pending request already IS — or is refused out loud, and in neither case
-    /// does the pending request, intent or activation change.
+    /// does the pending request or activation change. What the answer is for can: a request to
+    /// show the same scan takes that over, with where it was asked from.
     pub(crate) fn open_via_actor(&mut self, scan_id: i64, intent: OpenIntent) {
-        if let Some(pending) = &self.routes.open {
+        if let Some(pending) = &mut self.routes.open {
             let message = if pending.scan_id == scan_id {
                 // Leaning on Enter, or an auto-switch that agrees with what is already being
-                // opened: idempotent, because the answer on its way is the answer to this.
+                // opened: the answer on its way is the answer to this. A request to show it
+                // makes the answer show it here, where the operator asked last; a request to
+                // stay changes nothing.
+                if intent == OpenIntent::Wizard {
+                    pending.intent = OpenIntent::Wizard;
+                    pending.asked_from = (self.mode, self.screen);
+                }
                 "Opening results…".to_string()
             } else {
                 format!(
@@ -1133,6 +1145,7 @@ impl App {
             act,
             scan_id,
             intent,
+            asked_from: (self.mode, self.screen),
         });
     }
 
@@ -1143,7 +1156,13 @@ impl App {
     /// all describe the same database state. A writer that republishes or re-marks while the
     /// payload is being built cannot split it, and there is no window in which half of a result
     /// is on screen. «One actor pass» was the weaker R4B-2c claim; R4B-2c1 made it a transaction.
-    fn install_opened(&mut self, act: Activation, payload: OpenedBrowse, intent: OpenIntent) {
+    fn install_opened(
+        &mut self,
+        act: Activation,
+        payload: OpenedBrowse,
+        intent: OpenIntent,
+        asked_from: (AppMode, Screen),
+    ) {
         let OpenedBrowse {
             scan_id,
             status,
@@ -1153,6 +1172,8 @@ impl App {
             dir_groups,
             presentation,
         } = payload;
+        // Decided by what was in front when the answer arrived, before anything below changes it.
+        let show = intent == OpenIntent::Wizard && self.still_where_asked(asked_from);
         self.installed_act = act;
         self.current_scan_id = Some(scan_id);
         self.opening_started = None;
@@ -1236,10 +1257,68 @@ impl App {
         for index in 0..panels {
             crate::tui::commander::fetch_panel_dedup(self, LoadTarget::Commander(index));
         }
-        if intent == OpenIntent::Wizard {
+        if show {
             self.mode = AppMode::Wizard;
             self.screen = Screen::Browser;
+            // An armed second layer is a commander key the operator had not finished: left armed
+            // across the switch, it would turn the next F-key back in the commander into another
+            // command — F4 into «remove a panel».
+            self.commander.second_layer = false;
+        } else if intent == OpenIntent::Wizard {
+            self.note_opened_away(asked_from, scan_id);
         }
+    }
+
+    /// Whether an open asked for from `asked_from` may switch to the group view now: the operator
+    /// is still there, and the switch would not hide something that takes every key.
+    ///
+    /// A commander window, the Triage Board and a move waiting for its panel live in the commander:
+    /// switched away from, they would stay armed unseen, and the next key would reach the group
+    /// view instead — the menu's Enter would set a keeper there. The wizard's yes/no question is
+    /// about the list it was asked over. Help holds nothing back: it is drawn over every screen and
+    /// takes the key that closes it in both modes, and a scan that ends under it still shows its
+    /// groups.
+    fn still_where_asked(&self, asked_from: (AppMode, Screen)) -> bool {
+        match asked_from.0 {
+            AppMode::Commander => {
+                self.mode == AppMode::Commander
+                    && self.commander.overlay == crate::tui::commander::state::Overlay::None
+                    && !self.commander.board_active
+                    && self.commander.triage.is_none()
+            }
+            AppMode::Wizard => (self.mode, self.screen) == asked_from && self.confirm.is_none(),
+        }
+    }
+
+    /// The note for an opened result that `still_where_asked` kept off the screen. The scan is
+    /// installed and the note names it, because the key that asked for it may mean something else
+    /// by now: F2 asks about whatever folder the active panel shows, Enter acts on whichever scan
+    /// the list's cursor is on. A window in front of the place it was asked from gets a way back
+    /// through the list of scans, action first as in `note_late_answer`; an operator who has moved
+    /// on is told what happened and nothing more — from some screens there is no way back to the
+    /// list, and on the trash screen Enter restores a session.
+    fn note_opened_away(&mut self, asked_from: (AppMode, Screen), scan_id: i64) {
+        let there = match asked_from.0 {
+            AppMode::Commander => self.mode == AppMode::Commander,
+            AppMode::Wizard => (self.mode, self.screen) == asked_from,
+        };
+        self.note_everywhere(match (there, asked_from.0) {
+            (true, AppMode::Commander) => format!(
+                "Close this window, then F12 and Enter on #{scan_id}: its results opened while it \
+                 was open"
+            ),
+            (true, AppMode::Wizard) => format!(
+                "Close this window, then Enter on #{scan_id}: its results opened while it was open"
+            ),
+            (false, _) => format!("Scan #{scan_id} opened while you were away and was not shown"),
+        });
+    }
+
+    /// A note for the status line of both screens: the one drawn now may not be the one the
+    /// operator was on when the answer was asked for.
+    fn note_everywhere(&mut self, note: String) {
+        self.status = note.clone();
+        self.commander.status = note;
     }
 
     /// The line that reports what was opened. `None` groups means the scan has no published
@@ -1524,7 +1603,7 @@ impl App {
             "an open reply carries the activation it proposed"
         );
         match result {
-            Ok(payload) => self.install_opened(route.act, *payload, route.intent),
+            Ok(payload) => self.install_opened(route.act, *payload, route.intent, route.asked_from),
             // Class B: the actor uninstalled both its connection and its scan, so the UI must
             // stop describing one too. Every other failure is class A — the previously
             // installed scan is untouched and still served.
@@ -2640,6 +2719,17 @@ impl App {
             return;
         }
         match window {
+            // The review opens over the group view it was asked from, or not at all: a plan kept
+            // without its review is guarded by nothing, so one that cannot be shown now is
+            // dropped, as F11's is, and r builds it again. The note offers no way back: from the
+            // scan settings of the classic wizard there is none.
+            PlanWindow::Wizard
+                if (self.mode, self.screen) != (AppMode::Wizard, Screen::Browser) =>
+            {
+                self.note_everywhere(
+                    "The plan built after you left the group view was dropped".to_string(),
+                )
+            }
             PlanWindow::Wizard => {
                 let mut list = ListState::default();
                 list.select(Some(0));
@@ -2941,12 +3031,10 @@ impl App {
                             .spawn(self.db_path.clone(), spawn.role, sink)
                             .is_some()
                         {
+                            // The scan already on screen comes back; nothing asked to be shown, so
+                            // the operator stays where they are.
                             if let Some(scan_id) = spawn.reopen {
-                                let intent = match self.mode {
-                                    AppMode::Commander => OpenIntent::Commander,
-                                    AppMode::Wizard => OpenIntent::Wizard,
-                                };
-                                self.open_via_actor(scan_id, intent);
+                                self.open_via_actor(scan_id, OpenIntent::Commander);
                             }
                         }
                     }
@@ -3307,12 +3395,9 @@ impl App {
         if matches!(self.browse.phase(), crate::state::browse::FleetPhase::Idle) {
             // No actor to replace: the next request opens one with the new capability.
             self.browse.cancel_pending_spawn();
+            // The scan already on screen comes back; the operator stays where they are.
             if let Some(scan_id) = reopen {
-                let intent = match self.mode {
-                    AppMode::Commander => OpenIntent::Commander,
-                    AppMode::Wizard => OpenIntent::Wizard,
-                };
-                self.open_via_actor(scan_id, intent);
+                self.open_via_actor(scan_id, OpenIntent::Commander);
             }
             return;
         }

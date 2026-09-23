@@ -7757,6 +7757,524 @@ mod dir_watch_tests {
                 crate::app::drain(&mut app, &events);
             }
         }
+
+        /// B15 — an opened result does not switch the screen out from under what the operator is
+        /// using.
+        ///
+        /// Keys go through `handle_event`, the way the terminal delivers them: after a switch they
+        /// reach the wizard, and that is where the Enter meant for a menu did its harm.
+        mod open_under_windows {
+            use super::*;
+            use crate::app::{AppMode, Screen};
+            use crate::tui::event::AppEvent;
+
+            fn key(app: &mut App, code: KeyCode) {
+                app.handle_event(AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+            }
+
+            /// `marked_app` after consent: every test application starts with the startup notice
+            /// open, and it takes every key.
+            fn open_app() -> (PathBuf, App, crossbeam_channel::Receiver<AppEvent>) {
+                let (db, mut app, events) = marked_app();
+                app.show_disclaimer = false;
+                (db, app, events)
+            }
+
+            fn open_landed(app: &App) -> bool {
+                app.routes.open.is_none()
+            }
+
+            /// F2 over `/tank`, then O in the choice it opens: the completed scan's results are
+            /// asked for, to be shown in the wizard's group view.
+            fn ask_for_the_results(app: &mut App, events: &crossbeam_channel::Receiver<AppEvent>) {
+                app.commander_scan(vec![PathBuf::from("/tank")]);
+                crate::app::pump_until(app, events, "the F2 check", f2_check_landed);
+                assert_eq!(app.commander.overlay, Overlay::ResumeScan);
+                key(app, KeyCode::Char('o'));
+                assert!(app.routes.open.is_some(), "the results are being opened");
+            }
+
+            /// A plan answer as the actor delivers it to the classic review — the route r records —
+            /// built over real files, as `deliver_a_plan` builds one for F11. The scenario owns the
+            /// files and must outlive the check.
+            fn deliver_a_review_plan(app: &mut App) -> crate::testfixtures::PlanScenario {
+                use crate::state::browse::{BrowseEvent, RequestId};
+                let scenario = crate::testfixtures::PlanScenario::new("b15_plan");
+                let keeper = scenario.file("keeper.bin");
+                let twin = scenario.file("twin.bin");
+                let mut store = scenario.store();
+                let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
+                scenario.mark(&mut store, scan_id, &keeper, true, None);
+                scenario.mark(&mut store, scan_id, &twin, false, Some(ActionKind::Delete));
+                drop(store);
+                let plan = crate::actions::tests::plan_of(&scenario, scan_id);
+                let req = RequestId(u64::MAX - 15);
+                app.routes.plan = Some((req, crate::app::PlanWindow::Wizard));
+                app.handle_event(AppEvent::Browse(Box::new(BrowseEvent::PlanReady {
+                    act: app.installed_act,
+                    req,
+                    plan: Box::new(plan),
+                })));
+                scenario
+            }
+
+            /// F12 in the commander, and the list of sessions loaded with the scan under the cursor.
+            fn sessions_list(app: &mut App, events: &crossbeam_channel::Receiver<AppEvent>) {
+                key(app, KeyCode::F(12));
+                assert_eq!((app.mode, app.screen), (AppMode::Wizard, Screen::Resume));
+                crate::app::pump_until(app, events, "the sessions", |app| app.sessions_loaded);
+                assert!(!app.sessions.is_empty(), "the scan is listed");
+            }
+
+            /// The F9 menu opened while the results were opening keeps the screen and its Enter.
+            /// Red on the parent: the answer switched to the wizard's group view, where the Enter
+            /// meant for the menu set a keeper on the first file of the first group.
+            #[test]
+            fn an_opened_result_stays_behind_the_menu() {
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = open_app();
+                let scan_id = app.current_scan_id.expect("a scan is installed");
+                ask_for_the_results(&mut app, &events);
+                key(&mut app, KeyCode::F(9));
+                for _ in 0..4 {
+                    key(&mut app, KeyCode::Down);
+                }
+                crate::app::pump_until(&mut app, &events, "the open", open_landed);
+                let note = app.commander.status.clone();
+                // The first group is read whether or not the screen switched; Enter waits for it,
+                // so a keeper would be set if the Enter reached the group view.
+                crate::app::pump_until(&mut app, &events, "the first group", |app| {
+                    app.browser.open_group.is_some()
+                });
+                key(&mut app, KeyCode::Enter);
+                assert!(app.pending_marks.is_empty(), "no keeper was sent");
+                assert_eq!(app.mode, AppMode::Commander, "no switch");
+                assert_eq!(
+                    app.commander.overlay,
+                    Overlay::ClearMarks,
+                    "Enter reached the menu"
+                );
+                assert_eq!(
+                    note,
+                    format!(
+                        "Close this window, then F12 and Enter on #{scan_id}: its results opened \
+                         while it was open"
+                    )
+                );
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// The Triage Board takes every key; the answer does not switch out from under it. Red
+            /// on the parent: it did, and the board went on taking nothing.
+            #[test]
+            fn an_opened_result_does_not_switch_from_under_the_triage_board() {
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = open_app();
+                ask_for_the_results(&mut app, &events);
+                key(&mut app, KeyCode::Char('`'));
+                key(&mut app, KeyCode::F(12));
+                assert!(app.commander.board_active);
+                crate::app::pump_until(&mut app, &events, "the open", open_landed);
+                assert_eq!(app.mode, AppMode::Commander, "no switch");
+                assert!(app.commander.board_active, "the board stays");
+                assert!(
+                    app.commander
+                        .status
+                        .starts_with("Close this window, then F12 and Enter on #"),
+                    "{:?}",
+                    app.commander.status
+                );
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// A move waiting for its target panel takes every key as well.
+            #[test]
+            fn an_opened_result_does_not_switch_while_a_move_waits_for_its_panel() {
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = open_app();
+                ask_for_the_results(&mut app, &events);
+                key(&mut app, KeyCode::Char('m'));
+                assert!(app.commander.triage.is_some());
+                crate::app::pump_until(&mut app, &events, "the open", open_landed);
+                assert_eq!(app.mode, AppMode::Commander, "no switch");
+                assert!(app.commander.triage.is_some(), "the move still waits");
+                assert!(
+                    app.commander
+                        .status
+                        .starts_with("Close this window, then F12 and Enter on #"),
+                    "{:?}",
+                    app.commander.status
+                );
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// The operator went on to the list of sessions (F12) while the results were opening:
+            /// the answer leaves them there. Red on the parent: it moved them to the group view.
+            #[test]
+            fn an_opened_result_leaves_an_operator_who_went_on_where_they_are() {
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = open_app();
+                let scan_id = app.current_scan_id.expect("a scan is installed");
+                ask_for_the_results(&mut app, &events);
+                sessions_list(&mut app, &events);
+                crate::app::pump_until(&mut app, &events, "the open", open_landed);
+                assert_eq!((app.mode, app.screen), (AppMode::Wizard, Screen::Resume));
+                assert_eq!(
+                    app.status,
+                    format!("Scan #{scan_id} opened while you were away and was not shown"),
+                    "the wizard draws its own line"
+                );
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// From the list of sessions: Enter opens the scan, Del asks to move it to the trash
+            /// before the answer. The question stays over the list it is about. Red on the parent:
+            /// the answer switched to the group view under the question.
+            #[test]
+            fn an_opened_result_leaves_the_trash_question_over_its_list() {
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = open_app();
+                let scan_id = app.current_scan_id.expect("a scan is installed");
+                sessions_list(&mut app, &events);
+                key(&mut app, KeyCode::Enter);
+                assert!(app.routes.open.is_some(), "the scan is being opened");
+                key(&mut app, KeyCode::Delete);
+                assert!(app.confirm.is_some(), "the question is asked");
+                crate::app::pump_until(&mut app, &events, "the open", open_landed);
+                assert_eq!(app.screen, Screen::Resume, "the list stays");
+                assert!(app.confirm.is_some(), "the question stays");
+                assert_eq!(
+                    app.status,
+                    format!(
+                        "Close this window, then Enter on #{scan_id}: its results opened while it \
+                         was open"
+                    )
+                );
+                // What the note says works: N answers the question, Enter opens the scan again.
+                key(&mut app, KeyCode::Char('n'));
+                assert!(app.confirm.is_none());
+                key(&mut app, KeyCode::Enter);
+                crate::app::pump_until(&mut app, &events, "the second open", open_landed);
+                assert_eq!(app.screen, Screen::Browser, "Enter again shows the groups");
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// From the list of sessions: Enter, then t for the trash before the answer. The trash
+            /// stays, and the note names the scan without a key to press: on this screen Enter
+            /// restores a session. Red on the parent: the answer moved the operator to the group
+            /// view.
+            #[test]
+            fn an_opened_result_leaves_the_trash_screen_in_place() {
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = open_app();
+                let scan_id = app.current_scan_id.expect("a scan is installed");
+                sessions_list(&mut app, &events);
+                key(&mut app, KeyCode::Enter);
+                assert!(app.routes.open.is_some(), "the scan is being opened");
+                key(&mut app, KeyCode::Char('t'));
+                assert_eq!(app.screen, Screen::Trash);
+                crate::app::pump_until(&mut app, &events, "the open", open_landed);
+                assert_eq!(app.screen, Screen::Trash, "the trash stays");
+                assert_eq!(
+                    app.status,
+                    format!("Scan #{scan_id} opened while you were away and was not shown")
+                );
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// The classic review of a plan: r asks for the plan, Esc leaves the group view before
+            /// it arrives. The review does not open over the screen the operator went to. Red on the
+            /// parent: it did.
+            #[test]
+            fn a_built_plan_does_not_open_the_review_over_another_screen() {
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = open_app();
+                // The classic wizard as `--classic` starts it: Esc in the group view goes back to
+                // the scan settings, not to a commander it was never opened from.
+                app.mode = AppMode::Wizard;
+                app.screen = Screen::Browser;
+                key(&mut app, KeyCode::Esc);
+                assert_eq!(app.screen, Screen::ScanConfig);
+                let _plan = deliver_a_review_plan(&mut app);
+                assert_eq!(app.screen, Screen::ScanConfig, "the review did not open");
+                assert!(
+                    app.review.plan.is_none(),
+                    "no plan is kept without its review"
+                );
+                // No way back is offered: from the scan settings of the classic wizard there is
+                // none.
+                assert_eq!(
+                    app.status,
+                    "The plan built after you left the group view was dropped"
+                );
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// The same after the operator went back to the commander from the group view: the
+            /// wizard's screen is still the group view, but nobody is looking at it, and nothing is
+            /// kept for a review they cannot see. Red on the parent: the review was set up under the
+            /// commander with the plan in it.
+            #[test]
+            fn a_built_plan_keeps_nothing_after_the_operator_went_back_to_the_commander() {
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = open_app();
+                app.open_wizard(Screen::Browser);
+                key(&mut app, KeyCode::Esc);
+                assert_eq!(
+                    (app.mode, app.screen),
+                    (AppMode::Commander, Screen::Browser)
+                );
+                let _plan = deliver_a_review_plan(&mut app);
+                assert_eq!(app.screen, Screen::Browser, "no review was set up");
+                assert!(app.review.plan.is_none(), "no plan is kept");
+                assert_eq!(
+                    app.commander.status,
+                    "The plan built after you left the group view was dropped"
+                );
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// Help stays in front across a switch and takes the key that closes it, so it does not
+            /// hold the group view back: a scan that ends under help still shows its results.
+            /// Must hold on both sides — a finished scan's screen has nothing left to do.
+            #[test]
+            fn a_scan_that_ends_under_help_still_shows_its_results() {
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = open_app();
+                let scan_id = app.current_scan_id.expect("a scan is installed");
+                app.open_wizard(Screen::Scanning);
+                app.show_help = true;
+                app.handle_event(AppEvent::ScanFinished(Ok(
+                    crate::pipeline::ScanOutcome::Completed(crate::model::scan::ScanResults {
+                        scan_id,
+                        summary: Default::default(),
+                    }),
+                )));
+                crate::app::pump_until(&mut app, &events, "the open", open_landed);
+                assert_eq!((app.mode, app.screen), (AppMode::Wizard, Screen::Browser));
+                assert!(app.show_help, "help is still in front");
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// Taking a role reopens the scan already on screen with a connection of the new kind.
+            /// Nothing asked for it to be shown: an operator on the scan settings stays there.
+            ///
+            /// Today the role is asked only at startup, before the classic wizard has anything open,
+            /// so the program cannot reach this state; the test holds the rule for a reopen — it
+            /// puts back what is on screen and moves nobody. Red on the parent in this state: the
+            /// reopen moved the operator to the group view.
+            #[test]
+            fn a_reopen_after_a_role_change_leaves_the_operator_where_they_are() {
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = open_app();
+                assert!(app.current_scan_id.is_some(), "a scan is on screen");
+                app.mode = AppMode::Wizard;
+                app.screen = Screen::ScanConfig;
+                app.concurrency_prompt = Some(crate::lock::Holder {
+                    pid: 4242,
+                    since: "2026-09-23 10:00".to_string(),
+                });
+                let before = app.installed_act;
+                key(&mut app, KeyCode::Char('r'));
+                assert!(app.read_only, "the observer role was taken");
+                crate::app::pump_until(&mut app, &events, "the reopen", |app| {
+                    app.installed_act != before && app.routes.open.is_none()
+                });
+                assert_eq!(
+                    (app.mode, app.screen),
+                    (AppMode::Wizard, Screen::ScanConfig)
+                );
+                crate::app::drain(&mut app, &events);
+                // The role is process-wide; the next holder of the guard would reset it anyway.
+                crate::state::set_observer_role(false);
+            }
+
+            /// The same when no actor is left to replace — the one before has closed: the role
+            /// change starts a new one, reopens the scan through it and still moves nobody. As
+            /// above, a state the program does not reach today. Red on the parent in this state.
+            #[test]
+            fn a_reopen_with_no_actor_left_leaves_the_operator_where_they_are() {
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = open_app();
+                assert!(app.current_scan_id.is_some(), "a scan is on screen");
+                assert!(app.browse.begin_close().is_none(), "the close was sent");
+                crate::app::pump_until(&mut app, &events, "the actor to close", |app| {
+                    app.browse.phase() == crate::state::browse::FleetPhase::Idle
+                });
+                app.mode = AppMode::Wizard;
+                app.screen = Screen::ScanConfig;
+                app.concurrency_prompt = Some(crate::lock::Holder {
+                    pid: 4242,
+                    since: "2026-09-23 10:00".to_string(),
+                });
+                let before = app.installed_act;
+                key(&mut app, KeyCode::Char('r'));
+                assert!(app.routes.open.is_some(), "the scan is being reopened");
+                crate::app::pump_until(&mut app, &events, "the reopen", |app| {
+                    app.installed_act != before && app.routes.open.is_none()
+                });
+                assert_eq!(
+                    (app.mode, app.screen),
+                    (AppMode::Wizard, Screen::ScanConfig)
+                );
+                crate::app::drain(&mut app, &events);
+                crate::state::set_observer_role(false);
+            }
+
+            /// The same scan asked for twice before it opens — O in the F2 choice, then Enter on
+            /// it in the list of scans: the second request says where to show it, and the answer
+            /// shows it there. The parent switched whatever was in front, so it is green there;
+            /// this holds the rule that the last request to show a scan decides where.
+            #[test]
+            fn the_last_request_to_show_a_scan_decides_where_it_is_shown() {
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = open_app();
+                // The list is loaded first and stays loaded: F12 then shows it without asking
+                // again, so Enter can land while the open is still on its way.
+                sessions_list(&mut app, &events);
+                key(&mut app, KeyCode::Esc);
+                assert_eq!(app.mode, AppMode::Commander);
+                crate::app::pump_until(&mut app, &events, "the commander's reopen", open_landed);
+                ask_for_the_results(&mut app, &events);
+                key(&mut app, KeyCode::F(12));
+                assert_eq!(app.screen, Screen::Resume);
+                key(&mut app, KeyCode::Enter);
+                assert_eq!(
+                    app.status, "Opening results…",
+                    "the second request joined the first"
+                );
+                crate::app::pump_until(&mut app, &events, "the open", open_landed);
+                assert_eq!((app.mode, app.screen), (AppMode::Wizard, Screen::Browser));
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// An open of the same scan the commander started on its own — a panel entering a folder
+            /// that scan covers — is on its way when the operator presses O in the F2 choice: the
+            /// answer shows the groups. Red on the parent: O joined an open meant to stay, and
+            /// nothing was shown, not even a note.
+            #[test]
+            fn o_on_a_scan_the_commander_is_already_opening_shows_it() {
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = open_app();
+                let scan_id = app.current_scan_id.expect("a scan is installed");
+                app.commander_scan(vec![PathBuf::from("/tank")]);
+                crate::app::pump_until(&mut app, &events, "the F2 check", f2_check_landed);
+                assert_eq!(app.commander.overlay, Overlay::ResumeScan);
+                app.open_via_actor(scan_id, crate::app::OpenIntent::Commander);
+                key(&mut app, KeyCode::Char('o'));
+                crate::app::pump_until(&mut app, &events, "the open", open_landed);
+                assert_eq!((app.mode, app.screen), (AppMode::Wizard, Screen::Browser));
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// The prefix key arms the second layer for the next F-key. An answer that switches
+            /// to the group view discards it: left armed, it waited in the commander, and back
+            /// there F4 removed a panel instead of hashing the file. Red on the parent.
+            #[test]
+            fn an_armed_second_layer_does_not_outlive_the_switch() {
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = open_app();
+                let panels = app.commander.panels.len();
+                ask_for_the_results(&mut app, &events);
+                key(&mut app, KeyCode::Char('`'));
+                assert!(app.commander.second_layer);
+                crate::app::pump_until(&mut app, &events, "the open", open_landed);
+                assert_eq!((app.mode, app.screen), (AppMode::Wizard, Screen::Browser));
+                key(&mut app, KeyCode::Esc);
+                assert_eq!(app.mode, AppMode::Commander, "back in the commander");
+                key(&mut app, KeyCode::F(4));
+                assert_eq!(app.commander.panels.len(), panels, "F4 removed no panel");
+                assert!(!app.commander.second_layer);
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// The manual says what an opened result does when the operator has moved on, in both
+            /// places a result is opened from.
+            #[test]
+            fn the_manual_says_an_opened_result_does_not_move_an_operator_who_went_on() {
+                let flat = |chapter: &str| {
+                    crate::testfixtures::manual(chapter)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                let commander = flat("05-commando.md");
+                for said in [
+                    "the scan opens but the screen stays where it is",
+                    "F12, then Enter on it in the list of scans shows its groups",
+                ] {
+                    assert!(
+                        commander.contains(said),
+                        "the commander's F2 section: {said}"
+                    );
+                }
+                let classic = flat("06-classic.md");
+                for said in [
+                    "the result opens without taking you to it",
+                    "Enter on it in the list opens it again",
+                    "if you leave the Browser before it is ready, it is dropped",
+                ] {
+                    assert!(classic.contains(said), "the classic wizard: {said}");
+                }
+            }
+
+            /// The control: with nothing in front and the operator where they asked, each answer
+            /// switches as before.
+            #[test]
+            fn with_nothing_in_front_an_opened_result_is_shown() {
+                let _role = crate::state::store::role_guard();
+
+                let (_db, mut app, events) = open_app();
+                ask_for_the_results(&mut app, &events);
+                crate::app::pump_until(&mut app, &events, "the open", open_landed);
+                assert_eq!(
+                    (app.mode, app.screen),
+                    (AppMode::Wizard, Screen::Browser),
+                    "F2, O"
+                );
+                crate::app::drain(&mut app, &events);
+
+                let (_db, mut app, events) = open_app();
+                sessions_list(&mut app, &events);
+                key(&mut app, KeyCode::Enter);
+                crate::app::pump_until(&mut app, &events, "the open", open_landed);
+                assert_eq!(app.screen, Screen::Browser, "the list of sessions, Enter");
+                crate::app::drain(&mut app, &events);
+
+                let (_db, mut app, events) = open_app();
+                sessions_list(&mut app, &events);
+                key(&mut app, KeyCode::Enter);
+                key(&mut app, KeyCode::Char('?'));
+                crate::app::pump_until(&mut app, &events, "the open", open_landed);
+                assert_eq!(
+                    app.screen,
+                    Screen::Browser,
+                    "the list of sessions, Enter, help"
+                );
+                assert!(app.show_help);
+                crate::app::drain(&mut app, &events);
+
+                let (_db, mut app, events) = open_app();
+                ask_for_the_results(&mut app, &events);
+                key(&mut app, KeyCode::F(1));
+                crate::app::pump_until(&mut app, &events, "the open", open_landed);
+                assert_eq!(
+                    (app.mode, app.screen),
+                    (AppMode::Wizard, Screen::Browser),
+                    "F2, O, help"
+                );
+                assert!(app.show_help);
+                crate::app::drain(&mut app, &events);
+
+                let (_db, mut app, events) = open_app();
+                app.mode = AppMode::Wizard;
+                app.screen = Screen::Browser;
+                let _plan = deliver_a_review_plan(&mut app);
+                assert_eq!(app.screen, Screen::ActionReview, "r in the group view");
+                assert!(app.review.plan.is_some());
+                crate::app::drain(&mut app, &events);
+            }
+        }
     }
 }
 
