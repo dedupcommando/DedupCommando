@@ -219,8 +219,9 @@ pub struct ScanStore {
     /// needs to see it happen.
     #[cfg(test)]
     dir_memo_cap: std::cell::Cell<usize>,
-    /// Test-only: how many set-based digest-propagation statements this store has issued. The
-    /// hashing phase must spend one per batch, never one per alias, and a counter on the store
+    /// Test-only: how many digest-propagation statements this store has executed, counted where
+    /// they run. The hashing phase must spend one for the pass that opens a session, then one per
+    /// committed object at each checkpoint — never one per alias — and a counter on the store
     /// itself proves that without a dependency, rusqlite tracing, or a timing measurement. Per
     /// instance rather than global, so parallel tests cannot pollute each other.
     #[cfg(test)]
@@ -527,9 +528,18 @@ fn eligible_sizes_sql() -> String {
     )
 }
 
+/// A trusted source for the pathname being filled: the same scan, the complete temporal identity
+/// of the same physical object, and a digest that is fd-verified or inherited from one.
+const TRUSTED_SOURCE: &str = "src.scan_id = file.scan_id
+                  AND src.device = file.device AND src.inode = file.inode
+                  AND src.size = file.size AND src.mtime = file.mtime
+                  AND src.mtime_nsec = file.mtime_nsec
+                  AND src.ctime_sec = file.ctime_sec AND src.ctime_nsec = file.ctime_nsec
+                  AND src.identity_version = 1 AND src.hash IS NOT NULL";
+
 /// Propagates a trusted digest to every hash-null pathname of the same current-scan object.
 ///
-/// Set-based on purpose: one statement per checkpoint, not one per alias. The source must be
+/// Set-based on purpose: one statement per pass, not one per alias. The source must be
 /// `identity_version = 1` — only an fd-verified or inherited-from-fd-verified digest — and the
 /// target must match the source's complete temporal identity, so linking, unlinking or replacing
 /// any alias changes the inode ctime and disqualifies the whole stale object. `hash IS NULL`
@@ -537,19 +547,36 @@ fn eligible_sizes_sql() -> String {
 ///
 /// `LIMIT 1` is only safe because `conflicting_digest_objects` has already refused any object
 /// carrying more than one distinct trusted digest, so there is nothing to choose between.
+///
+/// This scan-wide form walks every hash-null row, so it runs once per hashing phase, after
+/// inheritance. A checkpoint runs [`propagate_object_sql`] instead.
 fn propagate_sql() -> String {
-    let matches_source = "src.scan_id = file.scan_id
-                  AND src.device = file.device AND src.inode = file.inode
-                  AND src.size = file.size AND src.mtime = file.mtime
-                  AND src.mtime_nsec = file.mtime_nsec
-                  AND src.ctime_sec = file.ctime_sec AND src.ctime_nsec = file.ctime_nsec
-                  AND src.identity_version = 1 AND src.hash IS NOT NULL";
     format!(
         "UPDATE file
-            SET hash = (SELECT src.hash FROM file AS src WHERE {matches_source} LIMIT 1),
+            SET hash = (SELECT src.hash FROM file AS src WHERE {TRUSTED_SOURCE} LIMIT 1),
                 identity_version = 1
           WHERE scan_id = ?1 AND hash IS NULL
-            AND EXISTS (SELECT 1 FROM file AS src WHERE {matches_source})"
+            AND EXISTS (SELECT 1 FROM file AS src WHERE {TRUSTED_SOURCE})"
+    )
+}
+
+/// The same propagation bounded to ONE physical object, `(device, inode)` — the object a
+/// checkpoint has just committed a representative for.
+///
+/// Every trusted digest that exists when a hashing session opens — inherited from a past scan or
+/// committed by an earlier session of this one — is spread by the scan-wide pass that opens the
+/// session (`propagate_inherited_hashes`); after that the only new sources are a checkpoint's own
+/// representatives, so the scan-wide walk would find nothing the bounded one misses. And it is not
+/// free: on a two-million-file scan it cost about 4.5 s of CPU per 64-file batch, which held
+/// hashing at ~14 files a second with the disks idle. The rest of the identity is still checked by
+/// [`TRUSTED_SOURCE`], exactly as before.
+fn propagate_object_sql() -> String {
+    format!(
+        "UPDATE file
+            SET hash = (SELECT src.hash FROM file AS src WHERE {TRUSTED_SOURCE} LIMIT 1),
+                identity_version = 1
+          WHERE scan_id = ?1 AND device = ?2 AND inode = ?3 AND hash IS NULL
+            AND EXISTS (SELECT 1 FROM file AS src WHERE {TRUSTED_SOURCE})"
     )
 }
 
@@ -1027,6 +1054,28 @@ fn take_export_race_hook() {
 fn propagate_trusted_digests(tx: &Connection, scan_id: i64) -> Result<u64> {
     let updated = tx.execute(&propagate_sql(), params![scan_id])?;
     Ok(updated as u64)
+}
+
+/// The checkpoint's propagation: the object-bounded statement once per object the checkpoint
+/// committed, never once per alias. Returns the rows it filled in and the statements it ran.
+fn propagate_committed_objects(
+    tx: &Connection,
+    scan_id: i64,
+    objects: &[(u64, u64)],
+) -> Result<(u64, u64)> {
+    if objects.is_empty() {
+        return Ok((0, 0));
+    }
+    let mut stmt = tx.prepare(&propagate_object_sql())?;
+    let mut seen = std::collections::HashSet::new();
+    let (mut filled, mut statements) = (0u64, 0u64);
+    for &(device, inode) in objects {
+        if seen.insert((device, inode)) {
+            filled += stmt.execute(params![scan_id, device as i64, inode as i64])? as u64;
+            statements += 1;
+        }
+    }
+    Ok((filled, statements))
 }
 
 impl ScanStore {
@@ -2019,7 +2068,8 @@ impl ScanStore {
     /// This is the hash-once contract: the content of an allocation is read once, not once per
     /// pathname pointing at it. Every path row stays in the manifest — nothing is collapsed there —
     /// but only the representative is handed to the hashing phase, and the digest reaches its
-    /// aliases by propagation (`propagate_trusted_digests`) rather than by reading them again.
+    /// aliases by propagation (the scan-wide pass that opens a hashing session, then each
+    /// checkpoint's bounded one) rather than by reading them again.
     ///
     /// The representative is `MIN(path)` within the object, so it is deterministic across runs and
     /// across a resume. Aliases share `nlink` by construction, so `MIN` over the group returns
@@ -2148,8 +2198,9 @@ impl ScanStore {
     /// A checkpoint of fd-verified hashes of the scan phase. A conditional UPDATE —
     /// commits the hash ONLY if the row in the DB still carries the same identity that
     /// was verified on the descriptor (size + full time + dev/inode). 0 updated rows
-    /// = a race/change, NOT a success (the hash is not committed). `identity_version=1` is set
-    /// exclusively here → only these hashes qualify as a source of inheritance.
+    /// = a race/change, NOT a success (the hash is not committed). `identity_version=1` marks a
+    /// digest read here, inherited from one, or propagated from either → only these hashes
+    /// qualify as a source of inheritance.
     /// Returns the rows ACTUALLY committed (count + volume) — drives by them
     /// an honest DB progress via the persisted delta, without `candidate_stats` on each batch.
     pub fn record_hashes_verified(
@@ -2166,6 +2217,8 @@ impl ScanStore {
         let counter = &self.propagations;
         let tx = self.conn.transaction()?;
         let mut persisted = PersistedHashes::default();
+        // The objects whose representative committed: the only ones this checkpoint gave a source.
+        let mut committed: Vec<(u64, u64)> = Vec::with_capacity(rows.len());
         {
             let mut stmt = tx.prepare(
                 "UPDATE file SET hash = ?3, identity_version = 1
@@ -2193,16 +2246,21 @@ impl ScanStore {
                     persisted.representatives += updated as u64;
                     persisted.files += updated as u64;
                     persisted.bytes += row.size;
+                    committed.push((row.device, row.inode));
                 }
             }
         }
         // In the SAME transaction as the representatives: a crash must never leave an object
         // trusted while its unchanged aliases sit unpropagated, which a later run would then read
         // again. A representative that did not commit leaves no trusted source, so it propagates
-        // nothing — the identity check above is the only gate needed.
+        // nothing — the identity check above is the only gate needed. Bounded to the committed
+        // objects: see `propagate_object_sql` for why the scan-wide pass does not belong here.
+        let (filled, statements) = propagate_committed_objects(&tx, scan_id, &committed)?;
         #[cfg(test)]
-        counter.set(counter.get() + 1);
-        persisted.files += propagate_trusted_digests(&tx, scan_id)?;
+        counter.set(counter.get() + statements);
+        #[cfg(not(test))]
+        let _ = statements;
+        persisted.files += filled;
         tx.commit()?;
         Ok(persisted)
     }
@@ -14001,12 +14059,12 @@ mod tests {
             "the unobserved link must not appear in the manifest"
         );
 
-        // One propagation statement for the inheritance pass plus one per hashing batch — never
-        // one per alias.
+        // One propagation statement for the pass that opens the session, then one per object the
+        // batch committed — never one per alias.
         assert_eq!(
             store.propagation_statements(),
-            2,
-            "set-based propagation: one inheritance pass + one batch"
+            1 + 3,
+            "the opening pass + one per committed object"
         );
     }
 
@@ -14437,6 +14495,291 @@ mod tests {
         assert_eq!(hash_of(&store, id, "/x/b"), None);
     }
 
+    /// A checkpoint fills the aliases of the objects IT committed, and nothing else.
+    ///
+    /// The planted source cannot arise in the product: after the pass that opens a session, the
+    /// only new sources are a checkpoint's own representatives, which
+    /// `after_every_checkpoint_the_scan_wide_pass_has_nothing_left_to_fill` guards. This test
+    /// guards the cost boundary, not a wanted outcome.
+    ///
+    /// Red on the parent, where every checkpoint re-ran the scan-wide pass: the digest planted on
+    /// `/x/c` — standing in for any source this checkpoint did not write — spread to `/x/d` on a
+    /// checkpoint that never touched their object. That sweep over every hash-null row cost about
+    /// 4.5 s of CPU per 64-file batch on a two-million-file scan.
+    #[test]
+    fn a_checkpoint_fills_only_the_objects_it_committed() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store
+            .record_files(
+                id,
+                &[
+                    alias_row("/x/a", 2, 11),
+                    alias_row("/x/b", 2, 11),
+                    alias_row("/x/c", 3, 11),
+                    alias_row("/x/d", 3, 11),
+                ],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE file SET hash = ?1, identity_version = 1
+                 WHERE scan_id = ?2 AND path = '/x/c'",
+                params![&[6u8; 32][..], id],
+            )
+            .unwrap();
+
+        let persisted = store
+            .record_hashes_verified(id, &[(alias_row("/x/a", 2, 11), [5u8; 32])])
+            .unwrap();
+        assert_eq!(persisted.representatives, 1);
+        assert_eq!(persisted.files, 2, "the representative and its own alias");
+        assert!(hash_of(&store, id, "/x/b").is_some());
+        assert_eq!(hash_of(&store, id, "/x/b"), hash_of(&store, id, "/x/a"));
+        assert_eq!(
+            hash_of(&store, id, "/x/d"),
+            None,
+            "another object's alias is not this checkpoint's business"
+        );
+    }
+
+    /// The checkpoint's statement costs the object it names, not the scan: beside thousands of
+    /// hash-null rows it stays within a few hundred VM steps, while the scan-wide pass pays for
+    /// every one of them.
+    #[test]
+    fn the_checkpoint_propagation_costs_its_object_not_the_scan() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        let mut rows = vec![alias_row("/x/a", 2, 11), alias_row("/x/b", 2, 11)];
+        rows.extend((0..3_000u64).map(|n| alias_row(&format!("/x/n{n}"), 100 + n, 11)));
+        store.record_files(id, &rows).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE file SET hash = ?1, identity_version = 1
+                 WHERE scan_id = ?2 AND path = '/x/a'",
+                params![&[5u8; 32][..], id],
+            )
+            .unwrap();
+
+        let mut bounded = store.conn.prepare(&propagate_object_sql()).unwrap();
+        assert_eq!(
+            bounded.execute(params![id, 1i64, 2i64]).unwrap(),
+            1,
+            "the alias is filled"
+        );
+        let bounded_steps = bounded.get_status(rusqlite::StatementStatus::VmStep);
+
+        let mut wide = store.conn.prepare(&propagate_sql()).unwrap();
+        assert_eq!(
+            wide.execute(params![id]).unwrap(),
+            0,
+            "nothing is left for the wide pass"
+        );
+        let wide_steps = wide.get_status(rusqlite::StatementStatus::VmStep);
+
+        assert!(
+            bounded_steps < 500,
+            "{bounded_steps} VM steps for one object beside 3000 hash-null rows"
+        );
+        assert!(
+            wide_steps > 3_000,
+            "the scan-wide pass walks every hash-null row: {wide_steps} VM steps"
+        );
+    }
+
+    /// An alias whose inode changed between the two names being read keeps no digest and no trust
+    /// mark, and the checkpoint does not count it. Without the trusted-source check the bounded
+    /// statement would mark it trusted with no digest and report it as done.
+    #[test]
+    fn a_checkpoint_does_not_fill_or_count_an_alias_of_a_changed_object() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store
+            .record_files(id, &[alias_row("/x/a", 2, 11), alias_row("/x/b", 2, 12)])
+            .unwrap();
+
+        let persisted = store
+            .record_hashes_verified(id, &[(alias_row("/x/a", 2, 11), [5u8; 32])])
+            .unwrap();
+        assert_eq!(persisted.representatives, 1);
+        assert_eq!(persisted.files, 1, "only the representative is done");
+        assert_eq!(hash_of(&store, id, "/x/b"), None);
+        let trust: i64 = store
+            .conn
+            .query_row(
+                "SELECT identity_version FROM file WHERE scan_id = ?1 AND path = '/x/b'",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trust, 0, "an alias without a digest is not trusted");
+    }
+
+    /// The claim the checkpoint's bounded propagation rests on: after the pass that opens a
+    /// hashing session, the only new trusted sources are a checkpoint's own representatives, so the
+    /// scan-wide pass never has anything left to fill. Randomized runs of the production call
+    /// sequence — past scans with or without hash reuse, one or two sessions with the first stopped
+    /// part-way, checkpoints of random size with failed reads — check it after every checkpoint.
+    /// The seeds are fixed, so a failure repeats.
+    #[test]
+    fn after_every_checkpoint_the_scan_wide_pass_has_nothing_left_to_fill() {
+        for seed in 0..200u64 {
+            let reuse = seed % 2 == 1;
+            let left = checkpoint_leftovers(seed, reuse);
+            assert_eq!(
+                left, 0,
+                "seed {seed}, hash reuse {reuse}: the scan-wide pass would still fill {left} rows"
+            );
+        }
+    }
+
+    /// One randomized run for the test above: the most rows the scan-wide pass would have filled
+    /// right after any single checkpoint.
+    fn checkpoint_leftovers(seed: u64, reuse: bool) -> u64 {
+        /// xorshift64*: repeatable without a dependency.
+        struct Rng(u64);
+        impl Rng {
+            fn below(&mut self, n: u64) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D) % n.max(1)
+            }
+            fn chance(&mut self, pct: u64) -> bool {
+                self.below(100) < pct
+            }
+        }
+        fn row(path: String, device: u64, inode: u64, size: u64, ctime_nsec: i64) -> ManifestRow {
+            ManifestRow {
+                path: PathBuf::from(path),
+                size,
+                mtime: 1_700_000_000,
+                mtime_nsec: 5,
+                ctime_sec: 1_700_000_100,
+                ctime_nsec,
+                device,
+                inode,
+                nlink: 4,
+            }
+        }
+        /// What a read would produce: a function of the complete identity, so every digest of one
+        /// object agrees, whether read, inherited or propagated.
+        fn digest(r: &ManifestRow) -> [u8; 32] {
+            let identity = format!(
+                "{}:{}:{}:{}:{}:{}:{}",
+                r.device, r.inode, r.size, r.mtime, r.mtime_nsec, r.ctime_sec, r.ctime_nsec
+            );
+            *blake3::hash(identity.as_bytes()).as_bytes()
+        }
+        fn leftovers(store: &ScanStore, scan_id: i64) -> u64 {
+            store
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM file WHERE scan_id = ?1 AND hash IS NULL
+                           AND EXISTS (SELECT 1 FROM file AS src WHERE {TRUSTED_SOURCE})"
+                    ),
+                    params![scan_id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap() as u64
+        }
+
+        let mut rng = Rng((seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03) | 1);
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let objects = 2 + rng.below(40);
+        let mut current = Vec::new();
+        for i in 0..objects {
+            let device = 1 + rng.below(2);
+            let inode = 10 + rng.below(3 * objects);
+            let size = if rng.chance(15) {
+                1000 + i
+            } else {
+                100 * (1 + rng.below(3))
+            };
+            for j in 0..1 + rng.below(4) {
+                // Some pathnames were read after their inode changed.
+                let ctime_nsec = if rng.chance(12) {
+                    1 + rng.below(2) as i64
+                } else {
+                    0
+                };
+                current.push(row(
+                    format!("/x/o{i}/a{j}"),
+                    device,
+                    inode,
+                    size,
+                    ctime_nsec,
+                ));
+            }
+        }
+        for _ in 0..rng.below(3) {
+            let past = store
+                .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+                .unwrap();
+            let mut rows = Vec::new();
+            for r in &current {
+                if rng.chance(50) {
+                    let mut seen = r.clone();
+                    if rng.chance(30) {
+                        seen.ctime_nsec += 10;
+                    }
+                    rows.push(seen);
+                }
+            }
+            store.record_files(past, &rows).unwrap();
+            let pairs: Vec<_> = rows.iter().map(|r| (r.clone(), digest(r))).collect();
+            store.record_hashes_verified(past, &pairs).unwrap();
+            store.set_status(past, ScanStatus::Complete).unwrap();
+        }
+        let id = store
+            .begin_scan(&ScanConfig::new(vec![PathBuf::from("/x")]))
+            .unwrap();
+        store.record_files(id, &current).unwrap();
+        store.set_status(id, ScanStatus::Hashing).unwrap();
+
+        let mut worst = 0;
+        let sessions = if rng.chance(50) { 2 } else { 1 };
+        for session in 0..sessions {
+            if reuse {
+                store.inherit_hashes(id).unwrap();
+            }
+            store.propagate_inherited_hashes(id).unwrap();
+            let mut candidates = store.candidate_objects(id).unwrap();
+            candidates.sort_by_key(|r| (r.device, r.inode));
+            // The first of two sessions stops part-way, as a cancellation or a crash leaves it.
+            let limit = if session + 1 < sessions {
+                rng.below(candidates.len() as u64 + 1) as usize
+            } else {
+                candidates.len()
+            };
+            let mut next = 0;
+            while next < limit {
+                let end = (next + 1 + rng.below(8) as usize).min(limit);
+                // Some reads fail or find the identity moved on disk: those are not committed.
+                let batch: Vec<_> = candidates[next..end]
+                    .iter()
+                    .filter(|_| !rng.chance(15))
+                    .map(|r| (r.clone(), digest(r)))
+                    .collect();
+                store.record_hashes_verified(id, &batch).unwrap();
+                worst = worst.max(leftovers(&store, id));
+                next = end;
+            }
+        }
+        worst
+    }
+
     /// After a cancellation the committed objects stay committed, and a resume re-selects only
     /// what is genuinely left — each remaining allocation exactly once.
     #[test]
@@ -14518,7 +14861,7 @@ mod tests {
         assert_eq!(
             store.propagation_statements() - before,
             1,
-            "one statement for the batch, not one per alias"
+            "one statement for the one committed object, not one per alias"
         );
 
         let after = store.candidate_stats(id).unwrap();

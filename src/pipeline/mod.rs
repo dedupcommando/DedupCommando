@@ -45,6 +45,13 @@ enum WalkPublication {
 const WALK_BATCH: usize = 2048;
 /// Hashing batch size (= the interval between checkpoints and progress updates).
 const HASH_CHUNK: usize = 64;
+/// At most one hashing progress report per tick, whether from inside a batch or at its end; the
+/// last batch, and a batch after which the scan stops, are always reported.
+const HASH_TICK: Duration = Duration::from_millis(200);
+/// How often the coordinator looks whether the batch is done. Short on purpose: a batch of small
+/// files takes a few milliseconds, and waiting a whole `HASH_TICK` for it rounded every batch up to
+/// 200 ms — a ceiling of 64 files per tick (~320 a second) whatever the disks could do.
+const HASH_POLL: Duration = Duration::from_millis(5);
 
 /// Empirical estimate of the grouping-phase peak memory per ONE hashed file:
 /// `file_hash_status` (~290 B) + `build_dir_groups` (~2.2 KiB, a replica of the record under each
@@ -702,7 +709,8 @@ fn hash_phase(
     // Immediately after inheritance and before any candidate is chosen: give every alias of an
     // object the digest one of its pathnames inherited. An object whose aliases are all filled in
     // this way is no longer a candidate and costs zero reads. Refuses if two aliases inherited
-    // different digests — see `propagate_inherited_hashes`.
+    // different digests — see `propagate_inherited_hashes`. It must stay AFTER inheritance: a
+    // checkpoint fills only the objects it read itself, so nothing later spreads an inherited digest.
     let propagated = store.propagate_inherited_hashes(scan_id)?;
     if propagated > 0 {
         tracing::info!("hash reuse: {propagated} aliases filled from an inherited digest");
@@ -772,7 +780,11 @@ fn hash_phase(
         profile.label()
     );
 
-    for chunk in candidates.chunks(HASH_CHUNK) {
+    // Progress keeps its old cadence — at most one report per `HASH_TICK`, plus the last batch —
+    // now that a batch of small files can finish in milliseconds.
+    let mut last_report = Instant::now();
+    let batches = candidates.len().div_ceil(HASH_CHUNK);
+    for (batch, chunk) in candidates.chunks(HASH_CHUNK).enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Ok(false);
         }
@@ -824,9 +836,14 @@ fn hash_phase(
                 })
             });
 
-            // While the batch is being computed — we send progress every 200 ms.
+            // While the batch is being computed — progress every `HASH_TICK`, and the end of the
+            // batch noticed within `HASH_POLL` instead of at the next tick.
             while !handle.is_finished() {
-                thread::sleep(Duration::from_millis(200));
+                thread::sleep(HASH_POLL);
+                if last_report.elapsed() < HASH_TICK {
+                    continue;
+                }
+                last_report = Instant::now();
                 // Live bytes read (incl. the current batch's files, not yet committed) —
                 // ONLY for rate/ETA (this is read throughput). They do NOT go into the
                 // `bytes_done` field: the progress must reflect only committed
@@ -886,25 +903,31 @@ fn hash_phase(
             files_done,
             bytes_done,
         );
-        let (rate, eta, ema) = governor::rate_eta(
-            phase_start.elapsed().as_secs_f64(),
-            bytes_done.saturating_sub(session_start_bytes),
-            bytes_total.saturating_sub(bytes_done),
-            ema_rate,
-        );
-        ema_rate = ema;
-        on_progress(ScanProgress::Hashing {
-            files_done,
-            files_total,
-            bytes_done,
-            bytes_total,
-            chunk_done: chunk_total,
-            chunk_total,
-            current_path: chunk.first().map(|row| row.path.clone()),
-            rate_bytes_per_sec: rate,
-            eta_secs: eta,
-            hash_failures: hash_failures_seen,
-        });
+        if batch + 1 == batches
+            || cancel.load(Ordering::Relaxed)
+            || last_report.elapsed() >= HASH_TICK
+        {
+            last_report = Instant::now();
+            let (rate, eta, ema) = governor::rate_eta(
+                phase_start.elapsed().as_secs_f64(),
+                bytes_done.saturating_sub(session_start_bytes),
+                bytes_total.saturating_sub(bytes_done),
+                ema_rate,
+            );
+            ema_rate = ema;
+            on_progress(ScanProgress::Hashing {
+                files_done,
+                files_total,
+                bytes_done,
+                bytes_total,
+                chunk_done: chunk_total,
+                chunk_total,
+                current_path: chunk.first().map(|row| row.path.clone()),
+                rate_bytes_per_sec: rate,
+                eta_secs: eta,
+                hash_failures: hash_failures_seen,
+            });
+        }
         tracing::info!("hash progress: {files_done}/{files_total} files");
     }
 
@@ -995,6 +1018,85 @@ mod hash_failures_tests {
             store.scan_status(results.scan_id).unwrap(),
             ScanStatus::Complete,
             "status Complete without warnings"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A hard link the first scan did not see costs no read in the second: its own path inherits
+    /// nothing, but its object does, and the pass that opens hashing spreads that digest to it.
+    /// That holds only while the pass runs AFTER inheritance — a checkpoint fills only the objects
+    /// it read itself, so nothing later would repair a swapped order.
+    #[test]
+    fn a_hard_link_the_last_scan_did_not_see_is_not_read() {
+        let base = unique_temp_dir("free_alias");
+        let a_dir = base.join("A");
+        let b_dir = base.join("B");
+        std::fs::create_dir_all(&a_dir).unwrap();
+        std::fs::create_dir_all(&b_dir).unwrap();
+        std::fs::write(a_dir.join("a.bin"), vec![7u8; 4096]).unwrap();
+        std::fs::write(a_dir.join("c.bin"), vec![7u8; 4096]).unwrap();
+        std::fs::hard_link(a_dir.join("a.bin"), b_dir.join("b.bin")).unwrap();
+        let config = |roots: Vec<PathBuf>| {
+            let mut cfg = ScanConfig::new(roots);
+            cfg.min_size = 0;
+            cfg.exclude_globs = Vec::new();
+            cfg
+        };
+
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(false);
+        let first = config(vec![a_dir.clone()]);
+        assert!(matches!(
+            run_scan(&mut store, &first, None, false, &cancel, |_| {}).unwrap(),
+            ScanOutcome::Completed(_)
+        ));
+        let second = config(vec![a_dir.clone(), b_dir.clone()]);
+        let log = crate::testfixtures::ReadLog::start();
+        let outcome = run_scan(&mut store, &second, None, false, &cancel, |_| {}).unwrap();
+        let reads = log.paths();
+        drop(log);
+
+        assert!(matches!(outcome, ScanOutcome::Completed(_)));
+        assert!(
+            !reads.iter().any(|path| path.starts_with(&base)),
+            "every object was read by the first scan, the link inherits through it: {reads:?}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The last batch is always reported, however fast it went: reports are at least `HASH_TICK`
+    /// apart, and a phase that ends inside that wait must still show every file done.
+    #[test]
+    fn the_last_hashing_batch_is_always_reported() {
+        let dir = unique_temp_dir("last_batch");
+        std::fs::write(dir.join("a.bin"), b"identical duplicate content").unwrap();
+        std::fs::write(dir.join("b.bin"), b"identical duplicate content").unwrap();
+
+        let mut cfg = ScanConfig::new(vec![dir.clone()]);
+        cfg.min_size = 0;
+        cfg.exclude_globs = Vec::new();
+
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut hashing = Vec::new();
+        let outcome = run_scan(&mut store, &cfg, None, false, &cancel, |progress| {
+            if let ScanProgress::Hashing {
+                files_done,
+                files_total,
+                ..
+            } = progress
+            {
+                hashing.push((files_done, files_total));
+            }
+        })
+        .unwrap();
+
+        assert!(matches!(outcome, ScanOutcome::Completed(_)));
+        assert_eq!(
+            hashing.last(),
+            Some(&(2, 2)),
+            "the last report shows both files hashed: {hashing:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
