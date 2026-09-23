@@ -6736,6 +6736,397 @@ mod dir_watch_tests {
             );
         }
 
+        /// A plan answer as the actor delivers it: a real plan over real files (the fixture scan's
+        /// digests were never verified against files, so its own plans are refused), on the route
+        /// F11 records. The scenario owns the files and must outlive the check.
+        fn deliver_a_plan(app: &mut App) -> crate::testfixtures::PlanScenario {
+            use crate::state::browse::{BrowseEvent, RequestId};
+            let scenario = crate::testfixtures::PlanScenario::new("b12_plan");
+            let keeper = scenario.file("keeper.bin");
+            let twin = scenario.file("twin.bin");
+            let mut store = scenario.store();
+            let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
+            scenario.mark(&mut store, scan_id, &keeper, true, None);
+            scenario.mark(&mut store, scan_id, &twin, false, Some(ActionKind::Delete));
+            drop(store);
+            let plan = crate::actions::tests::plan_of(&scenario, scan_id);
+            let req = RequestId(u64::MAX - 12);
+            app.routes.plan = Some((req, crate::app::PlanWindow::Commander));
+            app.handle_event(crate::tui::event::AppEvent::Browse(Box::new(
+                BrowseEvent::PlanReady {
+                    act: app.installed_act,
+                    req,
+                    plan: Box::new(plan),
+                },
+            )));
+            scenario
+        }
+
+        /// A file-info answer as the actor delivers it, on the route recorded for `purpose`.
+        fn deliver_file_info(
+            app: &mut App,
+            purpose: crate::app::InfoPurpose,
+            result: std::result::Result<
+                Box<crate::state::FileInfoAnswer>,
+                crate::state::browse::StoreMiss,
+            >,
+        ) {
+            use crate::state::browse::{BrowseEvent, RequestId};
+            let req = RequestId(u64::MAX - 13);
+            app.routes.infos.insert(req.0, purpose);
+            app.handle_event(crate::tui::event::AppEvent::Browse(Box::new(
+                BrowseEvent::FileInfo {
+                    act: app.installed_act,
+                    req,
+                    result,
+                },
+            )));
+        }
+
+        /// The route F3 records for its own window.
+        fn f3_window() -> crate::app::InfoPurpose {
+            crate::app::InfoPurpose::Overlay {
+                header: vec!["Name:     IMG_3120.HEIC".to_string()],
+            }
+        }
+
+        /// The fixture with a mark set and settled, so the menu's fifth item has marks to ask
+        /// about once nothing is in flight.
+        fn marked_app() -> (
+            PathBuf,
+            App,
+            crossbeam_channel::Receiver<crate::tui::event::AppEvent>,
+        ) {
+            let (db, _scan_id, mut app, events) = clear_marks_app();
+            press(&mut app, KeyCode::F(7));
+            settle(&mut app, &events);
+            (db, app, events)
+        }
+
+        /// F9 with the cursor on the fifth item, «Clear all marks».
+        fn open_menu(app: &mut App) {
+            press(app, KeyCode::F(9));
+            for _ in 0..4 {
+                press(app, KeyCode::Down);
+            }
+            assert_eq!(app.commander.overlay, Overlay::Menu { cursor: 4 });
+        }
+
+        fn f2_check_landed(app: &App) -> bool {
+            app.commander.resume_probes_in_flight == 0
+        }
+
+        /// What an answer held back leaves: the window in front untouched, no scan started, and
+        /// a note that puts the key to press before the reason.
+        fn assert_held_back(app: &App, window: Overlay, key: &str) {
+            assert_eq!(app.commander.overlay, window, "the window in front stays");
+            assert!(app.scan.is_none(), "no scan was started");
+            let lead = format!("Close this window, press {key} again: ");
+            assert!(
+                app.commander.status.starts_with(&lead),
+                "{:?}",
+                app.commander.status
+            );
+        }
+
+        /// The menu's own Enter: its fifth item is «Clear all marks», and with nothing in flight
+        /// any more the question opens. The key went where the operator meant it.
+        fn enter_reaches_the_menu(app: &mut App) {
+            press(app, KeyCode::Enter);
+            assert_eq!(
+                app.commander.overlay,
+                Overlay::ClearMarks,
+                "Enter reached the menu: {:?}",
+                app.commander.status
+            );
+        }
+
+        /// B12 — the F2 answer over saved scans does not put the scan choice over the F9 menu.
+        ///
+        /// Red on the parent: it did, and the menu's Enter went to the choice and opened the
+        /// scan's results.
+        #[test]
+        fn a_saved_scan_answer_stays_behind_the_menu() {
+            let _role = crate::state::store::role_guard();
+            let (_db, mut app, events) = marked_app();
+            app.commander_scan(vec![PathBuf::from("/tank")]);
+            open_menu(&mut app);
+            crate::app::pump_until(&mut app, &events, "the F2 check", f2_check_landed);
+            assert_held_back(&app, Overlay::Menu { cursor: 4 }, "F2");
+            enter_reaches_the_menu(&mut app);
+            crate::app::drain(&mut app, &events);
+        }
+
+        /// An answer of «no saved scan» starts no scan from under the menu. Red on the parent: it
+        /// started scanning and left the commander for the scanning screen.
+        #[test]
+        fn a_no_saved_scan_answer_starts_nothing_behind_the_menu() {
+            let _role = crate::state::store::role_guard();
+            let (_db, mut app, events) = marked_app();
+            app.commander_scan(vec![PathBuf::from("/nowhere-scanned")]);
+            open_menu(&mut app);
+            crate::app::pump_until(&mut app, &events, "the F2 check", f2_check_landed);
+            assert_eq!(app.mode, crate::app::AppMode::Commander);
+            assert_held_back(&app, Overlay::Menu { cursor: 4 }, "F2");
+            enter_reaches_the_menu(&mut app);
+            crate::app::drain(&mut app, &events);
+        }
+
+        /// The F3 answer stays behind the menu. Red on the parent: the file info took the menu's
+        /// place.
+        #[test]
+        fn a_file_info_answer_stays_behind_the_menu() {
+            let _role = crate::state::store::role_guard();
+            let (_db, mut app, events) = marked_app();
+            press(&mut app, KeyCode::F(3));
+            open_menu(&mut app);
+            crate::app::pump_until(&mut app, &events, "the F3 answer", |app| {
+                app.routes.infos.is_empty()
+            });
+            assert_held_back(&app, Overlay::Menu { cursor: 4 }, "F3");
+            enter_reaches_the_menu(&mut app);
+            crate::app::drain(&mut app, &events);
+        }
+
+        /// So does an F3 answer whose read failed: that half opens the same window.
+        #[test]
+        fn a_failed_file_info_answer_stays_behind_the_menu() {
+            let _role = crate::state::store::role_guard();
+            let (_db, mut app, events) = marked_app();
+            open_menu(&mut app);
+            deliver_file_info(
+                &mut app,
+                f3_window(),
+                Err(crate::state::browse::StoreMiss::NoActiveScan),
+            );
+            assert_held_back(&app, Overlay::Menu { cursor: 4 }, "F3");
+            enter_reaches_the_menu(&mut app);
+            crate::app::drain(&mut app, &events);
+        }
+
+        /// A built plan is not seated behind the menu, and the manual says what a late answer
+        /// does. Red on the parent: the confirmation took the menu's place.
+        #[test]
+        fn a_plan_answer_stays_behind_the_menu() {
+            let _role = crate::state::store::role_guard();
+            let (_db, mut app, events) = marked_app();
+            open_menu(&mut app);
+            let _plan = deliver_a_plan(&mut app);
+            assert_held_back(&app, Overlay::Menu { cursor: 4 }, "F11 (or x)");
+            assert!(app.commander.pending_plan.is_none(), "no plan seated");
+            enter_reaches_the_menu(&mut app);
+            crate::app::drain(&mut app, &events);
+
+            let manual = crate::testfixtures::manual("05-commando.md");
+            let manual = manual.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                manual.contains("the answer opens nothing and starts no scan"),
+                "the manual states what a late answer does"
+            );
+        }
+
+        /// Any window in front holds an answer back, not only the menu: here the F11
+        /// confirmation, whose plan stays seated under a late F2 answer.
+        #[test]
+        fn a_late_answer_does_not_replace_a_seated_confirmation() {
+            let _role = crate::state::store::role_guard();
+            let (_db, mut app, events) = marked_app();
+            let _plan = deliver_a_plan(&mut app);
+            let confirm = Overlay::Confirm {
+                tab: state::ConfirmTab::Summary,
+            };
+            assert_eq!(app.commander.overlay, confirm);
+            app.commander_scan(vec![PathBuf::from("/tank")]);
+            crate::app::pump_until(&mut app, &events, "the F2 check", f2_check_landed);
+            assert_held_back(&app, confirm, "F2");
+            assert!(
+                app.commander.pending_plan.is_some(),
+                "the plan stays seated"
+            );
+            crate::app::drain(&mut app, &events);
+        }
+
+        /// Help takes every key: nothing is seated under it, and no scan starts while the
+        /// operator is reading.
+        #[test]
+        fn a_late_answer_does_not_act_under_help() {
+            let _role = crate::state::store::role_guard();
+            for root in ["/tank", "/nowhere-scanned"] {
+                let (_db, mut app, events) = marked_app();
+                app.commander_scan(vec![PathBuf::from(root)]);
+                press(&mut app, KeyCode::F(1));
+                assert!(app.show_help);
+                crate::app::pump_until(&mut app, &events, root, f2_check_landed);
+                assert_eq!(app.mode, crate::app::AppMode::Commander, "{root}");
+                assert_held_back(&app, Overlay::None, "F2");
+                crate::app::drain(&mut app, &events);
+            }
+        }
+
+        /// The Triage Board is a screen of its own that takes every key: nothing is put under it
+        /// and no scan starts from under it. Red on the parent (found by the review): the answer
+        /// of «no saved scan» started scanning from under the board.
+        #[test]
+        fn a_late_answer_does_not_act_under_the_triage_board() {
+            let _role = crate::state::store::role_guard();
+            for root in ["/tank", "/nowhere-scanned"] {
+                let (_db, mut app, events) = marked_app();
+                app.commander_scan(vec![PathBuf::from(root)]);
+                press(&mut app, KeyCode::Char('`'));
+                press(&mut app, KeyCode::F(12));
+                assert!(app.commander.board_active, "{root}");
+                crate::app::pump_until(&mut app, &events, root, f2_check_landed);
+                assert!(app.commander.board_active, "{root}: the board stays");
+                assert_eq!(app.mode, crate::app::AppMode::Commander, "{root}");
+                assert_held_back(&app, Overlay::None, "F2");
+                crate::app::drain(&mut app, &events);
+            }
+        }
+
+        /// A move waiting for its target panel takes every key as well.
+        #[test]
+        fn a_late_answer_does_not_act_while_a_move_waits_for_its_panel() {
+            let _role = crate::state::store::role_guard();
+            let (_db, mut app, events) = marked_app();
+            app.commander_scan(vec![PathBuf::from("/nowhere-scanned")]);
+            press(&mut app, KeyCode::Char('m'));
+            assert!(app.commander.triage.is_some());
+            crate::app::pump_until(&mut app, &events, "the F2 check", f2_check_landed);
+            assert!(app.commander.triage.is_some(), "the move still waits");
+            assert_eq!(app.mode, crate::app::AppMode::Commander);
+            assert_held_back(&app, Overlay::None, "F2");
+            crate::app::drain(&mut app, &events);
+        }
+
+        /// Away from the commander — a wizard screen opened from the F9 menu — the answer starts
+        /// nothing and moves nobody, and the note is on the status line of the screen the
+        /// operator is on. Red on the parent: it moved the operator to the scanning screen.
+        #[test]
+        fn a_late_answer_does_not_act_while_another_screen_is_open() {
+            let _role = crate::state::store::role_guard();
+            let (_db, mut app, events) = marked_app();
+            app.commander_scan(vec![PathBuf::from("/nowhere-scanned")]);
+            app.open_wizard(crate::app::Screen::Resume);
+            crate::app::pump_until(&mut app, &events, "the F2 check", f2_check_landed);
+            assert_eq!(app.mode, crate::app::AppMode::Wizard);
+            assert_eq!(
+                app.screen,
+                crate::app::Screen::Resume,
+                "not moved to scanning"
+            );
+            assert_held_back(&app, Overlay::None, "F2");
+            assert_eq!(
+                app.status, app.commander.status,
+                "the wizard draws its own line"
+            );
+            crate::app::drain(&mut app, &events);
+        }
+
+        /// Held back is the window, not the handling of the answer: a database replaced under
+        /// the view still uninstalls it, whatever window is open.
+        #[test]
+        fn a_fatal_file_info_miss_behind_a_window_still_uninstalls_the_view() {
+            let _role = crate::state::store::role_guard();
+            let (_db, mut app, events) = marked_app();
+            assert!(app.current_scan_id.is_some());
+            open_menu(&mut app);
+            deliver_file_info(
+                &mut app,
+                f3_window(),
+                Err(crate::state::browse::StoreMiss::PathChanged {
+                    detail: "the database file was replaced".to_string(),
+                }),
+            );
+            assert!(app.current_scan_id.is_none(), "the view was uninstalled");
+            crate::app::drain(&mut app, &events);
+        }
+
+        /// A watch panel is not a window: its answer still reaches it behind an open one.
+        #[test]
+        fn a_watch_answer_behind_a_window_still_reaches_its_panel() {
+            let _role = crate::state::store::role_guard();
+            let (_db, mut app, events) = marked_app();
+            open_menu(&mut app);
+            app.commander.watch_cache = vec![state::WatchEntry::default(); 1];
+            deliver_file_info(
+                &mut app,
+                crate::app::InfoPurpose::WatchDup { panel: 0 },
+                Ok(Box::new(crate::state::FileInfoAnswer::NotInScan)),
+            );
+            assert_eq!(
+                app.commander.watch_cache[0].empty,
+                state::WatchEmpty::NotInScan
+            );
+            assert_eq!(app.commander.overlay, Overlay::Menu { cursor: 4 });
+            crate::app::drain(&mut app, &events);
+        }
+
+        /// A check that failed opens nothing either way, and says why rather than inviting a
+        /// second F2 that would fail the same.
+        #[test]
+        fn a_failed_check_behind_a_window_still_says_why() {
+            let _role = crate::state::store::role_guard();
+            let (_db, mut app, events) = marked_app();
+            open_menu(&mut app);
+            app.handle_event(crate::tui::event::AppEvent::CommanderResumeProbe {
+                roots: vec![PathBuf::from("/tank")],
+                probe: Err("the check failed".to_string()),
+            });
+            assert_eq!(app.commander.status, "the check failed");
+            assert_eq!(app.commander.overlay, Overlay::Menu { cursor: 4 });
+            crate::app::drain(&mut app, &events);
+        }
+
+        /// The control: with nothing in front, each answer opens its window as before.
+        #[test]
+        fn an_answer_opens_its_window_when_nothing_is_open() {
+            let _role = crate::state::store::role_guard();
+
+            let (_db, mut app, events) = marked_app();
+            app.commander_scan(vec![PathBuf::from("/tank")]);
+            crate::app::pump_until(&mut app, &events, "the F2 check", f2_check_landed);
+            assert_eq!(app.commander.overlay, Overlay::ResumeScan, "F2");
+            crate::app::drain(&mut app, &events);
+
+            let (_db, mut app, events) = marked_app();
+            press(&mut app, KeyCode::F(3));
+            crate::app::pump_until(&mut app, &events, "the F3 answer", |app| {
+                app.routes.infos.is_empty()
+            });
+            assert_eq!(app.commander.overlay, Overlay::FileInfo, "F3");
+            crate::app::drain(&mut app, &events);
+
+            let (_db, mut app, events) = marked_app();
+            deliver_file_info(
+                &mut app,
+                f3_window(),
+                Err(crate::state::browse::StoreMiss::NoActiveScan),
+            );
+            assert_eq!(app.commander.overlay, Overlay::FileInfo, "a failed F3");
+            assert!(
+                app.commander
+                    .info_lines
+                    .iter()
+                    .any(|line| line.contains("file group unavailable")),
+                "{:?}",
+                app.commander.info_lines
+            );
+            crate::app::drain(&mut app, &events);
+
+            let (_db, mut app, events) = marked_app();
+            let _plan = deliver_a_plan(&mut app);
+            assert_eq!(
+                app.commander.overlay,
+                Overlay::Confirm {
+                    tab: state::ConfirmTab::Summary
+                },
+                "F11: {:?}",
+                app.commander.status
+            );
+            assert!(app.commander.pending_plan.is_some());
+            crate::app::drain(&mut app, &events);
+        }
+
         /// A question is about the scan it was asked over. An open installing a scan under it closes
         /// it with nothing cleared; a yes over another activation clears nothing; and a clear that
         /// reaches the actor after a reopen is reported, not dropped in silence.

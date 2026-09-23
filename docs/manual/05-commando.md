@@ -490,6 +490,14 @@ finished session, it asks what to do with it:
 | **N**   | Ignore everything, start a new scan                                   |
 | **Esc** | Cancel (return to the commander without a scan)                       |
 
+The check of saved scans runs in the background, as do the file info of F3 and
+the plan of F11. If something that takes the keys is in front when the answer
+arrives — the F9 menu or another F-key window, help, the Triage Board, a move
+waiting for its target panel — or you have left the commander, the answer
+opens nothing and starts no scan. Close what is in front and press the same key
+again. The status line says what arrived, except while a move waits for its
+panel: that line is the move's prompt then.
+
 ### Clear all marks — F9, item 5 (Overlay::ClearMarks)
 
 The F11 plan is built from every mark the database holds for the scan, marks

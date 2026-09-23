@@ -947,6 +947,12 @@ impl App {
                 self.commander.resume_probes_in_flight =
                     self.commander.resume_probes_in_flight.saturating_sub(1);
                 match probe {
+                    // An answer that lands after the operator moved on opens nothing and starts
+                    // nothing: the scan choice would take the Enter meant for the open window,
+                    // and a scan started unseen is hours of disk work. F2 asks again.
+                    Ok(_) if self.commander_window_open() => {
+                        self.note_late_answer("F2", "saved scans were checked")
+                    }
                     // Only a checkpoint that actually opened and holds no history for these roots
                     // is permission to start scanning.
                     Ok((None, None)) => self.commander_scan_new(roots),
@@ -1813,6 +1819,35 @@ impl App {
         }
     }
 
+    /// Whether an answer that arrives later may not open its window now: something that takes
+    /// every key is in front of the commander's panels — one of its windows, help, the Triage
+    /// Board, a move waiting for its target panel — or the operator is not on the commander at
+    /// all. Such an answer is dropped and the status line names the key that asks again: a window
+    /// put under the one the operator is using takes the key meant for that one, and a scan started
+    /// from under it runs unseen.
+    fn commander_window_open(&self) -> bool {
+        self.mode != AppMode::Commander
+            || self.show_help
+            || self.commander.board_active
+            || self.commander.triage.is_some()
+            || self.commander.overlay != crate::tui::commander::state::Overlay::None
+    }
+
+    /// The note for an answer `commander_window_open` held back. What to do comes first: the
+    /// status line is one row and a narrow terminal cuts its end. Away from the commander it goes
+    /// on the status line of the screen the operator is on as well, which is the one drawn.
+    fn note_late_answer(&mut self, key: &str, what: &str) {
+        let note = format!("Close this window, press {key} again: {what} while it was open");
+        if self.mode != AppMode::Commander {
+            self.status = note.clone();
+        }
+        self.commander.status = note;
+    }
+
+    fn file_info_arrived_late(&mut self) {
+        self.note_late_answer("F3", "the file info arrived")
+    }
+
     fn on_file_info(
         &mut self,
         act: Activation,
@@ -1832,6 +1867,9 @@ impl App {
                     return;
                 }
                 match purpose {
+                    InfoPurpose::Overlay { .. } if self.commander_window_open() => {
+                        self.file_info_arrived_late()
+                    }
                     InfoPurpose::Overlay { mut header } => {
                         header.push(format!("file group unavailable: {miss:?}"));
                         self.commander.info_lines = header;
@@ -1847,6 +1885,9 @@ impl App {
             }
         };
         match purpose {
+            InfoPurpose::Overlay { .. } if self.commander_window_open() => {
+                self.file_info_arrived_late()
+            }
             InfoPurpose::Overlay { header } => self.show_file_info(header, answer),
             InfoPurpose::WatchDup { panel } => self.watch_from_file_info(panel, answer),
         }
@@ -2610,6 +2651,11 @@ impl App {
                 };
                 self.status.clear();
                 self.screen = Screen::ActionReview;
+            }
+            // A plan is guarded only while its confirmation is seated, so one that cannot be
+            // seated now is dropped rather than kept aside: F11 builds it again.
+            PlanWindow::Commander if self.commander_window_open() => {
+                self.note_late_answer("F11 (or x)", "the plan was built")
             }
             PlanWindow::Commander => crate::tui::commander::actions::seat_plan(self, plan),
         }
