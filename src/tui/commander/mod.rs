@@ -7405,6 +7405,358 @@ mod dir_watch_tests {
                 }
             }
         }
+
+        /// B16 — the mouse does not reach what a window that takes every key is covering.
+        ///
+        /// Driven through `handle_event`, the way the terminal's events arrive: the route under
+        /// test is the one before the commander's own.
+        mod mouse_under_windows {
+            use super::*;
+            use crate::tui::event::AppEvent;
+
+            const WIDTH: u16 = 160;
+            const HEIGHT: u16 = 24;
+
+            /// The file under the cursor of the focused files panel of `clear_marks_app`.
+            fn old_copy() -> PathBuf {
+                PathBuf::from("/tank/old-copy/IMG_3120.HEIC")
+            }
+
+            /// `clear_marks_app` after consent: every test application starts with the startup
+            /// notice open.
+            fn open_app() -> (PathBuf, i64, App, crossbeam_channel::Receiver<AppEvent>) {
+                let (db, scan_id, mut app, events) = clear_marks_app();
+                app.show_disclaimer = false;
+                (db, scan_id, app, events)
+            }
+
+            fn mouse(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
+                app.handle_event(AppEvent::Mouse(MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                }));
+            }
+
+            fn click(app: &mut App, (column, row): (u16, u16)) {
+                mouse(app, MouseEventKind::Down(MouseButton::Left), column, row);
+            }
+
+            /// The middle of footer cell F`n`, on the commander drawn at 160×24.
+            fn footer_cell(app: &mut App, n: u16) -> (u16, u16) {
+                screen(app, WIDTH, HEIGHT);
+                let fkeys = layout::regions(Rect::new(0, 0, WIDTH, HEIGHT)).fkeys;
+                (fkeys.x + (2 * n - 1) * fkeys.width / 24, fkeys.y)
+            }
+
+            /// A panel other than the focused one and the place of its first entry, measured the
+            /// way a click is, on the commander drawn at 160×24.
+            fn other_panel_row(app: &mut App) -> (usize, (u16, u16)) {
+                screen(app, WIDTH, HEIGHT);
+                let regions = layout::regions(Rect::new(0, 0, WIDTH, HEIGHT));
+                let visible = visible_panel_count(app, regions.panels.width);
+                let rects = layout::panel_rects(regions.panels, visible);
+                let first = if app.commander.active < visible {
+                    0
+                } else {
+                    app.commander.active + 1 - visible
+                };
+                assert_ne!(
+                    first, app.commander.active,
+                    "the click aims at another panel"
+                );
+                (first, (rects[0].x + 2, rects[0].y + 1))
+            }
+
+            /// The wizard's group view with the first group open, drawn at 160×24, the index of its
+            /// first file that is not the keeper — a group opens with its keeper chosen, so only a
+            /// double click elsewhere changes what it shows — and the place the click handler maps to
+            /// that file. The handler counts rows from the top border and does not skip the claim
+            /// line drawn above the files, so that place is the row above the one the file is drawn
+            /// on: a defect of its own. What is tested here is whether a click reaches the handler
+            /// at all, so the place follows the handler, not the drawing.
+            fn classic_file_row(
+                app: &mut App,
+                events: &crossbeam_channel::Receiver<AppEvent>,
+            ) -> (usize, (u16, u16)) {
+                crate::app::pump_until(app, events, "the classic open group", |app| {
+                    app.browser.open_group.is_some()
+                });
+                app.open_wizard(crate::app::Screen::Browser);
+                crate::tui::hostile::frame_of(WIDTH, HEIGHT, |frame| {
+                    crate::tui::screens::browser::render(frame, app)
+                });
+                let files = app
+                    .browser
+                    .files_area
+                    .expect("the group view draws its files");
+                let index = app
+                    .browser
+                    .open_group
+                    .as_ref()
+                    .and_then(|open| open.files.iter().position(|file| !file.is_keeper))
+                    .expect("a file that is not the keeper");
+                (index, (files.x + 2, files.y + 1 + index as u16))
+            }
+
+            /// Where a single click in the wizard's group view would land: the file cursor and
+            /// whether the files have the focus.
+            fn classic_cursor(app: &App) -> (Option<usize>, bool) {
+                (app.browser.file_state.selected(), app.browser.focus_files)
+            }
+
+            /// The files of the group open in the wizard, with the keeper and the action each
+            /// shows.
+            fn group_marks(app: &App) -> Vec<(PathBuf, bool, Option<ActionKind>)> {
+                app.browser
+                    .open_group
+                    .as_ref()
+                    .map(|open| {
+                        open.files
+                            .iter()
+                            .map(|file| (file.path.clone(), file.is_keeper, file.action))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+
+            /// Help takes every key, and every click with them: the footer's 8 under it marks
+            /// nothing. Red on the parent: the click ran F8, and the file under the cursor was
+            /// marked for deletion with the write sent.
+            #[test]
+            fn a_click_on_f8_under_help_marks_nothing() {
+                let _role = crate::state::store::role_guard();
+                let (db, scan_id, mut app, events) = open_app();
+                press(&mut app, KeyCode::F(1));
+                assert!(app.show_help);
+                let cell = footer_cell(&mut app, 8);
+                click(&mut app, cell);
+                assert_eq!(app.commander.panels[2].marks.get(&old_copy()), None);
+                assert!(app.pending_marks.is_empty(), "no mark was sent");
+                assert!(app.show_help, "help stays open");
+                crate::app::drain(&mut app, &events);
+                assert_eq!(
+                    saved_marks(&db, scan_id),
+                    1,
+                    "the database holds the one it had"
+                );
+            }
+
+            /// A click on a panel under help moves neither the focus nor the cursor. Red on the
+            /// parent: the focus went to the panel clicked.
+            #[test]
+            fn a_click_on_a_panel_under_help_moves_nothing() {
+                let _role = crate::state::store::role_guard();
+                let (_db, _scan_id, mut app, events) = open_app();
+                let (panel, place) = other_panel_row(&mut app);
+                let cursor = app.commander.panels[panel].list.selected();
+                press(&mut app, KeyCode::F(1));
+                click(&mut app, place);
+                assert_eq!(app.commander.active, 2, "the focus stays off panel {panel}");
+                assert_eq!(app.commander.panels[panel].list.selected(), cursor);
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// Nor does the wheel. Red on the parent: it moved the focus to the panel under it.
+            #[test]
+            fn the_wheel_under_help_moves_nothing() {
+                let _role = crate::state::store::role_guard();
+                let (_db, _scan_id, mut app, events) = open_app();
+                let (panel, (column, row)) = other_panel_row(&mut app);
+                let cursor = app.commander.panels[panel].list.selected();
+                press(&mut app, KeyCode::F(1));
+                mouse(&mut app, MouseEventKind::ScrollDown, column, row);
+                assert_eq!(app.commander.active, 2, "the focus stays off panel {panel}");
+                assert_eq!(app.commander.panels[panel].list.selected(), cursor);
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// Before consent nothing under the startup notice is reachable: the footer's 2 sends
+            /// no check of saved scans. Red on the parent: the check went out, and over a directory
+            /// no scan covers its answer started scanning before the operator agreed to anything.
+            #[test]
+            fn a_click_before_consent_starts_no_scan() {
+                let _role = crate::state::store::role_guard();
+                let (_db, _scan_id, mut app, events) = clear_marks_app();
+                assert!(
+                    app.show_disclaimer,
+                    "a test application starts before consent"
+                );
+                app.commander.panels[2].cwd = PathBuf::from("/nowhere-scanned");
+                let cell = footer_cell(&mut app, 2);
+                click(&mut app, cell);
+                crate::app::pump_until(&mut app, &events, "the F2 check", f2_check_landed);
+                assert_eq!(
+                    app.mode,
+                    crate::app::AppMode::Commander,
+                    "not moved to scanning"
+                );
+                assert!(app.scan.is_none(), "no scan was started");
+                assert!(app.show_disclaimer, "the notice stays");
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// The role question takes every key until it is answered, and every click with them.
+            /// Red on the parent: the footer's 9 opened the menu under the question.
+            #[test]
+            fn a_click_under_the_role_question_opens_nothing() {
+                let _role = crate::state::store::role_guard();
+                let (_db, _scan_id, mut app, events) = open_app();
+                // Until the question is answered the application only reads, as `main` starts it.
+                app.read_only = true;
+                app.concurrency_prompt = Some(crate::lock::Holder {
+                    pid: 4242,
+                    since: "2026-09-23 10:00".to_string(),
+                });
+                let cell = footer_cell(&mut app, 9);
+                click(&mut app, cell);
+                assert_eq!(
+                    app.commander.overlay,
+                    Overlay::None,
+                    "no menu under the question"
+                );
+                assert!(
+                    app.concurrency_prompt.is_some(),
+                    "the question is still asked"
+                );
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// In the wizard's group view a double click is Enter, and Enter sets the keeper. Under
+            /// help it sets nothing. Red on the parent: the file clicked became the keeper, with the
+            /// write sent.
+            #[test]
+            fn a_double_click_under_help_sets_no_keeper() {
+                let _role = crate::state::store::role_guard();
+                let (_db, _scan_id, mut app, events) = open_app();
+                let (_, place) = classic_file_row(&mut app, &events);
+                let shown = group_marks(&app);
+                let cursor = classic_cursor(&app);
+                app.show_help = true;
+                click(&mut app, place);
+                assert_eq!(
+                    classic_cursor(&app),
+                    cursor,
+                    "the first click moved nothing"
+                );
+                click(&mut app, place);
+                assert_eq!(group_marks(&app), shown, "no keeper was set");
+                assert!(app.pending_marks.is_empty(), "no mark was sent");
+                assert!(app.show_help, "help stays open");
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// The wizard's yes/no question takes every key on any of its screens, the group view
+            /// included: an opened result switches to the group view without asking what is open.
+            /// A double click under it sets no keeper. Red on the parent: it set one.
+            #[test]
+            fn a_double_click_under_the_wizard_question_sets_no_keeper() {
+                let _role = crate::state::store::role_guard();
+                let (_db, scan_id, mut app, events) = open_app();
+                let (_, place) = classic_file_row(&mut app, &events);
+                let shown = group_marks(&app);
+                let cursor = classic_cursor(&app);
+                app.confirm = Some(crate::app::ConfirmAction::TrashScan(scan_id));
+                click(&mut app, place);
+                assert_eq!(
+                    classic_cursor(&app),
+                    cursor,
+                    "the first click moved nothing"
+                );
+                click(&mut app, place);
+                assert_eq!(group_marks(&app), shown, "no keeper was set");
+                assert!(app.pending_marks.is_empty(), "no mark was sent");
+                assert!(app.confirm.is_some(), "the question is still asked");
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// The manual says so where it tells the operator that a click on the footer runs the
+            /// command.
+            #[test]
+            fn the_manual_says_a_click_does_nothing_under_a_window() {
+                let manual = crate::testfixtures::manual("13-troubleshooting.md");
+                let manual = manual.split_whitespace().collect::<Vec<_>>().join(" ");
+                assert!(
+                    manual.contains(
+                        "A click does nothing while the startup notice, the role-selection \
+                         overlay, help, an F-key window or a yes/no question is open"
+                    ),
+                    "the manual states what a click under a window does"
+                );
+            }
+
+            /// The control: with nothing open each click does its own work. Without it the cases
+            /// above would pass for a click that missed its cell.
+            #[test]
+            fn with_nothing_open_each_click_does_its_work() {
+                let _role = crate::state::store::role_guard();
+
+                let (db, scan_id, mut app, events) = open_app();
+                let cell = footer_cell(&mut app, 8);
+                click(&mut app, cell);
+                assert_eq!(
+                    app.commander.panels[2].marks.get(&old_copy()),
+                    Some(&Mark::Delete),
+                    "F8: {:?}",
+                    app.commander.status
+                );
+                settle(&mut app, &events);
+                assert_eq!(saved_marks(&db, scan_id), 2, "F8 wrote its mark");
+                crate::app::drain(&mut app, &events);
+
+                let (_db, _scan_id, mut app, events) = open_app();
+                let (panel, place) = other_panel_row(&mut app);
+                click(&mut app, place);
+                assert_eq!(app.commander.active, panel, "a click on a panel");
+                crate::app::drain(&mut app, &events);
+
+                let (_db, _scan_id, mut app, events) = open_app();
+                let (panel, (column, row)) = other_panel_row(&mut app);
+                mouse(&mut app, MouseEventKind::ScrollDown, column, row);
+                assert_eq!(app.commander.active, panel, "the wheel");
+                crate::app::drain(&mut app, &events);
+
+                let (_db, _scan_id, mut app, events) = open_app();
+                app.commander.panels[2].cwd = PathBuf::from("/tank");
+                let cell = footer_cell(&mut app, 2);
+                click(&mut app, cell);
+                assert_eq!(
+                    app.commander.resume_probes_in_flight, 1,
+                    "F2 sent its check"
+                );
+                crate::app::pump_until(&mut app, &events, "the F2 check", f2_check_landed);
+                assert_eq!(app.commander.overlay, Overlay::ResumeScan, "F2");
+                crate::app::drain(&mut app, &events);
+
+                let (_db, _scan_id, mut app, events) = open_app();
+                let cell = footer_cell(&mut app, 9);
+                click(&mut app, cell);
+                assert_eq!(app.commander.overlay, Overlay::Menu { cursor: 0 }, "F9");
+                crate::app::drain(&mut app, &events);
+
+                let (_db, _scan_id, mut app, events) = open_app();
+                let (index, place) = classic_file_row(&mut app, &events);
+                click(&mut app, place);
+                assert_eq!(
+                    app.browser.file_state.selected(),
+                    Some(index),
+                    "the handler selected the file it maps the place to"
+                );
+                click(&mut app, place);
+                let keepers: Vec<bool> = group_marks(&app)
+                    .iter()
+                    .map(|(_, keeper, _)| *keeper)
+                    .collect();
+                assert!(
+                    keepers[index] && keepers.iter().filter(|keeper| **keeper).count() == 1,
+                    "a double click made that file the keeper: {keepers:?}"
+                );
+                assert!(!app.pending_marks.is_empty(), "and sent it");
+                settle(&mut app, &events);
+                crate::app::drain(&mut app, &events);
+            }
+        }
     }
 }
 

@@ -239,6 +239,8 @@ F9 → "Execute marked actions (F11 or x)"
 The prefix works for the whole first layer: `` ` `` then `1`…`9` = F1…F9,
 `` ` `` `0` = F10, `` ` `` `-` = F11, `` ` `` `=` = F12. A click on the footer cell
 also runs the command, but that needs mouse reporting (in tmux: `set -g mouse on`).
+A click does nothing while the startup notice, the role-selection overlay, help, an
+F-key window or a yes/no question is open: close it first.
 
 ### Shift+F works in a local terminal but not in the Proxmox web shell
 

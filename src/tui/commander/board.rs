@@ -208,6 +208,12 @@ pub fn on_key(app: &mut App, key: KeyEvent) {
 /// Mouse in Board: left click — focus the panel + cursor on the entry (a double
 /// click on a directory enters it), wheel — scroll the panel under the cursor.
 pub fn on_mouse(app: &mut App, mouse: MouseEvent) {
+    // A receiver waiting for its digit takes every key, as a move waiting for its panel does in
+    // the commander. A click would move the focus, and the digit would then assign the directory
+    // of another panel than the one focused when `a` was pressed.
+    if assign_pending(app) {
+        return;
+    }
     let area = Rect::new(0, 0, app.commander.term_width, app.commander.term_height);
     let [panels_area, _, _] = board_rows(area);
     let pos = Position {
@@ -681,5 +687,93 @@ mod hostile_name_tests {
         assert_eq!(status, format!("Receiver 1 ← /nonexistent/{RETITLE_SHOWN}"));
         let buffer = hostile::frame_of(300, 40, |frame| render(frame, &mut app));
         hostile::assert_inert(&buffer, "triage board after assigning a receiver");
+    }
+}
+
+/// B16 — the mouse does not reach the board while a receiver waits for its digit.
+#[cfg(test)]
+mod mouse_tests {
+    use super::*;
+    use crate::tui::commander::state::{BoardState, EntryKind};
+    use crate::tui::event::AppEvent;
+    use std::path::PathBuf;
+
+    const WIDTH: u16 = 160;
+    const HEIGHT: u16 = 40;
+
+    /// A board whose source and receivers each sit in a directory of their own, one file each,
+    /// drawn at 160×40 with the focus on the source. Nothing under the paths exists. The events
+    /// channel comes back with it, so a background read an assignment starts has somewhere to go.
+    fn board_app() -> (App, crossbeam_channel::Receiver<AppEvent>) {
+        let (mut app, events) = crate::app::test_app();
+        app.show_disclaimer = false;
+        let dir = |name: &str| PathBuf::from("/nonexistent/board").join(name);
+        let mut board = BoardState::new(dir("source"), ["r1", "r2", "r3", "r4"].map(dir));
+        for panel in std::iter::once(&mut board.source).chain(board.receivers.iter_mut()) {
+            panel.loading = false;
+            panel.entries = vec![crate::tui::hostile::entry(
+                panel.cwd.join("file.bin"),
+                EntryKind::File,
+            )];
+            panel.select(0);
+        }
+        app.commander.board = Some(board);
+        app.commander.board_active = true;
+        crate::tui::hostile::frame_of(WIDTH, HEIGHT, |frame| render(frame, &mut app));
+        assert_eq!(current_focus(&app), 0);
+        (app, events)
+    }
+
+    /// The first entry row of board slot `focus`, measured the way a click is.
+    fn slot_row(focus: usize) -> (u16, u16) {
+        let [panels, _, _] = board_rows(Rect::new(0, 0, WIDTH, HEIGHT));
+        let (_, rect) = board_slots(panels)
+            .into_iter()
+            .find(|(slot, _)| *slot == focus)
+            .expect("five slots");
+        (rect.x + 2, rect.y + 1)
+    }
+
+    fn click(app: &mut App, (column, row): (u16, u16)) {
+        app.handle_event(AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
+
+    fn key(app: &mut App, code: KeyCode) {
+        app.handle_event(AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    /// `a` on the source, a click on the first receiver, `2`: the second receiver gets the
+    /// source's directory — the one focused when `a` was pressed. Red on the parent: the click
+    /// moved the focus, and the digit assigned the first receiver's directory instead.
+    #[test]
+    fn a_click_while_a_receiver_waits_for_its_digit_moves_nothing() {
+        let (mut app, _events) = board_app();
+        key(&mut app, KeyCode::Char('a'));
+        assert!(assign_pending(&app));
+        click(&mut app, slot_row(1));
+        assert_eq!(current_focus(&app), 0, "the focus stays on the source");
+        assert!(
+            assign_pending(&app),
+            "the receiver still waits for its digit"
+        );
+        key(&mut app, KeyCode::Char('2'));
+        let board = app.commander.board.as_ref().expect("the board");
+        assert_eq!(
+            board.receivers[1].cwd,
+            PathBuf::from("/nonexistent/board/source")
+        );
+    }
+
+    /// The control: with nothing armed a click moves the focus to the panel clicked.
+    #[test]
+    fn with_nothing_armed_a_click_moves_the_focus() {
+        let (mut app, _events) = board_app();
+        click(&mut app, slot_row(1));
+        assert_eq!(current_focus(&app), 1);
     }
 }

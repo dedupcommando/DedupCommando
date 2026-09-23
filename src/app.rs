@@ -3453,12 +3453,21 @@ impl App {
 
     /// Mouse event: in commander mode — click and wheel over panels and the footer;
     /// on the Browser screen — wheel and left-click.
+    ///
+    /// A window that takes every key takes the mouse too, asked in the order `on_key` asks: the
+    /// startup notice, the role question and help are drawn over a screen that is still there, and
+    /// a click must not reach it — under help the footer's 8 would mark a file for deletion, before
+    /// consent its 2 would check for saved scans and could start one.
     fn on_mouse(&mut self, mouse: MouseEvent) {
+        if self.show_disclaimer || self.concurrency_prompt.is_some() || self.show_help {
+            return;
+        }
         if matches!(self.mode, AppMode::Commander) {
             crate::tui::commander::on_mouse(self, mouse);
             return;
         }
-        if matches!(self.screen, Screen::Browser) {
+        // The wizard's yes/no question takes every key on any of its screens.
+        if self.confirm.is_none() && matches!(self.screen, Screen::Browser) {
             self.on_mouse_browser(mouse);
         }
     }
