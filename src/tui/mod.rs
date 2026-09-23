@@ -340,8 +340,10 @@ fn render(frame: &mut Frame, app: &mut App) {
     if let Some(action) = app.confirm {
         render_confirm_modal(frame, action);
     }
-    // Loading animation for a finished scan's result (E2E feedback) — while it loads in the background.
-    if app.opening_started.is_some() {
+    // Loading animation for a finished scan's result (E2E feedback) — while it loads in the
+    // background, and not over a window that waits for a key: the box would hide what the window
+    // asks while its keys still answer it. The status line said the result is opening when it began.
+    if app.opening_started.is_some() && !app.window_waits_for_key() {
         render_opening_overlay(frame, app);
     }
     if app.show_help {

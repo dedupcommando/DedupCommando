@@ -179,6 +179,10 @@ pub struct Panel {
     pub sort: SortKey,
     /// Panel view mode — what it shows.
     pub view: PanelView,
+    /// Where the last frame drew a group's files in this panel: inside the frame, under the
+    /// group's claim line, a separator row after every 25th file. A click on them is counted from
+    /// it. `None` when the panel showed anything else.
+    pub group_files_list: Option<ratatui::layout::Rect>,
 }
 
 impl Panel {
@@ -211,6 +215,7 @@ impl Panel {
             generation: 0,
             sort: SortKey::Name,
             view: PanelView::Files,
+            group_files_list: None,
         }
     }
 

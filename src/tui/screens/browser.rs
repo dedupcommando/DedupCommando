@@ -134,6 +134,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         BrowserTab::Files => groups_that_fit(panes[0]) as u16,
         BrowserTab::Dirs => panes[0].height.saturating_sub(2),
     };
+    // The Files tab replaces it with the rows of its list: the files are drawn under the claim line.
     app.browser.files_visible_rows = panes[1].height.saturating_sub(2);
     app.browser.groups_area = Some(panes[0]);
     app.browser.files_area = Some(panes[1]);
@@ -213,7 +214,7 @@ fn render_files_tab(frame: &mut Frame, panes: std::rc::Rc<[ratatui::layout::Rect
     // mechanism itself (`maybe_load_more_files`) works, the title just doesn't reflect it.
     let path_style = app.browser.path_style;
     let files_title = format!(" Group files · view: {} ", path_style.label());
-    render_group_files(
+    let list = render_group_files(
         frame,
         panes[1],
         app.browser.open_group.as_ref(),
@@ -224,6 +225,8 @@ fn render_files_tab(frame: &mut Frame, panes: std::rc::Rc<[ratatui::layout::Rect
         app.browser.focus_files,
         &files_title,
     );
+    app.browser.files_visible_rows = list.height;
+    app.browser.files_list_area = Some(list);
 }
 
 /// Renders the panels of the `[1] Folders` tab.
@@ -508,6 +511,9 @@ pub(crate) fn render_group_list(
 
 /// Draws the file list of group `group` — reused by the
 /// Browser screen and the commander panels (GroupFiles / DuplicatesOfCursor).
+///
+/// Returns where the list itself was drawn: under the frame and, when the group's claim is shown,
+/// under the claim line too. A click is read against it, not against the frame.
 #[allow(clippy::too_many_arguments)] // render function: 9 list-drawing parameters
 pub(crate) fn render_group_files(
     frame: &mut Frame,
@@ -519,7 +525,7 @@ pub(crate) fn render_group_files(
     path_style: PathStyle,
     focused: bool,
     title: &str,
-) {
+) -> Rect {
     // The block is drawn here rather than by the List, so the group's own claim gets a line inside
     // it. That line is the group's full statement — the list row next door has room for three
     // words, this one has room for what those three words mean.
@@ -555,7 +561,23 @@ pub(crate) fn render_group_files(
     let inner_width = inner.width as usize;
     let (local_sel, file_items, window_start): (Option<usize>, Vec<ListItem>, usize) = match group {
         Some(group) => {
-            let (start, local_sel) = crate::tui::visible_window(state, group.files.len(), rows);
+            let (mut start, mut local_sel) =
+                crate::tui::visible_window(state, group.files.len(), rows);
+            // The window is counted in files and the list in rows, with a separator row after
+            // every 25th file. A separator above the cursor pushes it past the last row, and the
+            // list would scroll by itself, away from `state.offset`, which a click is read from.
+            // The window moves down instead, until the cursor's row is in it: the offset stays the
+            // first file the frame shows.
+            if let Some(sel) = local_sel {
+                let cursor = start + sel;
+                while start < cursor
+                    && cursor - start + separators_before_cursor(start, cursor) >= rows
+                {
+                    start += 1;
+                }
+                *state.offset_mut() = start;
+                local_sel = Some(cursor - start);
+            }
             let end = (start + rows).min(group.files.len());
             let keeper = group.files.iter().find(|file| file.is_keeper);
             let items = items_with_separators(
@@ -633,6 +655,7 @@ pub(crate) fn render_group_files(
         local_sel.map(|sel| sel + separators_before_cursor(window_start, window_start + sel)),
     );
     frame.render_stateful_widget(list, list_area, &mut local);
+    list_area
 }
 
 /// Draws the list of duplicate-directory groups — for the
@@ -700,7 +723,7 @@ fn member_prefix_spans(
 }
 
 /// Draws the list of attributed dir-group summaries for the browser
-/// `[2] Directories` tab. Analogous to `render_group_list`, but reads summaries
+/// `[1] Folders` tab. Analogous to `render_group_list`, but reads summaries
 /// (without `paths` in RAM) — on /tank there can be several thousand dir-groups, but we're
 /// consistent with the file tab: the left panel holds only summaries, paths are read on
 /// entering the group (`store::attributed_dir_group`). Without separators every 25

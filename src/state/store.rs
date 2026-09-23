@@ -140,7 +140,7 @@ pub struct GroupLinks {
 }
 
 /// A lightweight twin-directory group summary with the trust the current ledger vouches — for
-/// the `[2] Directories` tab in the browser. Analogous to `GroupSummary` for file groups: one
+/// the `[1] Folders` tab in the browser. Analogous to `GroupSummary` for file groups: one
 /// attributed read → summaries without `paths`; the surviving paths of one group are read on
 /// entry (`attributed_dir_group`). Counts are of SURVIVING members: a member the current ledger
 /// suppresses is removed exactly as the builder would have removed it, and a group left with
@@ -3408,7 +3408,7 @@ impl ScanStore {
         }
     }
 
-    /// Attributed summaries of all twin-directory groups for the browser tab `[2] Directories`
+    /// Attributed summaries of all twin-directory groups for the browser tab `[1] Folders`
     /// and its header totals. One deferred transaction, exactly 4 statements: 3 authority reads
     /// plus one ordered `dir_dedup` scan, folded with O(1) state per signature run and no path
     /// retained. Members the current ledger suppresses are removed, cardinality is re-evaluated

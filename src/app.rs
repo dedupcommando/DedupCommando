@@ -286,13 +286,16 @@ pub struct BrowserState {
     pub groups_area: Option<Rect>,
     /// Coordinates of the "Group files" panel.
     pub files_area: Option<Rect>,
+    /// Where the last frame of the Files tab drew the file list itself: under the frame and the
+    /// group's claim line. A click on the files is counted from it. `None` before that frame.
+    pub files_list_area: Option<Rect>,
     /// Time and position of the last mouse click — for
     /// detecting a double-click (Enter-like gesture).
     pub last_click: Option<(Instant, u16, u16)>,
     /// Active browser tab (Files/Dirs).
     pub tab: crate::tui::screens::browser::BrowserTab,
     /// Attributed summaries of twin-directory groups for
-    /// the `[2] Directories` tab. Loaded synchronously in `show_results` (on /tank
+    /// the `[1] Folders` tab. Loaded synchronously in `show_results` (on /tank
     /// ≤ a few thousand rows — not hundreds of thousands like file-groups).
     pub dir_group_summaries: Vec<crate::state::AttributedDirGroupSummary>,
     /// Total reclaim of dir-groups — TRUSTED groups only, for the tab bar. An unverified
@@ -313,10 +316,10 @@ pub struct BrowserState {
     /// Index of the "keeper" in `open_dir_group.paths` (★).
     /// Default 0 (first path); changed with Enter on the right panel.
     pub dir_keeper_index: usize,
-    /// Coordinates of the `[1] Files` tab on the tab bar — for mouse clicks.
+    /// Coordinates of the `[2] Files` tab on the tab bar — for mouse clicks.
     /// `None` until the first frame.
     pub tab_files_area: Option<Rect>,
-    /// The same for the `[2] Directories` tab.
+    /// The same for the `[1] Folders` tab.
     pub tab_dirs_area: Option<Rect>,
 }
 
@@ -1910,6 +1913,17 @@ impl App {
             || self.commander.board_active
             || self.commander.triage.is_some()
             || self.commander.overlay != crate::tui::commander::state::Overlay::None
+    }
+
+    /// Whether a window that answers keys is open under the place the «Please wait» box is drawn:
+    /// the yes/no question, the action review's last question, a window of the commander. Each is
+    /// drawn in the middle of the screen, and the box would hide what it asks while its keys — Y,
+    /// or Enter for most of them — still answer it.
+    pub(crate) fn window_waits_for_key(&self) -> bool {
+        self.confirm.is_some()
+            || self.review.confirming
+            || (self.mode == AppMode::Commander
+                && self.commander.overlay != crate::tui::commander::state::Overlay::None)
     }
 
     /// The note for an answer `commander_window_open` held back. What to do comes first: the
@@ -3621,8 +3635,8 @@ impl App {
         }
     }
 
-    /// Left-click in the body of the `[1] Files` tab (split).
-    /// Logic of behavior unchanged.
+    /// Left-click in the body of the `[2] Files` tab (split): the group or the file drawn under
+    /// the pointer, as the last frame drew it.
     fn browser_mouse_click_files(&mut self, col: u16, row: u16) {
         let groups_hit = self
             .browser
@@ -3650,14 +3664,24 @@ impl App {
             return;
         };
 
-        // Inside the panel: top — border (1 row), bottom — border too. visual_row
-        // (0-based) = row - area.y - 1. If the click is on the border — ignore.
-        let Some(visual_row) = row.checked_sub(area.y + 1) else {
+        // Rows are counted from the top of the list itself. The group list begins right under the
+        // frame; the files are drawn under the group's claim line as well, and the render reports
+        // where. A click on a border or on the claim line takes nothing.
+        let list = if want_focus_files {
+            self.browser.files_list_area
+        } else {
+            Some(Rect {
+                x: area.x.saturating_add(1),
+                y: area.y.saturating_add(1),
+                width: area.width.saturating_sub(2),
+                height: area.height.saturating_sub(2),
+            })
+        };
+        let Some(visual_row) =
+            list.and_then(|list| row.checked_sub(list.y).filter(|row| *row < list.height))
+        else {
             return;
         };
-        if (visual_row + 2) > area.height {
-            return; // click on the bottom border
-        }
 
         let (start, total) = if want_focus_files {
             (
@@ -3687,6 +3711,11 @@ impl App {
             // width needs, so the click maps by that height. Sharing the separator-aware mapping
             // with the file panel would land the cursor on a different group than the pointer.
             let rows = crate::tui::screens::browser::group_rows(area.width).max(1) as usize;
+            // Only whole groups are drawn: the rows under the last one are blank, and a click there
+            // would take a group the list does not show.
+            if visual_row as usize / rows >= crate::tui::screens::browser::groups_that_fit(area) {
+                return;
+            }
             let idx = start + visual_row as usize / rows;
             if idx >= total {
                 return; // click below the last group — ignore
@@ -3716,7 +3745,7 @@ impl App {
         }
     }
 
-    /// Left-click in the body of the `[2] Directories` tab (Stage 1).
+    /// Left-click in the body of the `[1] Folders` tab (Stage 1).
     /// Mirror of `browser_mouse_click_files` for the dir-states.
     fn browser_mouse_click_dirs(&mut self, col: u16, row: u16) {
         let groups_hit = self
@@ -3740,12 +3769,14 @@ impl App {
         }) else {
             return;
         };
-        let Some(visual_row) = row.checked_sub(area.y + 1) else {
+        // Both lists of this tab are drawn right under the frame, one row per entry and without
+        // separators: the row under the pointer is the entry. A click on a border takes nothing.
+        let Some(visual_row) = row
+            .checked_sub(area.y.saturating_add(1))
+            .filter(|row| *row < area.height.saturating_sub(2))
+        else {
             return;
         };
-        if (visual_row + 2) > area.height {
-            return;
-        }
 
         let (start, total) = if want_focus_files {
             (
@@ -3761,16 +3792,10 @@ impl App {
                 self.browser.dir_group_summaries.len(),
             )
         };
-        // Separators are not drawn in Dirs, but we use the common
-        // function for uniformity — with no separators the result is correct there.
-        let real_idx = match crate::tui::screens::browser::visual_to_real_index(
-            start,
-            visual_row as usize,
-            total,
-        ) {
-            Some(idx) => idx,
-            None => return,
-        };
+        let real_idx = start + visual_row as usize;
+        if real_idx >= total {
+            return;
+        }
 
         if want_focus_files {
             self.browser.dir_file_state.select(Some(real_idx));
@@ -4215,13 +4240,15 @@ impl App {
                 self.status.clear();
                 return;
             }
-            KeyCode::Char('1') => {
+            // The keys follow the labels the screen draws — «[1] Folders» and «[2] Files» — as the
+            // footer and the manual name them and a click on each label opens it.
+            KeyCode::Char('2') => {
                 self.browser.tab = BrowserTab::Files;
                 self.browser.focus_files = false;
                 self.status.clear();
                 return;
             }
-            KeyCode::Char('2') => {
+            KeyCode::Char('1') => {
                 self.browser.tab = BrowserTab::Dirs;
                 self.browser.focus_files = false;
                 // Open the selected dir-group lazily — on the first entry into the Dirs tab.
@@ -4250,7 +4277,7 @@ impl App {
         }
     }
 
-    /// Keys for the `[1] Files` tab (split by
+    /// Keys for the `[2] Files` tab (split by
     /// tabs). Identical to the behavior of — no regressions.
     fn on_key_browser_files(&mut self, key: KeyEvent) {
         match key.code {
@@ -4277,7 +4304,7 @@ impl App {
         }
     }
 
-    /// Keys for the `[2] Directories` tab (Stage 1). Only
+    /// Keys for the `[1] Folders` tab (Stage 1). Only
     /// viewing + assigning the ★ keeper; marks/actions — a separate round
     /// (Stage 2), for now they show a status message.
     fn on_key_browser_dirs(&mut self, key: KeyEvent) {
@@ -4546,7 +4573,7 @@ impl App {
         }
     }
 
-    // === Navigation in the `[2] Directories` tab ===
+    // === Navigation in the `[1] Folders` tab ===
     // Mirror of `browser_move`/`browser_page`/`browser_home`/`browser_end` for
     // the file-tab, but works with `dir_group_state` / `dir_file_state`.
 

@@ -540,7 +540,7 @@ fn render_fkeys(frame: &mut Frame, area: Rect, second_layer: bool) {
             FIRST_LAYER[index]
         };
         // Equal-width cells across the whole footer line — as in classic two-panel managers.
-        let cell = (index + 1) * total / 12 - index * total / 12;
+        let cell = fkey_cell_start(index + 1, total) - fkey_cell_start(index, total);
         let label_width = cell.saturating_sub(num.chars().count());
         let label = panel::fit(label, label_width);
         let label_cell = format!("{label:<label_width$}");
@@ -552,6 +552,21 @@ fn render_fkeys(frame: &mut Frame, area: Rect, second_layer: bool) {
         }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The column footer cell `index` (from 0) begins on, in a footer `width` columns wide: twelve
+/// equal cells, the columns left over spread among them. The footer is drawn by it and a click is
+/// read by it, so a click runs the F-key whose digit is drawn where it lands.
+fn fkey_cell_start(index: usize, width: usize) -> usize {
+    index * width / 12
+}
+
+/// The F-key under `column` of a footer `width` columns wide, counted from its left edge.
+fn fkey_at(column: usize, width: usize) -> u8 {
+    (1..12)
+        .take_while(|&index| fkey_cell_start(index, width) <= column)
+        .count() as u8
+        + 1
 }
 
 /// Handles a key in commander mode.
@@ -720,7 +735,7 @@ pub fn on_mouse(app: &mut App, mouse: MouseEvent) {
             // A click on the footer F-key line — run the command.
             if regions.fkeys.contains(pos) && regions.fkeys.width > 0 {
                 let rel = mouse.column.saturating_sub(regions.fkeys.x) as usize;
-                let n = (rel * 12 / regions.fkeys.width as usize + 1).min(12) as u8;
+                let n = fkey_at(rel, regions.fkeys.width as usize);
                 let mods = if app.commander.second_layer {
                     KeyModifiers::SHIFT
                 } else {
@@ -733,7 +748,10 @@ pub fn on_mouse(app: &mut App, mouse: MouseEvent) {
             // a repeated click on the same entry within the DOUBLE_CLICK window — enter.
             if let Some((panel_index, Some(entry))) = panel_hit(app, &regions, pos) {
                 app.commander.active = panel_index;
-                app.commander.panels[panel_index].select(entry);
+                // An entry of what the panel shows — its directory, the groups or a group's files —
+                // so the cursor is bounded by that list, not by the directory it may have left.
+                let rows = panel_row_count(app, panel_index);
+                app.commander.panels[panel_index].select_within(entry, rows);
                 let now = std::time::Instant::now();
                 let double = app
                     .commander
@@ -795,16 +813,36 @@ fn panel_hit(
         }
         let panel = &app.commander.panels[index];
         let row_count = panel_row_count(app, index);
+        // A group's files are drawn under the group's claim line, with a separator row after every
+        // 25th: their rows are counted from the list the last frame drew, separators taking none.
+        if let Some(list) = panel.group_files_list {
+            let entry = pos
+                .y
+                .checked_sub(list.y)
+                .filter(|row| *row < list.height)
+                .and_then(|row| {
+                    crate::tui::screens::browser::visual_to_real_index(
+                        panel.list.offset(),
+                        row as usize,
+                        row_count,
+                    )
+                });
+            return Some((index, entry));
+        }
         // Entry rows — under the top border, within the inner height. A file-group entry is two
         // rows tall (its reclaim claim has a line of its own), so the click maps by that height
         // rather than one row per entry.
         let rows_per_entry = rows_per_entry(panel.view, rect.width).max(1) as usize;
         let inner_rows = rect.height.saturating_sub(2);
+        // Only whole entries are drawn: the rows under the last one are blank.
+        let entries_drawn = (inner_rows as usize / rows_per_entry).max(1);
         let entry = pos
             .y
             .checked_sub(rect.y + 1)
             .filter(|row| *row < inner_rows)
-            .map(|row| panel.list.offset() + row as usize / rows_per_entry)
+            .map(|row| row as usize / rows_per_entry)
+            .filter(|drawn| *drawn < entries_drawn)
+            .map(|drawn| panel.list.offset() + drawn)
             .filter(|entry| *entry < row_count);
         return Some((index, entry));
     }
@@ -7471,11 +7509,8 @@ mod dir_watch_tests {
 
             /// The wizard's group view with the first group open, drawn at 160×24, the index of its
             /// first file that is not the keeper — a group opens with its keeper chosen, so only a
-            /// double click elsewhere changes what it shows — and the place the click handler maps to
-            /// that file. The handler counts rows from the top border and does not skip the claim
-            /// line drawn above the files, so that place is the row above the one the file is drawn
-            /// on: a defect of its own. What is tested here is whether a click reaches the handler
-            /// at all, so the place follows the handler, not the drawing.
+            /// double click elsewhere changes what it shows — and a place on the row that file is
+            /// drawn on, found in the frame.
             fn classic_file_row(
                 app: &mut App,
                 events: &crossbeam_channel::Receiver<AppEvent>,
@@ -7484,20 +7519,37 @@ mod dir_watch_tests {
                     app.browser.open_group.is_some()
                 });
                 app.open_wizard(crate::app::Screen::Browser);
-                crate::tui::hostile::frame_of(WIDTH, HEIGHT, |frame| {
+                let buffer = crate::tui::hostile::frame_of(WIDTH, HEIGHT, |frame| {
                     crate::tui::screens::browser::render(frame, app)
                 });
+                let rows = crate::tui::hostile::rows(&buffer);
                 let files = app
                     .browser
                     .files_area
                     .expect("the group view draws its files");
-                let index = app
+                let (index, path) = app
                     .browser
                     .open_group
                     .as_ref()
-                    .and_then(|open| open.files.iter().position(|file| !file.is_keeper))
+                    .and_then(|open| {
+                        open.files
+                            .iter()
+                            .enumerate()
+                            .find(|(_, file)| !file.is_keeper)
+                            .map(|(index, file)| (index, file.path.display().to_string()))
+                    })
                     .expect("a file that is not the keeper");
-                (index, (files.x + 2, files.y + 1 + index as u16))
+                let row = (files.y..files.y + files.height)
+                    .find(|y| {
+                        rows[*y as usize]
+                            .chars()
+                            .skip(files.x as usize)
+                            .take(files.width as usize)
+                            .collect::<String>()
+                            .contains(&path)
+                    })
+                    .unwrap_or_else(|| panic!("{path} is drawn"));
+                (index, (files.x + 2, row))
             }
 
             /// Where a single click in the wizard's group view would land: the file cursor and
@@ -7741,7 +7793,7 @@ mod dir_watch_tests {
                 assert_eq!(
                     app.browser.file_state.selected(),
                     Some(index),
-                    "the handler selected the file it maps the place to"
+                    "the click selected the file drawn there"
                 );
                 click(&mut app, place);
                 let keepers: Vec<bool> = group_marks(&app)
@@ -7797,7 +7849,9 @@ mod dir_watch_tests {
             /// A plan answer as the actor delivers it to the classic review — the route r records —
             /// built over real files, as `deliver_a_plan` builds one for F11. The scenario owns the
             /// files and must outlive the check.
-            fn deliver_a_review_plan(app: &mut App) -> crate::testfixtures::PlanScenario {
+            pub(super) fn deliver_a_review_plan(
+                app: &mut App,
+            ) -> crate::testfixtures::PlanScenario {
                 use crate::state::browse::{BrowseEvent, RequestId};
                 let scenario = crate::testfixtures::PlanScenario::new("b15_plan");
                 let keeper = scenario.file("keeper.bin");
@@ -8272,6 +8326,921 @@ mod dir_watch_tests {
                 let _plan = deliver_a_review_plan(&mut app);
                 assert_eq!(app.screen, Screen::ActionReview, "r in the group view");
                 assert!(app.review.plan.is_some());
+                crate::app::drain(&mut app, &events);
+            }
+        }
+
+        /// B17–B20 — a click or a key does what the screen shows where it lands: the F-key whose
+        /// digit is drawn there, the file on the row it is drawn on, the tab its label names; and
+        /// a question that takes the keys is drawn whole. Every place clicked here is found in the
+        /// drawn frame, not computed the way the handlers compute it.
+        mod input_where_drawn {
+            use super::*;
+            use crate::app::{AppMode, ConfirmAction, Screen};
+            use crate::tui::event::AppEvent;
+            use crate::tui::screens::browser::BrowserTab;
+
+            fn key(app: &mut App, code: KeyCode) {
+                app.handle_event(AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+            }
+
+            fn click(app: &mut App, (column, row): (u16, u16)) {
+                app.handle_event(AppEvent::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                }));
+            }
+
+            /// `clear_marks_app` after consent: the photos in «group files» (panel 1) and a files
+            /// panel over `/tank/old-copy` with the focus, its cursor on the photo there.
+            fn open_app() -> (PathBuf, i64, App, crossbeam_channel::Receiver<AppEvent>) {
+                let (db, scan_id, mut app, events) = clear_marks_app();
+                app.show_disclaimer = false;
+                (db, scan_id, app, events)
+            }
+
+            /// One group of `count` files, `/tank/long/f00.bin` on, published: the group on the
+            /// left, its files in «group files» beside it (panel 1).
+            fn long_group_app(count: usize) -> (App, crossbeam_channel::Receiver<AppEvent>) {
+                let db = db_path("long_group");
+                let mut store = ScanStore::open(&db).unwrap();
+                let scan_id = store
+                    .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank")]))
+                    .unwrap();
+                let paths: Vec<PathBuf> = (0..count)
+                    .map(|i| PathBuf::from(format!("/tank/long/f{i:02}.bin")))
+                    .collect();
+                let rows: Vec<_> = paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, path)| crate::state::ManifestRow {
+                        path: path.clone(),
+                        size: MIB,
+                        mtime: 0,
+                        device: 1,
+                        inode: i as u64 + 1,
+                        nlink: 1,
+                        ..Default::default()
+                    })
+                    .collect();
+                store.record_files(scan_id, &rows).unwrap();
+                let hashes: Vec<_> = paths.iter().map(|path| (path.clone(), [9u8; 32])).collect();
+                store.record_hashes(scan_id, &hashes).unwrap();
+                store
+                    .publish_results(scan_id, crate::state::PublishMode::Derived)
+                    .unwrap();
+                store.set_status(scan_id, ScanStatus::Complete).unwrap();
+                drop(store);
+                let (mut app, events) = groups_app(&db, scan_id, 0);
+                app.show_disclaimer = false;
+                (app, events)
+            }
+
+            /// The row `text` is drawn on inside `area` of a drawn frame, if it is drawn there.
+            fn find_row(rows: &[String], area: Rect, text: &str) -> Option<u16> {
+                (area.y..area.y + area.height).find(|y| {
+                    rows[*y as usize]
+                        .chars()
+                        .skip(area.x as usize)
+                        .take(area.width as usize)
+                        .collect::<String>()
+                        .contains(text)
+                })
+            }
+
+            /// The row `text` is drawn on inside `area` of a drawn frame.
+            fn drawn_row(rows: &[String], area: Rect, text: &str) -> u16 {
+                find_row(rows, area, text)
+                    .unwrap_or_else(|| panic!("{text:?} is drawn in {area:?}"))
+            }
+
+            /// The wizard's group view drawn at 160×`height`, as the main loop draws it before every
+            /// event.
+            fn classic_frame(app: &mut App, height: u16) -> Vec<String> {
+                let buffer = crate::tui::hostile::frame_of(160, height, |frame| {
+                    crate::tui::screens::browser::render(frame, app)
+                });
+                crate::tui::hostile::rows(&buffer)
+            }
+
+            /// `long_group_app(40)` in the wizard's group view, the files focused and their cursor
+            /// walked down past the separator after the 25th file, a frame drawn before every key.
+            fn scrolled_classic_app() -> (App, crossbeam_channel::Receiver<AppEvent>) {
+                let (mut app, events) = long_group_app(40);
+                crate::app::pump_until(&mut app, &events, "the classic open group", |app| {
+                    app.browser.open_group.is_some()
+                });
+                app.open_wizard(Screen::Browser);
+                app.browser.focus_files = true;
+                app.browser.file_state.select(Some(0));
+                for _ in 0..30 {
+                    classic_frame(&mut app, 24);
+                    key(&mut app, KeyCode::Down);
+                }
+                assert_eq!(app.browser.file_state.selected(), Some(30));
+                (app, events)
+            }
+
+            /// The paths of the group the wizard shows, in the order it draws them.
+            fn classic_paths(app: &App) -> Vec<String> {
+                app.browser
+                    .open_group
+                    .as_ref()
+                    .map(|open| {
+                        open.files
+                            .iter()
+                            .map(|file| file.path.display().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+
+            /// An unfinished scan of `/tank/old-copy`, as the F2 check reports it.
+            fn unfinished() -> crate::model::scan::ResumeInfo {
+                crate::model::scan::ResumeInfo {
+                    scan_id: 77,
+                    created_at: "2026-09-01 10:00:00".to_string(),
+                    status: ScanStatus::Hashing,
+                    roots: vec![PathBuf::from("/tank/old-copy")],
+                    files_total: 10,
+                    files_hashed: 2,
+                    cand_bytes_total: 1000,
+                    cand_bytes_hashed: 200,
+                    files_scanned: 0,
+                    reclaim: crate::model::reclaim::ReclaimEstimate::unknown(),
+                    already_linked_sets: None,
+                }
+            }
+
+            /// `groups` groups of two files each, published: the group list on the left, the
+            /// first group's files beside it.
+            fn many_groups_app(groups: usize) -> (App, crossbeam_channel::Receiver<AppEvent>) {
+                let db = db_path("many_groups");
+                let mut store = ScanStore::open(&db).unwrap();
+                let scan_id = store
+                    .begin_scan(&ScanConfig::new(vec![PathBuf::from("/tank")]))
+                    .unwrap();
+                let paths: Vec<(PathBuf, usize)> = (0..groups * 2)
+                    .map(|i| {
+                        (
+                            PathBuf::from(format!("/tank/many/g{:02}-{}.bin", i / 2, i % 2)),
+                            i / 2,
+                        )
+                    })
+                    .collect();
+                let rows: Vec<_> = paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (path, group))| crate::state::ManifestRow {
+                        path: path.clone(),
+                        size: MIB * (groups - group) as u64,
+                        mtime: 0,
+                        device: 1,
+                        inode: i as u64 + 1,
+                        nlink: 1,
+                        ..Default::default()
+                    })
+                    .collect();
+                store.record_files(scan_id, &rows).unwrap();
+                let hashes: Vec<_> = paths
+                    .iter()
+                    .map(|(path, group)| (path.clone(), [*group as u8 + 1; 32]))
+                    .collect();
+                store.record_hashes(scan_id, &hashes).unwrap();
+                store
+                    .publish_results(scan_id, crate::state::PublishMode::Derived)
+                    .unwrap();
+                store.set_status(scan_id, ScanStatus::Complete).unwrap();
+                drop(store);
+                let (mut app, events) = groups_app(&db, scan_id, 0);
+                app.show_disclaimer = false;
+                (app, events)
+            }
+
+            /// The footer the commander draws at `width`×24: its area and, for each F-key, the
+            /// column its digits begin on and the number they read.
+            fn drawn_footer(app: &mut App, width: u16) -> (Rect, Vec<(u16, u8)>) {
+                let (rows, _) = screen(app, width, 24);
+                let fkeys = layout::regions(Rect::new(0, 0, width, 24)).fkeys;
+                let row: Vec<char> = rows[fkeys.y as usize].chars().collect();
+                let end = (fkeys.x + fkeys.width) as usize;
+                let mut digits = Vec::new();
+                let mut x = fkeys.x as usize;
+                while x < end {
+                    if row[x].is_ascii_digit() {
+                        let start = x;
+                        while x < end && row[x].is_ascii_digit() {
+                            x += 1;
+                        }
+                        let number: String = row[start..x].iter().collect();
+                        digits.push((start as u16, number.parse().unwrap()));
+                    } else {
+                        x += 1;
+                    }
+                }
+                (fkeys, digits)
+            }
+
+            /// The wizard's group view with its group open, drawn at `width`×`height`: the files
+            /// panel and the row each file is drawn on, found by its path in the frame.
+            fn classic_rows(
+                app: &mut App,
+                events: &crossbeam_channel::Receiver<AppEvent>,
+                width: u16,
+                height: u16,
+            ) -> (Rect, Vec<u16>) {
+                crate::app::pump_until(app, events, "the classic open group", |app| {
+                    app.browser.open_group.is_some()
+                });
+                app.open_wizard(Screen::Browser);
+                let buffer = crate::tui::hostile::frame_of(width, height, |frame| {
+                    crate::tui::screens::browser::render(frame, app)
+                });
+                let rows = crate::tui::hostile::rows(&buffer);
+                let files = app
+                    .browser
+                    .files_area
+                    .expect("the group view draws its files");
+                let drawn = app
+                    .browser
+                    .open_group
+                    .as_ref()
+                    .expect("a group is open")
+                    .files
+                    .iter()
+                    .map(|file| drawn_row(&rows, files, &file.path.display().to_string()))
+                    .collect();
+                (files, drawn)
+            }
+
+            /// Who is the keeper in the group the wizard shows.
+            fn keepers(app: &App) -> Vec<bool> {
+                app.browser
+                    .open_group
+                    .as_ref()
+                    .map(|open| open.files.iter().map(|file| file.is_keeper).collect())
+                    .unwrap_or_default()
+            }
+
+            /// F12 in the commander, and the list of scans loaded.
+            fn sessions_list(app: &mut App, events: &crossbeam_channel::Receiver<AppEvent>) {
+                key(app, KeyCode::F(12));
+                assert_eq!((app.mode, app.screen), (AppMode::Wizard, Screen::Resume));
+                crate::app::pump_until(app, events, "the sessions", |app| app.sessions_loaded);
+                assert!(!app.sessions.is_empty(), "the scan is listed");
+            }
+
+            /// The whole screen as drawn at 80×24.
+            fn drawn_screen(app: &mut App) -> String {
+                let buffer =
+                    crate::tui::hostile::frame_of(80, 24, |frame| crate::tui::draw(frame, app));
+                crate::tui::hostile::rows(&buffer).join("\n")
+            }
+
+            /// B17. The footer draws F-key `n` from the column its digits begin on to the next
+            /// F-key's, and a click anywhere in that span runs F`n` — at widths a twelfth of which
+            /// is a whole number of columns and at widths where it is not. Red on the parent: on
+            /// the first column of a cell that does not begin on a whole twelfth the click ran the
+            /// F-key before it, 8 cells of 12 at 80 columns.
+            #[test]
+            fn a_click_on_the_footer_runs_the_f_key_drawn_there() {
+                let _role = crate::state::store::role_guard();
+                let (_db, _scan_id, mut app, events) = open_app();
+                for width in [80u16, 81, 97, 100, 120, 131, 160, 200] {
+                    let (fkeys, digits) = drawn_footer(&mut app, width);
+                    assert_eq!(
+                        digits.iter().map(|(_, n)| *n).collect::<Vec<u8>>(),
+                        (1..=12).collect::<Vec<u8>>(),
+                        "{width} columns: every F-key is drawn"
+                    );
+                    for column in fkeys.x..fkeys.x + fkeys.width {
+                        let drawn = digits
+                            .iter()
+                            .rev()
+                            .find(|(start, _)| *start <= column)
+                            .map(|(_, n)| *n)
+                            .expect("the footer begins with F1");
+                        assert_eq!(
+                            fkey_at((column - fkeys.x) as usize, fkeys.width as usize),
+                            drawn,
+                            "{width} columns, column {column}"
+                        );
+                    }
+                }
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// B17 where it did harm: at 80 columns «9 Menu» begins on a column the click read as
+            /// F8, and F8 marked the file under the cursor for deletion and saved the mark. A click
+            /// on the drawn 9 opens the menu and marks nothing. Red on the parent.
+            #[test]
+            fn a_click_on_the_drawn_9_opens_the_menu_and_marks_nothing() {
+                let _role = crate::state::store::role_guard();
+                let (db, scan_id, mut app, events) = open_app();
+                let (fkeys, digits) = drawn_footer(&mut app, 80);
+                let (column, _) = *digits.iter().find(|(_, n)| *n == 9).expect("9 is drawn");
+                click(&mut app, (column, fkeys.y));
+                assert_eq!(app.commander.overlay, Overlay::Menu { cursor: 0 }, "F9");
+                assert_eq!(
+                    app.commander.panels[2]
+                        .marks
+                        .get(&PathBuf::from("/tank/old-copy/IMG_3120.HEIC")),
+                    None
+                );
+                assert!(app.pending_marks.is_empty(), "no mark was sent");
+                crate::app::drain(&mut app, &events);
+                assert_eq!(
+                    saved_marks(&db, scan_id),
+                    1,
+                    "the database holds the one it had"
+                );
+            }
+
+            /// B18. The wizard's group view draws its files under the group's claim line, with a
+            /// separator after every 25th, and a click on the row a file is drawn on puts the
+            /// cursor on that file — the last one too. Red on the parent: the click was counted
+            /// from the frame, so it took the file below, and the last file could not be clicked.
+            #[test]
+            fn a_click_in_the_classic_group_view_takes_the_file_drawn_there() {
+                let _role = crate::state::store::role_guard();
+                let (mut app, events) = long_group_app(30);
+                let (files, drawn) = classic_rows(&mut app, &events, 160, 50);
+                assert_eq!(drawn.len(), 30);
+                for (index, row) in drawn.iter().enumerate() {
+                    click(&mut app, (files.x + 10, *row));
+                    assert_eq!(
+                        (app.browser.file_state.selected(), app.browser.focus_files),
+                        (Some(index), true),
+                        "file {index}, drawn on row {row}"
+                    );
+                }
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// A double click there makes that file the keeper and saves it. Red on the parent: the
+            /// file below took the click.
+            #[test]
+            fn a_double_click_in_the_classic_group_view_keeps_the_file_drawn_there() {
+                let _role = crate::state::store::role_guard();
+                let (_db, _scan_id, mut app, events) = open_app();
+                let (files, drawn) = classic_rows(&mut app, &events, 160, 24);
+                let target = keepers(&app)
+                    .iter()
+                    .position(|keeper| !keeper)
+                    .expect("a file that is not the keeper");
+                click(&mut app, (files.x + 10, drawn[target]));
+                click(&mut app, (files.x + 10, drawn[target]));
+                let after = keepers(&app);
+                assert!(
+                    after[target] && after.iter().filter(|keeper| **keeper).count() == 1,
+                    "file {target} is the keeper now: {after:?}"
+                );
+                assert!(!app.pending_marks.is_empty(), "and it is being saved");
+                settle(&mut app, &events);
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// The row above the files is the group's claim, not a file: a click there leaves the
+            /// cursor where it was. Red on the parent: it took the first file.
+            #[test]
+            fn a_click_on_the_claim_line_takes_no_file() {
+                let _role = crate::state::store::role_guard();
+                let (_db, _scan_id, mut app, events) = open_app();
+                let (files, drawn) = classic_rows(&mut app, &events, 160, 24);
+                let claim = files.y + 1;
+                assert_eq!(
+                    drawn[0],
+                    claim + 1,
+                    "the claim line is drawn above the first file"
+                );
+                app.browser.focus_files = true;
+                app.browser.file_state.select(Some(1));
+                click(&mut app, (files.x + 10, claim));
+                assert_eq!(app.browser.file_state.selected(), Some(1));
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// PgDn steps a page of the list's own rows, the claim line not among them: from the top
+            /// of a frame with no separator in it, it lands on the last file drawn. Red on the parent:
+            /// the page was counted from all the rows inside the frame, and PgDn went one file past
+            /// the last one drawn.
+            #[test]
+            fn pgdn_in_the_classic_group_view_counts_the_rows_under_the_claim_line() {
+                let _role = crate::state::store::role_guard();
+                let (mut app, events) = long_group_app(40);
+                crate::app::pump_until(&mut app, &events, "the classic open group", |app| {
+                    app.browser.open_group.is_some()
+                });
+                app.open_wizard(Screen::Browser);
+                app.browser.focus_files = true;
+                app.browser.file_state.select(Some(0));
+                let rows = classic_frame(&mut app, 24);
+                let files = app
+                    .browser
+                    .files_area
+                    .expect("the group view draws its files");
+                let paths = classic_paths(&app);
+                let last_drawn = (0..paths.len())
+                    .filter(|index| find_row(&rows, files, &paths[*index]).is_some())
+                    .max()
+                    .expect("files are drawn");
+                assert!(
+                    last_drawn + 1 < paths.len(),
+                    "the group goes on past the frame"
+                );
+                key(&mut app, KeyCode::PageDown);
+                assert_eq!(app.browser.file_state.selected(), Some(last_drawn));
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// B18 in the commander: «group files» draws a group's files the same way, and a click
+            /// on the row a file is drawn on puts the cursor on that file — past the separator too.
+            /// Red on the parent for two reasons: the cursor was bounded by the length of the
+            /// panel's directory, which a group's files do not have, so the click dropped it; and the
+            /// row was counted from the frame, one off for the claim line and one more past the
+            /// separator.
+            #[test]
+            fn a_click_in_group_files_takes_the_file_drawn_there() {
+                let _role = crate::state::store::role_guard();
+                let (mut app, events) = long_group_app(30);
+                let (rows, rects) = screen(&mut app, 160, 50);
+                let shown: Vec<PathBuf> = marks_shown(&app, 1)
+                    .into_iter()
+                    .map(|(path, _, _)| path)
+                    .collect();
+                assert_eq!(shown.len(), 30);
+                for (index, path) in shown.iter().enumerate() {
+                    let name = path.file_name().unwrap().to_string_lossy().to_string();
+                    let row = drawn_row(&rows, rects[1], &name);
+                    click(&mut app, (rects[1].x + 3, row));
+                    assert_eq!(
+                        (
+                            app.commander.active,
+                            app.commander.panels[1].list.selected()
+                        ),
+                        (1, Some(index)),
+                        "{name}, drawn on row {row}"
+                    );
+                }
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// The frame under a group's files is no file either: where the list goes on past what
+            /// fits, a click on the frame takes nothing — in the wizard's group view and in «group
+            /// files». Red on the parent in the wizard: it took a file the list did not show.
+            #[test]
+            fn a_click_on_the_frame_under_a_group_s_files_takes_no_file() {
+                let _role = crate::state::store::role_guard();
+                let (mut app, events) = long_group_app(40);
+                let (_, rects) = screen(&mut app, 160, 24);
+                assert!(
+                    rects[1].height < 40,
+                    "«group files» shows fewer rows than the group has files"
+                );
+                app.commander.active = 1;
+                app.commander.panels[1].list.select(Some(0));
+                click(&mut app, (rects[1].x + 3, rects[1].y + rects[1].height - 1));
+                assert_eq!(
+                    app.commander.panels[1].list.selected(),
+                    Some(0),
+                    "«group files»"
+                );
+
+                crate::app::pump_until(&mut app, &events, "the classic open group", |app| {
+                    app.browser.open_group.is_some()
+                });
+                app.open_wizard(Screen::Browser);
+                crate::tui::hostile::frame_of(160, 24, |frame| {
+                    crate::tui::screens::browser::render(frame, &mut app)
+                });
+                let files = app
+                    .browser
+                    .files_area
+                    .expect("the group view draws its files");
+                app.browser.focus_files = true;
+                app.browser.file_state.select(Some(0));
+                click(&mut app, (files.x + 10, files.y + files.height - 1));
+                assert_eq!(
+                    app.browser.file_state.selected(),
+                    Some(0),
+                    "the wizard's group view"
+                );
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// A panel that showed a group's files and lists a directory now reads a click by the
+            /// directory's rows again: a click is counted from what the last frame drew there.
+            #[test]
+            fn a_panel_that_stops_showing_group_files_reads_a_click_by_its_own_rows() {
+                let _role = crate::state::store::role_guard();
+                let (_db, _scan_id, mut app, events) = open_app();
+                screen(&mut app, 160, 24);
+                assert!(
+                    app.commander.panels[1].group_files_list.is_some(),
+                    "the group's files are drawn in panel 1"
+                );
+                let panel = &mut app.commander.panels[1];
+                panel.view = PanelView::Files;
+                panel.loading = false;
+                panel.entries = ["alpha", "bravo", "charlie"]
+                    .iter()
+                    .map(|name| panel_entry(&format!("/tank/media/{name}"), EntryKind::File))
+                    .collect();
+                let (rows, rects) = screen(&mut app, 160, 24);
+                let row = drawn_row(&rows, rects[1], "bravo");
+                click(&mut app, (rects[1].x + 3, row));
+                assert_eq!(app.commander.panels[1].list.selected(), Some(1));
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// And in the group list beside it: a click on a group puts the cursor on that group.
+            /// Red on the parent: the cursor was bounded by the directory the panel listed before it
+            /// showed groups — none here — so the click took the cursor away.
+            #[test]
+            fn a_click_in_the_group_list_takes_the_group_drawn_there() {
+                let _role = crate::state::store::role_guard();
+                let (_db, _scan_id, mut app, events) = open_app();
+                let (rows, rects) = screen(&mut app, 160, 24);
+                let ranks: Vec<i64> = app
+                    .commander
+                    .group_summaries
+                    .iter()
+                    .map(|(id, _)| id.rank)
+                    .collect();
+                assert!(ranks.len() >= 2, "groups to click between");
+                for (index, rank) in ranks.iter().enumerate() {
+                    let row = drawn_row(&rows, rects[0], &format!("#{rank:<4} "));
+                    click(&mut app, (rects[0].x + 3, row));
+                    assert_eq!(
+                        (
+                            app.commander.active,
+                            app.commander.panels[0].list.selected()
+                        ),
+                        (0, Some(index)),
+                        "group #{rank}, drawn on row {row}"
+                    );
+                }
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// B18 once the list is scrolled: the cursor walked down «group files» past the
+            /// separator after the 25th file, a frame drawn before every event as the main loop
+            /// draws it. A click on the row a file is drawn on takes that file. Red on the parent of
+            /// this check: the window was counted in files and the list in rows, the list scrolled
+            /// itself by the separator row, and a click took the file above the one under it.
+            #[test]
+            fn a_click_in_scrolled_group_files_takes_the_file_drawn_there() {
+                let _role = crate::state::store::role_guard();
+                let (mut app, events) = long_group_app(40);
+                app.commander.active = 1;
+                app.commander.panels[1].list.select(Some(0));
+                for _ in 0..30 {
+                    screen(&mut app, 160, 24);
+                    press(&mut app, KeyCode::Down);
+                }
+                assert_eq!(app.commander.panels[1].list.selected(), Some(30));
+                let names: Vec<String> = marks_shown(&app, 1)
+                    .iter()
+                    .map(|(path, _, _)| path.file_name().unwrap().to_string_lossy().to_string())
+                    .collect();
+                let (rows, rects) = screen(&mut app, 160, 24);
+                let drawn: Vec<usize> = (0..names.len())
+                    .filter(|index| find_row(&rows, rects[1], &names[*index]).is_some())
+                    .collect();
+                assert!(
+                    drawn.iter().any(|index| *index < 25) && drawn.iter().any(|index| *index >= 25),
+                    "the separator is inside the window: {drawn:?}"
+                );
+                for index in drawn {
+                    let (rows, rects) = screen(&mut app, 160, 24);
+                    let row = drawn_row(&rows, rects[1], &names[index]);
+                    click(&mut app, (rects[1].x + 3, row));
+                    assert_eq!(
+                        app.commander.panels[1].list.selected(),
+                        Some(index),
+                        "{}, drawn on row {row}",
+                        names[index]
+                    );
+                }
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// The same in the wizard's group view. Red on the parent of this check.
+            #[test]
+            fn a_click_in_a_scrolled_classic_group_view_takes_the_file_drawn_there() {
+                let _role = crate::state::store::role_guard();
+                let (mut app, events) = scrolled_classic_app();
+                let paths = classic_paths(&app);
+                let rows = classic_frame(&mut app, 24);
+                let files = app
+                    .browser
+                    .files_area
+                    .expect("the group view draws its files");
+                let drawn: Vec<usize> = (0..paths.len())
+                    .filter(|index| find_row(&rows, files, &paths[*index]).is_some())
+                    .collect();
+                assert!(
+                    drawn.iter().any(|index| *index < 25) && drawn.iter().any(|index| *index >= 25),
+                    "the separator is inside the window: {drawn:?}"
+                );
+                for index in drawn {
+                    let rows = classic_frame(&mut app, 24);
+                    let row = drawn_row(&rows, files, &paths[index]);
+                    click(&mut app, (files.x + 10, row));
+                    assert_eq!(
+                        app.browser.file_state.selected(),
+                        Some(index),
+                        "{}, drawn on row {row}",
+                        paths[index]
+                    );
+                }
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// And a double click there, with the frame the main loop draws between its two clicks,
+            /// makes the file drawn under the pointer the keeper. Red on the parent of this check:
+            /// the first click took the file above, the frame between moved the list under the
+            /// pointer, and the second click made that neighbour the keeper and saved it.
+            #[test]
+            fn a_double_click_in_a_scrolled_classic_group_view_keeps_the_file_drawn_there() {
+                let _role = crate::state::store::role_guard();
+                let (mut app, events) = scrolled_classic_app();
+                let paths = classic_paths(&app);
+                let target = paths
+                    .iter()
+                    .position(|path| path.ends_with("/f27.bin"))
+                    .expect("f27 is in the group");
+                assert!(!keepers(&app)[target], "f27 is not the keeper yet");
+                let rows = classic_frame(&mut app, 24);
+                let files = app
+                    .browser
+                    .files_area
+                    .expect("the group view draws its files");
+                let row = drawn_row(&rows, files, &paths[target]);
+                click(&mut app, (files.x + 10, row));
+                classic_frame(&mut app, 24);
+                click(&mut app, (files.x + 10, row));
+                let after = keepers(&app);
+                assert!(
+                    after[target] && after.iter().filter(|keeper| **keeper).count() == 1,
+                    "f27 is the keeper now: {after:?}"
+                );
+                assert!(!app.pending_marks.is_empty(), "and it is being saved");
+                settle(&mut app, &events);
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// B18 on the Folders tab: its lists draw no separators, and a click past the 25th
+            /// group takes the group drawn under it. Red on the parent: the click skipped a separator
+            /// row that is not drawn there and took the group above.
+            #[test]
+            fn a_click_on_the_folders_tab_takes_the_group_drawn_there() {
+                let (mut app, events) = crate::app::test_app();
+                app.show_disclaimer = false;
+                app.mode = AppMode::Wizard;
+                app.screen = Screen::Browser;
+                app.browser.tab = BrowserTab::Dirs;
+                app.browser.dir_group_summaries = (1..=40u32)
+                    .map(|rank| crate::state::AttributedDirGroupSummary {
+                        rank,
+                        signature: format!("{rank:064x}"),
+                        dir_count: 2,
+                        file_count: 3,
+                        size_per_dir: 4096,
+                        trust: crate::model::duplicate::DirTrust::Trusted,
+                    })
+                    .collect();
+                for index in 0..40usize {
+                    app.browser.focus_files = false;
+                    app.browser.dir_group_state.select(Some(0));
+                    app.browser.last_click = None;
+                    let rows = classic_frame(&mut app, 50);
+                    let groups = app.browser.groups_area.expect("the groups are drawn");
+                    let row = drawn_row(&rows, groups, &format!("#{:<4} ", index + 1));
+                    click(&mut app, (groups.x + 3, row));
+                    assert_eq!(
+                        app.browser.dir_group_state.selected(),
+                        Some(index),
+                        "#{}, drawn on row {row}",
+                        index + 1
+                    );
+                }
+
+                // The frame under a list that goes on past it takes no group,
+                app.browser.dir_group_state.select(Some(0));
+                app.browser.last_click = None;
+                classic_frame(&mut app, 24);
+                let groups = app.browser.groups_area.expect("the groups are drawn");
+                click(&mut app, (groups.x + 3, groups.y + groups.height - 1));
+                assert_eq!(app.browser.dir_group_state.selected(), Some(0), "the frame");
+                // nor does a row under the last group of a short list.
+                app.browser.dir_group_summaries.truncate(5);
+                classic_frame(&mut app, 24);
+                click(&mut app, (groups.x + 3, groups.y + 1 + 5));
+                assert_eq!(
+                    app.browser.dir_group_state.selected(),
+                    Some(0),
+                    "under the last group"
+                );
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// A group list draws only whole groups, and the rows under the last one are blank: a
+            /// click there takes no group — in the commander and in the wizard. Red on the parent:
+            /// it took the next group, one the list does not show, and scrolled to it.
+            #[test]
+            fn a_click_under_the_last_whole_group_takes_no_group() {
+                let _role = crate::state::store::role_guard();
+                let (mut app, events) = many_groups_app(20);
+                let blank_row = |rows: &[String], area: Rect| {
+                    let row = area.y + area.height - 2;
+                    let text: String = rows[row as usize]
+                        .chars()
+                        .skip(area.x as usize + 1)
+                        .take(area.width as usize - 2)
+                        .collect();
+                    assert!(text.trim().is_empty(), "row {row} is blank: {text:?}");
+                    row
+                };
+                let fills_partly = |area: Rect| {
+                    let per = crate::tui::screens::browser::group_rows(area.width);
+                    let inner = area.height - 2;
+                    inner % per != 0 && ((inner / per) as usize) < 20
+                };
+
+                app.commander.panels[0].list.select(Some(0));
+                let height = (20u16..60)
+                    .find(|height| fills_partly(screen(&mut app, 160, *height).1[0]))
+                    .expect("a height the groups do not fill");
+                let (rows, rects) = screen(&mut app, 160, height);
+                click(&mut app, (rects[0].x + 3, blank_row(&rows, rects[0])));
+                assert_eq!(
+                    app.commander.panels[0].list.selected(),
+                    Some(0),
+                    "the commander"
+                );
+
+                crate::app::pump_until(&mut app, &events, "the classic open group", |app| {
+                    app.browser.open_group.is_some()
+                });
+                app.open_wizard(Screen::Browser);
+                app.browser.focus_files = false;
+                app.browser.group_state.select(Some(0));
+                let height = (20u16..60)
+                    .find(|height| {
+                        classic_frame(&mut app, *height);
+                        fills_partly(app.browser.groups_area.expect("the groups are drawn"))
+                    })
+                    .expect("a height the groups do not fill");
+                let rows = classic_frame(&mut app, height);
+                let groups = app.browser.groups_area.expect("the groups are drawn");
+                click(&mut app, (groups.x + 3, blank_row(&rows, groups)));
+                assert_eq!(app.browser.group_state.selected(), Some(0), "the wizard");
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// B19. The wizard's group view labels its tabs «[1] Folders» and «[2] Files» — the
+            /// title, the footer, the manual — and 1 and 2 open them. Red on the parent: 1 opened
+            /// Files and 2 Folders.
+            #[test]
+            fn keys_1_and_2_open_the_tabs_their_labels_name() {
+                let _role = crate::state::store::role_guard();
+                let (_db, _scan_id, mut app, events) = open_app();
+                crate::app::pump_until(&mut app, &events, "the classic open group", |app| {
+                    app.browser.open_group.is_some()
+                });
+                app.open_wizard(Screen::Browser);
+                key(&mut app, KeyCode::Char('1'));
+                assert_eq!(app.browser.tab, BrowserTab::Dirs, "1 is Folders");
+                key(&mut app, KeyCode::Char('2'));
+                assert_eq!(app.browser.tab, BrowserTab::Files, "2 is Files");
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// B20. Enter in the list of scans opens the result behind a «Please wait» box, and a
+            /// Del meanwhile asks «Move to trash?», which takes Enter as yes. The box is not drawn
+            /// over the question. Red on the parent: the box covered its text and [Y]/[N].
+            #[test]
+            fn the_trash_question_is_not_covered_by_the_please_wait_box() {
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = marked_app();
+                app.show_disclaimer = false;
+                sessions_list(&mut app, &events);
+                key(&mut app, KeyCode::Enter);
+                key(&mut app, KeyCode::Delete);
+                assert!(matches!(app.confirm, Some(ConfirmAction::TrashScan(_))));
+                assert!(app.opening_started.is_some(), "the result is still opening");
+                let screen = drawn_screen(&mut app);
+                assert!(
+                    screen.contains("moved to the trash") && screen.contains("[Y] yes"),
+                    "{screen}"
+                );
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// Nor over «Purge from trash?», where yes cannot be undone: t in the list while the
+            /// result opens, then Del in the trash. Red on the parent.
+            #[test]
+            fn the_purge_question_is_not_covered_by_the_please_wait_box() {
+                let _role = crate::state::store::role_guard();
+                let (db, mut app, events) = marked_app();
+                app.show_disclaimer = false;
+                let mut store = ScanStore::open(&db).unwrap();
+                let trashed = store
+                    .begin_scan(&ScanConfig::new(vec![PathBuf::from("/srv")]))
+                    .unwrap();
+                store.set_status(trashed, ScanStatus::Complete).unwrap();
+                store.trash_scan(trashed).unwrap();
+                drop(store);
+                sessions_list(&mut app, &events);
+                key(&mut app, KeyCode::Enter);
+                key(&mut app, KeyCode::Char('t'));
+                assert_eq!(app.screen, Screen::Trash);
+                key(&mut app, KeyCode::Delete);
+                assert!(matches!(app.confirm, Some(ConfirmAction::PurgeScan(_))));
+                assert!(app.opening_started.is_some(), "the result is still opening");
+                let screen = drawn_screen(&mut app);
+                assert!(
+                    screen.contains("deleted PERMANENTLY") && screen.contains("[Y] yes"),
+                    "{screen}"
+                );
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// B20 in the commander: an open in flight — at startup the commander opens the newest
+            /// scan this way — and the answer of F2 lands first: «resume the unfinished scan?»,
+            /// which Enter answers yes. The Please wait box is not drawn over it. Red on the parent:
+            /// the box hid the scan, its progress and the recommendation.
+            #[test]
+            fn the_f2_question_is_not_covered_by_the_please_wait_box() {
+                let _role = crate::state::store::role_guard();
+                let (_db, scan_id, mut app, events) = open_app();
+                app.open_via_actor(scan_id, crate::app::OpenIntent::Commander);
+                assert!(app.opening_started.is_some(), "an open is in flight");
+                app.handle_event(AppEvent::CommanderResumeProbe {
+                    roots: vec![PathBuf::from("/tank/old-copy")],
+                    probe: Ok((Some(unfinished()), None)),
+                });
+                assert_eq!(app.commander.overlay, Overlay::ResumeScan);
+                let screen = drawn_screen(&mut app);
+                assert!(
+                    !screen.contains("Please wait")
+                        && screen.contains("Unfinished scan from 2026-09-01")
+                        && screen.contains("Root: /tank/old-copy")
+                        && screen.contains("[R]/[Enter] resume"),
+                    "{screen}"
+                );
+                app.commander.overlay = Overlay::None;
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// And the F9 menu, whose Enter runs the item under the cursor: every item is drawn.
+            /// Red on the parent: the box hid five of them.
+            #[test]
+            fn the_f9_menu_is_not_covered_by_the_please_wait_box() {
+                let _role = crate::state::store::role_guard();
+                let (_db, scan_id, mut app, events) = open_app();
+                app.open_via_actor(scan_id, crate::app::OpenIntent::Commander);
+                key(&mut app, KeyCode::F(9));
+                assert_eq!(app.commander.overlay, Overlay::Menu { cursor: 0 });
+                assert!(app.opening_started.is_some(), "still opening");
+                let screen = drawn_screen(&mut app);
+                let hidden: Vec<&str> = MENU
+                    .iter()
+                    .map(|(label, _)| *label)
+                    .filter(|label| !screen.contains(label))
+                    .collect();
+                assert!(
+                    hidden.is_empty() && !screen.contains("Please wait"),
+                    "hidden: {hidden:?}\n{screen}"
+                );
+                app.commander.overlay = Overlay::None;
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// And the action review's last question, which Y answers, drawn in the middle of the
+            /// screen like the rest. No path reaches it while a result opens today, so the open is
+            /// set here by hand: the rule is about what the frame draws. Red on the parent: the box
+            /// was drawn over the question.
+            #[test]
+            fn the_review_question_is_not_covered_by_the_please_wait_box() {
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = marked_app();
+                app.show_disclaimer = false;
+                app.mode = AppMode::Wizard;
+                app.screen = Screen::Browser;
+                let _plan = super::open_under_windows::deliver_a_review_plan(&mut app);
+                assert_eq!(app.screen, Screen::ActionReview);
+                key(&mut app, KeyCode::Char('y'));
+                assert!(app.review.confirming, "the last question is asked");
+                app.opening_started = Some(std::time::Instant::now());
+                let screen = drawn_screen(&mut app);
+                assert!(
+                    !screen.contains("Please wait") && screen.contains("[Y] yes"),
+                    "{screen}"
+                );
                 crate::app::drain(&mut app, &events);
             }
         }

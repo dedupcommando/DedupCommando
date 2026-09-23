@@ -63,6 +63,8 @@ pub fn render_panel(
     let source_result = source.and_then(|e| e.result.as_ref());
     let source_empty = source.map(|e| e.empty).unwrap_or_default();
     let source_unavailable = source.and_then(|e| e.unavailable.as_ref());
+    // Set again below if this frame draws a group's files here.
+    panel.group_files_list = None;
     let border = if focused {
         Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     } else {
@@ -170,7 +172,7 @@ pub fn render_panel(
             match (panel.view, source_result) {
                 (_, Some(WatchResult::FileGroup(group, claim))) => {
                     let colors = browser::name_palette(group);
-                    browser::render_group_files(
+                    panel.group_files_list = Some(browser::render_group_files(
                         frame,
                         area,
                         Some(group),
@@ -180,7 +182,7 @@ pub fn render_panel(
                         PathStyle::NameFirst,
                         focused,
                         &title,
-                    );
+                    ));
                 }
                 (PanelView::DuplicatesOfCursor, Some(WatchResult::DirGroup(group))) => {
                     // A trusted group keeps the mode's own title byte for byte. An unverified one
