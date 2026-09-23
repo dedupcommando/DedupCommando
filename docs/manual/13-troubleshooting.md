@@ -24,7 +24,9 @@ The Merkle algorithm uses O(tree depth) RAM — tens to hundreds of MB regardles
 of the number of files.
 
 > Resuming an old scan continues with **the same algorithm** it was started with.
-> If it died on an old scan, start over with `--no-resume --merkle-dirs`.
+> If it died on an old scan, start over: `dedcom --scan /tank --no-resume
+> --merkle-dirs`, or a new scan (not "resume") in the interface started with
+> `--merkle-dirs`.
 
 ### The scan hammers the disk and my VMs/backups slowed down
 
@@ -207,8 +209,12 @@ ask the question), so it simply refuses to start. The headless message is:
 
 ```text
 write cancelled (PID 12345, since 2026-06-20 14:32:15): held by another instance
-or --read-only given — terminate that process or retry with --force
+— terminate that process or retry with --force
 ```
+
+(If the cron line itself carries `--read-only`, the message says so instead:
+`write cancelled: --read-only given, and this mode runs as the operator — run it
+without --read-only`.)
 
 **Fix:**
 

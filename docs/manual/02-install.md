@@ -233,13 +233,13 @@ A full walkthrough of Commando is in [§05](05-commando.md); the stepwise wizard
 | `dedcom --classic`         | Open the stepwise wizard. Useful for getting to know the tool.               |
 | `dedcom --read-only`       | A second window — "watch what the operator is doing".                        |
 | `dedcom --state-dir /path` | State directory outside `~` (for example, `/var/lib/dedcom`).                |
-| `dedcom --no-resume`       | Ignore the saved checkpoint and start a new scan.                            |
+| `dedcom --classic --no-resume` | The wizard without its list of saved scans: straight to a new scan.      |
 | `dedcom -V`                | Version.                                                                      |
 | `dedcom -h`                | Full help for all flags.                                                      |
 
 Options for scripting and automation (`--scan`, `--stats`, `--compact-db`, `--export-csv`,
-`--purge-quarantine`, `--include-ext`, `--strict-verify`, `--no-hash-reuse`, `--merkle-dirs`)
-have their own chapter — [§11 Headless](11-headless.md).
+`--purge-quarantine`, `--include-ext`, `--no-hash-reuse`, `--merkle-dirs`) have their own
+chapter — [§11 Headless](11-headless.md).
 
 ## What's next
 

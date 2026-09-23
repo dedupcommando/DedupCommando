@@ -15,6 +15,11 @@ another `dedcom` is already working on this state directory, the headless mode
 **does not prompt** — it exits with an error right away (there is no way to
 answer interactively).
 
+A run does **one** of them: two different modes in one run are refused before
+anything starts (exit code 2) — run them one after another. `--scan` may still
+be given several times, one root each. Without any of the five `dedcom` opens
+the interface.
+
 ## Common: state directory, lock, exit codes
 
 All headless modes:
@@ -33,8 +38,14 @@ Exit codes:
 - **0** — success, or `--help` / `--version`, or `--purge-quarantine` without
   `--yes` (size reported, nothing deleted).
 - **1** — runtime error. Printed as `dedcom: error: {message}` on stderr.
-- **2** — argument-parsing error. Printed as `dedcom: {message}` followed by
-  `Run with --help for usage.` on stderr.
+- **2** — argument-parsing error: an unknown flag, a missing or wrong value, two
+  different modes in one run, `--export-csv` given twice, two flags that undo
+  each other (`--classic` with `--commando`, `--read-only` with `--force`), or a
+  flag the run would ignore — for example `--include-ext` without `--scan`,
+  `--yes` without `--purge-quarantine`, `--strict-verify` with a headless mode
+  (the table at the end of this chapter says which run reads which flag).
+  Printed as `dedcom: {message}` followed by `Run with --help for usage.` on
+  stderr.
 
 ## 11.1. `--scan <PATH>` — scanning without the UI
 
@@ -47,6 +58,12 @@ dedcom --scan /tank --no-hash-reuse           # ignore the hash cache
 dedcom --scan /tank --no-resume               # start fresh, no resume
 dedcom --scan /tank --verify                  # byte-by-byte comparison after hashing
 ```
+
+A root whose path is not valid UTF-8 is refused before the scan starts (exit
+code 2). dedcom leaves out every file whose path is not UTF-8, so nothing under
+such a path could be scanned: rename what is not UTF-8 in it, or scan a
+directory above that part — its files are then counted under `Omissions:`
+(below).
 
 The output is line-by-line text for logging:
 
@@ -378,19 +395,29 @@ In the top-right corner the ` ● READ-ONLY ` badge stays lit. All action keys
 
 ## Other flags (not headless, but important for scripts)
 
-| Flag                       | Action                                                    |
-|----------------------------|-----------------------------------------------------------|
-| `--state-dir /path`        | A different state directory (not `~/.local/state/dedcom`) |
-| `--no-resume`              | Ignore the saved checkpoint                               |
-| `--no-hash-reuse`          | Disable the hash cache (re-hash everything)               |
-| `--verify`                 | Byte-by-byte comparison after hashing                     |
-| `--strict-verify`          | Strict revalidation for the TUI (at launch; see [§08](08-actions.md)) |
-| `--merkle-dirs`            | Directory signatures via streaming Merkle (memory-friendly, opt-in) |
-| `--include-ext jpg,heic`   | Extension filter                                          |
-| `--storage-type hdd`       | Override media auto-detection                             |
-| `--force`                  | Seize the lock (dangerous)                                |
-| `-V` / `--version`         | Version → stdout, exit 0                                  |
-| `-h` / `--help`            | Help → stdout, exit 0                                     |
+| Flag                       | Action                                                    | Applies to |
+|----------------------------|-----------------------------------------------------------|------------|
+| `--state-dir /path`        | A different state directory (not `~/.local/state/dedcom`) | every run |
+| `--no-resume`              | Ignore the saved checkpoint                               | `--scan`, the classic wizard |
+| `--no-hash-reuse`          | Disable the hash cache (re-hash everything)               | `--scan` |
+| `--verify`                 | Byte-by-byte comparison after hashing                     | `--scan`, both interfaces |
+| `--strict-verify`          | Strict revalidation before an action (see [§08](08-actions.md)) | both interfaces |
+| `--merkle-dirs`            | Directory signatures via streaming Merkle (memory-friendly, opt-in) | `--scan`, both interfaces |
+| `--include-ext jpg,heic`   | Extension filter                                          | `--scan` |
+| `--storage-type hdd`       | Override media auto-detection                             | `--scan` |
+| `--yes`                    | Confirm the deletion (§11.5)                              | `--purge-quarantine` |
+| `--classic`, `--commando`  | Open the step-by-step wizard, or the Commando interface   | either interface, not both |
+| `--read-only`              | Observer (§11.6)                                          | every run, not with `--force` |
+| `--force`                  | Seize the lock (dangerous)                                | every run, not with `--read-only` |
+| `-V` / `--version`         | Version → stdout, exit 0                                  | — |
+| `-h` / `--help`            | Help → stdout, exit 0                                     | — |
+
+"Both interfaces" are the Commando interface (the default) and the classic
+wizard (`--classic`). A flag given to a run it does not apply to is refused
+(exit code 2) rather than ignored. `--no-resume` belongs to the wizard, which
+offers the saved scans at start; the Commando interface offers them when asked
+(F2, F12), so there the flag is refused. `--read-only` and `--force` are taken
+by every run, but not together: an observer never takes the operator's lock.
 
 ## What's next
 

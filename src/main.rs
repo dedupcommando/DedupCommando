@@ -84,7 +84,8 @@ fn main() {
     let cli = match cli::Cli::parse() {
         Ok(cli) => cli,
         Err(msg) => {
-            eprintln!("dedcom: {msg}");
+            // A refusal may quote an argument, so it gets the escaping `run` gives an error too.
+            eprintln!("dedcom: {}", textsan::terminal(&msg));
             eprintln!("Run with --help for usage.");
             std::process::exit(2);
         }
@@ -151,7 +152,8 @@ enum Mode<'a> {
 
 impl<'a> Mode<'a> {
     /// A fixed precedence among the mode flags, whatever order they were typed in: `--stats`,
-    /// `--compact-db`, `--export-csv`, `--purge-quarantine`, `--scan`, then the interface.
+    /// `--compact-db`, `--export-csv`, `--purge-quarantine`, `--scan`, then the interface. The
+    /// parser refuses two of them in one run, so the order only decides for a `Cli` built by hand.
     fn of(cli: &'a cli::Cli) -> Self {
         if cli.stats {
             Mode::Stats
@@ -203,8 +205,8 @@ mod mode_tests {
     }
 
     /// The precedence the dispatch has always had: `--stats`, `--compact-db`, `--export-csv`,
-    /// `--purge-quarantine`, `--scan`, then the interface. Flags that do not combine are not
-    /// refused (yet), so the order is what decides which mode runs.
+    /// `--purge-quarantine`, `--scan`, then the interface. The parser refuses two mode flags in
+    /// one run (`cli::mode_tests`), so this order is only the fallback for a `Cli` built by hand.
     #[test]
     fn the_first_mode_flag_in_precedence_wins() {
         let out = Path::new(OUT);
@@ -231,7 +233,8 @@ mod mode_tests {
     }
 
     /// `--stats` and `--export-csv` only report on the state directory; every other mode writes
-    /// to it. `--compact-db --export-csv` is a compaction, so it writes.
+    /// to it. `--compact-db --export-csv` — a `Cli` built by hand, since the parser refuses the
+    /// pair — is a compaction, so it writes.
     #[test]
     fn only_the_reporting_modes_reach_the_state_directory_read_only() {
         use paths::StateAccess::{ReadOnly, Writing};
@@ -494,6 +497,56 @@ mod run_tests {
         for name in ["dedcom.db", "dedcom.lock", "dedcom.log"] {
             assert!(state.join(name).exists(), "{name}");
         }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// What the parser now lets through, past the parser: a state directory and a CSV whose names
+    /// are not UTF-8 are pathnames like any other, and every headless mode takes them — the scan,
+    /// the report, the export under its own name, the compaction, the quarantine count. The child
+    /// is handed a `Cli` built by hand, so this test does not go through the parser (the parser's
+    /// own tests hold that) and passes on a build that still panicked on such an argument.
+    #[test]
+    fn names_that_are_not_utf8_serve_every_headless_mode() {
+        use std::os::unix::ffi::OsStrExt;
+        let base = temp_base("bytes");
+        let probe = base.join(std::ffi::OsStr::from_bytes(b"probe\xff"));
+        std::fs::create_dir(&probe).expect(
+            "this test needs a filesystem that takes names that are not UTF-8 \
+             (a dataset with utf8only=on refuses them)",
+        );
+        std::fs::remove_dir(&probe).unwrap();
+        let state = base.join(std::ffi::OsStr::from_bytes(b"st\xffate"));
+        let csv = base.join(std::ffi::OsStr::from_bytes(b"gr\xfe\x80oups.csv"));
+        let root = base.join("root");
+        std::fs::create_dir(&root).unwrap();
+        for name in ["a.bin", "b.bin"] {
+            std::fs::write(root.join(name), [7u8; 8192]).unwrap();
+        }
+
+        for (mode, arg) in [
+            ("--scan", &root),
+            ("--stats", &csv),
+            ("--export-csv", &csv),
+            ("--compact-db", &csv),
+            ("--purge-quarantine", &csv),
+        ] {
+            let (code, stderr) = dedcom(mode, &state, arg);
+            assert_eq!(code, Some(0), "{mode}: {stderr}");
+        }
+        for name in ["dedcom.db", "dedcom.lock", "dedcom.log"] {
+            assert!(state.join(name).exists(), "{name}");
+        }
+        let exported = std::fs::read_to_string(&csv).expect("the CSV under its own name");
+        for name in ["/root/a.bin", "/root/b.bin"] {
+            assert!(exported.contains(name), "{name}:\n{exported}");
+        }
+        let mut expected = vec![
+            OsString::from("root"),
+            state.file_name().unwrap().to_owned(),
+            csv.file_name().unwrap().to_owned(),
+        ];
+        expected.sort();
+        assert_eq!(names_in(&base), expected, "and nothing else beside them");
         std::fs::remove_dir_all(&base).ok();
     }
 }
@@ -860,8 +913,9 @@ mod startup_order_tests {
 }
 
 /// DedupCommando IS the multi-pane commando, so it is open by default. `--classic` takes you
-/// to the classic step-by-step wizard; `--commando` is an explicit synonym for the default
-/// (takes priority over `--classic` if both are passed).
+/// to the classic step-by-step wizard; `--commando` is an explicit synonym for the default. The
+/// parser refuses the two together, so its priority over `--classic` decides only for a `Cli`
+/// built by hand.
 fn wants_commander(cli: &cli::Cli) -> bool {
     !cli.force_classic || cli.force_commando
 }
@@ -900,6 +954,12 @@ fn acquire_write_lock(cli: &cli::Cli) -> Result<Option<lock::InstanceLock>> {
     let policy = lock::load_policy(&state_dir);
     match lock::decide_headless(lock_state, policy, cli.read_only, cli.force) {
         lock::Decision::Operator => Ok(guard),
+        // An observer never writes, and the parser refuses `--force` beside `--read-only`: the way
+        // on is to drop the flag, whatever the lock says.
+        _ if cli.read_only => Err(AppError::msg(
+            "write cancelled: --read-only given, and this mode runs as the operator — run it \
+             without --read-only",
+        )),
         _ if lock_state == lock::LockState::Unknown => Err(AppError::msg(format!(
             "write cancelled: cannot verify the single-instance lock in {} — \
              put the state directory on local storage (a network filesystem without lockd \
@@ -911,8 +971,8 @@ fn acquire_write_lock(cli: &cli::Cli) -> Result<Option<lock::InstanceLock>> {
                 .map(|h| format!(" (PID {}, since {})", h.pid, textsan::terminal(&h.since)))
                 .unwrap_or_default();
             Err(AppError::msg(format!(
-                "write cancelled{who}: held by another instance or --read-only given — \
-                 terminate that process or retry with --force"
+                "write cancelled{who}: held by another instance — terminate that process or \
+                 retry with --force"
             )))
         }
     }
@@ -1520,6 +1580,71 @@ mod acquire_write_lock_tests {
             "there is no lock to hold when flock cannot be evaluated"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--read-only` on a mode that writes is refused with the one way on — drop the flag — not with
+    /// the advice for a held lock, `--force`, which the parser refuses beside `--read-only`. The
+    /// lock is free here, so it is the flag alone that refuses.
+    #[test]
+    fn read_only_refuses_the_write_and_says_to_drop_the_flag() {
+        let dir = temp_state_dir("read_only");
+        let observer = cli::Cli {
+            read_only: true,
+            ..cli_for(&dir, false)
+        };
+        let err = match acquire_write_lock(&observer) {
+            Ok(_) => panic!("an observer does not write"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("--read-only given"), "{err}");
+        assert!(!err.contains("--force"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The flag gets its own answer whatever the lock says — held by another instance, or past
+    /// evaluating. Without it, a held lock gets the held lock's answer, `--force` as the way on —
+    /// and so does a `read-only` concurrency policy, which is not the flag.
+    #[test]
+    fn read_only_gets_its_own_answer_in_every_lock_state() {
+        let observer = |dir: &Path| cli::Cli {
+            read_only: true,
+            ..cli_for(dir, false)
+        };
+        let refused = |cli: &cli::Cli| match acquire_write_lock(cli) {
+            Ok(_) => panic!("the write must be refused"),
+            Err(err) => err.to_string(),
+        };
+
+        let dir = temp_state_dir("held");
+        let held = match crate::lock::try_acquire(&dir).unwrap() {
+            crate::lock::Acquire::Operator(guard) => guard,
+            crate::lock::Acquire::Busy(_) => panic!("a fresh directory's lock is free"),
+        };
+        let err = refused(&observer(&dir));
+        assert!(err.contains("--read-only given"), "{err}");
+        assert!(!err.contains("--force"), "{err}");
+        for policy in [None, Some(r#"{"concurrency":"read-only"}"#)] {
+            if let Some(json) = policy {
+                std::fs::write(dir.join("config.json"), json).unwrap();
+            }
+            let err = refused(&cli_for(&dir, false));
+            assert!(
+                err.contains(
+                    "held by another instance — terminate that process or retry with --force"
+                ),
+                "{policy:?}: {err}"
+            );
+            assert!(!err.contains("--read-only"), "{policy:?}: {err}");
+        }
+        drop(held);
+        std::fs::remove_dir_all(&dir).ok();
+
+        let dir = temp_state_dir("unevaluable_ro");
+        std::fs::create_dir_all(dir.join("dedcom.lock")).unwrap();
+        let err = refused(&observer(&dir));
+        assert!(err.contains("--read-only given"), "{err}");
+        assert!(!err.contains("--force"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2177,17 +2302,18 @@ impl TempArtifact {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos())
             .unwrap_or(0);
-        let base = format!(
-            ".{}.dedcom-export-{}-{nanos}",
-            dest.to_string_lossy(),
-            std::process::id()
-        );
+        // From the destination's bytes: spelled lossily, each byte that is not UTF-8 took three,
+        // and a name of 80 of them outgrew the limit on a name's length.
+        let mut base = std::ffi::OsString::from(".");
+        base.push(dest);
+        base.push(format!(".dedcom-export-{}-{nanos}", std::process::id()));
         let mut attempt = 0u32;
         loop {
-            let candidate = std::ffi::OsString::from(if attempt == 0 {
-                format!("{base}.tmp")
+            let mut candidate = base.clone();
+            candidate.push(if attempt == 0 {
+                ".tmp".to_string()
             } else {
-                format!("{base}-r{attempt}.tmp")
+                format!("-r{attempt}.tmp")
             });
             match dir.create_new_file(&candidate) {
                 Ok(file) => {
@@ -2701,6 +2827,25 @@ mod export_csv_tests {
         }
         assert_eq!(parsed.iter().filter(|row| row.keep == "1").count(), 1);
         assert_eq!(find(&parsed, "/tank/c").keep, "1", "freshest mtime keeps");
+        assert!(rig.residue().is_empty());
+    }
+
+    /// A destination named in a single-byte encoding — 80 bytes, none of them UTF-8 — is exported
+    /// under exactly those bytes. The temporary name beside it used to carry the name spelled
+    /// lossily, three bytes for each of those, and outgrew the limit on a name's length.
+    #[test]
+    fn a_long_name_that_is_not_utf8_is_exported_under_its_own_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let rig = Rig::new("long_bytes");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        complete_derived(&mut rig.store(), &rows, 0xA7);
+        let mut name = vec![0xE0u8; 80];
+        name.extend_from_slice(b".csv");
+        let dest = rig.dir.join(std::ffi::OsStr::from_bytes(&name));
+
+        run_export_csv(&rig.cli(), &dest).expect("the export must succeed");
+        let csv = std::fs::read_to_string(&dest).expect("the CSV under its own bytes");
+        assert_eq!(rows_of(&csv).len(), 2, "{csv}");
         assert!(rig.residue().is_empty());
     }
 

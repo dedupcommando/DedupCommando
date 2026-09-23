@@ -150,7 +150,7 @@ Headless modes (`--scan`, `--stats`, `--compact-db`, `--export-csv`,
 nothing to answer interactively:
 
 ```text
-write cancelled: held by another instance or --read-only given — terminate that process or retry with --force
+write cancelled: held by another instance — terminate that process or retry with --force
 ```
 
 > ⚠️ **`--force` is dangerous.** It seizes the lock, but the previous instance keeps

@@ -284,12 +284,15 @@ additional messages, the most important being:
 |---------------------------------------------------|-------------------------------------------------------------------|
 | Scan `/tank`, gently (live VMs)                   | TUI: F9 → scan configuration wizard → Space tank → G to Idle → S  |
 | Scan `/tank`, headless from cron                  | `dedcom --scan /tank` (profile defaults to Balanced; for cron, set Idle once via the TUI — it persists in the checkpoint) |
-| Large pool, little RAM                            | + `--merkle-dirs`                                                  |
-| Doubts about hash integrity                       | + `--verify` (2× slower)                                           |
-| Suspicion that external software changes content  | + `--no-hash-reuse`                                                |
-| Media only                                        | + `--include-ext jpg,heic,mp4,mov`                                 |
+| Large pool, little RAM                            | + `--merkle-dirs` (with `--scan`, or at TUI launch)                |
+| Doubts about hash integrity                       | + `--verify` (with `--scan`, or at TUI launch; 2× slower)          |
+| Suspicion that external software changes content  | `--scan` + `--no-hash-reuse` (TUI: **C** in the wizard)            |
+| Media only                                        | `--scan` + `--include-ext jpg,heic,mp4,mov` (TUI: **P** in the wizard) |
 | Paranoid apply                                    | `dedcom --strict-verify` (at TUI launch)                           |
-| VM with wrong storage auto-detection              | + `--storage-type hdd`                                             |
+| VM with wrong storage auto-detection              | `--scan` + `--storage-type hdd`                                    |
+
+A flag given to a run that does not read it is refused with exit code 2 — for
+example `--include-ext` without `--scan` ([§11](11-headless.md)).
 
 ## What's next
 

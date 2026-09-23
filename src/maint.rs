@@ -130,8 +130,10 @@ pub fn vacuum_only(db_path: &Path, state_dir: &Path) -> Result<()> {
 /// DB size on disk: main file + WAL — the single source for
 /// `--stats` and the F12 header.
 pub fn db_size_bytes(db_path: &Path) -> u64 {
-    let wal = PathBuf::from(format!("{}-wal", db_path.display()));
-    file_size(db_path) + file_size(&wal)
+    // From the bytes: `display()` would name another file when the state directory is not UTF-8.
+    let mut wal = db_path.as_os_str().to_os_string();
+    wal.push("-wal");
+    file_size(db_path) + file_size(Path::new(&wal))
 }
 
 fn file_size(path: &Path) -> u64 {
@@ -146,6 +148,28 @@ mod tests {
     fn off_when_interval_zero() {
         assert!(!vacuum_due(0, None, 1_000_000));
         assert!(!vacuum_due(0, Some(0), 1_000_000));
+    }
+
+    /// The size counts the log beside the database under the database's own bytes: in a state
+    /// directory whose name is not UTF-8, `--stats` used to look for the log under another name
+    /// and count it as nothing.
+    #[test]
+    fn the_size_counts_the_log_in_a_directory_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let base =
+            std::env::temp_dir().join(format!("dedcom_maint_wal_{}_{nanos}", std::process::id()));
+        let dir = base.join(std::ffi::OsStr::from_bytes(b"st\xffate"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("dedcom.db");
+        std::fs::write(&db, [0u8; 100]).unwrap();
+        std::fs::write(dir.join("dedcom.db-wal"), [0u8; 1000]).unwrap();
+        let size = db_size_bytes(&db);
+        std::fs::remove_dir_all(&base).ok();
+        assert_eq!(size, 1100);
     }
 
     /// Retention runs unasked on every completed scan, so the number it keeps is a promise about

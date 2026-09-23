@@ -1,0 +1,5 @@
+# `std::env::args` makes a `String` of every argument and panics on the first one that is not UTF-8,
+# the program's own name included. A pathname is bytes, so the arguments are read with `args_os`.
+disallowed-methods = [
+    { path = "std::env::args", reason = "panics on an argument that is not UTF-8; read the arguments with std::env::args_os" },
+]
