@@ -86,8 +86,8 @@ pub struct ScanConfig {
     pub hash_profile: HashProfile,
     /// Directory signature algorithm. `#[serde(default)]` → `Old` for
     /// old checkpoints without the field. CLI `--merkle-dirs` sets `Merkle` at the start
-    /// of a new scan; on resume the value is read from the DB (the CLI flag is ignored,
-    /// like for `hash_profile`).
+    /// of a new scan; on resume the value is read from the DB, like `hash_profile` — a
+    /// headless resume refuses a flag that asks for another one, the interface ignores it.
     #[serde(default)]
     pub dir_sig_algo: DirSigAlgo,
 }

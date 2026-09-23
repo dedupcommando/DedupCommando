@@ -210,7 +210,10 @@ minutes, not hours. NOTHING on the filesystem is changed.
 > ⚠️ **Memory peak in 3/3.** This is the most RAM-intensive phase (~2.5 KiB/file;
 > on 2 million files, ~5 GiB). If RAM runs out, the OOM killer kills the process.
 > Resume after an OOM picks the scan back up, but phase 3 will hit the same problem
-> again. The fix: `--merkle-dirs` (memory is O(depth), not O(files)) — see
+> again: a resume keeps the algorithm the scan was started with. The fix: start it
+> over with `--merkle-dirs` — `dedcom --scan /tank --merkle-dirs --no-resume`, or a
+> new scan rather than a resume in the interface (memory is O(depth), not
+> O(files); the hashes already read come back from the cache) — see
 > [§07](07-scanning.md).
 
 ### …press **Esc** during a scan

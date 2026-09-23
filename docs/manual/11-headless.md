@@ -37,7 +37,8 @@ Exit codes:
 
 - **0** — success, or `--help` / `--version`, or `--purge-quarantine` without
   `--yes` (size reported, nothing deleted).
-- **1** — runtime error. Printed as `dedcom: error: {message}` on stderr.
+- **1** — runtime error, including a `--scan` root that does not exist or cannot
+  be read. Printed as `dedcom: error: {message}` on stderr.
 - **2** — argument-parsing error: an unknown flag, a missing or wrong value, two
   different modes in one run, `--export-csv` given twice, two flags that undo
   each other (`--classic` with `--commando`, `--read-only` with `--force`), or a
@@ -64,6 +65,20 @@ code 2). dedcom leaves out every file whose path is not UTF-8, so nothing under
 such a path could be scanned: rename what is not UTF-8 in it, or scan a
 directory above that part — its files are then counted under `Omissions:`
 (below).
+
+A root that does not exist or cannot be read — a typo, a mount point that is
+gone — is refused with exit code 1 before the lock or the database is touched.
+It never becomes an empty "finished" scan that retention would count against the
+good scans of that root ([§10](10-diff-trash.md)).
+
+An empty directory is still a root like any other — and that includes the mount
+point a dataset that is not mounted usually leaves behind. Such a scan finds
+nothing, finishes, and counts toward the history kept like any other. In cron,
+guard the line with `mountpoint -q` on the mount point of the dataset the root
+lives on — `/tank` for `/tank` itself and for a plain directory under it (the
+last example below does). A plain directory is never a mount point: guarded by
+its own path, the line never runs. The guard checks that one dataset; a dataset
+below the root that failed to mount still leaves an empty directory in the scan.
 
 The output is line-by-line text for logging:
 
@@ -110,7 +125,8 @@ On a repeated run of `--scan <the same roots>` without the `--no-resume` flag:
 
 ```text
 $ dedcom --scan /tank
-Resuming unfinished scan #142 from 2026-05-20 14:15 (12345 / 23456 files already hashed)
+Resuming unfinished scan #142 from 2026-05-20 14:15:00 (12345 / 23456 files already hashed)
+Settings kept from its start: extensions all; hash cache on; directory signatures default; profile Idle
 [phase] Hashing
 ...
 ```
@@ -119,6 +135,12 @@ Resuming unfinished scan #142 from 2026-05-20 14:15 (12345 / 23456 files already
   record in the DB).
 - Completed scans are not resumed (no need).
 - `--no-resume` → start a new scan, ignoring the checkpoint.
+- A resume keeps the settings its scan was started with — the extension
+  filter, the hash cache, the directory signatures, the profile — and prints
+  them. A flag that asks for something else (`--include-ext` with another list,
+  `--no-hash-reuse`, `--merkle-dirs`) is refused rather than ignored: run
+  without it to resume, or add `--no-resume` to start a new scan with it.
+  `--verify` applies to a resume as well.
 
 ### Applying actions from headless? — no
 
@@ -147,11 +169,20 @@ in the DB):
 0 2 * * * root flock -n /var/lock/dedcom.scan /usr/local/bin/dedcom --scan /tank >> /var/log/dedcom-scan.log 2>&1
 ```
 
-> ⚠️ **On a production /tank in cron — always use the Idle profile.** Headless
-> `--scan` does not switch the profile automatically; it takes it from the last
-> scan configuration in the DB (or Balanced by default). Set Idle once via the
-> TUI: F9 → scan configuration wizard → `G` until Idle → `S` (run at least an
-> empty scan). After that the profile is remembered and cron will run on Idle.
+> ⚠️ **A new headless scan runs on the Balanced profile.** There is no flag for
+> the profile yet, and `--scan` does not take it over from an earlier scan: every
+> new scan starts on Balanced — two reading threads at normal priority. Only a
+> resume keeps the profile its scan was started with. On a production /tank,
+> give the cron line Idle's priorities from outside — and skip the night, with a
+> line in the log, when the pool is not mounted:
+>
+> ```cron
+> 0 2 * * * root if mountpoint -q /tank; then flock -n /var/lock/dedcom.scan nice -n 19 ionice -c 3 /usr/local/bin/dedcom --scan /tank; else echo "$(date) /tank is not mounted, no scan"; fi >> /var/log/dedcom-scan.log 2>&1
+> ```
+>
+> Every thread of the run inherits them, the walk and the database writes as well
+> as the two reading threads: they yield the CPU to VMs and backups, and ask the
+> disk to do the same, as Idle does. Unlike Idle, there are two reading threads.
 
 ## 11.2. `--stats` — statistics for scans and the DB
 

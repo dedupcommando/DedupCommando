@@ -15,6 +15,9 @@
 //! - [`DirAliasGuard`] runs during the walk, where an alias inside a selected root first becomes
 //!   visible (a bind mount under it, or a followed directory symlink). It fails the whole scan
 //!   closed; a manifest that saw one tree twice must never be published as a complete result.
+//!
+//! One more check stands in front of both for `--scan`: [`ensure_reachable`] refuses a root the
+//! walk could not enter at all.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -62,13 +65,15 @@ pub struct ResolvedRoot {
 pub struct RootDescriptor {
     pub given: PathBuf,
     /// `None` when the path cannot be resolved right now (it does not exist, or is unreadable). Such
-    /// a root is still scanned, exactly as before; it simply cannot be compared with the others.
+    /// a root simply cannot be compared with the others; `--scan` has refused it by then
+    /// ([`ensure_reachable`]), the interface still scans it.
     pub resolved: Option<ResolvedRoot>,
 }
 
 /// Reads what the filesystem knows about each root. Never fails and never drops a root: an
-/// unresolvable path yields `resolved: None`, because refusing it here would turn a scan that used
-/// to return "nothing found" into a hard error.
+/// unresolvable path yields `resolved: None` and is simply not compared. Refusing a root the walk
+/// cannot enter is [`ensure_reachable`]'s job before any `--scan`, a new one or a resume; only the
+/// interface still gets here with one.
 pub fn describe(paths: &[PathBuf]) -> Vec<RootDescriptor> {
     paths
         .iter()
@@ -122,6 +127,82 @@ pub fn validate(roots: &[RootDescriptor]) -> Result<()> {
 /// and no result behind.
 pub fn ensure_disjoint(paths: &[PathBuf]) -> Result<()> {
     validate(&describe(paths))
+}
+
+/// Refuses a root the walk could not enter: one that does not exist, cannot be read, or is neither
+/// a directory nor a regular file.
+///
+/// Such a root used to become one walk error and a finished, empty scan with exit code 0 and the
+/// reason nowhere. Worse, that scan counted toward the history kept, so two nights of a cron scan
+/// over a root that was gone moved both good scans of it to the trash. `--scan` runs this before
+/// it takes the lock, so a refusal leaves no lock and no database behind — only its line in the
+/// log. The root is checked as given, the way the walk opens it: a relative root stays relative,
+/// and a symbolic link is followed.
+///
+/// An empty directory passes, and so does the empty mount point a dataset that is not mounted
+/// leaves behind: telling the two apart takes ZFS, not a path.
+pub fn ensure_reachable(paths: &[PathBuf]) -> Result<()> {
+    for path in paths {
+        let reach = look(path, |dir| std::fs::read_dir(dir).map(drop));
+        if let Some(refusal) = refusal(path, reach) {
+            return Err(refusal);
+        }
+    }
+    Ok(())
+}
+
+/// What the filesystem says about a root, as far as the walk is concerned.
+#[derive(Debug)]
+enum Reach {
+    /// A directory that can be listed, or a regular file.
+    Walkable,
+    Missing,
+    /// A symbolic link that leads nowhere.
+    Dangling,
+    /// `stat` failed for another reason: a loop of links, a file taken for a directory, no search
+    /// permission on the way.
+    Unreachable(std::io::Error),
+    /// A directory that may not be listed.
+    Unlistable(std::io::Error),
+    /// A device, a FIFO, a socket.
+    NotWalkable,
+}
+
+/// Looks at a root the way the walk will: its metadata through a symbolic link, and for a
+/// directory whether `list` can list it. The listing is handed in, so a test can give the
+/// filesystem's answer that root would never get — root lists every directory there is.
+fn look(path: &Path, list: impl FnOnce(&Path) -> std::io::Result<()>) -> Reach {
+    match std::fs::metadata(path) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Reach::Unreachable(err),
+        Err(_) if std::fs::symlink_metadata(path).is_ok() => Reach::Dangling,
+        Err(_) => Reach::Missing,
+        Ok(meta) if meta.is_dir() => match list(path) {
+            Ok(()) => Reach::Walkable,
+            Err(err) => Reach::Unlistable(err),
+        },
+        Ok(meta) if meta.is_file() => Reach::Walkable,
+        Ok(_) => Reach::NotWalkable,
+    }
+}
+
+/// The refusal for a root the walk could not enter, if it is one.
+fn refusal(path: &Path, reach: Reach) -> Option<AppError> {
+    let shown = show(path);
+    let why = match reach {
+        Reach::Walkable => return None,
+        Reach::Missing => "does not exist, so nothing was scanned — check the spelling, and that \
+                           the dataset is mounted"
+            .to_string(),
+        Reach::Dangling => "is a symbolic link to nothing, so nothing was scanned — check what it \
+                            points to, and that the dataset there is mounted"
+            .to_string(),
+        Reach::Unreachable(err) => format!("cannot be reached ({err}), so nothing was scanned"),
+        Reach::Unlistable(err) => format!("cannot be read ({err}), so nothing was scanned"),
+        Reach::NotWalkable => {
+            "is neither a directory nor a regular file, so nothing was scanned".to_string()
+        }
+    };
+    Some(AppError::msg(format!("scan root {shown} {why}")))
 }
 
 /// Builds the rejection, naming both roots, the class and what to do about it.
@@ -398,5 +479,91 @@ mod tests {
             guard.note(Path::new("/tank/a"), 1, 10).is_ok(),
             "the same directory by the same name is not an alias"
         );
+    }
+
+    /// A directory that may not be listed is refused as unreadable, and only a directory is listed.
+    /// Root lists every directory there is, so the filesystem's answer is handed in here rather
+    /// than looked for on the machine.
+    #[test]
+    fn a_directory_that_may_not_be_listed_is_refused() {
+        let base = temp_dir("unlistable");
+        let file = base.join("file.bin");
+        std::fs::write(&file, b"x").unwrap();
+        let denied = |_: &Path| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+
+        let refused = refusal(&base, look(&base, denied))
+            .expect("a directory it may not list")
+            .to_string();
+        assert!(refused.contains("cannot be read"), "{refused}");
+        assert!(refused.contains("nothing was scanned"), "{refused}");
+        assert!(refused.contains(&show(&base)), "{refused}");
+
+        let listed = look(&file, |_| panic!("a file is not listed"));
+        assert!(refusal(&file, listed).is_none());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Whatever the walk can enter passes: a directory, an empty one included, a regular file, a
+    /// relative spelling, a symbolic link to a directory.
+    #[test]
+    fn a_root_the_walk_can_enter_is_reachable() {
+        let base = temp_dir("reachable");
+        let empty = base.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let file = base.join("file.bin");
+        std::fs::write(&file, b"x").unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&empty, &link).unwrap();
+        let roots = [empty, file, link, PathBuf::from(".")];
+        let reached = ensure_reachable(&roots);
+        std::fs::remove_dir_all(&base).ok();
+        reached.expect("every one of them can be walked");
+    }
+
+    /// A root that is not there, a link to nothing, a path the kernel will not follow (a loop of
+    /// links, a file taken for a directory) and a device are each refused by name, first or second
+    /// in the list, and a control character in the name is spelled out.
+    #[test]
+    fn a_root_the_walk_cannot_enter_is_refused_by_name() {
+        let base = temp_dir("unreachable");
+        let fine = base.join("fine");
+        std::fs::create_dir(&fine).unwrap();
+        let missing = base.join("miss\u{1b}[2Jing");
+        let dangling = base.join("dangling");
+        std::os::unix::fs::symlink(base.join("nowhere"), &dangling).unwrap();
+        let (loop_a, loop_b) = (base.join("loop_a"), base.join("loop_b"));
+        std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+        std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+        let file = base.join("file.bin");
+        std::fs::write(&file, b"x").unwrap();
+        let through_a_file = file.join("inside");
+        // A character device, on every Linux: neither a directory nor a regular file.
+        let device = PathBuf::from("/dev/null");
+
+        let cases = [
+            (
+                &missing,
+                "does not exist, so nothing was scanned — check the spelling, and that the \
+                 dataset is mounted",
+            ),
+            (
+                &dangling,
+                "is a symbolic link to nothing, so nothing was scanned — check what it points \
+                 to, and that the dataset there is mounted",
+            ),
+            (&loop_a, "cannot be reached"),
+            (&through_a_file, "cannot be reached"),
+            (&device, "is neither a directory nor a regular file"),
+        ];
+        for (root, says) in cases {
+            for roots in [[fine.clone(), root.clone()], [root.clone(), fine.clone()]] {
+                let refusal = ensure_reachable(&roots).expect_err(says).to_string();
+                assert!(refusal.contains(says), "{refusal}");
+                assert!(refusal.contains("nothing was scanned"), "{refusal}");
+                assert!(refusal.contains(&show(root)), "{refusal}");
+                assert!(!refusal.contains(char::is_control), "{refusal:?}");
+            }
+        }
+        std::fs::remove_dir_all(&base).ok();
     }
 }

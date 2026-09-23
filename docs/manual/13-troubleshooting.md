@@ -15,18 +15,18 @@ memory per hashed file. On a pool with 2 M files that is a peak of about 5 GiB
 **Fix:**
 
 ```text
-dedcom --scan /tank --merkle-dirs    # headless, with the memory-friendly algorithm
+dedcom --scan /tank --merkle-dirs --no-resume   # headless, with the memory-friendly algorithm
 # or in the TUI:
-dedcom --merkle-dirs                  # the flag applies to a NEW scan from this session
+dedcom --merkle-dirs                             # the flag applies to a NEW scan from this session
 ```
 
 The Merkle algorithm uses O(tree depth) RAM — tens to hundreds of MB regardless
 of the number of files.
 
-> Resuming an old scan continues with **the same algorithm** it was started with.
-> If it died on an old scan, start over: `dedcom --scan /tank --no-resume
-> --merkle-dirs`, or a new scan (not "resume") in the interface started with
-> `--merkle-dirs`.
+> The killed scan is still unfinished, and a resume continues with **the same
+> algorithm** it was started with — so start a new one: `--no-resume` with
+> `--scan` (without it the flag is refused), "new" rather than "resume" in the
+> interface. The hashes the killed scan already read come back from the cache.
 
 ### The scan hammers the disk and my VMs/backups slowed down
 
@@ -36,9 +36,9 @@ the disk in parallel and competes with your other workloads.
 **Fix:** switch to **Idle** (1 thread + nice 19 + ionice idle):
 
 - In the TUI: F9 → scan configuration wizard → `G` until `Idle` → start.
-- Headless: the profile comes from the last scan configuration in the database
-  (set it **once** through the TUI, then cron picks it up automatically — the
-  profile is persisted in the checkpoint).
+- Headless: there is no flag for the profile, and every new `--scan` runs on
+  Balanced. Run it under `nice -n 19 ionice -c 3` — see
+  [§11](11-headless.md#cron-example-a-nightly-scan-of-tank).
 
 See [§07 Intensity profiles](07-scanning.md#intensity-profiles-resource-governor).
 
@@ -66,7 +66,9 @@ mtime)` that match the current file exactly. Any change is a cache miss:
 ### `--no-hash-reuse` is off right now — but I want it on
 
 In the TUI: scan configuration wizard → key **C** (cache toggle). Headless:
-`dedcom --scan /tank --no-hash-reuse`.
+`dedcom --scan /tank --no-hash-reuse` — and `--no-resume` with it if an
+unfinished scan of `/tank` is waiting: a resume keeps the cache setting it was
+started with, so the flag alone is refused.
 
 ### The scan reports "0 files scanned" on a ZFS pool
 
@@ -78,6 +80,17 @@ enter the scan. Headless output simply prints `Files scanned:        0`.
 in code. If you need to deduplicate tiny files you have to change
 `ScanConfig::new` in the source (`src/model/scan.rs`) and rebuild. For a typical
 backup/media workload `min_size=4096` is the right default.
+
+**Another cause:** the root is the mount point of a dataset that is not mounted —
+an empty directory, so the scan finds nothing and finishes. Like any finished
+scan it counts toward the history kept, so earlier scans of that root may have
+gone to the trash: restore them from there, and move the empty scans to the
+trash — otherwise the next finished scan moves the restored ones out again
+([§10](10-diff-trash.md)). Check with `zfs get mounted <dataset>`, and in cron
+guard the line with `mountpoint -q` on the mount point of the dataset the root
+lives on — never on a plain directory, which is never a mount point
+([§11](11-headless.md)). A root that does not exist at all is refused instead
+(exit code 1).
 
 ## Applying actions
 

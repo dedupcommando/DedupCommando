@@ -40,7 +40,8 @@ Turbo → Balanced → Idle → Turbo
 > scan.
 
 The profile is persisted in the scan's checkpoint DB — resume uses the same
-profile (a CLI flag change is not applied to an already-running session).
+profile. There is no command-line flag for it: a headless `--scan` starts every
+new scan on Balanced ([§11](11-headless.md)).
 
 ## Filters
 
@@ -157,7 +158,10 @@ dedcom --scan /tank --merkle-dirs       # headless
 > **When you need `--merkle-dirs`:** on a host where `~2.5 KiB × file_count` is
 > close to free RAM or exceeds it. Before phase 3/3 dedcom prints a forecast and
 > compares it with free RAM — if you get a red warning, or a previous scan was
-> killed by OOM on 3/3, turn it on.
+> killed by OOM on 3/3, turn it on. A scan killed that way is still unfinished,
+> and a resume keeps the algorithm it was started with, so start a new one:
+> `dedcom --scan /tank --merkle-dirs --no-resume` (without `--no-resume` the
+> flag is refused, see [§11](11-headless.md)).
 
 The algorithm is persisted in the checkpoint — resume uses the same one.
 
@@ -238,10 +242,11 @@ a new one".
 > - A change of `min_size` or the extension filter (new files could enter the
 >   scan).
 > - Deleting `dedcom.db` or the state directory.
-> - All CLI flags that affect the config (`--merkle-dirs`, `--no-hash-reuse`,
+> - All settings that affect the config (`--merkle-dirs`, `--no-hash-reuse`,
 >   `--include-ext`, the profile): they apply ONLY at the start of a new scan; on
->   resume the values are read from the checkpoint and the command-line flags are
->   ignored.
+>   resume the values are read from the checkpoint. The interface ignores such
+>   flags on a resume; a headless `--scan` that asks for other values is refused
+>   (add `--no-resume` to start a new scan with them).
 
 ## Storage-type override (`--storage-type`)
 
@@ -276,14 +281,16 @@ additional messages, the most important being:
 - **"Phase 3/3 peak estimate: X GiB, free: Y GiB"** — the `files × 2.5 KiB`
   calculation from the phase-2 results vs `available_ram_bytes`. If X > Y it is
   printed in yellow: a risk of OOM, and you are advised to interrupt (Esc) and
-  restart with `--merkle-dirs`.
+  start a new scan with `--merkle-dirs` — "new" rather than "resume" in the
+  interface, `--no-resume` with `--scan`: a resume keeps the algorithm it was
+  started with.
 
 ## Summary — typical flag combinations
 
 | Scenario                                          | Command                                                           |
 |---------------------------------------------------|-------------------------------------------------------------------|
 | Scan `/tank`, gently (live VMs)                   | TUI: F9 → scan configuration wizard → Space tank → G to Idle → S  |
-| Scan `/tank`, headless from cron                  | `dedcom --scan /tank` (profile defaults to Balanced; for cron, set Idle once via the TUI — it persists in the checkpoint) |
+| Scan `/tank`, headless from cron                  | `nice -n 19 ionice -c 3 dedcom --scan /tank` (a new headless scan runs on Balanced — the full cron line is in [§11](11-headless.md#cron-example-a-nightly-scan-of-tank)) |
 | Large pool, little RAM                            | + `--merkle-dirs` (with `--scan`, or at TUI launch)                |
 | Doubts about hash integrity                       | + `--verify` (with `--scan`, or at TUI launch; 2× slower)          |
 | Suspicion that external software changes content  | `--scan` + `--no-hash-reuse` (TUI: **C** in the wizard)            |

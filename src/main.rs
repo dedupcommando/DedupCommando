@@ -40,6 +40,7 @@ use ratatui::crossterm::event::KeyCode;
 
 use crate::app::App;
 use crate::error::{AppError, Result};
+use crate::model::duplicate::DirSigAlgo;
 use crate::model::scan::{ScanConfig, ScanProgress};
 use crate::pipeline::ScanOutcome;
 use crate::state::{HostProfile, ScanStore};
@@ -121,7 +122,10 @@ fn run(cli: &cli::Cli) -> i32 {
         Mode::PurgeQuarantine => {
             acquire_write_lock(cli).and_then(|_lock| run_purge_quarantine(cli))
         }
-        Mode::HeadlessScan => acquire_write_lock(cli).and_then(|_lock| run_headless_scan(cli)),
+        // A root the walk could not enter is refused before the lock, so it never becomes a scan.
+        Mode::HeadlessScan => pipeline::roots::ensure_reachable(&cli.scan_roots)
+            .and_then(|()| acquire_write_lock(cli))
+            .and_then(|_lock| run_headless_scan(cli)),
         Mode::Tui => run_tui(cli),
     };
 
@@ -300,6 +304,13 @@ mod run_tests {
 
     /// Runs `run` with `mode` over `state` in a child process: its exit code and its stderr.
     fn dedcom(mode: &str, state: &Path, arg: &Path) -> (Option<i32>, String) {
+        let (code, _, stderr) = dedcom_out(mode, state, arg);
+        (code, stderr)
+    }
+
+    /// The same, with what the child printed on stdout as well — the test harness's lines around
+    /// it included.
+    fn dedcom_out(mode: &str, state: &Path, arg: &Path) -> (Option<i32>, String, String) {
         use std::os::unix::process::CommandExt;
         use std::time::{Duration, Instant};
         const CHILD: &str = "run_tests::the_child_runs_what_it_is_given";
@@ -352,7 +363,7 @@ mod run_tests {
             stdout.contains("running 1 test"),
             "the child ran no test — {CHILD} no longer names it:\n{stdout}"
         );
-        (status.code(), stderr)
+        (status.code(), stdout, stderr)
     }
 
     fn temp_base(tag: &str) -> PathBuf {
@@ -450,6 +461,66 @@ mod run_tests {
             assert_eq!(names_in(&dir), [OsString::from("passwd")], "{mode}");
         }
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A root that is not there — a typo, a mount point that is gone — used to become a finished
+    /// scan with one walk error and exit code 0, the reason nowhere, and that empty scan counted
+    /// toward the history kept: two nights of cron over a missing root put both good scans of it in
+    /// the trash. It is refused before the lock or the database is touched, with the root and the
+    /// reason named, on stderr and in the log. An empty directory is still a root like any other.
+    #[test]
+    fn a_scan_root_that_is_not_there_is_refused_before_the_database_is_touched() {
+        let base = temp_base("noroot");
+        let state = base.join("state");
+        let missing = base.join("missing");
+        let (code, stderr) = dedcom("--scan", &state, &missing);
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(stderr.contains("does not exist"), "{stderr}");
+        assert!(stderr.contains(&missing.display().to_string()), "{stderr}");
+        for name in ["dedcom.db", "dedcom.lock"] {
+            assert!(!state.join(name).exists(), "{name}: {:?}", names_in(&state));
+        }
+        let log = std::fs::read_to_string(state.join("dedcom.log")).unwrap_or_default();
+        assert!(
+            log.contains("does not exist"),
+            "the refusal is logged: {log}"
+        );
+
+        let empty = base.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let (code, stderr) = dedcom("--scan", &state, &empty);
+        assert_eq!(code, Some(0), "an empty directory is scanned: {stderr}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// `--scan` over the roots of an unfinished scan continues it, and says so on stdout with the
+    /// settings it keeps — the line an operator reads in the cron log.
+    #[test]
+    fn a_headless_resume_prints_the_settings_it_keeps() {
+        let base = temp_base("resume");
+        let state = base.join("state");
+        let root = base.join("root");
+        std::fs::create_dir(&root).unwrap();
+        crate::paths::establish_state_dir(&state).unwrap();
+        let id = ScanStore::open_writable(&state.join("dedcom.db"))
+            .unwrap()
+            .begin_scan(&crate::model::scan::ScanConfig::new(vec![root.clone()]))
+            .unwrap();
+
+        let (code, stdout, stderr) = dedcom_out("--scan", &state, &root);
+        std::fs::remove_dir_all(&base).ok();
+        assert_eq!(code, Some(0), "{stderr}");
+        assert!(
+            stdout.contains(&format!("Resuming unfinished scan #{id} from ")),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(
+                "Settings kept from its start: extensions all; hash cache on; directory signatures \
+                 default; profile Balanced"
+            ),
+            "{stdout}"
+        );
     }
 
     /// In its own directory `--stats` works and logs as before, and leaves the mode alone.
@@ -987,28 +1058,10 @@ fn run_headless_scan(cli: &cli::Cli) -> Result<()> {
     config.storage_type_override = cli.storage_type.clone();
     config.reuse_hashes = !cli.no_hash_reuse;
     if cli.merkle_dirs {
-        config.dir_sig_algo = crate::model::duplicate::DirSigAlgo::Merkle;
+        config.dir_sig_algo = DirSigAlgo::Merkle;
     }
 
-    let resume = if cli.no_resume {
-        None
-    } else {
-        // Resume ONLY an unfinished scan of the SAME roots: find_resumable took the
-        // newest ANY scan without checking the roots or the trash filter — `--scan /b` could
-        // continue an unfinished `/a` (or one moved to trash). resume_probe_for_roots checks
-        // the roots and skips trashed (via list_scans).
-        let (unfinished, _complete) = store.resume_probe_for_roots(&config.roots)?;
-        match unfinished {
-            Some(info) if info.status.is_resumable() => {
-                println!(
-                    "Resuming unfinished scan #{} from {} ({} / {} files already hashed)",
-                    info.scan_id, info.created_at, info.files_hashed, info.files_total
-                );
-                Some(info.scan_id)
-            }
-            _ => None,
-        }
-    };
+    let resume = choose_resume(&store, &config, cli.no_resume, &mut std::io::stdout())?;
 
     // The scan checks the flag at phase and chunk boundaries, so it is safe to catch signals
     // here. Watch the signal flag itself: this used to be a freshly created flag that nothing
@@ -1061,6 +1114,296 @@ fn run_headless_scan(cli: &cli::Cli) -> Result<()> {
         ScanOutcome::Cancelled => println!("Scan cancelled."),
     }
     Ok(())
+}
+
+/// Which unfinished scan `--scan` continues, if any: `None` starts a new one.
+///
+/// A resume walks and hashes by the settings its scan was started with. A flag asking for
+/// something else used to be dropped without a word — `--merkle-dirs`, the way out of a scan the
+/// out-of-memory killer stopped, resumed the old algorithm and ran out of memory again. Such a
+/// flag is refused, with both ways on named. A flag left out asks for nothing, and the settings a
+/// resume keeps are written to `out` under the line that announces it.
+fn choose_resume(
+    store: &ScanStore,
+    config: &ScanConfig,
+    no_resume: bool,
+    out: &mut impl std::io::Write,
+) -> Result<Option<i64>> {
+    if no_resume {
+        return Ok(None);
+    }
+    // Resume ONLY an unfinished scan of the SAME roots: find_resumable took the
+    // newest ANY scan without checking the roots or the trash filter — `--scan /b` could
+    // continue an unfinished `/a` (or one moved to trash). resume_probe_for_roots checks
+    // the roots and skips trashed (via list_scans).
+    let (unfinished, _complete) = store.resume_probe_for_roots(&config.roots)?;
+    let Some(info) = unfinished.filter(|info| info.status.is_resumable()) else {
+        return Ok(None);
+    };
+    let saved = store.load_config(info.scan_id)?;
+    let dropped = flags_a_resume_would_drop(config, &saved);
+    if !dropped.is_empty() {
+        let them = if dropped.len() == 1 { "it" } else { "them" };
+        return Err(AppError::msg(format!(
+            "scan #{} of these roots is unfinished, and a resume keeps the settings it was started \
+             with ({}), so {} would be ignored. Run without {them} to resume the scan as it was \
+             started, or add --no-resume to start a new scan.",
+            info.scan_id,
+            resume_settings(&saved),
+            cli::listed(&dropped)
+        )));
+    }
+    writeln!(
+        out,
+        "Resuming unfinished scan #{} from {} ({} / {} files already hashed)",
+        info.scan_id, info.created_at, info.files_hashed, info.files_total
+    )?;
+    writeln!(out, "{}", resume_settings_line(&saved))?;
+    Ok(Some(info.scan_id))
+}
+
+/// The line a resume prints under «Resuming …». A preset's extension can hold any text, so the
+/// line is escaped for the terminal.
+fn resume_settings_line(saved: &ScanConfig) -> String {
+    textsan::terminal(&format!(
+        "Settings kept from its start: {}",
+        resume_settings(saved)
+    ))
+}
+
+/// The flags behind `asked` that a resume of `saved` would not apply. The extension lists are
+/// compared as the walk reads them — as given, in any order.
+fn flags_a_resume_would_drop(asked: &ScanConfig, saved: &ScanConfig) -> Vec<String> {
+    let set = |list: &[String]| {
+        list.iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let mut dropped = Vec::new();
+    if !asked.include_extensions.is_empty()
+        && set(&asked.include_extensions) != set(&saved.include_extensions)
+    {
+        // Quoted, so the commas of the list are not taken for those between the flags.
+        dropped.push(format!(
+            "--include-ext \"{}\"",
+            asked.include_extensions.join(",")
+        ));
+    }
+    if !asked.reuse_hashes && saved.reuse_hashes {
+        dropped.push("--no-hash-reuse".to_string());
+    }
+    if asked.dir_sig_algo == DirSigAlgo::Merkle && saved.dir_sig_algo != DirSigAlgo::Merkle {
+        dropped.push("--merkle-dirs".to_string());
+    }
+    dropped
+}
+
+/// What a resume keeps from the start of its scan, in one line.
+fn resume_settings(saved: &ScanConfig) -> String {
+    let extensions = if saved.include_extensions.is_empty() {
+        "all".to_string()
+    } else {
+        saved.include_extensions.join(",")
+    };
+    let cache = if saved.reuse_hashes {
+        "on"
+    } else {
+        "off (--no-hash-reuse)"
+    };
+    let directories = match saved.dir_sig_algo {
+        DirSigAlgo::Old => "default",
+        DirSigAlgo::Merkle => "streaming Merkle (--merkle-dirs)",
+    };
+    format!(
+        "extensions {extensions}; hash cache {cache}; directory signatures {directories}; \
+         profile {}",
+        saved.hash_profile.label()
+    )
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::choose_resume;
+    use crate::model::duplicate::DirSigAlgo;
+    use crate::model::scan::ScanConfig;
+    use crate::state::ScanStore;
+    use std::path::PathBuf;
+
+    /// A store of its own that holds one unfinished scan of `/tank`, started with `saved`.
+    struct Rig {
+        dir: PathBuf,
+        store: ScanStore,
+        id: i64,
+    }
+
+    impl Rig {
+        fn new(tag: &str, saved: impl FnOnce(&mut ScanConfig)) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!(
+                "dedcom_resume_{tag}_{}_{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut store = ScanStore::open_writable(&dir.join("dedcom.db")).unwrap();
+            let mut config = tank();
+            saved(&mut config);
+            let id = store.begin_scan(&config).unwrap();
+            Rig { dir, store, id }
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn tank() -> ScanConfig {
+        ScanConfig::new(vec![PathBuf::from("/tank")])
+    }
+
+    /// A resume walks and hashes by the settings the scan was started with, so a flag that asks for
+    /// something else used to be dropped without a word. `--merkle-dirs` is the manual's way out of a
+    /// scan the out-of-memory killer stopped — and it resumed the old algorithm and ran out of memory
+    /// again. Such a flag is refused, and the refusal names the scan, the flag and both ways on.
+    #[test]
+    fn a_flag_the_resume_would_drop_is_refused() {
+        type Setup = fn(&mut ScanConfig);
+        let cases: [(&str, Setup, Setup, &str); 3] = [
+            (
+                "ext",
+                |saved| saved.include_extensions = vec!["jpg".into()],
+                |asked| asked.include_extensions = vec!["png".into()],
+                "--include-ext \"png\"",
+            ),
+            (
+                "reuse",
+                |_| {},
+                |asked| asked.reuse_hashes = false,
+                "--no-hash-reuse",
+            ),
+            (
+                "merkle",
+                |_| {},
+                |asked| asked.dir_sig_algo = DirSigAlgo::Merkle,
+                "--merkle-dirs",
+            ),
+        ];
+        for (tag, saved, asked, flag) in cases {
+            let rig = Rig::new(tag, saved);
+            let mut config = tank();
+            asked(&mut config);
+            let mut printed = Vec::new();
+            let refusal = choose_resume(&rig.store, &config, false, &mut printed)
+                .expect_err(tag)
+                .to_string();
+            let scan = format!("scan #{}", rig.id);
+            for says in [scan.as_str(), flag, "--no-resume"] {
+                assert!(refusal.contains(says), "{tag}: {says} in {refusal}");
+            }
+            assert!(
+                printed.is_empty(),
+                "{tag}: a refused resume announces nothing: {}",
+                String::from_utf8_lossy(&printed)
+            );
+        }
+    }
+
+    /// Only a scan that can be resumed is: an aborted one of the same roots is left alone, and a
+    /// new scan starts.
+    #[test]
+    fn an_aborted_scan_is_not_resumed() {
+        let rig = Rig::new("aborted", |_| {});
+        rig.store
+            .set_status(rig.id, crate::model::scan::ScanStatus::Aborted)
+            .unwrap();
+        let chosen = choose_resume(&rig.store, &tank(), false, &mut std::io::sink()).unwrap();
+        assert_eq!(chosen, None);
+    }
+
+    /// Asking for what the scan already has — or for nothing — resumes it, and `--no-resume` never
+    /// does.
+    #[test]
+    fn the_settings_it_was_started_with_resume_it() {
+        let rig = Rig::new("same", |saved| {
+            saved.include_extensions = vec!["jpg".into(), "heic".into()];
+            saved.reuse_hashes = false;
+            saved.dir_sig_algo = DirSigAlgo::Merkle;
+        });
+        let mut same = tank();
+        same.include_extensions = vec!["heic".into(), "jpg".into(), "jpg".into()];
+        same.reuse_hashes = false;
+        same.dir_sig_algo = DirSigAlgo::Merkle;
+        let sink = &mut std::io::sink();
+        for asked in [tank(), same] {
+            let chosen = choose_resume(&rig.store, &asked, false, sink).expect("resumes");
+            assert_eq!(chosen, Some(rig.id), "{asked:?}");
+            assert_eq!(choose_resume(&rig.store, &asked, true, sink).unwrap(), None);
+        }
+    }
+
+    /// Every flag it would drop is named, and so is what the scan keeps.
+    #[test]
+    fn every_flag_the_resume_would_drop_is_named() {
+        let rig = Rig::new("all", |saved| {
+            saved.include_extensions = vec!["jpg".into()];
+        });
+        let mut asked = tank();
+        asked.include_extensions = vec!["png".into()];
+        asked.reuse_hashes = false;
+        asked.dir_sig_algo = DirSigAlgo::Merkle;
+        let refusal = choose_resume(&rig.store, &asked, false, &mut std::io::sink())
+            .expect_err("three flags")
+            .to_string();
+        for says in [
+            "(extensions jpg; hash cache on; directory signatures default; profile Balanced)",
+            "--include-ext \"png\", --no-hash-reuse and --merkle-dirs would be ignored",
+            "Run without them",
+        ] {
+            assert!(refusal.contains(says), "{says} in {refusal}");
+        }
+    }
+
+    /// The two lines a resume prints: which scan it continues, and every setting it keeps — each
+    /// the way the scan has it, and escaped for the terminal.
+    #[test]
+    fn a_resume_prints_the_settings_it_keeps() {
+        let rig = Rig::new("printed", |saved| {
+            saved.include_extensions = vec!["jpg".into(), "x\u{1b}[2J".into()];
+            saved.reuse_hashes = false;
+            saved.dir_sig_algo = DirSigAlgo::Merkle;
+            saved.hash_profile = crate::model::scan::HashProfile::Turbo;
+        });
+        let mut out = Vec::new();
+        let chosen = choose_resume(&rig.store, &tank(), false, &mut out).expect("resumes");
+        assert_eq!(chosen, Some(rig.id));
+        let printed = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = printed.lines().collect();
+        assert_eq!(lines.len(), 2, "{printed}");
+        let announced = format!("Resuming unfinished scan #{} from ", rig.id);
+        assert!(lines[0].starts_with(&announced), "{printed}");
+        assert_eq!(
+            lines[1],
+            "Settings kept from its start: extensions jpg,x\\u{1b}[2J; hash cache off \
+             (--no-hash-reuse); directory signatures streaming Merkle (--merkle-dirs); profile Turbo"
+        );
+    }
+
+    /// §11 shows the line a resume prints under «Resuming …», made by the function that prints it.
+    #[test]
+    fn the_manual_shows_the_settings_line_the_code_prints() {
+        let mut sample = tank();
+        sample.hash_profile = crate::model::scan::HashProfile::Idle;
+        let line = super::resume_settings_line(&sample);
+        let chapter = crate::testfixtures::manual("11-headless.md");
+        assert!(
+            chapter.lines().any(|shown| shown == line),
+            "11-headless.md, «Resume in headless», must show:\n{line}"
+        );
+    }
 }
 
 /// How many groups the headless listing prints in full.

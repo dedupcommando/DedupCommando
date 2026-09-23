@@ -286,7 +286,7 @@ fn refuse_what_a_run_would_ignore(
 }
 
 /// `a`, `a and b`, `a, b and c`.
-fn listed<T: AsRef<str>>(items: &[T]) -> String {
+pub(crate) fn listed<T: AsRef<str>>(items: &[T]) -> String {
     let items: Vec<&str> = items.iter().map(AsRef::as_ref).collect();
     match items.split_last() {
         Some((last, head)) if !head.is_empty() => format!("{} and {last}", head.join(", ")),
