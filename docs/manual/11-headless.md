@@ -66,19 +66,26 @@ RSS probe: build_dir_groups before=…  free=… peak estimate=…
 Files scanned:        5230
 Failed to hash:       0
 Duplicate groups:     24
-Potentially reclaimable: 1234567890 bytes
-Scan time:            0:23:45 (speed 87 MiB/s)
-  #1     5 files x 104857600 bytes
+Already linked sets:  3
+Reclaim:              guaranteed after quarantine purge: 1.1 GiB
+Scan time:            23m45s (speed 87.0 MiB/s)
+Omissions:            3919 files, 0 walk errors, 0 unsupported entries
+  #0    5 files x 104857600 bytes
         /tank/media/photo/IMG_canonical.HEIC
         /tank/backup/IMG_canonical.HEIC
         ...
-  #2     3 files x 52428800 bytes
+  #1    3 files x 52428800 bytes
         ...
-  ... and 22 more groups
 ```
 
 > The first 50 groups are printed with their members; the rest are a count
-> only. For a full dump, use `--export-csv`.
+> only (`... and N more groups`). For a full dump, use `--export-csv`.
+>
+> `Omissions:` is what the walk left out: files outside the size limits or the
+> extension filter, names that are not UTF-8, and files whose metadata could not
+> be read; then walk errors (one may stand for a whole unreadable subtree) and
+> entries that are neither files nor directories (symbolic links, FIFOs, sockets,
+> devices).
 
 ### Resume in headless
 
@@ -296,10 +303,17 @@ rather than a formula.
 A pathname that holds control characters — a newline, a tab, a terminal escape
 sequence — is exported with them spelled out: `\n`, `\t`, `\u{1b}`. The export is
 a file that gets printed, and a terminal would act on the raw bytes; spelled out,
-every record is also exactly one line. A pathname the scan could not read as
-UTF-8 is exported in the same replacement spelling the rest of dedcom shows
-(`?`-like `U+FFFD`). Neither row is byte-faithful, so do not feed such a row back
-to `rm` expecting it to name the same file.
+every record is also exactly one line. Such a row is not byte-faithful, so do not
+feed it back to `rm` expecting it to name the same file.
+
+A pathname that is not valid UTF-8 never reaches the export: the scan leaves it
+out of the manifest. That holds for every file under a directory whose name is
+not UTF-8, too. Such a file is counted in the `Omissions:` total `--scan` prints
+when it finishes (§11.1), and in the `⚠ gaps` note on the TUI status line when
+the scan is opened — together with files skipped by size or extension, so the
+count does not name it. To see why one particular file is missing, put the
+commander cursor on it and press F3. A name that really contains `U+FFFD` (the
+`?`-like replacement character) is an ordinary name and is exported as it is.
 
 ### What to do with this CSV
 

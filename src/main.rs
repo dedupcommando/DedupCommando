@@ -1756,6 +1756,46 @@ mod reporting_tests {
         }
     }
 
+    /// §11.1 shows the summary `--scan` prints when it finishes, line for line. The expected lines
+    /// come from `completion_lines` itself, so the sample cannot drift from the output again: it
+    /// had, and §11.4 now sends the reader to its `Omissions:` line.
+    #[test]
+    fn the_manual_shows_the_scan_summary_the_code_prints() {
+        use model::omission::{EventCount, OmissionReason, OmissionSummary};
+        use model::scan::OmissionAccounting;
+        let mut omitted = OmissionSummary::default();
+        omitted
+            .add(OmissionReason::MinSize, EventCount::new(3917).unwrap())
+            .unwrap();
+        omitted
+            .add(OmissionReason::NonUtf8, EventCount::new(2).unwrap())
+            .unwrap();
+        let sample = ScanSummary {
+            files_scanned: 5230,
+            groups_found: 24,
+            reclaim: ReclaimEstimate::exact(1_234_567_890),
+            already_linked_sets: 3,
+            bytes_hashed: 130_023_424_000,
+            elapsed_seconds: 1425.0,
+            hash_failures: 0,
+            omissions: OmissionAccounting::Ledger(omitted),
+        };
+        let expected = completion_lines(&sample);
+
+        let chapter = crate::testfixtures::manual("11-headless.md");
+        let shown: Vec<&str> = chapter
+            .lines()
+            .skip_while(|line| !line.starts_with("## 11.1."))
+            .skip_while(|line| *line != "=== Done ===")
+            .skip(1)
+            .take(expected.len())
+            .collect();
+        assert_eq!(
+            shown, expected,
+            "11-headless.md §11.1 must show what --scan prints when it finishes"
+        );
+    }
+
     /// Headless says what the browser says: the state-aware phrase and the already-linked count,
     /// through the same formatter.
     #[test]
@@ -2323,8 +2363,7 @@ fn record_export_fault_len(len: u64) {
 /// Control characters go first, spelled out the way `textsan::terminal` spells them: the export
 /// is a file people `cat`, and a file name may hold `ESC ] 0 ; … BEL` as easily as a newline.
 /// Spelled out, a record is also always one line, which is what `grep` and `wc -l` assume. Such a
-/// cell is no longer the file's exact name; the manual says so next to the replacement spelling
-/// of a name that is not UTF-8, which already was not.
+/// cell is no longer the file's exact name, and the manual says so.
 ///
 /// Excel/LibreOffice execute a cell as a formula if it starts with `= + - @` or the control
 /// characters `\t`/`\r`. A file name on /tank can set such a first character; opening the
@@ -3170,21 +3209,95 @@ mod export_csv_tests {
         assert!(!rig.dest().exists());
     }
 
-    /// G15 — a pathname the walk could not read as UTF-8 is exported in the manifest's own
-    /// spelling; the export adds no second lossy conversion of its own.
+    /// G15 — a pathname that is not UTF-8 never reaches the export: the walk leaves it out of the
+    /// manifest and counts it among the omitted files, which is where the scan's own summary
+    /// reports it. A name that really holds U+FFFD is an ordinary name and is exported as it is.
+    ///
+    /// This used to assert the opposite, over a manifest row put there by hand: that such a name
+    /// comes out in U+FFFD spelling. No walk of any published build writes that row, and the
+    /// manual promised the same unreachable thing.
     #[test]
-    fn a_non_utf8_pathname_keeps_the_manifest_spelling() {
+    fn a_non_utf8_pathname_never_reaches_the_export() {
         use std::os::unix::ffi::OsStrExt;
+        use std::sync::atomic::AtomicBool;
         let rig = Rig::new("nonutf8");
-        let raw = PathBuf::from(std::ffi::OsStr::from_bytes(b"/tank/bad\xffname.bin"));
-        let mut rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
-        rows[1].path = raw;
-        complete_derived(&mut rig.store(), &rows, 0xB0);
+        let tree = rig.dir.join("tree");
+        let odd_dir = tree.join(std::ffi::OsStr::from_bytes(b"d\xff"));
+        std::fs::create_dir_all(&odd_dir).unwrap();
+        let body = b"one and the same body";
+        for name in ["a.bin", "b.bin", "twin\u{FFFD}.bin"] {
+            std::fs::write(tree.join(name), body).unwrap();
+        }
+        // A name that is not UTF-8, and a UTF-8 name under a directory whose name is not: the
+        // whole path decides, so both are left out.
+        std::fs::write(
+            tree.join(std::ffi::OsStr::from_bytes(b"bad\xffname.bin")),
+            body,
+        )
+        .unwrap();
+        std::fs::write(odd_dir.join("inner.bin"), body).unwrap();
+
+        let mut config = ScanConfig::new(vec![tree.clone()]);
+        config.min_size = 0;
+        config.exclude_globs = Vec::new();
+        let outcome = {
+            let mut store = rig.store();
+            crate::pipeline::run_scan(
+                &mut store,
+                &config,
+                None,
+                false,
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap()
+        };
+        let crate::pipeline::ScanOutcome::Completed(results) = outcome else {
+            panic!("the scan must complete");
+        };
+        let summary = crate::completion_lines(&results.summary).join("\n");
+        assert!(
+            summary.contains("Omissions:            2 files"),
+            "both are counted where the scan reports what it left out:\n{summary}"
+        );
 
         let csv = rig.export();
+        let paths: Vec<String> = rows_of(&csv).into_iter().map(|row| row.path).collect();
+        let spelled = |name: &str| tree.join(name).to_string_lossy().into_owned();
+        assert_eq!(
+            paths.len(),
+            3,
+            "the three UTF-8 names and nothing else:\n{csv}"
+        );
+        for name in ["a.bin", "b.bin", "twin\u{FFFD}.bin"] {
+            assert!(paths.contains(&spelled(name)), "{name} is exported:\n{csv}");
+        }
+        // By path, not by searching the file: the digest column is hex, and «bad» is hex.
+        let tree_text = tree.to_string_lossy().into_owned();
         assert!(
-            csv.contains("/tank/bad\u{FFFD}name.bin"),
-            "the manifest's lossy spelling is what every surface uses:\n{csv}"
+            !paths
+                .iter()
+                .any(|path| path.starts_with(&tree_text) && path.contains("name.bin")),
+            "no spelling of bad\\xffname.bin:\n{csv}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.ends_with("/inner.bin")),
+            "nothing from under d\\xff:\n{csv}"
+        );
+
+        let manual = crate::testfixtures::manual("11-headless.md");
+        let manual = manual.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !manual.contains("is exported in the same replacement spelling"),
+            "the manual no longer promises an export no walk can produce"
+        );
+        assert!(
+            manual.contains("never reaches the export"),
+            "the manual says where such a name goes instead"
+        );
+        assert!(
+            manual.contains("counted in the `Omissions:` total"),
+            "and names the line that counts it — the one §11.1 shows, pinned to the code there"
         );
     }
 
