@@ -236,7 +236,9 @@ $ dedcom --stats
 | Speed            | Accumulated hashed volume / accumulated active time         |
 
 Read-only — it does not block other sessions and can be run alongside a running
-TUI.
+TUI. It may leave `dedcom.db-wal` and `dedcom.db-shm` in the state directory; they
+are harmless, and the next `dedcom` that opens the database to write removes them
+([§12](12-maintenance.md)).
 
 ## 11.3. `--compact-db` — trash cleanup and VACUUM
 

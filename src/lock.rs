@@ -262,24 +262,10 @@ fn read_holder(path: &Path) -> Option<Holder> {
     Some(Holder { pid, since })
 }
 
-/// Reads the `concurrency` policy from `<state_dir>/config.json`. File missing /
-/// field absent / value unknown → [`ConcurrencyPolicy::Ask`].
+/// Reads the `concurrency` policy from `<state_dir>/config.json`, through the one reader of that
+/// file. File missing or unreadable / field absent / value unknown → [`ConcurrencyPolicy::Ask`].
 pub fn load_policy(state_dir: &Path) -> ConcurrencyPolicy {
-    #[derive(serde::Deserialize)]
-    struct Cfg {
-        concurrency: Option<String>,
-    }
-    let path = state_dir.join("config.json");
-    let Ok(json) = std::fs::read_to_string(path) else {
-        return ConcurrencyPolicy::default();
-    };
-    let Ok(cfg) = serde_json::from_str::<Cfg>(&json) else {
-        return ConcurrencyPolicy::default();
-    };
-    cfg.concurrency
-        .as_deref()
-        .and_then(ConcurrencyPolicy::from_str_opt)
-        .unwrap_or_default()
+    crate::maint::concurrency_policy(state_dir)
 }
 
 /// The pure role decision from the acquire outcome, the policy, and the CLI flags.

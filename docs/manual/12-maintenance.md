@@ -8,6 +8,7 @@ All of `dedcom`'s runtime state lives in a single directory:
 ~/.local/state/dedcom/             ← default (the XDG state dir on Linux)
 ├── dedcom.db                       ← SQLite checkpoint of all scans
 ├── dedcom.db-wal                   ← SQLite WAL journal (grows during apply, shrinks at checkpoint)
+├── dedcom.db-shm                   ← SQLite WAL index (comes and goes with the journal)
 ├── dedcom.log                      ← Log (tracing → file; grows without auto-rotation)
 ├── benchmarks.log                  ← Separate timing log (`bench::start`) — for spotting degradation
 ├── consent.json                    ← The user's acceptance of the notice
@@ -25,6 +26,14 @@ dedcom --state-dir /var/lib/dedcom
 
 Useful when `~` sits on a thin root (a Linux/ZFS root filesystem may be only 16–32 GiB),
 while the database can grow to hundreds of MB — move it somewhere roomier.
+
+The last `dedcom` that writes removes `dedcom.db-wal` and `dedcom.db-shm` when it closes. A
+run that only reads — `--stats`, `--export-csv`, an observer (`--read-only`) — may leave them
+behind: a read-only connection cannot remove them. Left that way they are harmless, and the
+next `dedcom` that opens the database to write removes them. Do not delete them by hand: while
+`dedcom` runs they are in use, and after a `dedcom` that did not exit cleanly `dedcom.db-wal`
+holds changes that are not in `dedcom.db` yet — the next `dedcom` that opens the database
+folds them in.
 
 ## `dedcom.db` — structure and size
 
@@ -92,6 +101,8 @@ At TUI startup the auto-VACUUM flag in `config.json` is checked:
 
 Auto-VACUUM runs **in the background** after TUI startup — it does not block work.
 It does not touch the trash (it only compacts); clearing the trash is manual only.
+If `config.json` or either of these fields cannot be read, it does not run (see
+«`config.json` — format and fields» below).
 
 ### When to change the interval
 
@@ -104,11 +115,16 @@ It does not touch the trash (it only compacts); clearing the trash is manual onl
 
 ```text
 # Change the interval to 30 days (via jq):
-jq '. + {vacuum_interval_hours: 720}' ~/.local/state/dedcom/config.json | \
-  sponge ~/.local/state/dedcom/config.json
+f=~/.local/state/dedcom/config.json
+[ -e "$f" ] || [ -L "$f" ] || echo '{}' > "$f"
+jq -s '(if length > 1 then error("more than one JSON value") else .[0] // {} end)
+  + {vacuum_interval_hours: 720}' "$f" > "$f.new" && mv "$f.new" "$f"
 ```
 
-(This is not yet configurable in the TUI.)
+(This is not yet configurable in the TUI.) A missing or empty file starts from `{}`. A broken one,
+one holding more than one JSON value, or a link to a file that is not there stops `jq` before
+anything is replaced. Run `dedcom` once before the first edit: a state directory that holds
+nothing of `dedcom`'s but `config.json` is not taken as its own.
 
 ## Retention — the session-history limit
 
@@ -136,6 +152,9 @@ The parameter in `config.json`:
 
 This is **not deletion** but a move to the session trash (see [§10 Diff & trash](10-diff-trash.md)).
 Final cleanup happens only via the UI Trash → Delete or `--compact-db`.
+If `config.json` or its `history_keep` cannot be read, nothing is moved: the limit meant is
+not known (see «`config.json` — format and fields» below). Until the file is fixed every scan
+stays, and the database grows by one scan's manifest per scan.
 
 ## Logs — `dedcom.log` and `benchmarks.log`
 
@@ -204,6 +223,23 @@ In full (all fields optional, absence = default):
 | `vacuum_interval_hours` | integer ≥ 0                            | 120      | Auto-VACUUM (see above)                  |
 | `last_vacuum`           | unix timestamp                         | (none)   | Timestamp; updated automatically         |
 | `history_keep`          | integer ≥ 0                            | 2        | Session-history limit (see above)        |
+
+**A file `dedcom` cannot read.** If `config.json` is not valid JSON (one stray comma is
+enough), is not a JSON object, or cannot be read at all — it is not a regular file, or it is a
+link to a file that is not there, say — `dedcom` does not use it and never writes it: no
+automatic VACUUM, no history trimming, and the lock policy is the default `ask`. A field that
+holds the wrong kind of value — `"history_keep": "5"` written in quotes, `2.0`, a negative number
+— is treated the same way for what it decides: no automatic VACUUM for `vacuum_interval_hours` or
+`last_vacuum`, no history trimming for `history_keep`, the default `ask` for `concurrency`; the
+other fields still apply. A field given twice counts as its last value. Every run that writes
+says so on stderr and in `dedcom.log`, naming the file and the problem.
+`--compact-db` still empties the trash and compacts; only the time of that VACUUM goes
+unrecorded.
+
+When `dedcom` records `last_vacuum`, it writes a new file beside the old one and renames it
+into place, keeping every other field as it was — so a crash never leaves half a file. A
+symbolic link at `config.json` is replaced by a regular file; whatever it pointed at is left
+alone.
 
 ### Concurrency policy
 

@@ -437,6 +437,81 @@ mod run_tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// A config.json that cannot be read is named on stderr, once, by each mode that acts on it —
+    /// and by neither mode that only reads, since those take nothing from it. The file stays as
+    /// it was either way.
+    #[test]
+    fn the_modes_that_act_on_config_json_say_when_it_cannot_be_read() {
+        let base = temp_base("config_warning");
+        let (state, root) = (base.join("state"), base.join("root"));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        {
+            let _role = crate::state::store::role_guard();
+            drop(ScanStore::open(&state.join("dedcom.db")).unwrap());
+        }
+        let broken = b"{\"history_keep\": 7,}";
+        std::fs::write(state.join("config.json"), broken).unwrap();
+        let warning = format!(
+            "dedcom: warning: {} is not valid JSON",
+            state.join("config.json").display()
+        );
+        let csv = base.join("groups.csv");
+        for (mode, arg, told) in [
+            ("--stats", &csv, 0),
+            ("--export-csv", &csv, 0),
+            ("--compact-db", &csv, 1),
+            ("--scan", &root, 1),
+            ("--purge-quarantine", &csv, 1),
+            // The one mode with an automatic VACUUM; it fails here only later, on the terminal
+            // the child does not have.
+            ("interface", &root, 1),
+        ] {
+            let (_, stderr) = dedcom(mode, &state, arg);
+            assert_eq!(stderr.matches(&warning).count(), told, "{mode}: {stderr}");
+        }
+        assert_eq!(std::fs::read(state.join("config.json")).unwrap(), broken);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A FIFO left at `config.json` is never waited on. In a directory dedcom refuses, the refusal
+    /// comes first and the name is not even opened; in its own, it is a file it cannot use, and
+    /// the run says so and goes on.
+    #[test]
+    fn a_fifo_at_config_json_is_never_waited_on() {
+        fn fifo_at(path: &Path) {
+            use std::os::unix::ffi::OsStrExt;
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+        }
+        let base = temp_base("config_fifo");
+        let csv = base.join("groups.csv");
+        let foreign = foreign_dir(&base);
+        fifo_at(&foreign.join("config.json"));
+        for mode in ["--compact-db", "interface"] {
+            let (code, stderr) = dedcom(mode, &foreign, &csv);
+            assert_eq!(code, Some(1), "{mode} refused: {stderr}");
+            assert!(!stderr.contains("dedcom: warning"), "{mode}: {stderr}");
+        }
+
+        let state = base.join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        {
+            let _role = crate::state::store::role_guard();
+            drop(ScanStore::open(&state.join("dedcom.db")).unwrap());
+        }
+        fifo_at(&state.join("config.json"));
+        let (code, stderr) = dedcom("--compact-db", &state, &csv);
+        assert_eq!(code, Some(0), "{stderr}");
+        assert!(
+            stderr.contains("config.json is not a regular file"),
+            "{stderr}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     /// The same slip in every mode that writes — the interface first: `dedcom --state-dir /etc` is
     /// what starts it — is refused before anything is written, with the directory named on stderr.
     #[test]
@@ -654,6 +729,7 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
     // Fail-closed: on an untrusted chain (foreign/group-writable ancestor) or a directory that is
     // not dedcom's (`--state-dir /etc`) we refuse to operate, before the terminal is touched.
     paths::establish_state_dir(&state_dir)?;
+    warn_about_config(&state_dir);
 
     // Single-instance lock: acquiring the advisory flock = the OPERATOR role;
     // held by another live instance → the role is decided by the policy + CLI flags.
@@ -993,6 +1069,16 @@ fn wants_commander(cli: &cli::Cli) -> bool {
     !cli.force_classic || cli.force_commando
 }
 
+/// Says, once, which settings in config.json this run will not use: for a state directory the run
+/// has just taken as dedcom's — one it refuses is not read at all — and before the interface
+/// takes the terminal, so the words are still there when it closes.
+fn warn_about_config(state_dir: &Path) {
+    for warning in maint::config_warnings(state_dir) {
+        tracing::warn!("{warning}");
+        eprintln!("dedcom: warning: {warning}");
+    }
+}
+
 /// Acquires the single-instance lock for headless modes that WRITE to the DB/FS
 /// (`--scan`/`--compact-db`/`--purge-quarantine`), so there is no concurrent write
 /// (including with a running TUI operator). `Ok(Some(guard))` — the lock is ours, hold it until
@@ -1005,6 +1091,7 @@ fn acquire_write_lock(cli: &cli::Cli) -> Result<Option<lock::InstanceLock>> {
     let state_dir = paths::state_dir(cli);
     // Write mode: state-dir 0700 + a check of the whole chain, fail-closed.
     paths::establish_state_dir(&state_dir)?;
+    warn_about_config(&state_dir);
     let (lock_state, holder, guard) = match lock::try_acquire(&state_dir) {
         Ok(lock::Acquire::Operator(g)) => (lock::LockState::Held, None, Some(g)),
         Ok(lock::Acquire::Busy(h)) => (lock::LockState::Busy, h, None),

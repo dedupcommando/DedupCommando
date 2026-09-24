@@ -398,10 +398,13 @@ fn run_phases(
         // Retention: we trim the history of the same roots into the TRASH (softly,
         // recoverably) — finished ones beyond keep + stale unfinished ones. The scans holding files
         // under a root that turned up empty stay, and the operator is told why.
+        // A limit config.json cannot give trims nothing: the number meant is not known.
         let db = store.db_path();
         if let Some(state_dir) = db.as_deref().and_then(|p| p.parent()) {
-            let keep = crate::maint::history_keep(state_dir);
-            match store.apply_retention(&effective.roots, keep, scan_id) {
+            let retention = crate::maint::history_keep(state_dir)
+                .map_err(AppError::msg)
+                .and_then(|keep| store.apply_retention(&effective.roots, keep, scan_id));
+            match retention {
                 Ok(Retention { trashed, held_for }) => {
                     if trashed > 0 {
                         tracing::info!(
@@ -2087,6 +2090,50 @@ mod hash_failures_tests {
         assert_eq!(told().len(), 2, "a night with files trims without a word");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// End to end: retention reads how many scans to keep from config.json. One it could not
+    /// read — a file that does not parse, a `history_keep` that is not a whole number — used to
+    /// mean 2, and trimmed. The number the operator meant is not known, so nothing goes to the
+    /// trash; a number that can be read still trims, and the file is never touched either way.
+    #[test]
+    fn retention_trims_nothing_when_config_json_cannot_say_how_much() {
+        let _role = crate::state::store::role_guard();
+        for (tag, config, trimmed) in [
+            ("broken", &b"{\"history_keep\": 7,}"[..], 0),
+            ("text", br#"{"history_keep": "5"}"#, 0),
+            ("negative", br#"{"history_keep": -1}"#, 0),
+            ("not an object", b"[]", 0),
+            ("readable", br#"{"history_keep": 1}"#, 2),
+        ] {
+            let dir = unique_temp_dir("config_keep");
+            let root = dir.join("tank");
+            let state = dir.join("state");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::create_dir_all(&state).unwrap();
+            std::fs::write(root.join("a.bin"), b"identical duplicate content").unwrap();
+            std::fs::write(root.join("b.bin"), b"identical duplicate content").unwrap();
+            std::fs::write(state.join("config.json"), config).unwrap();
+            let mut store = ScanStore::open(&state.join("dedcom.db")).unwrap();
+            let mut cfg = ScanConfig::new(vec![root.clone()]);
+            cfg.min_size = 0;
+            cfg.exclude_globs = Vec::new();
+            for _ in 0..3 {
+                let cancel = Arc::new(AtomicBool::new(false));
+                run_scan(&mut store, &cfg, None, false, &cancel, |_| {}).unwrap();
+            }
+            assert_eq!(
+                store.list_trashed().unwrap().len(),
+                trimmed,
+                "{tag}: scans in the trash after three"
+            );
+            assert_eq!(
+                std::fs::read(state.join("config.json")).unwrap(),
+                config,
+                "{tag}: config.json was rewritten"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// A scan whose extension filter matches nothing under a root looks exactly like an empty mount
