@@ -430,9 +430,12 @@ pub struct App {
     pub show_disclaimer: bool,
     /// State of the disclaimer gate's checkboxes/focus.
     pub disclaimer: DisclaimerState,
-    /// "Read-only" mode: an observer alongside a live operator —
+    /// "Read-only" mode: an observer, asked for with `--read-only` or alongside a live operator —
     /// scanning and destructive operations are forbidden, banner in the corner.
     pub read_only: bool,
+    /// The observer was asked for with `--read-only`, rather than made one by another instance —
+    /// what a refused action names as its reason.
+    pub read_only_asked: bool,
     /// The held single-instance lock: while it's alive (until App is dropped),
     /// we are the operator. `None` — observer, or operator "by force".
     pub instance_lock: Option<crate::lock::InstanceLock>,
@@ -797,6 +800,7 @@ impl App {
             show_disclaimer,
             disclaimer: DisclaimerState::default(),
             read_only: lock_startup.read_only,
+            read_only_asked: lock_startup.read_only_asked,
             instance_lock: lock_startup.lock,
             concurrency_prompt: lock_startup.prompt,
             frame_guard_reported: false,
@@ -3558,7 +3562,7 @@ impl App {
     /// (the caller must abort). Otherwise `false` — the operation is allowed.
     pub fn deny_if_read_only(&mut self, what: &str) -> bool {
         if self.read_only {
-            let msg = format!("Read-only: {what} unavailable (another instance is active)");
+            let msg = Self::read_only_refusal(what, self.read_only_asked);
             match self.mode {
                 AppMode::Commander => self.commander.status = msg,
                 AppMode::Wizard => self.status = msg,
@@ -3566,6 +3570,17 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// The refusal an observer's action gets, with the reason the window observes: asked for with
+    /// `--read-only`, it may be the only instance there is.
+    pub(crate) fn read_only_refusal(what: &str, asked: bool) -> String {
+        let why = if asked {
+            "started with --read-only"
+        } else {
+            "another instance is active"
+        };
+        format!("Read-only: {what} unavailable ({why})")
     }
 
     /// Mouse event: in commander mode — click and wheel over panels and the footer;
@@ -5641,6 +5656,51 @@ mod mark_settlement_is_checked_tests {
     }
 }
 
+#[cfg(test)]
+mod read_only_reason_tests {
+    use super::*;
+
+    /// An observer asked for with `--read-only` may be the only instance there is, so a refused
+    /// action names the flag; one that another instance made an observer keeps that reason. The
+    /// window is built from the startup role the way `run_tui` builds it.
+    #[test]
+    fn an_observer_by_the_flag_is_not_told_another_instance_is_active() {
+        for (asked, says) in [
+            (
+                true,
+                "Read-only: Apply unavailable (started with --read-only)",
+            ),
+            (
+                false,
+                "Read-only: Apply unavailable (another instance is active)",
+            ),
+        ] {
+            let (mut app, _events) = test_app_with_startup(
+                PathBuf::from("/nonexistent/dedcom.db"),
+                crate::lock::Startup {
+                    lock: None,
+                    read_only: true,
+                    read_only_asked: asked,
+                    prompt: None,
+                },
+            );
+            assert!(app.deny_if_read_only("Apply"));
+            assert_eq!(app.commander.status, says);
+        }
+    }
+
+    /// §11.6 shows the line F11 gets in a window started with `--read-only`, word for word.
+    #[test]
+    fn the_manual_shows_the_refusal_an_observer_by_the_flag_gets() {
+        let line = App::read_only_refusal("executing actions", true);
+        let chapter = crate::testfixtures::manual("11-headless.md");
+        assert!(
+            chapter.lines().any(|shown| shown == line),
+            "11-headless.md, §11.6, must show:\n{line}"
+        );
+    }
+}
+
 /// A shutdown signal must not abandon background work that has no cancel flag: a move batch
 /// still has to reach `CommanderMoveDone` so its MoveRecord and Undo entry are written, and a
 /// purge still has to reach `SessionDeleted`.
@@ -5653,6 +5713,23 @@ pub(crate) fn test_app() -> (App, crossbeam_channel::Receiver<AppEvent>) {
 
 #[cfg(test)]
 pub(crate) fn test_app_with_db(db_path: PathBuf) -> (App, crossbeam_channel::Receiver<AppEvent>) {
+    test_app_with_startup(
+        db_path,
+        crate::lock::Startup {
+            lock: None,
+            read_only: false,
+            read_only_asked: false,
+            prompt: None,
+        },
+    )
+}
+
+/// The same with the startup role given, as `run_tui` hands it in.
+#[cfg(test)]
+pub(crate) fn test_app_with_startup(
+    db_path: PathBuf,
+    startup: crate::lock::Startup,
+) -> (App, crossbeam_channel::Receiver<AppEvent>) {
     let (tx, rx) = crate::tui::event::channel();
     let zfs = ZfsEnvironment {
         pools: Vec::new(),
@@ -5669,11 +5746,7 @@ pub(crate) fn test_app_with_db(db_path: PathBuf) -> (App, crossbeam_channel::Rec
         RevalidationMode::default(),
         Vec::new(),
         true,
-        crate::lock::Startup {
-            lock: None,
-            read_only: false,
-            prompt: None,
-        },
+        startup,
         false,
     );
     (app, rx)

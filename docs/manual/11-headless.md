@@ -43,8 +43,9 @@ Exit codes:
   different modes in one run, `--export-csv` given twice, two flags that undo
   each other (`--classic` with `--commando`, `--read-only` with `--force`), or a
   flag the run would ignore — for example `--include-ext` without `--scan`,
-  `--yes` without `--purge-quarantine`, `--strict-verify` with a headless mode
-  (the table at the end of this chapter says which run reads which flag).
+  `--yes` without `--purge-quarantine`, `--strict-verify` with a headless mode,
+  `--verify` beside `--read-only` in an interface (the table at the end of this
+  chapter says which run reads which flag).
   Printed as `dedcom: {message}` followed by `Run with --help for usage.` on
   stderr.
 
@@ -442,7 +443,17 @@ $ dedcom --read-only        # second window
 ```
 
 In the top-right corner the ` ● READ-ONLY ` badge stays lit. All action keys
-(F5–F8 / F11 / Delete / `S`) are either ignored or report "read-only mode".
+(F5–F8 / F11 / Delete / `S`) are either ignored or answered in the status line,
+F11 for example:
+
+```text
+Read-only: executing actions unavailable (started with --read-only)
+```
+
+A window that became an observer because another `dedcom` holds the lock
+([§02](02-install.md)) says `(another instance is active)` instead. An observer
+scans and applies nothing, so `--no-resume`, `--verify`, `--merkle-dirs` and
+`--strict-verify` are refused beside `--read-only` (exit code 2).
 
 ## Other flags (not headless, but important for scripts)
 
@@ -469,6 +480,9 @@ wizard (`--classic`). A flag given to a run it does not apply to is refused
 offers the saved scans at start; the Commando interface offers them when asked
 (F2, F12), so there the flag is refused. `--read-only` and `--force` are taken
 by every run, but not together: an observer never takes the operator's lock.
+Nor does an observer scan or apply, so in either interface `--read-only` refuses
+`--no-resume`, `--verify`, `--merkle-dirs` and `--strict-verify` beside it
+(§11.6).
 
 ## What's next
 

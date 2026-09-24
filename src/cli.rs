@@ -75,9 +75,10 @@ impl Cli {
         let mut include_ext_given = false;
 
         while let Some(arg) = args.next() {
-            // Every refusal of bytes that are not UTF-8 spells them the way `Debug` does: the byte
-            // itself (`\xFF`) rather than a replacement character, and a control or bidi character
-            // escaped.
+            // Every refusal that quotes what was typed spells it the way `Debug` does: a byte
+            // that is not UTF-8 as itself (`\xFF`) rather than a replacement character, and a
+            // control or bidi character escaped, so it can neither drive the terminal nor
+            // reorder the line.
             let Some(flag) = arg.to_str() else {
                 return Err(format!("unknown argument: {arg:?}"));
             };
@@ -149,8 +150,7 @@ impl Cli {
                     let value = value.trim().to_ascii_lowercase();
                     if !matches!(value.as_str(), "hdd" | "ssd" | "nvme") {
                         return Err(format!(
-                            "--storage-type takes hdd, ssd or nvme, not «{}»",
-                            crate::textsan::terminal(&value)
+                            "--storage-type takes hdd, ssd or nvme, not {value:?}"
                         ));
                     }
                     cli.storage_type = Some(value);
@@ -176,12 +176,7 @@ impl Cli {
                     println!("dedcom {}", crate::version());
                     std::process::exit(0);
                 }
-                other => {
-                    return Err(format!(
-                        "unknown argument: {}",
-                        crate::textsan::terminal(other)
-                    ))
-                }
+                other => return Err(format!("unknown argument: {other:?}")),
             }
         }
 
@@ -206,9 +201,10 @@ const MODES: [&str; 5] = [
 /// `--include-ext jpg` without `--scan` opened the interface, whose scan then took every extension.
 ///
 /// `--state-dir` serves every run. `--read-only` keeps its word in every run, and `--force` has
-/// nothing to do in a report that takes no lock, so neither is refused on its own. One case is
-/// left as it was: an observer (`--read-only`) opens an interface that neither scans nor applies,
-/// yet takes that interface's scan and apply flags.
+/// nothing to do in a report that takes no lock, so neither is refused on its own. An observer
+/// (`--read-only`) opens an interface that neither scans nor applies, so beside it that
+/// interface's scan and apply flags are refused too, and `--no-resume` with them: it would hide
+/// the saved scans the observer is there to watch, for a new scan it may not start.
 fn refuse_what_a_run_would_ignore(
     cli: &Cli,
     include_ext_given: bool,
@@ -261,6 +257,25 @@ fn refuse_what_a_run_would_ignore(
             None if cli.force_classic => CLASSIC,
             None => COMMANDO,
         };
+    // An observer first: the table below would send `--no-resume` to the classic wizard, where
+    // under `--read-only` it is refused just the same.
+    if cli.read_only && INTERFACES.contains(&run) {
+        let unread: Vec<&str> = [
+            ("--no-resume", cli.no_resume),
+            ("--verify", cli.verify),
+            ("--merkle-dirs", cli.merkle_dirs),
+            ("--strict-verify", cli.strict_verify),
+        ]
+        .into_iter()
+        .filter_map(|(flag, given)| given.then_some(flag))
+        .collect();
+        if !unread.is_empty() {
+            return Err(format!(
+                "{run} would ignore {} under --read-only: an observer neither scans nor applies",
+                listed(&unread)
+            ));
+        }
+    }
 
     let flags: [(&str, bool, &[&str]); 10] = [
         ("--no-resume", cli.no_resume, SCAN_OR_CLASSIC),
@@ -315,7 +330,9 @@ interface, or the classic wizard with --classic. A flag the run would ignore is
 refused: --include-ext, --storage-type and --no-hash-reuse apply to --scan only,
 --yes to --purge-quarantine only, --no-resume to --scan and the classic wizard,
 --verify and --merkle-dirs to --scan and both interfaces, --strict-verify to both
-interfaces. --classic and --commando do not go together, nor --read-only and --force.
+interfaces; an observer (--read-only) scans and applies nothing, so it takes none of
+--no-resume, --verify, --merkle-dirs and --strict-verify. --classic and --commando do
+not go together, nor --read-only and --force.
 
 OPTIONS:
     --scan <PATH>         Scan a root without the TUI (may be given several times;
@@ -377,6 +394,20 @@ mod help_tests {
             "«the last scan» reads as «the last FINISHED scan», which is not the contract"
         );
     }
+
+    /// The observer's rule stands in the help beside the others.
+    #[test]
+    fn the_help_says_what_an_observer_refuses() {
+        let help = help_text();
+        let flowing = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flowing.contains(
+                "an observer (--read-only) scans and applies nothing, so it takes none of \
+                 --no-resume, --verify, --merkle-dirs and --strict-verify"
+            ),
+            "{help}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -406,6 +437,27 @@ mod storage_type_tests {
         }
         let refusal = parse(&["--no-such-\u{1b}[2Jflag"]).expect_err("an unknown flag");
         assert!(!refusal.chars().any(char::is_control), "{refusal:?}");
+    }
+
+    /// A refusal that quotes what was typed spells it the way `Debug` does, as the refusals of
+    /// bytes that are not UTF-8 already did: a character that turns the direction of the text
+    /// around (U+202E) must not reorder the line it is printed in.
+    #[test]
+    fn a_refusal_escapes_the_bidi_characters_of_typed_text() {
+        for (args, says) in [
+            (
+                &["--no-such-\u{202e}flag"][..],
+                "unknown argument: \"--no-such-\\u{202e}flag\"",
+            ),
+            (
+                &["--storage-type", "hd\u{202e}d"],
+                "--storage-type takes hdd, ssd or nvme, not \"hd\\u{202e}d\"",
+            ),
+        ] {
+            let refusal = parse(args).expect_err(says);
+            assert!(!refusal.contains('\u{202e}'), "{refusal:?}");
+            assert_eq!(refusal, says);
+        }
     }
 }
 
@@ -512,10 +564,16 @@ mod mode_tests {
                     assert!(refusal.starts_with(&named), "{args:?}: {refusal}");
                 }
             }
-            // All its own together — but `--force`, which does not go with `--read-only`.
+            // All its own together — but `--force`, which does not go with `--read-only`, and in an
+            // interface `--read-only`, beside which the scan and apply flags are refused
+            // (`an_observer_refuses_the_scan_and_apply_flags_it_would_ignore`).
             let own: Vec<&str> = READERS
                 .iter()
-                .filter(|(flag, readers)| readers.contains(&run) && flag[0] != "--force")
+                .filter(|(flag, readers)| {
+                    readers.contains(&run)
+                        && flag[0] != "--force"
+                        && !(flag[0] == "--read-only" && [COMMANDO, CLASSIC].contains(&run))
+                })
                 .flat_map(|(flag, _)| flag.iter().copied())
                 .collect();
             let args = [starts, own.as_slice()].concat();
@@ -598,6 +656,50 @@ mod mode_tests {
         for (args, says) in cases {
             assert_eq!(parse(args).expect_err(says), says, "{args:?}");
         }
+    }
+
+    /// An observer (`--read-only`) opens an interface that neither scans nor applies, so that
+    /// interface's scan and apply flags have nothing to do in it, and each is refused by name.
+    /// `--no-resume` goes with them: it hides the saved scans an observer is there to watch and
+    /// heads for a new scan, which an observer may not start.
+    #[test]
+    fn an_observer_refuses_the_scan_and_apply_flags_it_would_ignore() {
+        let why = "under --read-only: an observer neither scans nor applies";
+        for (run, starts) in [(COMMANDO, &[][..]), (CLASSIC, &["--classic"][..])] {
+            for flag in ["--verify", "--merkle-dirs", "--strict-verify"] {
+                let args = [starts, &["--read-only", flag][..]].concat();
+                let refusal = parse(&args).expect_err(&args.join(" "));
+                assert_eq!(
+                    refusal,
+                    format!("{run} would ignore {flag} {why}"),
+                    "{args:?}"
+                );
+            }
+        }
+        let refusal = parse(&["--classic", "--read-only", "--no-resume"]).expect_err("--no-resume");
+        assert_eq!(refusal, format!("{CLASSIC} would ignore --no-resume {why}"));
+        // The observer's reason even where the general table would send the flag elsewhere: the
+        // classic wizard reads `--no-resume`, but not under `--read-only`.
+        let refusal = parse(&["--read-only", "--no-resume"]).expect_err("--no-resume, Commando");
+        assert_eq!(
+            refusal,
+            format!("{COMMANDO} would ignore --no-resume {why}")
+        );
+        let refusal = parse(&["--read-only", "--verify", "--strict-verify"]).expect_err("both");
+        assert_eq!(
+            refusal,
+            format!("{COMMANDO} would ignore --verify and --strict-verify {why}")
+        );
+        // What an observer does take.
+        for args in [
+            &["--read-only"][..],
+            &["--read-only", "--classic"],
+            &["--read-only", "--commando", "--state-dir", "/srv/dedcom"],
+        ] {
+            parse(args).unwrap_or_else(|refusal| panic!("{args:?}: {refusal}"));
+        }
+        // A mode keeps its own answer: the lock refuses a writing one, not the parser.
+        parse(&["--read-only", "--scan", "/tank", "--verify"]).expect("--scan reads --verify");
     }
 
     /// The coarser mistake is the one a refusal names: two modes before anything else, and with a

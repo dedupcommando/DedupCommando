@@ -714,6 +714,7 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
         lock::Decision::Ask => (true, holder),
         lock::Decision::Blocked => unreachable!("handled above"),
     };
+    let read_only_asked = lock::observer_asked(&decision, cli.read_only);
 
     // The role decided above is what makes read-only real: from here on every ScanStore::open in
     // this process hands back a query_only connection, so an observer cannot write marks — or
@@ -849,6 +850,7 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
         lock::Startup {
             lock: lock_to_hold,
             read_only,
+            read_only_asked,
             prompt,
         },
         cli.merkle_dirs,
@@ -1183,9 +1185,11 @@ fn flags_a_resume_would_drop(asked: &ScanConfig, saved: &ScanConfig) -> Vec<Stri
     if !asked.include_extensions.is_empty()
         && set(&asked.include_extensions) != set(&saved.include_extensions)
     {
-        // Quoted, so the commas of the list are not taken for those between the flags.
+        // Quoted, so the commas of the list are not taken for those between the flags — and quoted
+        // the way `Debug` does, as the parser quotes what was typed: a control or bidi character in
+        // it can neither drive the terminal nor reorder the refusal.
         dropped.push(format!(
-            "--include-ext \"{}\"",
+            "--include-ext {:?}",
             asked.include_extensions.join(",")
         ));
     }
@@ -1365,6 +1369,26 @@ mod resume_tests {
         ] {
             assert!(refusal.contains(says), "{says} in {refusal}");
         }
+    }
+
+    /// The list typed after `--include-ext` is quoted the way `Debug` does, as the parser's own
+    /// refusals are: a character that turns the direction of the text around (U+202E) must not
+    /// reorder the refusal and the advice in it.
+    #[test]
+    fn a_resume_refusal_escapes_the_bidi_characters_of_the_typed_list() {
+        let rig = Rig::new("bidi", |saved| {
+            saved.include_extensions = vec!["jpg".into()];
+        });
+        let mut asked = tank();
+        asked.include_extensions = vec!["pn\u{202e}g".into()];
+        let refusal = choose_resume(&rig.store, &asked, false, &mut std::io::sink())
+            .expect_err("a different list")
+            .to_string();
+        assert!(!refusal.contains('\u{202e}'), "{refusal:?}");
+        assert!(
+            refusal.contains("--include-ext \"pn\\u{202e}g\""),
+            "{refusal}"
+        );
     }
 
     /// The two lines a resume prints: which scan it continues, and every setting it keeps — each

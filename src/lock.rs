@@ -111,6 +111,9 @@ pub struct Startup {
     pub lock: Option<InstanceLock>,
     /// The read-only role.
     pub read_only: bool,
+    /// The role was asked for with `--read-only`. Otherwise an observer is one because another
+    /// instance holds the lock — and there may be no other instance at all when it was asked for.
+    pub read_only_asked: bool,
     /// `Some` → show the startup choice overlay (the `ask` policy).
     pub prompt: Option<Holder>,
 }
@@ -336,10 +339,39 @@ pub fn decide_headless(
     }
 }
 
+/// Whether the observer role was asked for with `--read-only`, rather than taken because another
+/// instance holds the lock. [`decide`] answers the flag before it looks at the lock, so an observer
+/// without the flag is one by the `readonly` policy or while the `ask` overlay is waiting.
+pub fn observer_asked(decision: &Decision, cli_read_only: bool) -> bool {
+    matches!(decision, Decision::ReadOnly) && cli_read_only
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Every way a window becomes an observer, and whether the flag asked for it: only then may a
+    /// refused action say «started with --read-only».
+    #[test]
+    fn an_observer_is_asked_for_only_by_the_flag() {
+        use ConcurrencyPolicy::{Ask, ReadOnly};
+        for (state, policy, flag, asked) in [
+            (LockState::Held, Ask, true, true),
+            (LockState::Busy, Ask, true, true),
+            (LockState::Unknown, Ask, true, true),
+            (LockState::Busy, ReadOnly, false, false),
+            (LockState::Busy, Ask, false, false),
+            (LockState::Held, Ask, false, false),
+        ] {
+            let decision = decide(state, policy, flag, false);
+            assert_eq!(
+                observer_asked(&decision, flag),
+                asked,
+                "{state:?}, {policy:?}, --read-only {flag}: {decision:?}"
+            );
+        }
+    }
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
