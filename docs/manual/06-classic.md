@@ -46,8 +46,8 @@ intensity profile.
 │┌ Datasets and folders — Space select, F add folder ────────────────────┐│
 ││   [ ] rpool        →  /rpool                                          ││
 ││ ▸ [x] tank         →  /tank                                           ││
-││   [ ] tank/media   →  /tank/media                                     ││
-││   [ ] tank/backup  →  /tank/backup                                    ││
+││   [ ] tank/vm      →  /tank/vm                                        ││
+││   [ ] tank/iso     →  /tank/iso                                       ││
 │└───────────────────────────────────────────────────────────────────────┘│
 ├─────────────────────────────────────────────────────────────────────────┤
 │ ↑↓ · Space · F folder · P preset · C cache · G intensity · Del remove · S start · Q quit │

@@ -93,6 +93,16 @@ pub enum PlanRefusal {
         "the group {hash} has files marked for an action and no keeper — choose the file to keep"
     )]
     MissingKeeper { hash: String },
+    // The status line does not wrap, so the reason, the count and the way out come before the
+    // two pathnames, which may be long.
+    #[error("cannot hardlink or reflink across datasets ({}) — mark DELETE, unmark, or pick a keeper on the same dataset; first: {} ({}), keeper {}", mark_count(.marks), .target.display(), .kind.label(), .keeper.display())]
+    CrossDataset {
+        kind: ActionKind,
+        target: PathBuf,
+        keeper: PathBuf,
+        /// Every mark of the plan that would link across a dataset boundary, this one included.
+        marks: usize,
+    },
     #[error("the group {hash} holds different sizes for one digest. Rescan, or move the old dedcom.db aside.")]
     InconsistentGroupSize { hash: String },
     #[error("{} has no recorded link count, so nothing can tell an alias from an independent copy — rescan required", .path.display())]
@@ -130,6 +140,14 @@ pub enum PlanRefusal {
 impl From<PlanRefusal> for AppError {
     fn from(refusal: PlanRefusal) -> Self {
         AppError::msg(refusal.to_string())
+    }
+}
+
+/// «1 mark», «3 marks».
+fn mark_count(count: &usize) -> String {
+    match count {
+        1 => "1 mark".to_string(),
+        count => format!("{count} marks"),
     }
 }
 
@@ -696,6 +714,9 @@ impl ActionPlan {
         let mut objects: Vec<PlannedObject> = Vec::new();
         let mut actions: Vec<PlanAction> = Vec::new();
         let mut warnings: Vec<PlanWarning> = Vec::new();
+        // The first mark that would link across a dataset boundary, and how many there are.
+        let mut crossing: Option<(ActionKind, PathBuf, PathBuf)> = None;
+        let mut crossing_marks = 0;
 
         for group in &groups {
             let members = &group.members;
@@ -767,9 +788,21 @@ impl ActionPlan {
             };
             let keeper_object = index_of(keeper.key).expect("the keeper is one of the members");
             for target in covered {
+                let kind = target.action().expect("targets carry an action");
+                // A hardlink and a clone both stay inside one filesystem — `link` and FICLONE
+                // answer EXDEV across two — and every ZFS dataset is a filesystem of its own, two
+                // datasets of one pool included. Refused here, before anything is confirmed, not
+                // by the batch after the snapshots and after both files were read in full.
+                if kind != ActionKind::Delete && target.key.device != keeper.key.device {
+                    if crossing.is_none() {
+                        crossing = Some((kind, target.path.clone(), keeper.path.clone()));
+                    }
+                    crossing_marks += 1;
+                    continue;
+                }
                 let target_object = index_of(target.key).expect("a target is one of the members");
                 actions.push(PlanAction {
-                    kind: target.action().expect("targets carry an action"),
+                    kind,
                     target: target.path.clone(),
                     keeper: keeper.path.clone(),
                     target_object,
@@ -778,6 +811,18 @@ impl ActionPlan {
                     expected_hash: group.hash.clone(),
                 });
             }
+        }
+
+        // After every group, so the operator learns how many marks to change instead of meeting
+        // them one refusal at a time. The whole plan, even when valid links sit beside them: a
+        // plan that quietly dropped them would confirm less than was marked.
+        if let Some((kind, target, keeper)) = crossing {
+            return Err(PlanRefusal::CrossDataset {
+                kind,
+                target,
+                keeper,
+                marks: crossing_marks,
+            });
         }
 
         if actions.is_empty() {
@@ -2334,5 +2379,197 @@ mod tests {
             None,
             "how a digest was established is not something stat can disagree with"
         );
+    }
+
+    fn key_on(device: u64, inode: u64) -> PlanObjectKey {
+        PlanObjectKey {
+            device,
+            ..key(inode, S)
+        }
+    }
+
+    /// A hardlink or a clone cannot leave its filesystem, and every ZFS dataset is one — two
+    /// datasets of one pool included (FICLONE between them is EXDEV). The plan refuses such a mark
+    /// before anything runs; it used to be refused by the batch, after the snapshots and after
+    /// both files were read in full.
+    #[test]
+    fn a_link_to_a_keeper_on_another_dataset_is_refused() {
+        for kind in [ActionKind::Hardlink, ActionKind::Reflink] {
+            let refusal = ActionPlan::try_new(
+                1,
+                vec![group(vec![
+                    member("/a/keeper.bin", key_on(1, 10), 1, true, None),
+                    member("/b/twin.bin", key_on(2, 11), 1, false, Some(kind)),
+                ])],
+            )
+            .expect_err("a link cannot cross datasets")
+            .to_string();
+            assert_eq!(
+                refusal,
+                format!(
+                    "cannot hardlink or reflink across datasets (1 mark) — mark DELETE, unmark, or \
+                     pick a keeper on the same dataset; first: /b/twin.bin ({}), keeper \
+                     /a/keeper.bin",
+                    kind.label()
+                )
+            );
+        }
+    }
+
+    /// A valid link beside a crossing one does not save the plan: dropping the crossing mark
+    /// quietly would confirm less than was marked, and its bytes would stay in the estimate.
+    #[test]
+    fn a_crossing_mark_refuses_the_valid_links_beside_it() {
+        let refusal = ActionPlan::try_new(
+            1,
+            vec![group(vec![
+                member("/a/keeper.bin", key_on(1, 10), 1, true, None),
+                member(
+                    "/a/same.bin",
+                    key_on(1, 12),
+                    1,
+                    false,
+                    Some(ActionKind::Hardlink),
+                ),
+                member(
+                    "/b/twin.bin",
+                    key_on(2, 11),
+                    1,
+                    false,
+                    Some(ActionKind::Hardlink),
+                ),
+            ])],
+        )
+        .expect_err("one crossing mark refuses the whole plan");
+        assert_eq!(
+            refusal,
+            PlanRefusal::CrossDataset {
+                kind: ActionKind::Hardlink,
+                target: PathBuf::from("/b/twin.bin"),
+                keeper: PathBuf::from("/a/keeper.bin"),
+                marks: 1,
+            }
+        );
+    }
+
+    /// Delete moves the target into the quarantine of its own dataset and never touches the
+    /// keeper's, so where the keeper lives does not matter to it. The control for the refusal
+    /// above: a link on the keeper's own dataset sits in the same group.
+    #[test]
+    fn a_delete_on_another_dataset_is_still_planned() {
+        let plan = ActionPlan::try_new(
+            1,
+            vec![group(vec![
+                member("/a/keeper.bin", key_on(1, 10), 1, true, None),
+                member(
+                    "/a/same.bin",
+                    key_on(1, 12),
+                    1,
+                    false,
+                    Some(ActionKind::Hardlink),
+                ),
+                member(
+                    "/b/twin.bin",
+                    key_on(2, 11),
+                    1,
+                    false,
+                    Some(ActionKind::Delete),
+                ),
+            ])],
+        )
+        .expect("a delete may leave the keeper's dataset");
+        assert_eq!(plan.actions().len(), 2);
+    }
+
+    /// Every crossing mark is counted, so the operator learns how many marks to change instead of
+    /// meeting them one refusal at a time. The one named is the first in the plan's own order —
+    /// groups by rank, members by path — whatever order the groups were handed over in.
+    #[test]
+    fn the_refusal_names_the_first_crossing_mark_and_counts_them_all() {
+        let first = PlanGroupInput {
+            id: gid(0),
+            hash: "ab".repeat(32),
+            members: vec![
+                member("/a/k0.bin", key_on(1, 10), 1, true, None),
+                member(
+                    "/b/y0.bin",
+                    key_on(2, 12),
+                    1,
+                    false,
+                    Some(ActionKind::Reflink),
+                ),
+                member(
+                    "/b/x0.bin",
+                    key_on(2, 11),
+                    1,
+                    false,
+                    Some(ActionKind::Hardlink),
+                ),
+            ],
+        };
+        let second = PlanGroupInput {
+            id: gid(1),
+            hash: "cd".repeat(32),
+            members: vec![
+                member("/a/k1.bin", key_on(1, 20), 1, true, None),
+                member(
+                    "/b/x1.bin",
+                    key_on(2, 21),
+                    1,
+                    false,
+                    Some(ActionKind::Reflink),
+                ),
+            ],
+        };
+        let refusal =
+            ActionPlan::try_new(1, vec![second, first]).expect_err("three links cross datasets");
+        assert_eq!(
+            refusal,
+            PlanRefusal::CrossDataset {
+                kind: ActionKind::Hardlink,
+                target: PathBuf::from("/b/x0.bin"),
+                keeper: PathBuf::from("/a/k0.bin"),
+                marks: 3,
+            }
+        );
+        assert!(
+            refusal
+                .to_string()
+                .starts_with("cannot hardlink or reflink across datasets (3 marks) — "),
+            "{refusal}"
+        );
+    }
+
+    /// The manual quotes the refusal word for word, the count and the pathnames aside, where it
+    /// says what a link can reach and where an operator looks the message up.
+    #[test]
+    fn the_manual_quotes_the_cross_dataset_refusal() {
+        for (kind, chapters) in [
+            (
+                ActionKind::Hardlink,
+                &["08-actions.md", "13-troubleshooting.md"][..],
+            ),
+            (ActionKind::Reflink, &["08-actions.md"][..]),
+        ] {
+            let refusal = ActionPlan::try_new(
+                1,
+                vec![group(vec![
+                    member("/a/keeper.bin", key_on(1, 10), 1, true, None),
+                    member("/b/twin_0.bin", key_on(2, 11), 1, false, Some(kind)),
+                    member("/b/twin_1.bin", key_on(2, 12), 1, false, Some(kind)),
+                ])],
+            )
+            .expect_err("a link cannot cross datasets")
+            .to_string();
+            let quoted = refusal
+                .replace("(2 marks)", "(N marks)")
+                .replace("/b/twin_0.bin", "…")
+                .replace("/a/keeper.bin", "…");
+            for chapter in chapters {
+                let text = crate::testfixtures::manual(chapter);
+                let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                assert!(text.contains(&quoted), "{chapter} must quote: {quoted}");
+            }
+        }
     }
 }

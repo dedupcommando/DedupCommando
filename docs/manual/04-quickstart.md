@@ -106,8 +106,8 @@ opens (Screen::ScanConfig).
 │ Datasets and folders — Space select, F add folder                       │
 │   [ ] rpool        →  /rpool                                            │
 │ ▸ [x] tank         →  /tank                                             │
-│   [ ] tank/media   →  /tank/media                                       │
-│   [ ] tank/backup  →  /tank/backup                                      │
+│   [ ] tank/vm      →  /tank/vm                                          │
+│   [ ] tank/iso     →  /tank/iso                                         │
 │                                                                         │
 ├─────────────────────────────────────────────────────────────────────────┤
 │ ↑↓ · Space · F folder · P preset · C cache · G intensity · Del remove · S start · Q quit │
@@ -248,6 +248,11 @@ from a file of the group to the file itself:
    keeper** (`H`).
 4. Repeat step 3 for each remaining copy.
 
+A hardlink or a reflink stays inside one dataset: here all three copies are in
+`tank`. A copy on another dataset than the keeper can only be deleted (**F8**); a
+hardlink or reflink mark on it makes **F11** refuse the plan
+([§13](13-troubleshooting.md)).
+
 "group files" shows the marks as they are saved:
 
 ```text
@@ -267,7 +272,8 @@ Alternatives, in the files panel:
 - **F8** on a copy → delete to quarantine (not a hardlink); marked `D`, shown as `x`
   in "group files".
 - **F6** → reflink (only if `block_cloning: active` for the dataset — see the
-  scan-configuration header); marked `C`, shown as `c`.
+  scan-configuration header); marked `C`, shown as `c`. Like a hardlink, only for a
+  copy on the keeper's dataset.
 - **Space** on a marked file — clear the mark.
 
 How `delete` differs from `hardlink` and which to pick when are in

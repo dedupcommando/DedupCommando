@@ -16,7 +16,7 @@ quarantine instead of being unlinked, and file content is re-validated immediate
 ## Features
 
 - **Three reclaim actions:** delete-to-quarantine, **hardlink** (same dataset), and **reflink** / CoW
-  block-clone (ZFS `block_cloning`).
+  block-clone (ZFS `block_cloning`, same dataset).
 - **Exact matching** via BLAKE3 hashing, with an optional byte-for-byte re-compare (`--verify`).
 - **Directory dedup ("twin folders")** — find directory trees whose scanned contents are recursively identical.
 - **Two interfaces:** a multi-panel "commander" (default) or a classic stepwise wizard (`--classic`).

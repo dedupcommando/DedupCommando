@@ -89,7 +89,7 @@ After apply:
 
 | Limitation | Details |
 |---|---|
-| Only within a **single dataset** | If the target and keeper are in different datasets — the error `cross-dataset hardlink is impossible — files are in different datasets`. A ZFS dataset is a separate filesystem, and a hardlink between filesystems is impossible in principle. |
+| Only within a **single dataset** | If the target and keeper are in different datasets, the plan is refused before anything runs: `cannot hardlink or reflink across datasets (N marks) — mark DELETE, unmark, or pick a keeper on the same dataset; first: … (HARDLINK), keeper …`. A ZFS dataset is a separate filesystem, and a hardlink between filesystems is impossible in principle. |
 | The target takes on the keeper's metadata | After the action the path IS the keeper's inode, so its owner, permissions, ACL and xattrs are the keeper's. The target's own are not merged — they stay only on the original in quarantine, and `--purge-quarantine` removes them for good. If the two files must keep different metadata, choose reflink. |
 | Metadata is merged | A change of permissions/owner through any path is seen by all — it is **one** inode entry. |
 | A write through one path = a write for all | That is exactly what a hardlink means, but if different copies are expected to diverge, choose reflink or do NOT deduplicate them. |
@@ -126,7 +126,7 @@ After apply:
 | Limitation | Details |
 |---|---|
 | ZFS ≥ 2.3 with `block_cloning` enabled | `zpool get all <pool> \| grep block_cloning`; the scan configuration header shows on which pools it is active. If the host does not qualify, the action is cancelled with `reflink is unavailable on this host — needs ZFS 2.3+ with block cloning enabled`. |
-| The target and keeper in the **same pool** | Between datasets of the SAME pool it is fine; between different pools — the error `reflink is impossible — files are in different ZFS pools`. |
+| The target and keeper in the **same dataset** | As for a hardlink. `dedcom` clones with `FICLONE`, which the kernel refuses between two filesystems (`Invalid cross-device link`), and every ZFS dataset is a filesystem of its own — two datasets of one pool included. (ZFS itself can share blocks between datasets of one pool through `copy_file_range`, but where it cannot clone, that call quietly makes a full copy, so `dedcom` does not use it.) Such a plan is refused before anything runs, with no snapshot and nothing read: `cannot hardlink or reflink across datasets (N marks) — mark DELETE, unmark, or pick a keeper on the same dataset; first: … (REFLINK), keeper …`. |
 | `reflink_safe` is determined at startup | If `dedcom` did not establish at startup that `block_cloning` is safe for the pool, the action is cancelled (this is the same `reflink is unavailable …` refusal above). |
 | The metadata has to be carryable | The replaced file's owner/mode/ACL/xattr are written onto the clone before it is published. If that cannot be done — no privilege to hand the file back to its owner, a filesystem that refuses an attribute — the action is cancelled with `cannot carry over the …` and the file is left untouched. Publishing a clone with the wrong owner would be the worse outcome. |
 
@@ -147,13 +147,10 @@ After apply:
 ## 8.4. Decision matrix
 
 ```text
-                                 ┌─ same pool? ─ yes ─┬─ same dataset? ─ yes ─► HARDLINK or REFLINK
-                                 │                    │
-                                 │                    └─ no ─────────────────► REFLINK (if block_cloning)
-                                 │                                              or DELETE / nothing
-                                 │
-target and keeper in same pool? ─┴─ no ───────────────────────────────────────► DELETE or nothing
-                                                                                 (hardlink/reflink impossible)
+target and keeper in the same dataset? ─┬─ yes ─► HARDLINK or REFLINK (reflink: if block_cloning)
+                                        │
+                                        └─ no ──► DELETE or nothing
+                                                  (hardlink/reflink impossible — the plan is refused)
 
 Need different metadata on the copies?
    yes ──► REFLINK (if possible) or do NOT deduplicate
@@ -259,18 +256,18 @@ the error carries a ready-to-run hint:
 
 ```text
 source and destination are on different filesystems (ZFS datasets):
-/tank/foo.bin -> /tank/backup/foo.bin;
+/tank/foo.bin -> /tank/vm/foo.bin;
 moving by copying would lose the owner/permissions/ACL/xattr, would inflate
 sparse images and would break hardlinks. Move within a single
-dataset or do it manually:  rsync -aHAX --sparse '/tank/foo.bin' '/tank/backup/foo.bin' && rm -f '/tank/foo.bin'
+dataset or do it manually:  rsync -aHAX --sparse '/tank/foo.bin' '/tank/vm/foo.bin' && rm -f '/tank/foo.bin'
 ```
 
 Why a refusal and not a silent copy: see
 [§03 Cross-device](03-safety.md#6-cross-device--refusal-not-work-around-it-by-copying).
 
 This applies to the **Triage Board** (a move, [§09](09-triage-board.md)), not to
-deduplication (Hardlink requires a single dataset, Reflink a single pool, Delete acts
-in place; by their own logic they never cross boundaries).
+deduplication (Hardlink and Reflink require a single dataset, and a plan that would
+cross one is refused; Delete acts in place).
 
 ## 8.8. After apply
 

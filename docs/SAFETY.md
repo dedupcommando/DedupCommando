@@ -73,7 +73,8 @@ mitigated by the snapshot, the atomic publish, repeated symlink checks, and quar
   non-ZFS filesystems, scanning works but there is no snapshot safety, so applying actions is not recommended.
 - **Root** is typically required (to take snapshots and to scan outside your home directory).
 - **Hardlink** works within a single dataset and shares one inode/metadata; **reflink** needs ZFS ≥ 2.3 with
-  `block_cloning` and the same pool.
+  `block_cloning` and, like hardlink, a single dataset. A plan that would link across datasets is refused
+  before anything runs.
 - **Grouping memory** can be large on big pools (≈ hashed files × 2.5 KiB, transient); `--merkle-dirs` reduces
   it to O(depth). `dedcom` estimates and warns before the grouping phase.
 - **One operator at a time** (the lock). The commander's group-files panel displays at most the first 200

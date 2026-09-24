@@ -539,6 +539,8 @@ impl Batch<'_> {
     }
 
     fn apply_hardlink(&mut self, action: &PlanAction) -> (ActionOutcome, ActionResult) {
+        // The plan already refuses a link across datasets (`ActionPlan::try_new`); this is the
+        // last line, not the check an operator meets.
         if self.plan.target_object_of(action).key().device
             != self.plan.keeper_object_of(action).key().device
         {
@@ -576,18 +578,20 @@ impl Batch<'_> {
                     .to_string(),
             );
         }
-        let target_dataset = self.target_dataset(action);
-        let target_pool = target_dataset.map(|dataset| dataset.pool_name().to_string());
-        let keeper_pool = dataset_by_device(
-            self.datasets,
-            self.plan.keeper_object_of(action).key().device,
-        )
-        .map(|dataset| dataset.pool_name().to_string());
-        let same_pool = target_pool.is_some() && target_pool == keeper_pool;
-        let Some(dataset) = target_dataset.filter(|_| same_pool) else {
+        // One pool is not enough: FICLONE answers EXDEV between two datasets of the same pool. As
+        // for a hardlink, the plan already refuses the pair and this is the last line.
+        if self.plan.target_object_of(action).key().device
+            != self.plan.keeper_object_of(action).key().device
+        {
             return refused(
                 action,
-                "reflink is impossible — files are in different ZFS pools".to_string(),
+                "cross-dataset reflink is impossible — files are in different datasets".to_string(),
+            );
+        }
+        let Some(dataset) = self.target_dataset(action) else {
+            return refused(
+                action,
+                "target file's dataset could not be determined — reflink is not performed without a ZFS snapshot".to_string(),
             );
         };
         let dir = quarantine::quarantine_dir(&dataset.mountpoint, &self.timestamp);
@@ -1147,6 +1151,77 @@ pub(crate) mod tests {
         );
         assert!(!twin.exists(), "the target moved to quarantine");
         assert_eq!(batch.quarantined_paths().len(), 1);
+    }
+
+    /// One keeper and one twin, the twin marked `kind` — the plan the store builds for it.
+    fn twin_marked(tag: &str, kind: ActionKind) -> (PlanScenario, PathBuf, ActionPlan) {
+        let scenario = PlanScenario::new(tag);
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &twin, false, Some(kind));
+        drop(store);
+        let plan = plan_of(&scenario, scan_id);
+        (scenario, twin, plan)
+    }
+
+    /// A target on a dataset the host did not report has neither a snapshot nor a quarantine, so
+    /// every kind refuses it — each in its own words. A link across datasets never reaches the
+    /// batch any more (`ActionPlan::try_new` refuses it), so this is what is left to meet here.
+    #[test]
+    fn an_action_on_a_dataset_nobody_reported_is_refused_by_name() {
+        for (kind, said) in [
+            (
+                ActionKind::Delete,
+                "target file's dataset could not be determined",
+            ),
+            (
+                ActionKind::Hardlink,
+                "target file's dataset could not be determined — hardlink is not performed \
+                 without a ZFS snapshot",
+            ),
+            (
+                ActionKind::Reflink,
+                "target file's dataset could not be determined — reflink is not performed \
+                 without a ZFS snapshot",
+            ),
+        ] {
+            let (_scenario, twin, plan) =
+                twin_marked(&format!("no_dataset_{}", kind.as_str()), kind);
+            let ops = FakeOps::new();
+            let batch = run(&ops, &plan, &[]).unwrap();
+            assert!(ops.made().is_empty(), "{kind:?}: no dataset, no snapshot");
+            assert_eq!(batch.outcomes.len(), 1, "{kind:?}");
+            assert_eq!(batch.outcomes[0].result, Err(said.to_string()), "{kind:?}");
+            assert!(twin.exists(), "{kind:?}: the target stays where it was");
+        }
+    }
+
+    /// A host that cannot clone refuses a reflink by name, and the target stays where it was.
+    #[test]
+    fn a_reflink_on_a_host_that_cannot_clone_is_refused_by_name() {
+        let (scenario, twin, plan) = twin_marked("no_clone", ActionKind::Reflink);
+        let ops = FakeOps::new();
+        let batch = apply_batch_with(
+            &ops,
+            &plan,
+            &[dataset_over(&scenario.root, "tank/test")],
+            false,
+            &ApplyShared::default(),
+            RevalidationMode::Hybrid,
+        )
+        .unwrap();
+        assert_eq!(batch.outcomes.len(), 1);
+        assert_eq!(
+            batch.outcomes[0].result,
+            Err(
+                "reflink is unavailable on this host — needs ZFS 2.3+ with block cloning enabled"
+                    .to_string()
+            )
+        );
+        assert!(twin.exists(), "the target stays where it was");
     }
 
     /// The C5 defect in the accounting: two pathnames of ONE allocation are one allocation's worth,

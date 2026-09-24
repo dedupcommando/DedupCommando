@@ -105,24 +105,26 @@ keep, so the actions are ignored.
 in the classic browser). You can also mark keepers automatically with **A** in
 the browser — the keeper is chosen by the most recent `mtime`.
 
-### "cross-dataset hardlink is impossible — files are in different datasets"
+### "cannot hardlink or reflink across datasets (N marks) — mark DELETE, unmark, or pick a keeper on the same dataset; first: … (HARDLINK), keeper …"
 
-**Cause:** the target and the keeper are in different ZFS datasets; a hardlink
-between filesystems is impossible by definition (a hardlink is a directory entry
-on the same filesystem).
+**Cause:** a file marked Hardlink or Reflink and the keeper of its group are in
+different ZFS datasets. Every dataset is a filesystem of its own, and neither a
+hardlink (a directory entry on the same filesystem) nor a reflink as `dedcom` makes
+it (`FICLONE`, which the kernel refuses between two filesystems) can span two — not
+even two datasets of one pool. The plan is refused as soon as it is built (`F11` in
+the commander, the review in the classic browser): nothing is snapshotted, read or
+changed, and the marks stay. `N marks` counts every mark of the plan that would
+link across datasets; the first of them is named, with `REFLINK` in place of
+`HARDLINK` for a reflink.
 
-**Fix:**
+**Fix,** for each such mark, one of:
 
-- Choose Reflink (`F6`) if both are in the **same pool** and `block_cloning` is
-  supported.
-- Or Delete (`F8`) — the target goes to quarantine, freeing space without any
-  link to the keeper.
-
-### "reflink is impossible — files are in different ZFS pools"
-
-**Cause:** ZFS reflink (`block_cloning`) only works within a single pool.
-
-**Fix:** Hardlink (if both are in the same dataset) or Delete.
+- if the group has another copy on the marked file's dataset, make that copy the
+  keeper (`F7` in the commander, Enter in the classic browser) — the link then stays
+  inside one dataset;
+- mark the file Delete (`F8` in the commander, `d` in the classic browser) — it goes
+  to quarantine, freeing space without any link to the keeper;
+- unmark it (Space in either window).
 
 ### "reflink is unavailable on this host — needs ZFS 2.3+ with block cloning enabled"
 
