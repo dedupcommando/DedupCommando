@@ -129,8 +129,16 @@ impl Cli {
                              that matches no file: the scan leaves out every name that is not"
                         )
                     })?;
-                    for ext in value.split(',') {
-                        let ext = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+                    for typed in value.split(',') {
+                        let ext = crate::model::preset::normalize_ext(typed);
+                        // No file name holds one, so such a filter would match nothing — silently.
+                        if ext.contains('/') {
+                            return Err(format!(
+                                "--include-ext {:?} is not an extension: a file name cannot hold \
+                                 \"/\" (separate extensions with commas)",
+                                typed.trim()
+                            ));
+                        }
                         if !ext.is_empty() {
                             cli.include_extensions.push(ext);
                         }
@@ -411,6 +419,48 @@ mod help_tests {
 }
 
 #[cfg(test)]
+mod include_ext_tests {
+    use super::Cli;
+
+    fn extensions(value: &str) -> Vec<String> {
+        Cli::parse_from(
+            ["--scan", "/tank", "--include-ext", value]
+                .into_iter()
+                .map(Into::into),
+        )
+        .expect(value)
+        .include_extensions
+    }
+
+    /// An extension is often typed the way a shell or a file manager shows it — `*.jpg`, `.PNG` —
+    /// and means `jpg` and `png`; a dot inside, as in `tar.gz`, is part of it.
+    #[test]
+    fn a_leading_star_and_dot_are_not_part_of_the_extension() {
+        assert_eq!(
+            extensions("*.jpg, .PNG ,tar.gz,*.TAR.GZ,*, *. heic,* .mov"),
+            ["jpg", "png", "tar.gz", "tar.gz", "heic", "mov"]
+        );
+    }
+
+    /// No file name holds a `/`, so a value with one would match nothing and the scan would find
+    /// nothing without a word: it is refused, quoted as typed.
+    #[test]
+    fn a_value_with_a_slash_is_refused() {
+        let refusal = Cli::parse_from(
+            ["--scan", "/tank", "--include-ext", "jpg, photos/PNG"]
+                .into_iter()
+                .map(Into::into),
+        )
+        .expect_err("a slash");
+        assert_eq!(
+            refusal,
+            "--include-ext \"photos/PNG\" is not an extension: a file name cannot hold \"/\" \
+             (separate extensions with commas)"
+        );
+    }
+}
+
+#[cfg(test)]
 mod storage_type_tests {
     use super::Cli;
 
@@ -452,6 +502,11 @@ mod storage_type_tests {
             (
                 &["--storage-type", "hd\u{202e}d"],
                 "--storage-type takes hdd, ssd or nvme, not \"hd\\u{202e}d\"",
+            ),
+            (
+                &["--scan", "/tank", "--include-ext", "jp\u{202e}g/x"],
+                "--include-ext \"jp\\u{202e}g/x\" is not an extension: a file name cannot hold \
+                 \"/\" (separate extensions with commas)",
             ),
         ] {
             let refusal = parse(args).expect_err(says);

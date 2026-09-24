@@ -419,6 +419,21 @@ fn by_name_bytes(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> std::cmp::Ordering
     a.as_bytes().cmp(b.as_bytes())
 }
 
+/// Whether the name ends in `.` and one of `extensions`, ASCII case aside: `a.tar.gz` has the
+/// extension `tar.gz` and the extension `gz`. Something has to stand before that dot, so a
+/// dot-file `.gz` has no extension, as `Path::extension` says. Compared as bytes, so a name that
+/// is not UTF-8 is matched the way any other is.
+fn has_extension(name: &std::ffi::OsStr, extensions: &[String]) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let name = name.as_bytes();
+    extensions.iter().any(|ext| {
+        let ext = ext.as_bytes();
+        name.len() > ext.len() + 1
+            && name[name.len() - ext.len() - 1] == b'.'
+            && name[name.len() - ext.len()..].eq_ignore_ascii_case(ext)
+    })
+}
+
 /// The shared builder settings. `standard_filters(false)` also turns off parent-ignore reading, so
 /// a per-root builder and the multi-root one behave identically apart from which paths they cover.
 ///
@@ -567,19 +582,11 @@ fn absorb(
         }
     }
 
-    if !config.include_extensions.is_empty() {
-        let ext = entry
-            .path()
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.to_ascii_lowercase());
-        match ext {
-            Some(ext) if config.include_extensions.contains(&ext) => {}
-            _ => {
-                sink.record_child(entry.path(), OmissionReason::ExtensionFiltered);
-                return Ok(());
-            }
-        }
+    if !config.include_extensions.is_empty()
+        && !has_extension(entry.file_name(), &config.include_extensions)
+    {
+        sink.record_child(entry.path(), OmissionReason::ExtensionFiltered);
+        return Ok(());
     }
 
     // Non-UTF8 guard: skip files whose path cannot be represented
@@ -1233,6 +1240,46 @@ mod tests {
         assert_eq!(whole.known_omitted_files().unwrap(), 5, "five files");
         assert_eq!(whole.unsupported_entries().unwrap(), 1, "one symlink");
         assert!(!whole.has_unknown_cardinality(), "no errors here");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// An extension with a dot inside — `tar.gz` — is matched against the end of the name, the way
+    /// a one-part `gz` always was. It used to be compared with the last part of the name alone and
+    /// matched nothing, and a scan that found nothing finished without a word. A one-part filter
+    /// matches what it did: a dot-file named `.tar.gz` has the extension `gz` but not `tar.gz`.
+    #[test]
+    fn an_extension_with_a_dot_inside_matches_the_end_of_the_name() {
+        let root = temp_dir("dotted_ext");
+        // `xetar.gz` and `abgz` end in the letters of an extension without the dot before them.
+        for name in [
+            "a.tar.gz", "b.gz", "c.txt", ".tar.gz", "d.TAR.GZ", "etar.gz", "xetar.gz", "abgz",
+        ] {
+            fs::write(root.join(name), b"content").unwrap();
+        }
+        let walk = |extensions: &[&str]| {
+            let mut config = base_config(&root);
+            config.include_extensions = extensions.iter().map(|ext| ext.to_string()).collect();
+            let outcome = collect(&config);
+            let mut names = walked_names(finished(&outcome), &root);
+            names.sort();
+            (names, cells(&outcome, &root))
+        };
+
+        let (names, cells) = walk(&["tar.gz"]);
+        assert_eq!(names, ["a.tar.gz", "d.TAR.GZ"]);
+        assert_eq!(
+            cells,
+            [(String::new(), OmissionReason::ExtensionFiltered, 6)],
+            "the other six are filtered out, and counted"
+        );
+        let (names, _) = walk(&["gz"]);
+        assert_eq!(
+            names,
+            [".tar.gz", "a.tar.gz", "b.gz", "d.TAR.GZ", "etar.gz", "xetar.gz"]
+        );
+        let (names, _) = walk(&["txt", "tar.gz"]);
+        assert_eq!(names, ["a.tar.gz", "c.txt", "d.TAR.GZ"]);
 
         fs::remove_dir_all(&root).ok();
     }

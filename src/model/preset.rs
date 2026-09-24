@@ -11,9 +11,16 @@ pub struct Preset {
     pub extensions: Vec<String>,
 }
 
-/// Normalizes an extension: strips whitespace and a leading dot, lowercases it.
-fn normalize_ext(ext: &str) -> String {
-    ext.trim().trim_start_matches('.').to_ascii_lowercase()
+/// Normalizes an extension: strips whitespace and the `*.` it is often typed with (`*.JPG` is
+/// `jpg`), lowercases it. A dot inside stays: `tar.gz` is one extension. The flag and the presets
+/// both go through here.
+pub(crate) fn normalize_ext(ext: &str) -> String {
+    ext.trim()
+        .trim_start_matches('*')
+        .trim_start()
+        .trim_start_matches('.')
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// Built-in presets. "All" is the first one (index 0), with no filter.
@@ -60,14 +67,41 @@ pub fn load_user_presets(path: &Path) -> Vec<Preset> {
     }
 }
 
-/// Built-in + user presets; all extensions are normalized.
+/// Built-in + user presets; all extensions are normalized, and an entry that names none (`*`,
+/// `.`, empty) is left out — as `--include-ext` leaves it out.
 pub fn load_all(user_presets_path: &Path) -> Vec<Preset> {
     let mut presets = builtin_presets();
     presets.extend(load_user_presets(user_presets_path));
     for preset in &mut presets {
-        for ext in &mut preset.extensions {
-            *ext = normalize_ext(ext);
-        }
+        preset.extensions = preset
+            .extensions
+            .iter()
+            .map(|ext| normalize_ext(ext))
+            .filter(|ext| !ext.is_empty())
+            .collect();
     }
     presets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A preset of the user's own is read the way `--include-ext` is: `*.JPG` is `jpg`, and a dot
+    /// inside an extension stays.
+    #[test]
+    fn a_users_preset_is_normalized_like_the_flag() {
+        let dir = crate::testfixtures::ScratchDir::new("presets");
+        let file = dir.path().join("presets.json");
+        std::fs::write(
+            &file,
+            br#"[{"name": "Archives", "extensions": ["*.JPG", ".tar.gz", " ZIP ", "*", " *. 7z"]}]"#,
+        )
+        .unwrap();
+        let archives = load_all(&file)
+            .into_iter()
+            .find(|preset| preset.name == "Archives")
+            .expect("the user's preset is loaded");
+        assert_eq!(archives.extensions, ["jpg", "tar.gz", "zip", "7z"]);
+    }
 }

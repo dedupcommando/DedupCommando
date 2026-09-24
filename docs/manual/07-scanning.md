@@ -61,15 +61,20 @@ The CLI flag **`--include-ext`** (repeatable, comma-separated):
 > `--include-ext <LIST>` — Scan only files with these extensions
 > (comma-separated: jpg,png,gif; flag repeatable)
 
-Case is ignored and the leading dot is stripped:
+Case is ignored for the letters A–Z, and a leading `*` and dot are stripped:
+`'*.JPG'` means `jpg` (quote it, or the shell expands the `*`). An extension may have
+a dot inside: `tar.gz` matches `photos.tar.gz`, and so does `gz`. A value with a `/`
+is refused — no file name holds one.
 
 ```text
 dedcom --scan /tank/media --include-ext jpg,heic,raw
 dedcom --scan /tank/media --include-ext jpg --include-ext heic
+dedcom --scan /tank/backup --include-ext tar.gz,zip
 ```
 
 In the TUI a preset is chosen with **P** in the scan configuration wizard.
-Presets are defined in the code — typical groups (media, documents, and so on).
+Presets are defined in the code — Images and Office documents — and in `presets.json` in
+the state directory, whose extensions lose a leading `*` and dot the same way.
 
 An empty filter (the default) means all files are scanned.
 

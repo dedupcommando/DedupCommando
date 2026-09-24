@@ -67,8 +67,8 @@ pub struct ScanConfig {
     pub min_size: u64,
     pub max_size: Option<u64>,
     pub follow_symlinks: bool,
-    /// Include filter by extensions (normalized: lowercase, no dot).
-    /// Empty = all files are scanned.
+    /// Include filter by extensions (normalized: ASCII lowercase, no leading `*` or dot; a dot
+    /// inside stays, as in `tar.gz`). Empty = all files are scanned.
     #[serde(default)]
     pub include_extensions: Vec<String>,
     /// Manual override of the storage type (the `--storage-type` flag).
