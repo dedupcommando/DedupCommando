@@ -369,6 +369,10 @@ pub struct ScanResults {
     /// The result's scan_id — so that action marks are saved to the right scan.
     pub scan_id: i64,
     pub summary: ScanSummary,
+    /// A root this completion found no file under, where an older scan of the same roots found
+    /// some: retention kept the scans holding them out of the trash. Told once, beside the result —
+    /// reopening the scan later does not bring it back.
+    pub history_kept_for: Option<PathBuf>,
 }
 
 /// Details about a found unfinished/past scan — for the Resume screen.

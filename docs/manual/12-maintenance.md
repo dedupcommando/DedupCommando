@@ -114,7 +114,10 @@ jq '. + {vacuum_interval_hours: 720}' ~/.local/state/dedcom/config.json | \
 
 On every scan **completion**, `dedcom` checks how many previously completed scans
 **of the same roots** are active. If there are more than the limit, the oldest ones are
-softly moved to the trash (not purged — reversible).
+softly moved to the trash (not purged — reversible). When a scan finds no files under a
+root where an earlier scan of the same roots found files, the scans holding files under it
+stay whatever the limit — they still count toward it; a scan that found no file at all
+takes no place in it ([§10](10-diff-trash.md)).
 
 The parameter in `config.json`:
 
@@ -128,7 +131,7 @@ The parameter in `config.json`:
 |------------|---------------------------------------------------------------------|
 | 2 (default) | Keep the 2 most recent completed scans for each set of roots       |
 | 5          | Keep more history                                                   |
-| 1          | Only the current one + one previous                                 |
+| 1          | Only the current one, for a new scan — the same as 0                |
 | 0          | Every new scan moves all previous ones to the trash                 |
 
 This is **not deletion** but a move to the session trash (see [§10 Diff & trash](10-diff-trash.md)).

@@ -466,6 +466,10 @@ pub struct App {
     /// The result was opened from the session list (F2/F12) — Esc returns to the list, not to
     /// commander (don't jump over the parent, E2E feedback).
     pub results_from_sessions: bool,
+    /// The scan just finished and the root it found empty, whose older scans retention kept: said
+    /// in the status line when that scan's result opens. The scan screen, which got the notice,
+    /// closes as soon as the result is there.
+    pub history_kept_note: Option<(i64, PathBuf)>,
 }
 
 /// Where the browsing actor's replies enter the application's event loop.
@@ -807,6 +811,7 @@ impl App {
             confirm: None,
             opening_started: None,
             results_from_sessions: false,
+            history_kept_note: None,
         };
         // The initial auto-switch to a covering scan
         // is done by render via `maybe_auto_switch_scan` on the first frame — we don't
@@ -1240,6 +1245,17 @@ impl App {
         self.commander.watch_dir_cache = Vec::new();
 
         self.status = self.completion_status(published, status);
+        if matches!(&self.history_kept_note, Some((id, _)) if *id == scan_id) {
+            if let Some((_, root)) = self.history_kept_note.take() {
+                // First on the line: counts and gaps can run past any screen, and it would go with
+                // them.
+                self.status = format!(
+                    "⚠ no files under {}: the older scans that hold some were kept · {}",
+                    crate::textsan::path(&root),
+                    self.status
+                );
+            }
+        }
         self.commander.status = self.status.clone();
         // A «Clear all marks» question was about the scan this open replaces. It is not carried
         // over to another scan: it closes, and the operator is told nothing was cleared.
@@ -2899,6 +2915,8 @@ impl App {
                 // summary the pipeline reported is what the header shows until the payload
                 // installs the authority's own answer.
                 self.browser.summary = results.summary;
+                self.history_kept_note =
+                    results.history_kept_for.map(|root| (results.scan_id, root));
                 self.open_via_actor(results.scan_id, OpenIntent::Wizard);
             }
             Ok(ScanOutcome::Cancelled) => {

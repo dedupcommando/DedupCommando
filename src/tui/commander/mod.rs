@@ -8102,11 +8102,60 @@ mod dir_watch_tests {
                     crate::pipeline::ScanOutcome::Completed(crate::model::scan::ScanResults {
                         scan_id,
                         summary: Default::default(),
+                        history_kept_for: None,
                     }),
                 )));
                 crate::app::pump_until(&mut app, &events, "the open", open_landed);
                 assert_eq!((app.mode, app.screen), (AppMode::Wizard, Screen::Browser));
                 assert!(app.show_help, "help is still in front");
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// B34. A scan that found a root empty, whose older scans retention kept, says so beside
+            /// its result: the scan screen that got the notice closes as soon as the result opens,
+            /// so without this the interface never shows why nothing went to the trash. First on the
+            /// status line — the counts and gaps after it can run past any screen — and so whole on
+            /// the narrowest one. Once only: opening the same scan again later says nothing more.
+            #[test]
+            fn a_scan_whose_older_scans_were_kept_says_so_beside_its_result() {
+                use ratatui::{backend::TestBackend, Terminal};
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = open_app();
+                let scan_id = app.current_scan_id.expect("a scan is installed");
+                app.open_wizard(Screen::Scanning);
+                app.handle_event(AppEvent::ScanFinished(Ok(
+                    crate::pipeline::ScanOutcome::Completed(crate::model::scan::ScanResults {
+                        scan_id,
+                        summary: Default::default(),
+                        history_kept_for: Some(std::path::PathBuf::from("/tank")),
+                    }),
+                )));
+                crate::app::pump_until(&mut app, &events, "the open", open_landed);
+                let said = "⚠ no files under /tank: the older scans that hold some were kept";
+                assert!(
+                    app.status.starts_with(&format!("{said} · ")),
+                    "{}",
+                    app.status
+                );
+                assert_eq!(app.commander.status, app.status);
+                assert!(app.history_kept_note.is_none(), "told once");
+
+                let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+                terminal
+                    .draw(|frame| crate::tui::draw(frame, &mut app))
+                    .unwrap();
+                let buffer = terminal.backend().buffer().clone();
+                let shown = (0..24).any(|y| {
+                    (0..80)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .contains(said)
+                });
+                assert!(shown, "the whole note must be on an 80-column screen");
+                assert!(
+                    crate::testfixtures::manual("11-headless.md").contains(said),
+                    "11-headless.md quotes the status line"
+                );
                 crate::app::drain(&mut app, &events);
             }
 

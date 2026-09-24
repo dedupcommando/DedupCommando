@@ -171,6 +171,18 @@ completion, completed scans of the same roots beyond the newest `history_keep`
 is deleted — the sessions stay in the trash and remain recoverable until you
 purge them yourself.
 
+Two exceptions keep an empty root — usually the mount point of a dataset that is
+not mounted — from eating the history. When a scan finds no files under one of
+its roots, where an earlier scan of the same roots found files, the scans that
+hold files under it stay out of the trash (an unfinished one too), and the scan
+says so (`History kept: …`, [§11](11-headless.md)); the rest is trimmed as usual.
+If the root is empty on purpose, move those scans to the trash yourself. And a
+finished scan that found no file at all takes no place in `history_keep`: the next
+trim moves it to the trash with the stale unfinished ones. With several roots, a
+scan that found only one of them empty still takes its place — after the dataset
+is back, it can push an older full scan to the trash; restore that one from here
+if you need it.
+
 The limit is `history_keep` in `config.json`; it is not yet settable from the
 UI. Values and what they mean: [§12 Maintenance](12-maintenance.md).
 

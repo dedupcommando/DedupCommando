@@ -10,7 +10,7 @@ pub mod store;
 pub use host_profile::HostProfile;
 pub use store::{
     set_observer_role, AttributedDirGroupSummary, GroupClaim, GroupLinks, GroupSummary,
-    LiveDirSignature, ManifestRow, ScanStore,
+    LiveDirSignature, ManifestRow, Retention, ScanStore,
 };
 // The consumer-facing half of the membership authority — consumers reach store types through
 // `crate::state`, while the resolver internals stay in `store`.

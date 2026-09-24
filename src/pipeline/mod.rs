@@ -14,7 +14,7 @@ use crate::model::scan::{
     HashProfile, OmissionAccounting, ScanConfig, ScanPhase, ScanProgress, ScanResults, ScanStatus,
     ScanSummary, WalkStage,
 };
-use crate::state::{ManifestRow, MembershipMode, PublishMode, ScanStore};
+use crate::state::{ManifestRow, MembershipMode, PublishMode, Retention, ScanStore};
 use walk::{OmissionSnapshot, SnapshotUnavailable, WalkOutcome};
 
 pub mod governor;
@@ -110,7 +110,11 @@ pub fn run_scan(
         store.prepare_legacy_for_viewing(scan_id)?;
         let summary = store.scan_summary(scan_id)?;
         on_progress(ScanProgress::Done(summary.clone()));
-        return Ok(ScanOutcome::Completed(ScanResults { scan_id, summary }));
+        return Ok(ScanOutcome::Completed(ScanResults {
+            scan_id,
+            summary,
+            history_kept_for: None,
+        }));
     }
 
     let environment = crate::zfs::pool::scan_environment(config.storage_type_override.as_deref());
@@ -229,6 +233,8 @@ fn run_phases(
     // The omission account this run established; the rare was_complete path reads it back from
     // the store instead, exactly as a reopen would.
     let mut run_accounting: Option<OmissionAccounting> = None;
+    // A root retention found empty this time, whose older scans it kept: told beside the result.
+    let mut history_kept_for: Option<PathBuf> = None;
 
     if !was_complete {
         // Grouping-phase memory warning — only for the Old path:
@@ -390,15 +396,26 @@ fn run_phases(
         }
         run_accounting = Some(accounting);
         // Retention: we trim the history of the same roots into the TRASH (softly,
-        // recoverably) — finished ones beyond keep + stale unfinished ones.
+        // recoverably) — finished ones beyond keep + stale unfinished ones. The scans holding files
+        // under a root that turned up empty stay, and the operator is told why.
         let db = store.db_path();
         if let Some(state_dir) = db.as_deref().and_then(|p| p.parent()) {
             let keep = crate::maint::history_keep(state_dir);
             match store.apply_retention(&effective.roots, keep, scan_id) {
-                Ok(n) if n > 0 => {
-                    tracing::info!("retention: {n} old sessions of the same roots → trash")
+                Ok(Retention { trashed, held_for }) => {
+                    if trashed > 0 {
+                        tracing::info!(
+                            "retention: {trashed} old sessions of the same roots → trash"
+                        );
+                    }
+                    if let Some(root) = held_for {
+                        let notice =
+                            history_kept_notice(&root, !effective.include_extensions.is_empty());
+                        tracing::warn!("retention held: {notice}");
+                        on_progress(ScanProgress::Notice(notice));
+                        history_kept_for = Some(root);
+                    }
                 }
-                Ok(_) => {}
                 Err(err) => tracing::warn!("retention skipped: {err}"),
             }
         }
@@ -432,7 +449,11 @@ fn run_phases(
             None => store.scan_omission_accounting(scan_id)?,
         },
     };
-    Ok(ScanOutcome::Completed(ScanResults { scan_id, summary }))
+    Ok(ScanOutcome::Completed(ScanResults {
+        scan_id,
+        summary,
+        history_kept_for,
+    }))
 }
 
 /// How many groups the scan's CURRENT publication holds.
@@ -645,6 +666,25 @@ fn warning_events_of(totals: &OmissionSummary) -> Result<u64> {
         }
     }
     Ok(total)
+}
+
+/// What the operator is told when a root turned up empty and retention kept the scans holding
+/// files under it. One line, so a cron log keeps it whole. The cause to check is named — the
+/// extension filter first when the scan had one, since a mount point is then only one of two
+/// answers — and so is the way out when the root is empty for good: nothing else ends the hold.
+fn history_kept_notice(root: &std::path::Path, filtered: bool) -> String {
+    let cause = if filtered {
+        "The extension filter may leave nothing there, or its dataset is not mounted \
+         (zfs get mounted)"
+    } else {
+        "Check that its dataset is mounted (zfs get mounted)"
+    };
+    format!(
+        "History kept: no files found under {}, where an earlier scan of the same roots found \
+         some — the scans that hold them stay out of the trash. {cause}; if it is empty on \
+         purpose, move those scans to the trash yourself.",
+        crate::textsan::path(root)
+    )
 }
 
 /// The one aggregate omission notice, or `None` when there is nothing to say. Zero clauses are
@@ -1957,6 +1997,152 @@ mod hash_failures_tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn scan_ids(scans: Vec<crate::model::scan::ResumeInfo>) -> Vec<i64> {
+        let mut ids: Vec<i64> = scans.iter().map(|scan| scan.scan_id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// B34, end to end. A dataset that is not mounted leaves an empty mount point, and the scan of
+    /// it finds nothing and finishes. Two such nights used to send both good scans to the trash.
+    /// Now the scans that hold the files stay until a scan finds them again, and that one trims
+    /// as usual; an empty scan holds nothing and goes at the next trim.
+    #[test]
+    fn nights_on_an_empty_mount_point_keep_the_good_scans() {
+        let dir = unique_temp_dir("empty_mount_point");
+        let root = dir.join("tank");
+        let state = dir.join("state");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let fill = || {
+            std::fs::write(root.join("a.bin"), b"identical duplicate content").unwrap();
+            std::fs::write(root.join("b.bin"), b"identical duplicate content").unwrap();
+        };
+        // Retention runs for a store kept in a state directory; one in memory has none.
+        let mut store = ScanStore::open(&state.join("dedcom.db")).unwrap();
+        let mut cfg = ScanConfig::new(vec![root.clone()]);
+        cfg.min_size = 0;
+        cfg.exclude_globs = Vec::new();
+        let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let night = |store: &mut ScanStore| -> (i64, Option<PathBuf>) {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let seen = Arc::clone(&notices);
+            let outcome = run_scan(store, &cfg, None, false, &cancel, move |progress| {
+                if let ScanProgress::Notice(text) = progress {
+                    seen.lock().unwrap().push(text);
+                }
+            })
+            .unwrap();
+            match outcome {
+                ScanOutcome::Completed(results) => (results.scan_id, results.history_kept_for),
+                ScanOutcome::Cancelled => panic!("a night must complete"),
+            }
+        };
+
+        fill();
+        let (good1, _) = night(&mut store);
+        let (good2, _) = night(&mut store);
+        // The dataset is not mounted: its mount point is an empty directory.
+        std::fs::remove_file(root.join("a.bin")).unwrap();
+        std::fs::remove_file(root.join("b.bin")).unwrap();
+        let (empty1, kept1) = night(&mut store);
+        let (empty2, kept2) = night(&mut store);
+        assert_eq!(
+            scan_ids(store.list_scans().unwrap()),
+            vec![good1, good2, empty2],
+            "two empty nights leave both good scans active"
+        );
+        assert_eq!(
+            scan_ids(store.list_trashed().unwrap()),
+            vec![empty1],
+            "only the first empty scan went, at the second night's trim"
+        );
+        assert_eq!((kept1, kept2), (Some(root.clone()), Some(root.clone())));
+        let told = || -> Vec<String> {
+            notices
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|text| text.starts_with("History kept"))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            told(),
+            vec![history_kept_notice(&root, false); 2],
+            "each empty night tells the operator which scans it kept, and why"
+        );
+
+        // Mounted again.
+        fill();
+        let (good3, kept3) = night(&mut store);
+        assert_eq!(kept3, None);
+        assert_eq!(scan_ids(store.list_scans().unwrap()), vec![good2, good3]);
+        assert_eq!(
+            scan_ids(store.list_trashed().unwrap()),
+            vec![good1, empty1, empty2]
+        );
+        assert_eq!(told().len(), 2, "a night with files trims without a word");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A scan whose extension filter matches nothing under a root looks exactly like an empty mount
+    /// point, so its line names the filter first rather than sending the operator to `zfs`.
+    #[test]
+    fn a_filter_that_matches_nothing_is_named_in_the_notice() {
+        let dir = unique_temp_dir("filter_holds");
+        let root = dir.join("tank");
+        let state = dir.join("state");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(root.join("a.txt"), b"a text file").unwrap();
+        let mut store = ScanStore::open(&state.join("dedcom.db")).unwrap();
+        let mut cfg = ScanConfig::new(vec![root.clone()]);
+        cfg.min_size = 0;
+        cfg.exclude_globs = Vec::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        run_scan(&mut store, &cfg, None, false, &cancel, |_| {}).unwrap();
+
+        cfg.include_extensions = vec!["bin".to_string()];
+        let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&notices);
+        run_scan(&mut store, &cfg, None, false, &cancel, move |progress| {
+            if let ScanProgress::Notice(text) = progress {
+                seen.lock().unwrap().push(text);
+            }
+        })
+        .unwrap();
+        assert!(
+            notices
+                .lock()
+                .unwrap()
+                .contains(&history_kept_notice(&root, true)),
+            "{:?}",
+            notices.lock().unwrap()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The manual quotes the line an empty root prints, word for word. A scan with an extension
+    /// filter names the filter first: there a mount point is only one of two answers.
+    #[test]
+    fn the_manual_shows_the_notice_an_empty_root_prints() {
+        let root = std::path::Path::new("/tank");
+        let line = history_kept_notice(root, false);
+        let chapter = crate::testfixtures::manual("11-headless.md");
+        assert!(
+            chapter.lines().any(|shown| shown == line),
+            "11-headless.md, the empty root paragraph, must show:\n{line}"
+        );
+        let filtered = history_kept_notice(root, true);
+        assert!(
+            filtered.contains("The extension filter may leave nothing there, or its dataset"),
+            "{filtered}"
+        );
     }
 }
 

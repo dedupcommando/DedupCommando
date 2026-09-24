@@ -73,12 +73,32 @@ good scans of that root ([§10](10-diff-trash.md)).
 
 An empty directory is still a root like any other — and that includes the mount
 point a dataset that is not mounted usually leaves behind. Such a scan finds
-nothing, finishes, and counts toward the history kept like any other. In cron,
-guard the line with `mountpoint -q` on the mount point of the dataset the root
-lives on — `/tank` for `/tank` itself and for a plain directory under it (the
-last example below does). A plain directory is never a mount point: guarded by
-its own path, the line never runs. The guard checks that one dataset; a dataset
-below the root that failed to mount still leaves an empty directory in the scan.
+nothing and finishes, but it does not send away the scans that still hold the
+files: when a root turns up empty where an earlier scan of the same roots found
+files, every scan holding files under it stays out of the trash, and the output
+says so:
+
+```text
+History kept: no files found under /tank, where an earlier scan of the same roots found some — the scans that hold them stay out of the trash. Check that its dataset is mounted (zfs get mounted); if it is empty on purpose, move those scans to the trash yourself.
+```
+
+With an extension filter the line names the filter first: a filter that matches
+nothing under a root looks the same. The rest of the history is trimmed as usual,
+so a root that stays empty for good holds on to those scans only — nothing
+retires them but files under that root again, or you (the trash, [§10](10-diff-trash.md)).
+The empty scan itself holds nothing and takes no place in `history_keep`
+([§12](12-maintenance.md)): the next trim moves it to the trash. The interface
+shows the same beside the result, first on the status line:
+`⚠ no files under /tank: the older scans that hold some were kept`.
+
+In cron, still guard the line with `mountpoint -q` on the mount point of the
+dataset the root lives on — the night is then skipped instead of leaving an
+empty scan in the list. That is `/tank` for `/tank` itself and for a plain
+directory under it (the last example below does). A plain directory is never a
+mount point: guarded by its own path, the line never runs. The guard checks that
+one dataset. A dataset below the root that failed to mount is not noticed at
+all: the scan found files in the rest of the root, so it trims the history as
+usual.
 
 The output is line-by-line text for logging:
 

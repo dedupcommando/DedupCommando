@@ -94,6 +94,18 @@ pub struct DbCounts {
     pub file_rows: u64,
 }
 
+/// What retention did after a completion.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Retention {
+    /// How many older sessions of the same roots went to the trash — none is an ordinary answer.
+    pub trashed: usize,
+    /// A root the scan found no file under, where an older scan of the same roots did. That is how
+    /// the mount point of a dataset that is not mounted looks: the scans holding files under it —
+    /// an interrupted one too — were kept out of the trash, since they are the only record of what
+    /// was there. Only those; the rest of the history was trimmed as usual.
+    pub held_for: Option<PathBuf>,
+}
+
 /// A lightweight duplicate-group summary — one `file_group` row, without
 /// members. Browser holds a Vec of these summaries (645k×~48 B ≈ 31 MiB), and reads a group's
 /// members on entry through the membership snapshot, rather than the whole scan into RAM.
@@ -1541,36 +1553,103 @@ impl ScanStore {
     /// Retention: on a fresh Complete, marks into the TRASH BIN (not purge!)
     /// completed scans of the same roots BEYOND the newest `keep`, as well as stale
     /// unfinished/aborted ones of the same roots. The just-completed one (`current`) we
-    /// do not touch and count toward `keep`. Returns the number moved to the trash bin.
-    pub fn apply_retention(&self, roots: &[PathBuf], keep: usize, current: i64) -> Result<usize> {
+    /// do not touch and count toward `keep`.
+    ///
+    /// Two guards keep the empty mount point of a dataset that is not mounted from eating the
+    /// history. A scan that holds files under a root the current scan found nothing under never
+    /// goes to the trash here — see [`Retention::held_for`]; the rest is trimmed as usual, so a root
+    /// that stays empty for good holds on to those scans only, never to every night after them. And
+    /// a completed scan that found no file at all takes no place in `keep`: it holds nothing, so it
+    /// goes to the trash with the stale unfinished ones.
+    pub fn apply_retention(
+        &self,
+        roots: &[PathBuf],
+        keep: usize,
+        current: i64,
+    ) -> Result<Retention> {
+        // list_scans is already DESC by id (newest first) and without the trash bin.
+        let scans: Vec<ResumeInfo> = self
+            .list_scans()?
+            .into_iter()
+            .filter(|info| info.roots == roots)
+            .collect();
+        let mut empty_roots: Vec<usize> = Vec::new();
+        for (index, root) in roots.iter().enumerate() {
+            if !self.has_files_under(current, root)? {
+                empty_roots.push(index);
+            }
+        }
+        let mut retention = Retention::default();
         let mut kept_complete = 0usize;
         let mut to_trash: Vec<i64> = Vec::new();
-        // list_scans is already DESC by id (newest first) and without the trash bin.
-        for info in self.list_scans()? {
-            if info.roots != roots {
-                continue;
-            }
+        for info in &scans {
             if info.scan_id == current {
                 kept_complete += 1;
                 continue;
             }
+            // Whatever its status: an interrupted walk may be the only way back into those files.
+            let mut holds = false;
+            for &index in &empty_roots {
+                // Each scan's root in its own spelling: that is how its walk wrote the paths.
+                let theirs = info.roots.get(index).unwrap_or(&roots[index]);
+                if self.has_files_under(info.scan_id, theirs)? {
+                    holds = true;
+                    retention
+                        .held_for
+                        .get_or_insert_with(|| roots[index].clone());
+                    break;
+                }
+            }
             match info.status {
                 ScanStatus::Complete | ScanStatus::CompleteWithWarnings => {
+                    if !self.has_any_file(info.scan_id)? {
+                        to_trash.push(info.scan_id);
+                        continue;
+                    }
                     kept_complete += 1;
-                    if kept_complete > keep {
+                    if kept_complete > keep && !holds {
                         to_trash.push(info.scan_id);
                     }
                 }
                 // Unfinished/aborted are stale — there is a fresh Complete.
                 ScanStatus::Walking | ScanStatus::Hashing | ScanStatus::Aborted => {
-                    to_trash.push(info.scan_id);
+                    if !holds {
+                        to_trash.push(info.scan_id);
+                    }
                 }
             }
         }
         for id in &to_trash {
             self.trash_scan(*id)?;
         }
-        Ok(to_trash.len())
+        retention.trashed = to_trash.len();
+        Ok(retention)
+    }
+
+    /// Whether the manifest of `scan_id` holds a file at `root` or under it, read the way the walk
+    /// wrote those paths — `root` joined with each name, so `/tank/` and `/tank` both lead to
+    /// `/tank/a`. The root itself is a manifest row only when it is a file.
+    fn has_files_under(&self, scan_id: i64, root: &Path) -> Result<bool> {
+        let exact = root.to_string_lossy();
+        let trimmed = exact.trim_end_matches('/');
+        let (lo, hi) = prefix_bounds(Path::new(if trimmed.is_empty() { "/" } else { trimmed }));
+        let found: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM file WHERE scan_id = ?1 AND path = ?2)
+                 OR EXISTS(SELECT 1 FROM file WHERE scan_id = ?1 AND path >= ?3 AND path < ?4)",
+            params![scan_id, exact.as_ref(), lo, hi],
+            |row| row.get(0),
+        )?;
+        Ok(found)
+    }
+
+    /// Whether the manifest of `scan_id` holds any file at all.
+    fn has_any_file(&self, scan_id: i64) -> Result<bool> {
+        let found: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM file WHERE scan_id = ?1)",
+            params![scan_id],
+            |row| row.get(0),
+        )?;
+        Ok(found)
     }
 
     /// Marks the session as deleted (trash bin) — instant and reversible.
@@ -12483,22 +12562,18 @@ mod tests {
     #[test]
     fn retention_trashes_old_completes_and_unfinished() {
         let mut store = ScanStore::open_in_memory().unwrap();
-        let cfg = ScanConfig::new(vec![PathBuf::from("/x")]);
-        let c1 = store.begin_scan(&cfg).unwrap();
-        store.set_status(c1, ScanStatus::Complete).unwrap();
-        let u = store.begin_scan(&cfg).unwrap();
-        store.set_status(u, ScanStatus::Hashing).unwrap();
-        let c2 = store.begin_scan(&cfg).unwrap();
-        store.set_status(c2, ScanStatus::Complete).unwrap();
-        let c3 = store.begin_scan(&cfg).unwrap();
-        store.set_status(c3, ScanStatus::Complete).unwrap();
+        // Every scan found a file: this is the ordinary trim, not the rule for an empty scan.
+        let c1 = scan_holding(&mut store, &["/x"], &["/x/a"], ScanStatus::Complete);
+        let u = scan_holding(&mut store, &["/x"], &["/x/a"], ScanStatus::Hashing);
+        let c2 = scan_holding(&mut store, &["/x"], &["/x/a"], ScanStatus::Complete);
+        let c3 = scan_holding(&mut store, &["/x"], &["/x/a"], ScanStatus::Complete);
 
         // Fresh Complete = c3. keep=2 → c3+c2 are active; c1 (old Complete) and u → trash bin.
         assert_eq!(
             store
                 .apply_retention(&[PathBuf::from("/x")], 2, c3)
                 .unwrap(),
-            2
+            trimmed(2)
         );
         let active: Vec<i64> = store
             .list_scans()
@@ -12522,19 +12597,20 @@ mod tests {
         // CompleteWithWarnings is counted by retention as a full-fledged Complete
         // (included in keep, trimmed beyond it) — not confused with an interrupted/unfinished one.
         let mut store = ScanStore::open_in_memory().unwrap();
-        let cfg = ScanConfig::new(vec![PathBuf::from("/x")]);
-        let c1 = store.begin_scan(&cfg).unwrap();
-        store
-            .set_status(c1, ScanStatus::CompleteWithWarnings)
-            .unwrap();
-        let c2 = store.begin_scan(&cfg).unwrap();
-        store.set_status(c2, ScanStatus::Complete).unwrap();
+        // Both found a file, or c1 would go as an empty scan and prove nothing about its status.
+        let c1 = scan_holding(
+            &mut store,
+            &["/x"],
+            &["/x/a"],
+            ScanStatus::CompleteWithWarnings,
+        );
+        let c2 = scan_holding(&mut store, &["/x"], &["/x/a"], ScanStatus::Complete);
         // Fresh = c2, keep=1 → c2 is active; c1 (old completed-with-warnings) → trash bin.
         assert_eq!(
             store
                 .apply_retention(&[PathBuf::from("/x")], 1, c2)
                 .unwrap(),
-            1
+            trimmed(1)
         );
         let active: Vec<i64> = store
             .list_scans()
@@ -12546,6 +12622,292 @@ mod tests {
             active.contains(&c2) && !active.contains(&c1),
             "c1 (complete_with_warnings) trimmed like an ordinary Complete"
         );
+    }
+
+    /// A scan of `roots` in `status` whose manifest holds `files` — none for the empty mount point
+    /// a dataset that is not mounted leaves behind.
+    fn scan_holding(
+        store: &mut ScanStore,
+        roots: &[&str],
+        files: &[&str],
+        status: ScanStatus,
+    ) -> i64 {
+        let cfg = ScanConfig::new(roots.iter().map(PathBuf::from).collect());
+        let id = store.begin_scan(&cfg).unwrap();
+        let rows: Vec<ManifestRow> = files
+            .iter()
+            .zip(1u64..)
+            .map(|(path, inode)| row(path, 4096, inode))
+            .collect();
+        if !rows.is_empty() {
+            store.record_files(id, &rows).unwrap();
+        }
+        store.set_status(id, status).unwrap();
+        id
+    }
+
+    fn active_scans(store: &ScanStore) -> Vec<i64> {
+        let mut ids: Vec<i64> = store
+            .list_scans()
+            .unwrap()
+            .iter()
+            .map(|s| s.scan_id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn trashed_scans(store: &ScanStore) -> Vec<i64> {
+        let mut ids: Vec<i64> = store
+            .list_trashed()
+            .unwrap()
+            .iter()
+            .map(|s| s.scan_id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Retention that trashed `trashed` sessions and held nothing back.
+    fn trimmed(trashed: usize) -> Retention {
+        Retention {
+            trashed,
+            held_for: None,
+        }
+    }
+
+    /// Retention that trashed `trashed` sessions and kept those holding files under `root`.
+    fn held(trashed: usize, root: &str) -> Retention {
+        Retention {
+            trashed,
+            held_for: Some(PathBuf::from(root)),
+        }
+    }
+
+    /// B34. A dataset that is not mounted leaves an empty mount point; the scan of it finds nothing
+    /// and finishes. Trimming against that scan would send every scan that still holds the files to
+    /// the trash — the interrupted one too, which is the only way back into a long walk.
+    #[test]
+    fn retention_keeps_the_history_when_the_root_turns_up_empty() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let good1 = scan_holding(&mut store, &["/x"], &["/x/a"], ScanStatus::Complete);
+        let walked = scan_holding(&mut store, &["/x"], &["/x/a"], ScanStatus::Hashing);
+        let good2 = scan_holding(&mut store, &["/x"], &["/x/a"], ScanStatus::Complete);
+        let empty = scan_holding(&mut store, &["/x"], &[], ScanStatus::Complete);
+
+        assert_eq!(
+            store
+                .apply_retention(&[PathBuf::from("/x")], 2, empty)
+                .unwrap(),
+            held(0, "/x")
+        );
+
+        assert_eq!(
+            active_scans(&store),
+            vec![good1, walked, good2, empty],
+            "nothing is trimmed against a root that turned up empty"
+        );
+        assert!(trashed_scans(&store).is_empty(), "the trash stays empty");
+    }
+
+    /// The same with several roots: one of them turning up empty is enough, because the older
+    /// scans are the only ones that still hold what was under it.
+    #[test]
+    fn retention_keeps_the_history_when_one_of_the_roots_turns_up_empty() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let roots = ["/x", "/y"];
+        let full = scan_holding(&mut store, &roots, &["/x/a", "/y/b"], ScanStatus::Complete);
+        let partial = scan_holding(&mut store, &roots, &["/x/a"], ScanStatus::Complete);
+
+        assert_eq!(
+            store
+                .apply_retention(&[PathBuf::from("/x"), PathBuf::from("/y")], 1, partial)
+                .unwrap(),
+            held(0, "/y")
+        );
+
+        assert_eq!(
+            active_scans(&store),
+            vec![full, partial],
+            "the only scan that holds /y stays active"
+        );
+    }
+
+    /// Control: a root no scan of these roots ever found a file under does not hold retention — or
+    /// several roots, one of them always empty, would keep a full manifest per night forever.
+    #[test]
+    fn a_root_no_scan_found_files_under_does_not_hold_retention() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let roots = ["/x", "/y"];
+        let c1 = scan_holding(&mut store, &roots, &["/x/a"], ScanStatus::Complete);
+        let c2 = scan_holding(&mut store, &roots, &["/x/a"], ScanStatus::Complete);
+        let c3 = scan_holding(&mut store, &roots, &["/x/a"], ScanStatus::Complete);
+
+        assert_eq!(
+            store
+                .apply_retention(&[PathBuf::from("/x"), PathBuf::from("/y")], 2, c3)
+                .unwrap(),
+            trimmed(1)
+        );
+
+        assert_eq!(active_scans(&store), vec![c2, c3]);
+        assert_eq!(trashed_scans(&store), vec![c1]);
+    }
+
+    /// Nights G1 G2 (good), E1 E2 (the mount point was empty), G3 (mounted again). The empty scans
+    /// hold nothing, so they take no place in `history_keep`: G3 and G2 stay, not G3 and E2.
+    #[test]
+    fn a_finished_scan_without_files_takes_no_place_in_the_history() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let good1 = scan_holding(&mut store, &["/x"], &["/x/a"], ScanStatus::Complete);
+        let good2 = scan_holding(&mut store, &["/x"], &["/x/a"], ScanStatus::Complete);
+        let empty1 = scan_holding(&mut store, &["/x"], &[], ScanStatus::Complete);
+        let empty2 = scan_holding(&mut store, &["/x"], &[], ScanStatus::CompleteWithWarnings);
+        let good3 = scan_holding(&mut store, &["/x"], &["/x/a"], ScanStatus::Complete);
+
+        assert_eq!(
+            store
+                .apply_retention(&[PathBuf::from("/x")], 2, good3)
+                .unwrap(),
+            trimmed(3)
+        );
+
+        assert_eq!(active_scans(&store), vec![good2, good3]);
+        assert_eq!(trashed_scans(&store), vec![good1, empty1, empty2]);
+    }
+
+    /// A root is read the way its own walk wrote the paths under it: with a trailing separator,
+    /// as `/`, relative (the gate's harness scans relative roots), or a file that is the root
+    /// itself. A sibling that merely shares the prefix is not under the root.
+    #[test]
+    fn retention_reads_each_root_the_way_its_walk_wrote_paths() {
+        for (root, file) in [
+            ("/x/", "/x/a"),
+            ("/", "/tank/a"),
+            ("rel", "rel/a"),
+            ("/x/f.bin", "/x/f.bin"),
+        ] {
+            let mut store = ScanStore::open_in_memory().unwrap();
+            let good = scan_holding(&mut store, &[root], &[file], ScanStatus::Complete);
+            let empty = scan_holding(&mut store, &[root], &[], ScanStatus::Complete);
+            assert_eq!(
+                store
+                    .apply_retention(&[PathBuf::from(root)], 1, empty)
+                    .unwrap(),
+                held(0, root),
+                "{file} is under the root {root}"
+            );
+            assert_eq!(
+                active_scans(&store),
+                vec![good, empty],
+                "{file} is under the root {root}"
+            );
+        }
+
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let sibling = scan_holding(&mut store, &["/x"], &["/x2/a"], ScanStatus::Complete);
+        let empty = scan_holding(&mut store, &["/x"], &[], ScanStatus::Complete);
+        assert_eq!(
+            store
+                .apply_retention(&[PathBuf::from("/x")], 1, empty)
+                .unwrap(),
+            trimmed(1)
+        );
+        assert_eq!(
+            active_scans(&store),
+            vec![empty],
+            "/x2/a is not under /x: nothing holds retention, and the older scan is beyond keep"
+        );
+        assert_eq!(trashed_scans(&store), vec![sibling]);
+
+        // «The same roots» compare by components, so two scans may spell one root differently, and
+        // each walk wrote its paths from its own spelling.
+        for older in ["/tank//data", "/tank/./data"] {
+            let mut store = ScanStore::open_in_memory().unwrap();
+            let file = format!("{older}/a");
+            let good = scan_holding(&mut store, &[older], &[&file], ScanStatus::Complete);
+            let empty = scan_holding(&mut store, &["/tank/data"], &[], ScanStatus::Complete);
+            assert_eq!(
+                store
+                    .apply_retention(&[PathBuf::from("/tank/data")], 1, empty)
+                    .unwrap(),
+                held(0, "/tank/data"),
+                "{file} is under the root {older}"
+            );
+            assert_eq!(active_scans(&store), vec![good, empty], "{older}");
+        }
+    }
+
+    /// An interrupted walk is a way back into the files it found. When it is the only scan that
+    /// holds them it stays out of the trash, though an unfinished scan is otherwise stale.
+    #[test]
+    fn an_interrupted_scan_that_holds_the_files_stays_out_of_the_trash() {
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let walked = scan_holding(&mut store, &["/x"], &["/x/a"], ScanStatus::Hashing);
+        let empty = scan_holding(&mut store, &["/x"], &[], ScanStatus::Complete);
+        assert_eq!(
+            store
+                .apply_retention(&[PathBuf::from("/x")], 2, empty)
+                .unwrap(),
+            held(0, "/x")
+        );
+        assert_eq!(active_scans(&store), vec![walked, empty]);
+    }
+
+    /// A root that stays empty for good holds on to the scans that hold its files, and to nothing
+    /// else: every later night is trimmed as usual, so the history stays at `keep` plus those —
+    /// never a full manifest more per night.
+    #[test]
+    fn a_root_that_stays_empty_holds_only_the_scans_that_hold_its_files() {
+        let roots = ["/x", "/y"];
+        let paths = [PathBuf::from("/x"), PathBuf::from("/y")];
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let full = scan_holding(&mut store, &roots, &["/x/a", "/y/b"], ScanStatus::Complete);
+        let mut nights = Vec::new();
+        for _ in 0..6 {
+            let night = scan_holding(&mut store, &roots, &["/x/a"], ScanStatus::Complete);
+            let retention = store.apply_retention(&paths, 2, night).unwrap();
+            assert_eq!(retention.held_for, Some(PathBuf::from("/y")));
+            nights.push(night);
+        }
+        assert_eq!(
+            active_scans(&store),
+            vec![full, nights[4], nights[5]],
+            "the last two nights, and the one scan that still holds /y"
+        );
+        assert_eq!(trashed_scans(&store), nights[..4].to_vec());
+
+        // One root: every empty night takes the previous one's place.
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let good = scan_holding(&mut store, &["/x"], &["/x/a"], ScanStatus::Complete);
+        let mut empties = Vec::new();
+        for _ in 0..6 {
+            let night = scan_holding(&mut store, &["/x"], &[], ScanStatus::Complete);
+            store
+                .apply_retention(&[PathBuf::from("/x")], 2, night)
+                .unwrap();
+            empties.push(night);
+        }
+        assert_eq!(active_scans(&store), vec![good, empties[5]]);
+        assert_eq!(trashed_scans(&store), empties[..5].to_vec());
+    }
+
+    /// A kept scan still takes its place in `keep`: it stays whatever the limit, and the older
+    /// scans around it are trimmed as usual.
+    #[test]
+    fn a_kept_scan_still_counts_toward_the_history_limit() {
+        let roots = ["/x", "/y"];
+        let paths = [PathBuf::from("/x"), PathBuf::from("/y")];
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let older = scan_holding(&mut store, &roots, &["/x/a"], ScanStatus::Complete);
+        let full = scan_holding(&mut store, &roots, &["/x/a", "/y/b"], ScanStatus::Complete);
+        let current = scan_holding(&mut store, &roots, &["/x/a"], ScanStatus::Complete);
+        assert_eq!(
+            store.apply_retention(&paths, 2, current).unwrap(),
+            held(1, "/y")
+        );
+        assert_eq!(active_scans(&store), vec![full, current]);
+        assert_eq!(trashed_scans(&store), vec![older]);
     }
 
     #[test]

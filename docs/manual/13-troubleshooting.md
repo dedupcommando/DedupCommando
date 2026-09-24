@@ -82,11 +82,13 @@ in code. If you need to deduplicate tiny files you have to change
 backup/media workload `min_size=4096` is the right default.
 
 **Another cause:** the root is the mount point of a dataset that is not mounted —
-an empty directory, so the scan finds nothing and finishes. Like any finished
-scan it counts toward the history kept, so earlier scans of that root may have
-gone to the trash: restore them from there, and move the empty scans to the
-trash — otherwise the next finished scan moves the restored ones out again
-([§10](10-diff-trash.md)). Check with `zfs get mounted <dataset>`, and in cron
+an empty directory, so the scan finds nothing and finishes. When an earlier scan
+of the same roots found files there, the output says `History kept: …`, and the
+scans that hold those files stay out of the trash; the empty scan leaves the list
+at the next trim ([§10](10-diff-trash.md)). If the root is empty on purpose, move
+the kept scans to the trash yourself — nothing else retires them. Versions before
+0.9.2 did trim the history against such a scan: if good scans of that root went to
+the trash back then, restore them from there. Check with `zfs get mounted <dataset>`, and in cron
 guard the line with `mountpoint -q` on the mount point of the dataset the root
 lives on — never on a plain directory, which is never a mount point
 ([§11](11-headless.md)). A root that does not exist at all is refused instead
@@ -341,7 +343,8 @@ dedcom --compact-db          # empty the session trash + VACUUM
 ```
 
 Or configure `history_keep` in `config.json` so old sessions move to the trash
-automatically (see [§12 Retention](12-maintenance.md)).
+automatically (see [§12 Retention](12-maintenance.md)). Scans kept for a root that
+turned up empty (`History kept: …`) are not trimmed by it — move them yourself.
 
 ### Opening an old scan from Resume takes tens of seconds
 
