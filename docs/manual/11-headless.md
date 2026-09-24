@@ -139,6 +139,12 @@ Omissions:            3919 files, 0 walk errors, 0 unsupported entries
 > be read; then walk errors (one may stand for a whole unreadable subtree) and
 > entries that are neither files nor directories (symbolic links, FIFOs, sockets,
 > devices).
+>
+> A walk error is most often a directory the walk could not open — no permission,
+> a path longer than 4095 bytes, or a directory removed before the walk reached it
+> — and the scan goes on without it. At the default log level each one is written
+> to `dedcom.log` with its path and cause: the first 1000 of each walk of the tree
+> (a resumed scan walks it again), then one line with the count of the rest.
 
 ### Resume in headless
 

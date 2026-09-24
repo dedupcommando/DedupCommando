@@ -239,6 +239,76 @@ struct Sink<'a> {
     files: &'a mut Vec<WalkedFile>,
     dirs: &'a mut super::roots::DirAliasGuard,
     account: Account<'a>,
+    log: &'a mut WalkErrorLog,
+    /// A directory yielded without its identity, until the walk's next item shows whether the
+    /// walk went into it — see `absorb`. At most one: an entry either settles it or stops the walk.
+    unverified: Option<Unverified>,
+}
+
+/// A directory whose `(device, inode)` could not be read, and why.
+struct Unverified {
+    dir: PathBuf,
+    cause: ignore::Error,
+}
+
+/// How many walk errors one walk writes to the log, a line each. The rest are counted into one
+/// closing line, so a tree the scan cannot read at all — `/` scanned without root — costs the log
+/// a thousand lines, not one per directory.
+const WALK_ERRORS_LOGGED: usize = 1000;
+
+/// One walk's walk errors in the log, with the path and the cause as `ignore` names them — the
+/// omission account keeps only a count per directory. Nothing the account relies on is kept here.
+#[derive(Default)]
+struct WalkErrorLog {
+    logged: usize,
+    unlogged: u64,
+}
+
+impl WalkErrorLog {
+    fn note(&mut self, err: &ignore::Error) {
+        if self.logged < WALK_ERRORS_LOGGED {
+            self.logged += 1;
+            // The path came off the disk: its control characters are escaped, as everywhere a
+            // name reaches the log.
+            log_line(&format!(
+                "walk error: {}",
+                crate::textsan::terminal(&err.to_string())
+            ));
+        } else {
+            self.unlogged += 1;
+        }
+    }
+}
+
+/// The closing line, when some errors were only counted — written however the walk ends: finished,
+/// cancelled, or stopped by an error whose `?` leaves `walk_collecting` early.
+impl Drop for WalkErrorLog {
+    fn drop(&mut self) {
+        if self.unlogged > 0 {
+            log_line(&format!(
+                "{} more walk errors not logged; the first {WALK_ERRORS_LOGGED} of this walk are \
+                 above",
+                self.unlogged
+            ));
+        }
+    }
+}
+
+/// The one place a walk error reaches `tracing`. Tests capture the line here rather than install
+/// a subscriber, for the reason `bench::emit` gives: callsite interest is cached process-wide, so a
+/// per-test subscriber can lose the event.
+fn log_line(line: &str) {
+    #[cfg(test)]
+    tests::capture_log(line);
+    tracing::warn!("{line}");
+}
+
+/// Whether `err` is `dir`'s own failure — its listing refused — rather than something met inside
+/// it. `ignore` 0.4 reports that failure as `WithPath` naming the directory, and nothing else does;
+/// a loop through the directory names it too, but inside `Loop`, as the ancestor. Should a later
+/// `ignore` wrap it, the real-filesystem tests count two events and fail.
+fn is_failure_of(err: &ignore::Error, dir: &Path) -> bool {
+    matches!(err, ignore::Error::WithPath { path, .. } if path == dir)
 }
 
 impl Sink<'_> {
@@ -254,8 +324,9 @@ impl Sink<'_> {
         }
     }
 
-    /// An iterator error: exactly one event, at one cell.
+    /// An iterator error: exactly one event, at one cell — and one line in the log.
     fn record_error(&mut self, err: &ignore::Error) {
+        self.log.note(err);
         match &mut self.account {
             Account::Ledger(ledger) => {
                 let cell = error_cell(err, &ledger.root);
@@ -264,6 +335,14 @@ impl Sink<'_> {
                     .record(&ledger.root, cell, OmissionReason::WalkError);
             }
             Account::Observed(tally) => tally.record(OmissionReason::WalkError),
+        }
+    }
+
+    /// A directory still waiting when its walk ends was not gone into: one walk error, named by
+    /// its own failure — a gap of unknown size, like any directory the walk could not open.
+    fn settle_unverified(&mut self) {
+        if let Some(unverified) = self.unverified.take() {
+            self.record_error(&unverified.cause);
         }
     }
 }
@@ -478,30 +557,61 @@ fn configure(
 /// Handles one item from a walk iterator.
 ///
 /// A yielded `Err` does NOT abort anything: it is recorded as one `walk_error` event and this
-/// returns `Ok(())`, because a file the walk could not reach is an omission like any other. The
-/// two cases that do return `Err` are the ones that are not omissions at all — a directory whose
-/// physical identity cannot be read, and a `DirAliasGuard` refusal. Both mean the walk can no
+/// returns `Ok(())`, because a file the walk could not reach is an omission like any other. A
+/// directory whose physical identity cannot be read does not abort by itself either — nothing
+/// under it has been walked yet — and becomes one `walk_error` unless the walk goes into it (see
+/// `Unverified`). The two cases that do return `Err` are the ones that are not omissions at all:
+/// the walk going into such a directory, and a `DirAliasGuard` refusal. Both mean the walk can no
 /// longer tell one tree from two, which is not a result worth publishing at any size.
 fn absorb(
     result: std::result::Result<ignore::DirEntry, ignore::Error>,
     config: &ScanConfig,
     sink: &mut Sink<'_>,
 ) -> Result<()> {
-    let entry = match result {
-        // Test-only: reach the outcome of the `Err` arm below for a nominated path, without a
-        // filesystem that has to misbehave. Absent from every non-test build. Built as the error
-        // `ignore` itself would produce, so the injected case goes through the real reduction.
-        #[cfg(test)]
-        Ok(ref entry) if crate::testfixtures::take_walk_fault(entry.path()) => {
-            let injected = ignore::Error::WithPath {
+    // Test-only: an iterator error for a nominated path, without a filesystem that has to
+    // misbehave. Absent from every non-test build. Built as the error `ignore` itself would
+    // produce and put in place of the iterator's own result, so everything below — a directory
+    // waiting for its identity included — takes it for the real thing.
+    #[cfg(test)]
+    let result = match result {
+        Ok(entry) if crate::testfixtures::take_walk_fault(entry.path()) => {
+            Err(ignore::Error::WithPath {
                 path: entry.path().to_path_buf(),
                 err: Box::new(ignore::Error::Io(std::io::Error::other(
                     "injected walk fault",
                 ))),
-            };
-            sink.record_error(&injected);
-            return Ok(());
+            })
         }
+        result => result,
+    };
+
+    // A directory yielded without its identity is settled by what comes next. `walkdir` opens a
+    // directory when it yields it and hands a failure to open over as the first item of the
+    // listing, so what comes next is that failure, a child, or — the directory listed empty —
+    // whatever follows it.
+    if let Some(unverified) = sink.unverified.take() {
+        match &result {
+            // The walk goes into it (or reaches it again as a later root): the guard is blind
+            // there, and the scan stops.
+            Ok(entry) if entry.path().starts_with(&unverified.dir) => {
+                return Err(unverifiable_directory(
+                    &unverified.dir,
+                    Some(&unverified.cause),
+                ));
+            }
+            // Its listing failed as well. That failure is its one event, recorded below like any
+            // iterator error; recording the stat too would count one directory twice.
+            Err(err) if is_failure_of(err, &unverified.dir) => {}
+            // Anything else that failed — a child, a loop through it, an error with no path —
+            // says nothing about whether the walk goes in: its listing may still hand out
+            // children. It keeps waiting.
+            Err(_) => sink.unverified = Some(unverified),
+            // The walk moved past it: one event, for the directory.
+            Ok(_) => sink.record_error(&unverified.cause),
+        }
+    }
+
+    let entry = match result {
         Ok(entry) => entry,
         Err(err) => {
             // No access, a broken link, a symlink loop: no file is named, and the entry type is
@@ -526,22 +636,38 @@ fn absorb(
         // A directory: the only place an alias inside a root can be caught. Its metadata is the
         // one extra `stat` this guard costs, and only for directories.
         //
-        // A failure here is fatal. It costs no file — the walker could still descend — but it
-        // is the guard losing its evidence: without `(device, inode)` this directory is no
-        // longer known NOT to be a second pathname for a tree already walked, and a manifest
-        // holding one file under two pathnames is not a result worth publishing. The scan
-        // stops for the same reason `DirAliasGuard::note` stops it.
+        // A failure here is the guard losing its evidence: without `(device, inode)` this
+        // directory is no longer known NOT to be a second pathname for a tree already walked.
+        // But nothing under it has been walked yet, so it waits for the next item (above): the
+        // walk going into it stops the scan, for the same reason `DirAliasGuard::note` does —
+        // a manifest holding one file under two pathnames is not a result worth publishing.
+        // Anything else makes it one walk error: a directory removed after its parent was
+        // listed, a pathname past `PATH_MAX`, a parent that lists but does not search.
         Some(file_type) if file_type.is_dir() => {
-            // Test-only: reach the failure outcome below for a nominated directory, without a
-            // filesystem that has to misbehave. Absent from every non-test build.
-            #[cfg(test)]
-            if crate::testfixtures::take_metadata_fault(entry.path()) {
-                return Err(unverifiable_directory(entry.path(), None));
+            let identity = match entry.metadata() {
+                // Test-only: the failure for a nominated directory, without a filesystem that has
+                // to misbehave. Only the result is replaced; everything after it is the real
+                // thing. Absent from every non-test build.
+                #[cfg(test)]
+                Ok(_) if crate::testfixtures::take_metadata_fault(entry.path()) => {
+                    Err(ignore::Error::WithPath {
+                        path: entry.path().to_path_buf(),
+                        err: Box::new(ignore::Error::Io(std::io::Error::other(
+                            "injected metadata fault",
+                        ))),
+                    })
+                }
+                identity => identity,
+            };
+            match identity {
+                Ok(meta) => sink.dirs.note(entry.path(), meta.dev(), meta.ino())?,
+                Err(cause) => {
+                    sink.unverified = Some(Unverified {
+                        dir: entry.into_path(),
+                        cause,
+                    })
+                }
             }
-            let meta = entry
-                .metadata()
-                .map_err(|err| unverifiable_directory(entry.path(), Some(&err)))?;
-            sink.dirs.note(entry.path(), meta.dev(), meta.ino())?;
             return Ok(());
         }
         // Neither a regular file nor a directory: a symlink this scan does not follow, a FIFO, a
@@ -670,6 +796,7 @@ pub fn walk_collecting(
     // see `roots::DirAliasGuard`. Bounded by the number of directories, which is small next to the
     // file vector this walk already holds.
     let mut dirs = super::roots::DirAliasGuard::default();
+    let mut log = WalkErrorLog::default();
     let mut cancelled = false;
 
     let snapshot = match root_keys(&config.roots) {
@@ -688,6 +815,8 @@ pub fn walk_collecting(
                 files: &mut files,
                 dirs: &mut dirs,
                 account: Account::Observed(&mut tally),
+                log: &mut log,
+                unverified: None,
             };
             // Test-only: the same iterator-error seam the ledgered branch has, so the observed
             // tally's walk-error counting is provable without a filesystem that misbehaves.
@@ -712,6 +841,7 @@ pub fn walk_collecting(
                 entries += 1;
                 absorb(result, config, &mut sink)?;
             }
+            sink.settle_unverified();
             tally.finish(why)
         }
         Ok(keys) => {
@@ -726,6 +856,8 @@ pub fn walk_collecting(
                         root: root_key.clone(),
                         collector: &mut collector,
                     }),
+                    log: &mut log,
+                    unverified: None,
                 };
                 // Test-only: an iterator error this root's filesystem has no way to produce —
                 // pathless, or nested inside `Partial`. Fires once, and only for this root.
@@ -748,6 +880,8 @@ pub fn walk_collecting(
                     entries += 1;
                     absorb(result, config, &mut sink)?;
                 }
+                // Settled in its own root: the next root's walk would put it in that ledger.
+                sink.settle_unverified();
             }
             collector.finish()
         }
@@ -879,7 +1013,7 @@ fn take_special_entry_fault(path: &Path) -> bool {
     }
 }
 
-/// A directory whose physical identity could not be read.
+/// A directory the walk went into although its physical identity could not be read.
 ///
 /// Names the directory and says what was lost, carrying the underlying error as context rather
 /// than inspecting or re-parsing its text. Deliberately not an omission: no file went missing, and
@@ -894,7 +1028,7 @@ fn unverifiable_directory(path: &Path, cause: Option<&ignore::Error>) -> AppErro
         "scan aborted: cannot read the physical identity of directory {}{context} — without its \
          device and inode the same-directory guard cannot tell whether this tree has already been \
          walked under another pathname, and one tree counted twice is not a result worth \
-         publishing. Fix access to the directory or exclude it, then rescan.",
+         publishing. Rescan; if the scan stops here again, fix access to the directory.",
         crate::textsan::terminal(&path.display().to_string()),
     ))
 }
@@ -907,6 +1041,126 @@ mod tests {
     use std::ffi::OsStr;
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
+
+    // -----------------------------------------------------------------------------------------
+    // The walk-error log, captured per thread.
+    // -----------------------------------------------------------------------------------------
+
+    thread_local! {
+        /// Walk-error log lines emitted on THIS thread while a `LogCapture` is alive. Thread-local
+        /// for the reason `bench::tests` gives, and it is enough: the walk runs on the caller's
+        /// thread.
+        static LOGGED: std::cell::RefCell<Option<Vec<String>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Called by `log_line` in test builds only; a no-op unless this thread is capturing.
+    pub(super) fn capture_log(line: &str) {
+        LOGGED.with(|slot| {
+            if let Some(lines) = slot.borrow_mut().as_mut() {
+                lines.push(line.to_string());
+            }
+        });
+    }
+
+    /// Collects this thread's walk-error log lines for as long as it is alive.
+    struct LogCapture;
+
+    impl LogCapture {
+        fn start() -> Self {
+            LOGGED.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+            Self
+        }
+
+        fn lines(&self) -> Vec<String> {
+            LOGGED.with(|slot| slot.borrow().clone().unwrap_or_default())
+        }
+    }
+
+    impl Drop for LogCapture {
+        fn drop(&mut self) {
+            LOGGED.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// A walk error reaches the log with its path and its cause. The first `WALK_ERRORS_LOGGED` of
+    /// one walk are written a line each; the rest become one closing count.
+    #[test]
+    fn the_walk_error_log_keeps_the_first_thousand_and_counts_the_rest() {
+        let capture = LogCapture::start();
+        let mut log = WalkErrorLog::default();
+        for n in 0..WALK_ERRORS_LOGGED + 2 {
+            log.note(&ignore::Error::WithPath {
+                path: PathBuf::from(format!("/tank/dir{n}")),
+                err: Box::new(ignore::Error::Io(std::io::Error::from_raw_os_error(
+                    libc::EACCES,
+                ))),
+            });
+        }
+        drop(log);
+
+        let lines = capture.lines();
+        assert_eq!(
+            lines.len(),
+            WALK_ERRORS_LOGGED + 1,
+            "a line each, then one count"
+        );
+        let denied = format!("(os error {})", libc::EACCES);
+        assert!(
+            lines[0].starts_with("walk error: /tank/dir0: ") && lines[0].ends_with(&denied),
+            "{}",
+            lines[0]
+        );
+        let last = format!("walk error: /tank/dir{}: ", WALK_ERRORS_LOGGED - 1);
+        assert!(
+            lines[WALK_ERRORS_LOGGED - 1].starts_with(&last),
+            "{}",
+            lines[WALK_ERRORS_LOGGED - 1]
+        );
+        assert_eq!(
+            lines[WALK_ERRORS_LOGGED],
+            format!(
+                "2 more walk errors not logged; the first {WALK_ERRORS_LOGGED} of this walk are \
+                 above"
+            )
+        );
+    }
+
+    /// A walk without errors adds nothing to the log, and a name's control characters never
+    /// reach it raw — `cat dedcom.log` must not run what a directory name carries.
+    #[test]
+    fn the_walk_error_log_is_silent_without_errors_and_escapes_names() {
+        let capture = LogCapture::start();
+        drop(WalkErrorLog::default());
+        assert_eq!(capture.lines(), Vec::<String>::new());
+
+        let mut log = WalkErrorLog::default();
+        log.note(&ignore::Error::WithPath {
+            path: PathBuf::from("/tank/\u{1b}]0;PWNED\u{7}dir"),
+            err: Box::new(ignore::Error::Io(std::io::Error::from_raw_os_error(
+                libc::EIO,
+            ))),
+        });
+        drop(log);
+        let lines = capture.lines();
+        assert_eq!(lines.len(), 1, "one error, one line, no count");
+        assert!(!lines[0].chars().any(char::is_control), "{:?}", lines[0]);
+        assert!(
+            lines[0].contains("\\u{1b}]0;PWNED\\u{7}dir"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    /// The manual names the cap the log keeps to.
+    #[test]
+    fn the_manual_states_how_many_walk_errors_are_logged() {
+        let said = format!("the first {WALK_ERRORS_LOGGED} of each walk");
+        assert!(
+            crate::testfixtures::manual("11-headless.md").contains(&said),
+            "11-headless.md, the `Omissions:` note, must say: {said}"
+        );
+    }
 
     // -----------------------------------------------------------------------------------------
     // Collection helpers.
@@ -1100,12 +1354,13 @@ mod tests {
             .collect()
     }
 
-    /// A directory whose physical identity cannot be read stops the scan.
+    /// A directory whose physical identity cannot be read stops the scan once the walk goes into
+    /// it — here its listing opens, so its first child is the walk going in.
     ///
     /// It costs no file — the walker could descend perfectly well — but `DirAliasGuard` has lost
     /// the one piece of evidence that tells a real directory from a second pathname for a tree
-    /// already walked. Before this, the failure was swallowed by `if let Ok(meta)` and the walk
-    /// carried on into the child with a blind guard.
+    /// already walked. Before the guard, the failure was swallowed by `if let Ok(meta)` and the
+    /// walk carried on into the child with a blind guard.
     #[test]
     fn a_directory_whose_metadata_fails_aborts_the_walk() {
         let (root, sub) = guard_tree("dirmeta");
@@ -1185,6 +1440,415 @@ mod tests {
             cells(&outcome, &root),
             vec![("sub".to_string(), OmissionReason::MetadataError, 1)],
             "and it is accounted, in the directory that holds it"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // A directory the walk cannot identify: one walk error, unless the walk goes into it.
+    // -----------------------------------------------------------------------------------------
+
+    /// A directory removed after its parent was listed — a vzdump temporary directory, a
+    /// container's rootfs — is one walk error where it was, and the scan goes on. The window is
+    /// real: `walkdir` reads a directory's whole listing when it enters it and reaches the entries
+    /// later. Here the first progress call, which comes after the root's listing is read, removes
+    /// `z` before the walk gets to it.
+    #[test]
+    fn a_directory_removed_during_the_walk_is_one_walk_error() {
+        let root = temp_dir("vanished");
+        fs::write(root.join("a.bin"), b"stays").unwrap();
+        let gone = root.join("z");
+        fs::create_dir_all(&gone).unwrap();
+        fs::write(gone.join("inner.bin"), b"never seen").unwrap();
+
+        let capture = LogCapture::start();
+        let cancel = AtomicBool::new(false);
+        let mut removed = false;
+        let outcome = walk_collecting(&guard_config(&root), &cancel, |_, _, _| {
+            if !removed {
+                fs::remove_dir_all(&gone).unwrap();
+                removed = true;
+            }
+        });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(err) => panic!("a directory that vanished must not stop the scan: {err}"),
+        };
+
+        assert!(removed, "the directory was removed mid-walk");
+        assert_eq!(
+            walked_names(finished(&outcome), &root),
+            vec!["a.bin".to_string()],
+            "the file beside it is in the manifest"
+        );
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![("z".to_string(), OmissionReason::WalkError, 1)],
+            "one event where the directory was — not one for its stat and one for its listing"
+        );
+        let lines = capture.lines();
+        assert_eq!(lines.len(), 1, "and one line in the log: {lines:?}");
+        let gone_shown = gone.display().to_string();
+        let not_found = format!("(os error {})", libc::ENOENT);
+        assert!(
+            lines[0].starts_with(&format!("walk error: {gone_shown}: "))
+                && lines[0].ends_with(&not_found),
+            "the path and the cause: {}",
+            lines[0]
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A chain of `links` directories under `root`, each name 250 bytes, made with `mkdirat` from
+    /// a descriptor — never by full pathname, never with `chdir` (tests run in parallel) — so it
+    /// can reach past `PATH_MAX`, as a tree copied in from elsewhere can. First link first.
+    fn deep_chain(root: &Path, links: usize) -> Vec<PathBuf> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let name = [b'd'; 250];
+        let c_name = std::ffi::CString::new(name.to_vec()).unwrap();
+        let c_root = std::ffi::CString::new(root.as_os_str().as_bytes()).unwrap();
+        let open = |at: libc::c_int, path: &std::ffi::CStr| {
+            let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+            let fd = unsafe { libc::openat(at, path.as_ptr(), flags) };
+            assert!(fd >= 0, "openat: {}", std::io::Error::last_os_error());
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        };
+        let mut dir = open(libc::AT_FDCWD, &c_root);
+        let mut path = root.to_path_buf();
+        let mut chain = Vec::with_capacity(links);
+        for _ in 0..links {
+            let rc = unsafe { libc::mkdirat(dir.as_raw_fd(), c_name.as_ptr(), 0o755) };
+            assert_eq!(rc, 0, "mkdirat: {}", std::io::Error::last_os_error());
+            dir = open(dir.as_raw_fd(), &c_name);
+            path.push(OsStr::from_bytes(&name));
+            chain.push(path.clone());
+        }
+        chain
+    }
+
+    /// A pathname past `PATH_MAX` fails `lstat` and `opendir` alike, with ENAMETOOLONG. The link
+    /// where that first happens is one walk error, and the rest of the walk is still scanned —
+    /// here both files, which sort after the chain.
+    #[test]
+    fn a_path_past_the_length_limit_is_one_walk_error() {
+        let root = temp_dir("deep");
+        let chain = deep_chain(&root, 4096 / 251 + 2);
+        fs::write(chain[0].join("f.bin"), b"in the first link").unwrap();
+        fs::write(root.join("keep.bin"), b"beside").unwrap();
+        let too_long = chain
+            .iter()
+            .find(|link| link.as_os_str().len() >= 4096)
+            .expect("the chain reaches past PATH_MAX");
+        let too_long_shown = format!("walk error: {}: ", too_long.display());
+        let too_long = too_long.strip_prefix(&root).unwrap().to_str().unwrap();
+
+        let capture = LogCapture::start();
+        let outcome = collect(&guard_config(&root));
+
+        let in_first_link = chain[0].join("f.bin");
+        let in_first_link = in_first_link.strip_prefix(&root).unwrap().to_str().unwrap();
+        assert_eq!(
+            walked_names(finished(&outcome), &root),
+            vec![in_first_link.to_string(), "keep.bin".to_string()],
+            "both files, in walk order, after the branch that failed"
+        );
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![(too_long.to_string(), OmissionReason::WalkError, 1)],
+            "exactly one event, at the first link too long to name"
+        );
+        assert_eq!(summary(&outcome, &root).unknown_cardinality_events(), 1);
+        let lines = capture.lines();
+        assert_eq!(lines.len(), 1, "one line in the log");
+        let too_long_cause = format!("(os error {})", libc::ENAMETOOLONG);
+        assert!(
+            lines[0].starts_with(&too_long_shown) && lines[0].ends_with(&too_long_cause),
+            "the path and the cause, {} bytes",
+            lines[0].len()
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Past the cap, a real walk ends its log with the count of the rest — here one directory more
+    /// than the cap, all removed after the root was listed, as a cleanup of many temporary
+    /// directories would.
+    #[test]
+    fn a_walk_past_the_log_cap_ends_with_the_count() {
+        let root = temp_dir("vanished_many");
+        let gone: Vec<PathBuf> = (0..=WALK_ERRORS_LOGGED)
+            .map(|n| root.join(format!("d{n:04}")))
+            .collect();
+        for dir in &gone {
+            fs::create_dir(dir).unwrap();
+        }
+
+        let capture = LogCapture::start();
+        let cancel = AtomicBool::new(false);
+        let mut removed = false;
+        let outcome = walk_collecting(&guard_config(&root), &cancel, |_, _, _| {
+            if !removed {
+                for dir in &gone {
+                    fs::remove_dir(dir).unwrap();
+                }
+                removed = true;
+            }
+        });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(err) => panic!("vanished directories must not stop the scan: {err}"),
+        };
+
+        assert_eq!(
+            summary(&outcome, &root).unknown_cardinality_events(),
+            WALK_ERRORS_LOGGED as u64 + 1,
+            "every directory is counted"
+        );
+        let lines = capture.lines();
+        assert_eq!(
+            lines.len(),
+            WALK_ERRORS_LOGGED + 1,
+            "a line each up to the cap, then one"
+        );
+        assert_eq!(
+            lines[WALK_ERRORS_LOGGED],
+            format!(
+                "1 more walk errors not logged; the first {WALK_ERRORS_LOGGED} of this walk are \
+                 above"
+            )
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A walk stopped by an error still closes its log: the count of the rest is written even when
+    /// `walk_collecting` leaves through `?` — here one directory more than the cap vanished, and
+    /// then the walk went into a directory it could not identify.
+    #[test]
+    fn a_walk_stopped_past_the_log_cap_still_writes_the_count() {
+        let root = temp_dir("vanished_then_blind");
+        let gone: Vec<PathBuf> = (0..=WALK_ERRORS_LOGGED)
+            .map(|n| root.join(format!("d{n:04}")))
+            .collect();
+        for dir in &gone {
+            fs::create_dir(dir).unwrap();
+        }
+        let blind = root.join("zz");
+        fs::create_dir(&blind).unwrap();
+        fs::write(blind.join("a.bin"), b"would be walked blind").unwrap();
+        let faults = WalkFaults::arm(&[(blind.clone(), WalkFault::Metadata)]);
+
+        let capture = LogCapture::start();
+        let cancel = AtomicBool::new(false);
+        let mut removed = false;
+        let stopped = walk_collecting(&guard_config(&root), &cancel, |_, _, _| {
+            if !removed {
+                for dir in &gone {
+                    fs::remove_dir(dir).unwrap();
+                }
+                removed = true;
+            }
+        })
+        .is_err();
+
+        assert!(stopped, "the walk went into `zz` and must stop");
+        assert_eq!(faults.fired(), vec![(blind, WalkFault::Metadata)]);
+        let lines = capture.lines();
+        assert_eq!(
+            lines.len(),
+            WALK_ERRORS_LOGGED + 1,
+            "the cap, then the count"
+        );
+        assert_eq!(
+            lines[WALK_ERRORS_LOGGED],
+            format!(
+                "1 more walk errors not logged; the first {WALK_ERRORS_LOGGED} of this walk are \
+                 above"
+            )
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// An unidentified directory that lists empty holds nothing a second pathname could repeat:
+    /// one walk error for it, and the walk carries on with the next entry — here `mm.bin`, whose
+    /// name begins with the directory's own. It is not inside `m`: pathnames are compared by
+    /// component, and a byte prefix would stop the scan on a mere neighbour.
+    #[test]
+    fn an_empty_directory_without_identity_is_one_walk_error() {
+        let root = temp_dir("dirmeta_empty");
+        fs::write(root.join("a.bin"), b"before").unwrap();
+        let empty = root.join("m");
+        fs::create_dir_all(&empty).unwrap();
+        fs::write(root.join("mm.bin"), b"after").unwrap();
+        let faults = WalkFaults::arm(&[(empty.clone(), WalkFault::Metadata)]);
+        let capture = LogCapture::start();
+
+        let outcome = collect(&guard_config(&root));
+
+        assert_eq!(faults.fired(), vec![(empty.clone(), WalkFault::Metadata)]);
+        assert_eq!(
+            walked_names(finished(&outcome), &root),
+            vec!["a.bin".to_string(), "mm.bin".to_string()]
+        );
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![("m".to_string(), OmissionReason::WalkError, 1)]
+        );
+        assert_eq!(
+            capture.lines(),
+            vec![format!(
+                "walk error: {}: injected metadata fault",
+                empty.display()
+            )],
+            "the event is logged by the stat that failed"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The same directory as the last entry of the first of two roots: nothing follows it in its
+    /// root's walk, so it is settled when that walk ends — in its own root, not the next one.
+    #[test]
+    fn a_directory_without_identity_last_in_its_root_stays_in_that_root() {
+        let first = temp_dir("dirmeta_last_first");
+        let second = temp_dir("dirmeta_last_second");
+        fs::write(first.join("a.bin"), b"one").unwrap();
+        let last = first.join("zz");
+        fs::create_dir_all(&last).unwrap();
+        fs::write(second.join("b.bin"), b"two").unwrap();
+        let faults = WalkFaults::arm(&[(last.clone(), WalkFault::Metadata)]);
+        let mut config = guard_config(&first);
+        config.roots.push(second.clone());
+
+        let outcome = collect(&config);
+
+        assert_eq!(faults.fired(), vec![(last, WalkFault::Metadata)]);
+        assert_eq!(finished(&outcome).len(), 2, "both files");
+        assert_eq!(
+            cells(&outcome, &first),
+            vec![("zz".to_string(), OmissionReason::WalkError, 1)]
+        );
+        assert_eq!(
+            cells(&outcome, &second),
+            Vec::new(),
+            "nothing leaks forward"
+        );
+
+        fs::remove_dir_all(&first).ok();
+        fs::remove_dir_all(&second).ok();
+    }
+
+    /// Without keyable roots the walk still ends with the directory counted once in the observed
+    /// tally — the settling after the loop exists on that branch too.
+    #[test]
+    fn an_unkeyable_walk_counts_a_directory_without_identity_once() {
+        let root = temp_dir("observed_dirmeta");
+        fs::write(root.join("a.bin"), b"one").unwrap();
+        fs::create_dir_all(root.join("zz")).unwrap();
+        let mut config = guard_config(&root);
+        config.roots = vec![root.join("..").join(root.file_name().unwrap())];
+        let last = config.roots[0].join("zz");
+        let faults = WalkFaults::arm(&[(last.clone(), WalkFault::Metadata)]);
+
+        let outcome = collect(&config);
+
+        assert_eq!(faults.fired(), vec![(last, WalkFault::Metadata)]);
+        match &outcome {
+            WalkOutcome::Finished {
+                files,
+                omissions:
+                    OmissionSnapshot::Unavailable(SnapshotUnavailable::Roots { observed, .. }),
+            } => {
+                assert_eq!(files.len(), 1);
+                assert_eq!(
+                    observed.per_reason().collect::<Vec<_>>(),
+                    vec![(OmissionReason::WalkError, EventCount::ONE)]
+                );
+            }
+            other => panic!("expected the Roots fallback, got {:?}", other.kind()),
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// An error between an unidentified directory and its next child — here the first child,
+    /// failing as an iterator error — says nothing about whether the walk goes in. The directory
+    /// keeps waiting, and the next child stops the scan. Otherwise one failed child would be enough
+    /// to walk the rest of the directory with a blind guard.
+    #[test]
+    fn an_error_inside_a_directory_without_identity_does_not_clear_it() {
+        let root = temp_dir("dirmeta_child_error");
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("a.bin"), b"fails").unwrap();
+        fs::write(sub.join("b.bin"), b"would be walked blind").unwrap();
+        let faults = WalkFaults::arm(&[
+            (sub.clone(), WalkFault::Metadata),
+            (sub.join("a.bin"), WalkFault::Iterator),
+        ]);
+        let cancel = AtomicBool::new(false);
+
+        let text = match walk_collecting(&guard_config(&root), &cancel, |_, _, _| {}) {
+            Err(err) => err.to_string(),
+            Ok(outcome) => panic!(
+                "the walk went into an unidentified directory, got {}",
+                outcome.kind()
+            ),
+        };
+
+        assert_eq!(
+            faults.fired(),
+            vec![
+                (sub.clone(), WalkFault::Metadata),
+                (sub.join("a.bin"), WalkFault::Iterator),
+            ],
+            "both seams fired, in walk order: the directory, then its first child"
+        );
+        assert!(
+            text.contains(&sub.display().to_string()) && text.contains("physical identity"),
+            "{text}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A loop through an unidentified directory names it — as the ancestor — but is not its own
+    /// failure: the directory listed, so its next child stops the scan.
+    #[test]
+    fn a_loop_through_a_directory_without_identity_does_not_clear_it() {
+        let root = temp_dir("dirmeta_loop");
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        std::os::unix::fs::symlink(&sub, sub.join("loop")).unwrap();
+        fs::write(sub.join("z.bin"), b"would be walked blind").unwrap();
+        let faults = WalkFaults::arm(&[(sub.clone(), WalkFault::Metadata)]);
+        let mut config = guard_config(&root);
+        config.follow_symlinks = true;
+        let capture = LogCapture::start();
+        let cancel = AtomicBool::new(false);
+
+        let text = match walk_collecting(&config, &cancel, |_, _, _| {}) {
+            Err(err) => err.to_string(),
+            Ok(outcome) => panic!(
+                "the walk went into an unidentified directory, got {}",
+                outcome.kind()
+            ),
+        };
+
+        assert_eq!(faults.fired(), vec![(sub.clone(), WalkFault::Metadata)]);
+        let lines = capture.lines();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the loop came first and was logged: {lines:?}"
+        );
+        assert!(lines[0].contains("File system loop found"), "{}", lines[0]);
+        assert!(
+            text.contains(&sub.display().to_string()) && text.contains("physical identity"),
+            "{text}"
         );
 
         fs::remove_dir_all(&root).ok();
