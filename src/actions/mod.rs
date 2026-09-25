@@ -2201,6 +2201,38 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A target whose own name is at the limit on a name's length is linked like any other. The
+    /// staging name beside it used to carry the whole name, could not be created, and the action
+    /// was refused — after the snapshot and after both files were read in full.
+    #[test]
+    fn a_hardlink_to_a_name_at_the_limit_is_published() {
+        let scenario = PlanScenario::new("name_limit");
+        let keeper = scenario.file(&"k".repeat(255));
+        let twin = scenario.file(&"t".repeat(255));
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &twin,
+            false,
+            Some(ActionKind::Hardlink),
+        );
+        drop(store);
+
+        let plan = plan_of(&scenario, scan_id);
+        let ops = FakeOps::new();
+        let batch = run(&ops, &plan, &[dataset_over(&scenario.root, "tank/test")]).unwrap();
+        assert_eq!(batch.succeeded(), 1, "{:?}", batch.outcomes);
+        assert_eq!(
+            std::fs::metadata(&twin).unwrap().ino(),
+            std::fs::metadata(&keeper).unwrap().ino(),
+            "the target is a hard link to the keeper"
+        );
+        assert!(!has_tmp_leftovers(&scenario.root), "nothing staged is left");
+    }
+
     #[test]
     fn hardlink_missing_target_says_nothing_moved() {
         let root = temp_dir("hl_missing");

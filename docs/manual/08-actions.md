@@ -180,6 +180,14 @@ step 3: publish the replacement into the freed target slot
         → /tank/.dedcom-quarantine/<ts>/tank/dup.bin       (original, intact)
 ```
 
+The temporary name starts with the target's name — its first 64 bytes at most, never half
+a character — so a leftover from a crash can be traced to its file; the full name is the
+quarantined original's. Keeping only the start leaves the temporary short enough for a
+target whose own name is at the 255-byte limit, even on a dataset with `normalization` or
+without case sensitivity, where ZFS holds the normalized form of a name to that limit. A
+leftover `.dedcom-tmp-…` is a link to, or a clone of, the keeper: once the target is back in
+place it can be deleted.
+
 All three steps are atomic at the kernel level (`renameat2(RENAME_NOREPLACE)`). If
 step 3 fails (someone claimed the slot between steps 2 and 3), the original is
 **automatically restored from quarantine**, with the error

@@ -109,6 +109,12 @@ pub(crate) fn rename_noreplace(src: &Path, dest: &Path) -> std::io::Result<()> {
     }
 }
 
+/// How much of the target's name a staging name keeps, in bytes. A name may be 255 bytes on ZFS
+/// without `longname`, ext4, xfs, btrfs and tmpfs, but ZFS with `normalization` or without case
+/// sensitivity holds the normalized or upper-cased form to that limit, and one byte of UTF-8 can
+/// grow into three there. The prefix is 62 bytes at most, and 62 + 3 × 64 still fits.
+const STAGING_NAME_KEPT: usize = 64;
+
 /// Unique temporary name in directory `parent` (hidden prefix + pid + time +
 /// counter): for atomic publication — evacuation of the original during hardlink/reflink
 /// (`actions/mod.rs`).
@@ -125,13 +131,31 @@ pub(crate) fn staging_path(parent: &Path, name: Option<&std::ffi::OsStr>) -> Pat
         .unwrap_or(0);
     // The name's own bytes, like everywhere else: this one is a temporary, but the cleanup
     // after a failed build is best-effort, and a leftover has to stay greppable back to the
-    // file it was staged for.
+    // file it was staged for. Only its start: the whole name would not fit beside the prefix
+    // when it is near the limit, and the target could never be linked.
     let base: &[u8] = name.map(OsStr::as_bytes).unwrap_or(b"item");
+    let base = &base[..utf8_prefix_len(base, STAGING_NAME_KEPT)];
     let prefix = format!(".dedcom-tmp-{}-{nanos}-{seq}-", std::process::id());
     let mut out = Vec::with_capacity(prefix.len() + base.len());
     out.extend_from_slice(prefix.as_bytes());
     out.extend_from_slice(base);
     parent.join(OsString::from_vec(out))
+}
+
+/// The length of the longest start of `bytes` that is at most `room` long and does not end in
+/// the middle of a UTF-8 character. Other bytes are cut where `room` falls; a run of stray
+/// continuation bytes moves the cut back by three at most.
+fn utf8_prefix_len(bytes: &[u8], room: usize) -> usize {
+    if bytes.len() <= room {
+        return bytes.len();
+    }
+    // A cut before a continuation byte (10xxxxxx) would split a character. A character is at
+    // most four bytes, so three steps back at most reach its first byte.
+    let mut cut = room;
+    while cut > 0 && room - cut < 3 && bytes[cut] & 0xC0 == 0x80 {
+        cut -= 1;
+    }
+    cut
 }
 
 /// Moves file `src` INTO directory `dir`, preserving the name.
@@ -364,6 +388,129 @@ mod tests {
         // No name at all still yields the neutral placeholder.
         let path = staging_path(Path::new("/tank"), None);
         assert!(path.file_name().unwrap().as_bytes().ends_with(b"-item"));
+    }
+
+    /// The staging name of the target's `name`, split into the generated prefix and the part of
+    /// the target's name it kept.
+    fn staged(name: &[u8]) -> (usize, Vec<u8>) {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let path = staging_path(Path::new("/tank"), Some(OsStr::from_bytes(name)));
+        let staged = path.file_name().unwrap().as_bytes().to_vec();
+        // The prefix ends at its fifth dash: `.dedcom-tmp-<pid>-<nanos>-<seq>-`.
+        let prefix = staged
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'-')
+            .nth(4)
+            .map(|(at, _)| at + 1)
+            .expect("the staging prefix");
+        (prefix, staged[prefix..].to_vec())
+    }
+
+    /// A name longer than a name may be (255 bytes on ZFS, ext4, xfs and tmpfs) cannot be created,
+    /// so a target whose own name is near the limit could never be linked. The staging name keeps
+    /// only the start of the target's name, never half a character, and little enough of it that
+    /// the name still fits where ZFS compares its normalized or upper-cased form, up to three
+    /// times longer.
+    #[test]
+    fn a_staging_name_keeps_only_the_start_of_the_name() {
+        let mut mixed = b"START".to_vec();
+        mixed.extend_from_slice(&[b'x'; 245]);
+        mixed.extend_from_slice(b"END!!");
+        let mut odd_cyrillic = b"a".to_vec();
+        odd_cyrillic.extend_from_slice("ж".repeat(127).as_bytes());
+        let names: [Vec<u8>; 7] = [
+            vec![b'a'; 255],
+            mixed,
+            "я".repeat(127).into_bytes(),
+            odd_cyrillic,
+            "€".repeat(85).into_bytes(),
+            "😀".repeat(63).into_bytes(),
+            vec![0xFF; 255],
+        ];
+        for original in &names {
+            let (prefix, kept) = staged(original);
+            assert!(!kept.is_empty(), "something of the name is kept");
+            assert!(
+                original.starts_with(&kept),
+                "the start of the name is kept, not its end: {:?}",
+                String::from_utf8_lossy(&kept)
+            );
+            assert!(
+                prefix + 3 * kept.len() <= 255,
+                "{prefix} + 3 × {} bytes would not fit",
+                kept.len()
+            );
+            if std::str::from_utf8(original).is_ok() {
+                assert!(
+                    std::str::from_utf8(&kept).is_ok(),
+                    "no character is cut in half: {:?}",
+                    kept
+                );
+            }
+        }
+        let (_, kept) = staged(&[b'a'; 255]);
+        assert_eq!(
+            kept.len(),
+            STAGING_NAME_KEPT,
+            "plain ASCII keeps the whole budget"
+        );
+        let (_, kept) = staged(b"short name.bin");
+        assert_eq!(kept, b"short name.bin", "a short name is kept whole");
+        // The longest prefix there can be — a 7-digit pid (Linux's `pid_max` tops out at
+        // 4 194 304), 20-digit nanoseconds and a 20-digit counter — beside a budget grown three
+        // times over. The prefixes above are shorter, so they cannot show this.
+        let longest_prefix = ".dedcom-tmp-".len() + 7 + 1 + 20 + 1 + 20 + 1;
+        assert!(
+            longest_prefix + 3 * STAGING_NAME_KEPT <= 255,
+            "{longest_prefix} + 3 × {STAGING_NAME_KEPT} does not fit in a name"
+        );
+    }
+
+    /// The manual says how much of the name a staging name keeps.
+    #[test]
+    fn the_manual_states_how_much_of_a_name_a_staging_name_keeps() {
+        let said = format!("its first {STAGING_NAME_KEPT} bytes at most");
+        let manual = crate::testfixtures::manual("08-actions.md");
+        let manual = manual.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            manual.contains(&said),
+            "08-actions.md §8.5 must say: {said}"
+        );
+    }
+
+    /// The cut never splits a character and never moves back further than a character is long.
+    #[test]
+    fn utf8_prefix_len_never_splits_a_character() {
+        let ya = "я".repeat(127);
+        assert_eq!(utf8_prefix_len(ya.as_bytes(), 101), 100);
+        assert_eq!(utf8_prefix_len(ya.as_bytes(), 100), 100);
+        // Continuation bytes from the upper half of their range too (ж = D0 B6, € = E2 82 AC).
+        assert_eq!(utf8_prefix_len("ж".repeat(127).as_bytes(), 101), 100);
+        assert_eq!(utf8_prefix_len("€".repeat(85).as_bytes(), 101), 99);
+        let smile = "😀😀".as_bytes();
+        assert_eq!(utf8_prefix_len(smile, 7), 4);
+        assert_eq!(utf8_prefix_len(smile, 5), 4);
+        assert_eq!(utf8_prefix_len(smile, 4), 4);
+        assert_eq!(utf8_prefix_len(smile, 3), 0);
+        assert_eq!(utf8_prefix_len(b"short", 255), 5);
+        assert_eq!(utf8_prefix_len(b"exact", 5), 5);
+        assert_eq!(
+            utf8_prefix_len(&[0xFF; 10], 5),
+            5,
+            "bytes that are not UTF-8 are cut where the room ends"
+        );
+        assert_eq!(
+            utf8_prefix_len(&[0x80; 10], 5),
+            2,
+            "a run of stray continuation bytes costs three bytes of room at most"
+        );
+        assert_eq!(
+            utf8_prefix_len(&[0x80; 10], 2),
+            0,
+            "and never steps back past the start"
+        );
     }
 
     #[test]

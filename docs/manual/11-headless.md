@@ -366,7 +366,10 @@ from a single consistent read of the database.
 
 The artifact is written to a temporary file in the destination's own directory
 and then renamed into place, so a failure never leaves a half-written CSV and
-never damages a previous one. If the destination is a symbolic link, the export
+never damages a previous one. The temporary is named
+`.dedcom-export-<pid>-<nanos>.tmp` (`…-r<N>.tmp` if that name is taken), never
+after the destination, so a destination name at the 255-byte limit exports too.
+Only a killed export can leave it behind; it is a partial CSV and can be deleted. If the destination is a symbolic link, the export
 refuses: renaming over it would destroy the link, writing through it would
 overwrite whatever it points at, and as root with a typo (`--export-csv
 /dev/stdout`) that link can be a system one. Give a regular pathname. The file is

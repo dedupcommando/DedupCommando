@@ -2667,9 +2667,9 @@ fn write_export_group(
 /// a write error, a corrupt mark discovered halfway through — and every unwind runs `Drop`, so
 /// there is no path on which a half-written file survives under a name that looks finished. What
 /// `Drop` cannot cover is stated rather than implied: `process::abort`, a panic while panicking
-/// and `SIGKILL` leave the temporary behind. It is inert — it never carries the destination's
-/// name, it is mode 0600, nothing in this product reads it, and the next export claims a fresh
-/// name.
+/// and `SIGKILL` leave the temporary behind. It is inert — named `.dedcom-export-<pid>-<nanos>.tmp`
+/// (`-r<N>.tmp` on a retry), never after the destination, mode 0600, nothing in this product reads
+/// it, and the next export claims a fresh name.
 struct TempArtifact {
     dir: paths::DirHandle,
     temp: std::ffi::OsString,
@@ -2756,11 +2756,10 @@ impl TempArtifact {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos())
             .unwrap_or(0);
-        // From the destination's bytes: spelled lossily, each byte that is not UTF-8 took three,
-        // and a name of 80 of them outgrew the limit on a name's length.
-        let mut base = std::ffi::OsString::from(".");
-        base.push(dest);
-        base.push(format!(".dedcom-export-{}-{nanos}", std::process::id()));
+        // Not after the destination: its name can be at the limit on a name's length and leave no
+        // room for the rest, and the pid and the time already keep the retries down.
+        let base =
+            std::ffi::OsString::from(format!(".dedcom-export-{}-{nanos}", std::process::id()));
         let mut attempt = 0u32;
         loop {
             let mut candidate = base.clone();
@@ -3301,6 +3300,26 @@ mod export_csv_tests {
         let csv = std::fs::read_to_string(&dest).expect("the CSV under its own bytes");
         assert_eq!(rows_of(&csv).len(), 2, "{csv}");
         assert!(rig.residue().is_empty());
+    }
+
+    /// A destination whose name is at the limit on a name's length exports like any other. The
+    /// temporary file beside it used to carry that name too, and could not be created.
+    #[test]
+    fn an_export_to_a_name_at_the_limit_succeeds() {
+        use std::os::unix::ffi::OsStrExt;
+        let rig = Rig::new("name_limit");
+        let rows = [row("/tank/a", 1, 1000), row("/tank/b", 2, 2000)];
+        complete_derived(&mut rig.store(), &rows, 0xA7);
+        for byte in [b'e', 0xE0] {
+            let mut name = vec![byte; 251];
+            name.extend_from_slice(b".csv");
+            let dest = rig.dir.join(std::ffi::OsStr::from_bytes(&name));
+
+            run_export_csv(&rig.cli(), &dest).expect("the export must succeed");
+            let csv = std::fs::read_to_string(&dest).expect("the CSV under its own name");
+            assert_eq!(rows_of(&csv).len(), 2, "{csv}");
+            assert!(rig.residue().is_empty());
+        }
     }
 
     /// A pathname is whatever bytes the directory held, and the export is a file people print.

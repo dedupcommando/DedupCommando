@@ -191,6 +191,40 @@ mod tests {
         std::fs::remove_dir_all(&mountpoint).ok();
     }
 
+    /// A clone replaces a target whose name is at the limit on a name's length like any other:
+    /// the name the clone is built under keeps only as much of the target's name as fits.
+    #[test]
+    fn a_clone_of_a_name_at_the_limit_is_published() {
+        let mountpoint = temp_dir("name_limit");
+        let quarantine = mountpoint.join(".dedcom-quarantine");
+        let target = mountpoint.join("t".repeat(255));
+        let keeper = mountpoint.join("keeper.bin");
+        std::fs::write(&target, b"duplicate content").unwrap();
+        std::fs::write(&keeper, b"duplicate content").unwrap();
+
+        let published = publish_clone(
+            &super::super::RealOps,
+            &target,
+            &keeper,
+            &mountpoint,
+            &quarantine,
+            |keeper, temp| {
+                std::fs::copy(keeper, temp)?;
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(published, Publication::Published { .. }),
+            "{published:?}"
+        );
+        assert!(
+            quarantine.join("t".repeat(255)).exists(),
+            "the original is recoverable"
+        );
+
+        std::fs::remove_dir_all(&mountpoint).ok();
+    }
+
     /// Ownership is the half that bites hardest: a duplicate owned by a user comes back owned by
     /// whoever ran the tool. Only checkable with the privilege to hand a file to someone else.
     #[test]
