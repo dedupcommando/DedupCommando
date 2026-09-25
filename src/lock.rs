@@ -174,10 +174,12 @@ pub fn try_acquire(state_dir: &Path) -> std::io::Result<Acquire> {
             // raise ELOOP too. `establish_state_dir` runs first at both call sites and walks every
             // component from `/` with `openat(O_DIRECTORY|O_NOFOLLOW)`, refusing any link in the
             // chain, so by the time this runs `dedcom.lock` is the only component left.
-            if err.raw_os_error() == Some(libc::ELOOP) {
-                not_our_lock_file(&path, "is a symbolic link")
-            } else {
-                err
+            match err.raw_os_error() {
+                Some(libc::ELOOP) => not_our_lock_file(&path, "is a symbolic link"),
+                // A directory under the name is as much «not ours» as a link. Left raw, EISDIR
+                // became an unevaluable lock and the advice about network filesystems.
+                Some(libc::EISDIR) => not_our_lock_file(&path, "is a directory"),
+                _ => err,
             }
         })?;
     require_plain_lock_file(&file, &path)?;
@@ -231,6 +233,33 @@ fn not_our_lock_file(path: &Path, what: &str) -> std::io::Error {
             crate::textsan::terminal(&path.display().to_string())
         ),
     )
+}
+
+/// What an operator can do about a lock that could not be evaluated, from the error that stopped it.
+///
+/// Only ENOLCK (and EOPNOTSUPP) is a filesystem that cannot lock at all — the network filesystem
+/// without lockd the old single sentence was written for. A read-only filesystem, a full one or
+/// a permission problem got the same advice, and moving the state directory or `--force` fixes
+/// none of them.
+pub fn unknown_lock_advice(err: &std::io::Error) -> &'static str {
+    match err.raw_os_error() {
+        Some(libc::ENOLCK | libc::EOPNOTSUPP) => {
+            "this filesystem cannot provide the lock (a network filesystem without lockd?) — put \
+             the state directory on local storage (--state-dir), or retry with --force"
+        }
+        Some(libc::EROFS) => {
+            "the state directory is on a read-only filesystem — point --state-dir at a writable one"
+        }
+        Some(libc::ENOSPC | libc::EDQUOT) => {
+            "the filesystem of the state directory has no space or quota left — free space or \
+             raise the quota"
+        }
+        Some(libc::EACCES | libc::EPERM) => {
+            "permission denied — check the owner and mode of the state directory and its lock \
+             file, and lsattr for an immutable or append-only flag (chattr -i, chattr -a)"
+        }
+        _ => "put the state directory on local storage (--state-dir), or retry with --force",
+    }
 }
 
 /// Writes the PID+time to the lock file (diagnostics). Errors are ignored — the
@@ -406,6 +435,53 @@ mod tests {
             "and the link itself must still be a link"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory under the lock's name is not an unevaluable lock: it is a file that is not ours,
+    /// and the advice for an unevaluable lock (move the state directory, or `--force`) would be
+    /// wrong in both halves.
+    #[test]
+    fn a_directory_under_the_lock_name_is_refused_by_name() {
+        let dir = temp_state_dir();
+        std::fs::create_dir(lock_path(&dir)).unwrap();
+
+        match try_acquire(&dir) {
+            Err(err) => {
+                assert!(is_not_our_lock_file(&err), "{err}");
+                assert!(err.to_string().contains("is a directory"), "{err}");
+            }
+            Ok(_) => panic!("a directory cannot be the lock"),
+        }
+        assert!(lock_path(&dir).is_dir(), "and it is left as it was");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each errno gets the advice that fixes it. Only a filesystem that cannot lock is told to move
+    /// the state directory or use `--force`; neither does anything for a full or read-only one.
+    #[test]
+    fn an_unevaluable_lock_is_advised_by_its_errno() {
+        for (errno, says) in [
+            (libc::ENOLCK, "cannot provide the lock"),
+            (libc::EOPNOTSUPP, "cannot provide the lock"),
+            (libc::EROFS, "read-only"),
+            (libc::ENOSPC, "no space or quota"),
+            (libc::EDQUOT, "no space or quota"),
+            (libc::EACCES, "permission denied"),
+            (libc::EPERM, "permission denied"),
+        ] {
+            let advice = unknown_lock_advice(&std::io::Error::from_raw_os_error(errno));
+            assert!(advice.contains(says), "errno {errno}: {advice}");
+        }
+        for errno in [
+            libc::EROFS,
+            libc::ENOSPC,
+            libc::EDQUOT,
+            libc::EACCES,
+            libc::EPERM,
+        ] {
+            let advice = unknown_lock_advice(&std::io::Error::from_raw_os_error(errno));
+            assert!(!advice.contains("--force"), "errno {errno}: {advice}");
+        }
     }
 
     /// A hard link is indistinguishable from a regular file at open time, and truncating one

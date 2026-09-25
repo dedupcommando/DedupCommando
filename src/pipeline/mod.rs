@@ -72,6 +72,87 @@ pub fn run_scan(
     // `&AtomicBool`, not `&Arc<…>`: the flag is only ever read here, and the process-wide signal
     // flag is a plain static. An `Arc<AtomicBool>` caller still passes `&cancel` unchanged.
     cancel: &AtomicBool,
+    on_progress: impl FnMut(ScanProgress),
+) -> Result<ScanOutcome> {
+    // One place for both front ends: the TUI worker and `--scan` both come through here, and the
+    // errno lives on this store's connection.
+    scan_steps(store, config, resume, verify, cancel, on_progress)
+        .map_err(|err| explain_failed_write(err, store.last_os_errno()))
+}
+
+/// The extended codes of a failed write — the ones for which SQLite records the errno of the call
+/// that failed. A failed read, a lock or a stat records one too, but it is not a write that ran out
+/// of room, and none of the causes below would be true of it.
+const WRITE_FAILURES: [std::ffi::c_int; 5] = [
+    rusqlite::ffi::SQLITE_IOERR_WRITE,
+    rusqlite::ffi::SQLITE_IOERR_FSYNC,
+    rusqlite::ffi::SQLITE_IOERR_DIR_FSYNC,
+    rusqlite::ffi::SQLITE_IOERR_TRUNCATE,
+    rusqlite::ffi::SQLITE_IOERR_SHMSIZE,
+];
+
+/// A write SQLite could not make is «disk I/O error» whatever stopped it, and a quota that runs out
+/// reads exactly like a dying disk; for a failed write SQLite keeps the errno, and it says which.
+/// A full database is different: SQLite keeps no errno for it and does not clear an older one, so
+/// it gets a fixed sentence — an errno read then could belong to an earlier, unrelated failure.
+/// Anything else is already a sentence about the database itself and is left as it is.
+///
+/// SQLite also writes large sorts to temporary files outside the state directory (`$TMPDIR`, by
+/// default `/var/tmp`), so where the room is missing is said to be one of the two.
+fn explain_failed_write(err: AppError, errno: i32) -> AppError {
+    let AppError::Db(rusqlite::Error::SqliteFailure(failure, _)) = &err else {
+        return err;
+    };
+    let cause = match failure.code {
+        rusqlite::ErrorCode::DiskFull => {
+            "there is no space or quota left for dedcom.db or for SQLite's temporary files — free \
+             space in the state directory and in $TMPDIR (by default /var/tmp), then scan again"
+                .to_string()
+        }
+        rusqlite::ErrorCode::SystemIoFailure if WRITE_FAILURES.contains(&failure.extended_code) => {
+            let why = match errno {
+                libc::EDQUOT => {
+                    "a quota is exhausted where dedcom.db or SQLite's temporary files are written — \
+                     raise it or free space in the state directory and in $TMPDIR (by default \
+                     /var/tmp), then scan again"
+                }
+                libc::ENOSPC => {
+                    "no space left where dedcom.db or SQLite's temporary files are written — free \
+                     space in the state directory and in $TMPDIR (by default /var/tmp), then scan \
+                     again"
+                }
+                libc::EIO => {
+                    "an I/O error on the device holding dedcom.db or SQLite's temporary files — \
+                     check `zpool status`"
+                }
+                libc::EROFS => "the filesystem holding the state directory became read-only",
+                libc::EFBIG => "dedcom.db reached this process's file-size limit (ulimit -f)",
+                0 => {
+                    "SQLite kept no OS error — check free space and quota in the state directory \
+                     and in $TMPDIR (df, zfs get quota,refquota)"
+                }
+                _ => "the OS refused the write",
+            };
+            if errno == 0 {
+                why.to_string()
+            } else {
+                format!("{why} ({})", std::io::Error::from_raw_os_error(errno))
+            }
+        }
+        _ => return err,
+    };
+    AppError::msg(format!(
+        "the scan could not write to its database: {cause} — {err}"
+    ))
+}
+
+/// [`run_scan`] before its error is explained.
+fn scan_steps(
+    store: &mut ScanStore,
+    config: &ScanConfig,
+    resume: Option<i64>,
+    verify: bool,
+    cancel: &AtomicBool,
     mut on_progress: impl FnMut(ScanProgress),
 ) -> Result<ScanOutcome> {
     let segment_start = Instant::now();
@@ -134,12 +215,25 @@ pub fn run_scan(
         verify,
         cancel,
         &mut on_progress,
-    );
+    )
+    // At once: the errno is the connection's, and the write below would record its own.
+    .map_err(|err| explain_failed_write(err, store.last_os_errno()));
 
-    // The active time of this segment accumulates even on cancellation or error.
-    store.add_elapsed(scan_id, segment_start.elapsed().as_secs_f64())?;
-
-    let mut outcome = outcome?;
+    // The active time of this segment accumulates even on cancellation or error — but when it
+    // cannot be saved after the scan failed, the scan's own error is the one the operator reads.
+    let elapsed = store.add_elapsed(scan_id, segment_start.elapsed().as_secs_f64());
+    let mut outcome = match outcome {
+        Err(err) => {
+            if let Err(also) = elapsed {
+                tracing::warn!("the scan's active time was not saved either: {also}");
+            }
+            return Err(err);
+        }
+        Ok(outcome) => {
+            elapsed?;
+            outcome
+        }
+    };
     if let ScanOutcome::Completed(results) = &mut outcome {
         results.summary.elapsed_seconds = store.elapsed_seconds(scan_id)?;
         store.record_scan_result(scan_id, &results.summary)?;
@@ -1064,6 +1158,139 @@ mod hash_failures_tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Selects the child half of [`a_failed_database_write_names_the_os_error`].
+    const FSIZE_CHILD_DIR: &str = "DEDCOM_TEST_FSIZE_CHILD_DIR";
+
+    /// SQLite reports a write it could not make as «disk I/O error» whatever stopped it — a quota,
+    /// a dead disk and a read-only remount read the same. The scan's error has to carry the OS
+    /// error that tells them apart.
+    ///
+    /// The failure is a real one, through SQLite's own VFS: a child process (a re-exec of this
+    /// test) opens the store, then caps its own file size (`RLIMIT_FSIZE`, with `SIGXFSZ` ignored
+    /// so the write fails instead of killing it), and scans. The scan's first write past the cap
+    /// fails with EFBIG.
+    #[test]
+    fn a_failed_database_write_names_the_os_error() {
+        if let Ok(dir) = std::env::var(FSIZE_CHILD_DIR) {
+            let dir = PathBuf::from(dir);
+            let mut store = ScanStore::open_writable(&dir.join("dedcom.db")).unwrap();
+            let mut cfg = ScanConfig::new(vec![dir.join("root")]);
+            cfg.min_size = 0;
+            cfg.exclude_globs = Vec::new();
+            // SAFETY: plain libc calls on this process; `limit` is a valid rlimit.
+            unsafe {
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                let mut limit: libc::rlimit = std::mem::zeroed();
+                assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit), 0);
+                limit.rlim_cur = 8192;
+                assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+            }
+            let cancel = AtomicBool::new(false);
+            let said = match run_scan(&mut store, &cfg, None, false, &cancel, |_| {}) {
+                Ok(_) => "the scan finished".to_string(),
+                Err(err) => err.to_string(),
+            };
+            println!("SCAN-VERDICT:{said}");
+            std::process::exit(0);
+        }
+
+        let dir = unique_temp_dir("fsize");
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        for i in 0..64u8 {
+            std::fs::write(root.join(format!("{i}.bin")), vec![i; 4096]).unwrap();
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "a_failed_database_write_names_the_os_error",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(FSIZE_CHILD_DIR, &dir)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Not at the start of a line: libtest prints the test's own name first, on the same line.
+        let said = stdout
+            .lines()
+            .find_map(|line| line.split_once("SCAN-VERDICT:").map(|(_, said)| said))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the child gave no verdict:\n{stdout}\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
+        assert!(said.contains("File too large"), "{said}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// SQLite's failure with this (extended) result code, in its own words.
+    fn sqlite_failure(code: std::ffi::c_int, words: &str) -> AppError {
+        AppError::Db(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some(words.to_string()),
+        ))
+    }
+
+    /// Which errno reads as which cause for a failed write, and what is left alone: a full database
+    /// has no errno of its own, a failed read is not a failed write, and a busy database is not a
+    /// disk problem.
+    #[test]
+    fn a_failed_write_is_explained_by_its_errno_and_nothing_else_is_rewritten() {
+        for write in WRITE_FAILURES {
+            for (errno, cause) in [
+                (libc::EDQUOT, "a quota is exhausted"),
+                (libc::ENOSPC, "no space left"),
+                (libc::EIO, "zpool status"),
+                (libc::EROFS, "became read-only"),
+                (libc::EFBIG, "file-size limit"),
+                (0, "SQLite kept no OS error"),
+            ] {
+                let said = explain_failed_write(sqlite_failure(write, "disk I/O error"), errno)
+                    .to_string();
+                assert!(said.contains(cause), "{write}, errno {errno}: {said}");
+                assert!(
+                    said.contains("disk I/O error"),
+                    "SQLite's own words stay: {said}"
+                );
+                if errno != 0 {
+                    let os = std::io::Error::from_raw_os_error(errno).to_string();
+                    assert!(said.contains(&os), "{write}, errno {errno}: {said}");
+                }
+            }
+        }
+        // Whatever the connection holds from an earlier failure, a full database reads the same:
+        // SQLite recorded no errno for it.
+        let full = |errno| {
+            explain_failed_write(
+                sqlite_failure(rusqlite::ffi::SQLITE_FULL, "database or disk is full"),
+                errno,
+            )
+            .to_string()
+        };
+        assert_eq!(full(0), full(libc::EIO));
+        assert_eq!(full(0), full(libc::ENOENT));
+        assert!(
+            full(0).contains("no space or quota") && full(0).contains("/var/tmp"),
+            "{}",
+            full(0)
+        );
+        for code in [
+            rusqlite::ffi::SQLITE_IOERR_READ,
+            rusqlite::ffi::SQLITE_IOERR_SHORT_READ,
+            rusqlite::ffi::SQLITE_IOERR_LOCK,
+            rusqlite::ffi::SQLITE_BUSY,
+        ] {
+            let before = sqlite_failure(code, "left as it is").to_string();
+            assert_eq!(
+                explain_failed_write(sqlite_failure(code, "left as it is"), libc::EDQUOT)
+                    .to_string(),
+                before,
+                "{code}"
+            );
+        }
     }
 
     /// A hard link the first scan did not see costs no read in the second: its own path inherits

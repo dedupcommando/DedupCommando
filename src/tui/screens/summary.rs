@@ -2,7 +2,7 @@
 use ratatui::{
     style::Stylize,
     text::{Line, Text},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
 
@@ -13,6 +13,15 @@ use crate::tui::human_bytes;
 
 /// How many exact quarantine pathnames the screen prints before summarising the rest.
 const QUARANTINE_LINES: usize = 10;
+
+/// The heading over the commands that release the space; the manual quotes it.
+const RELEASE_HEADING: &str = "Space is released AFTER verifying and purging with the commands:";
+
+/// The two purge commands the screen offers, as the manual's §8.8 prints them.
+const PURGE_COMMANDS: [&str; 2] = [
+    "dedcom --purge-quarantine       # shows what it would remove",
+    "dedcom --purge-quarantine --yes # removes every quarantine, for good",
+];
 
 /// How many allocations came out worth nothing, grouped by the reason, in a fixed order so the
 /// same batch always reads the same way.
@@ -166,14 +175,16 @@ pub fn render(frame: &mut Frame, app: &App) {
         };
         lines.push(Line::from(line).red());
     }
-    lines.push(Line::from(
-        "  Space is released AFTER verifying and purging with the commands:".to_string(),
-    ));
+    lines.push(Line::from(format!("  {RELEASE_HEADING}")));
     for snapshot in &result.snapshots {
         lines.push(Line::from(format!("    zfs destroy {snapshot}")));
     }
+    // On its own the purge only lists; offering it alone as the way to release the space offered a
+    // command that releases nothing. Both, as the manual's §8.8 prints them.
     if !result.quarantine_dirs.is_empty() {
-        lines.push(Line::from("    dedcom --purge-quarantine"));
+        for command in PURGE_COMMANDS {
+            lines.push(Line::from(format!("    {command}")));
+        }
     }
 
     // The batch is over, but the marks may not be: a durable-state warning belongs where the
@@ -190,12 +201,93 @@ pub fn render(frame: &mut Frame, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from("  [Esc] to configuration · [Q] quit".dim()));
 
+    // Wrapped: the reason an action failed comes after its pathname, and the screen does not scroll
+    // sideways — unwrapped, a long pathname pushed the reason off the edge.
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" DedupCommando — summary "),
-        ),
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" DedupCommando — summary "),
+            ),
         frame.area(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::action::{ActionKind, ActionOutcome};
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::path::PathBuf;
+
+    fn screen(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn batch_with_quarantine(outcomes: Vec<ActionOutcome>) -> BatchResult {
+        BatchResult {
+            planned: outcomes.len(),
+            outcomes,
+            snapshots: vec!["tank@dedcom-20260925-120000-0".to_string()],
+            quarantine_dirs: vec![PathBuf::from("/tank/.dedcom-quarantine/20260925-120000-0")],
+            ..Default::default()
+        }
+    }
+
+    /// `--purge-quarantine` on its own only lists what it would remove. A screen that offers it
+    /// as the way to release the space offers a command that releases nothing, so both are shown:
+    /// the one that lists, and the one that removes.
+    #[test]
+    fn the_summary_offers_the_purge_that_removes_and_the_one_that_lists() {
+        let (mut app, _events) = crate::app::test_app();
+        app.summary_result = Some(batch_with_quarantine(Vec::new()));
+        let shown = screen(&app, 100, 30);
+        assert!(shown.contains("--purge-quarantine --yes"), "{shown}");
+        for line in [RELEASE_HEADING, PURGE_COMMANDS[0], PURGE_COMMANDS[1]] {
+            assert!(shown.contains(line), "{line}\n{shown}");
+        }
+    }
+
+    /// The manual quotes the screen word for word — the heading and both commands — where it says
+    /// what to run after an apply. The strings come from the screen's own constants, so a change to
+    /// the screen that the manual does not follow fails here.
+    #[test]
+    fn the_manual_quotes_the_purge_commands_of_the_summary() {
+        let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let chapter = words(&crate::testfixtures::manual("08-actions.md"));
+        for line in [RELEASE_HEADING, PURGE_COMMANDS[0], PURGE_COMMANDS[1]] {
+            assert!(
+                chapter.contains(&words(line)),
+                "08-actions.md must quote: {line}"
+            );
+        }
+    }
+
+    /// The reason an action failed comes after its pathname, and the screen does not scroll
+    /// sideways: without wrapping, a long pathname pushed the reason off the edge.
+    #[test]
+    fn a_long_pathname_does_not_push_the_reason_off_the_screen() {
+        let (mut app, _events) = crate::app::test_app();
+        let deep = PathBuf::from(format!("/tank/{}/file.bin", "d".repeat(150)));
+        app.summary_result = Some(batch_with_quarantine(vec![ActionOutcome {
+            kind: ActionKind::Hardlink,
+            target: deep,
+            quarantine: None,
+            result: Err("ZZREASONZZ".to_string()),
+        }]));
+        let shown = screen(&app, 100, 30);
+        assert!(shown.contains("ZZREASONZZ"), "{shown}");
+    }
 }

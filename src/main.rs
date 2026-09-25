@@ -733,15 +733,14 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
 
     // Single-instance lock: acquiring the advisory flock = the OPERATOR role;
     // held by another live instance → the role is decided by the policy + CLI flags.
-    let (lock_state, holder, mut lock_to_hold) = match lock::try_acquire(&state_dir) {
-        Ok(lock::Acquire::Operator(guard)) => (lock::LockState::Held, None, Some(guard)),
-        Ok(lock::Acquire::Busy(h)) => (lock::LockState::Busy, h, None),
+    let reading = match LockReading::of(lock::try_acquire(&state_dir)) {
+        Ok(reading) => reading,
         // Something else under the lock's name is its own answer, not "the lock is unknown": the
         // advice for an unevaluable lock is to move the state directory or use --force, and both
         // are wrong here. The error carries which shape it was — a link, a second name, a device
         // node — because "is a symbolic link" sends the operator looking for a link that is not
         // there when the answer was a block device.
-        Err(err) if lock::is_not_our_lock_file(&err) => {
+        Err(err) => {
             eprintln!(
                 "dedcom: {err}.\n\
                  The lock file is truncated and rewritten on every start, so dedcom will not\n\
@@ -751,23 +750,25 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
             );
             return Ok(());
         }
-        Err(err) => {
-            // NOT «continue as operator»: we have no idea whether one is already running.
-            tracing::warn!("single-instance lock could not be evaluated: {err}");
-            (lock::LockState::Unknown, None, None)
-        }
     };
+    let (cause, advice) = reading.unevaluated_words();
+    let LockReading {
+        state: lock_state,
+        holder,
+        guard: mut lock_to_hold,
+        ..
+    } = reading;
     let policy = lock::load_policy(&state_dir);
     let decision = lock::decide(lock_state, policy, cli.read_only, cli.force);
     if matches!(decision, lock::Decision::Blocked) {
         if lock_state == lock::LockState::Unknown {
             eprintln!(
-                "dedcom: cannot verify the single-instance lock in {}.\n\
+                "dedcom: cannot verify the single-instance lock in {}{}.\n\
                  Refusing to start as the operator: two operators on one state can apply\n\
-                 destructive plans at the same time. A network filesystem without lockd cannot\n\
-                 provide the lock — put the state directory on local storage (--state-dir),\n\
-                 run with --read-only to observe, or with --force to proceed anyway.",
-                textsan::terminal(&state_dir.display().to_string())
+                 destructive plans at the same time. {}; or run with --read-only to observe.",
+                textsan::terminal(&state_dir.display().to_string()),
+                textsan::terminal(&cause),
+                capitalized(advice)
             );
             return Ok(());
         }
@@ -1088,16 +1089,86 @@ fn warn_about_config(state_dir: &Path) {
 /// at all. No UI — the `ask` policy collapses to `block`. Read-only modes (`--stats`,
 /// `--export-csv`) do not write and do not take the lock.
 fn acquire_write_lock(cli: &cli::Cli) -> Result<Option<lock::InstanceLock>> {
+    acquire_write_lock_with(cli, lock::try_acquire)
+}
+
+/// What one attempt on the single-instance lock established — one reading for both front ends, so
+/// an unevaluable lock carries its cause into both messages the same way.
+struct LockReading {
+    state: lock::LockState,
+    holder: Option<lock::Holder>,
+    guard: Option<lock::InstanceLock>,
+    /// Why the lock could not be evaluated, when `state` is `Unknown`.
+    unevaluated: Option<std::io::Error>,
+}
+
+impl LockReading {
+    /// `Err` — the lock's name holds a file that is not ours, which each front end refuses on its
+    /// own terms.
+    fn of(attempt: std::io::Result<lock::Acquire>) -> std::io::Result<Self> {
+        match attempt {
+            Ok(lock::Acquire::Operator(guard)) => Ok(Self {
+                state: lock::LockState::Held,
+                holder: None,
+                guard: Some(guard),
+                unevaluated: None,
+            }),
+            Ok(lock::Acquire::Busy(holder)) => Ok(Self {
+                state: lock::LockState::Busy,
+                holder,
+                guard: None,
+                unevaluated: None,
+            }),
+            Err(err) if lock::is_not_our_lock_file(&err) => Err(err),
+            Err(err) => {
+                // NOT «continue as operator»: we have no idea whether one is already running.
+                tracing::warn!("single-instance lock could not be evaluated: {err}");
+                Ok(Self {
+                    state: lock::LockState::Unknown,
+                    holder: None,
+                    guard: None,
+                    unevaluated: Some(err),
+                })
+            }
+        }
+    }
+
+    /// The error that kept the lock from being evaluated, as `": <error>"`, and the advice for it.
+    fn unevaluated_words(&self) -> (String, &'static str) {
+        match &self.unevaluated {
+            Some(err) => (format!(": {err}"), lock::unknown_lock_advice(err)),
+            None => (String::new(), "retry with --force"),
+        }
+    }
+}
+
+/// `text` with its first letter capitalised — the advice starts a sentence in the TUI message and
+/// follows a dash in the one-line refusal.
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// [`acquire_write_lock`] with the attempt on the lock passed in. A test hands back the errno of a
+/// filesystem that cannot lock at all (ENOLCK), which no directory a test can make produces.
+fn acquire_write_lock_with(
+    cli: &cli::Cli,
+    try_acquire: impl FnOnce(&Path) -> std::io::Result<lock::Acquire>,
+) -> Result<Option<lock::InstanceLock>> {
     let state_dir = paths::state_dir(cli);
     // Write mode: state-dir 0700 + a check of the whole chain, fail-closed.
     paths::establish_state_dir(&state_dir)?;
     warn_about_config(&state_dir);
-    let (lock_state, holder, guard) = match lock::try_acquire(&state_dir) {
-        Ok(lock::Acquire::Operator(g)) => (lock::LockState::Held, None, Some(g)),
-        Ok(lock::Acquire::Busy(h)) => (lock::LockState::Busy, h, None),
+    // An unevaluable lock used to return Ok(None) here — the write then proceeded with no lock
+    // whatsoever. It is `Unknown` now, and refused below unless --force.
+    let reading = match LockReading::of(try_acquire(&state_dir)) {
+        Ok(reading) => reading,
         // See the TUI path: this is not an unevaluable lock, and the standing advice for one
         // ("move the state directory, or --force") would be wrong in both halves.
-        Err(err) if lock::is_not_our_lock_file(&err) => {
+        Err(err) => {
             return Err(AppError::msg(format!(
                 "write cancelled: {err}. The lock file is truncated and rewritten on every start, \
                  so dedcom will not write through anything that is not a plain file of its own. \
@@ -1105,12 +1176,14 @@ fn acquire_write_lock(cli: &cli::Cli) -> Result<Option<lock::InstanceLock>> {
                  apply."
             )))
         }
-        Err(err) => {
-            // Used to return Ok(None) — the write then proceeded with no lock whatsoever.
-            tracing::warn!("single-instance lock could not be evaluated: {err}");
-            (lock::LockState::Unknown, None, None)
-        }
     };
+    let (cause, advice) = reading.unevaluated_words();
+    let LockReading {
+        state: lock_state,
+        holder,
+        guard,
+        ..
+    } = reading;
     let policy = lock::load_policy(&state_dir);
     match lock::decide_headless(lock_state, policy, cli.read_only, cli.force) {
         lock::Decision::Operator => Ok(guard),
@@ -1121,10 +1194,9 @@ fn acquire_write_lock(cli: &cli::Cli) -> Result<Option<lock::InstanceLock>> {
              without --read-only",
         )),
         _ if lock_state == lock::LockState::Unknown => Err(AppError::msg(format!(
-            "write cancelled: cannot verify the single-instance lock in {} — \
-             put the state directory on local storage (a network filesystem without lockd \
-             cannot provide the lock), or retry with --force",
-            textsan::terminal(&state_dir.display().to_string())
+            "write cancelled: cannot verify the single-instance lock in {}{} — {advice}",
+            textsan::terminal(&state_dir.display().to_string()),
+            textsan::terminal(&cause)
         ))),
         _ => {
             let who = holder
@@ -1979,7 +2051,23 @@ mod purge_tests {
 /// lock used to turn into `Ok(None)` and let the write proceed unlocked.
 #[cfg(test)]
 mod acquire_write_lock_tests {
-    use super::{acquire_write_lock, cli};
+    use super::{acquire_write_lock, acquire_write_lock_with, capitalized, cli, LockReading};
+
+    /// Both front ends read the lock through one function: an unevaluable lock keeps its cause, and
+    /// the advice that fits it, for whichever message is printed.
+    #[test]
+    fn an_unevaluable_lock_keeps_its_cause_for_both_front_ends() {
+        let erofs = || std::io::Error::from_raw_os_error(libc::EROFS);
+        let reading = LockReading::of(Err(erofs())).expect("a lock that cannot be evaluated");
+        assert!(reading.state == crate::lock::LockState::Unknown);
+        let (cause, advice) = reading.unevaluated_words();
+        assert!(cause.contains(&erofs().to_string()), "{cause}");
+        assert!(advice.contains("read-only"), "{advice}");
+        assert!(
+            capitalized(advice).starts_with("The state directory"),
+            "the TUI message starts a sentence with it: {advice}"
+        );
+    }
     use std::path::{Path, PathBuf};
 
     fn temp_state_dir(tag: &str) -> PathBuf {
@@ -2001,17 +2089,21 @@ mod acquire_write_lock_tests {
         }
     }
 
+    /// What a filesystem that cannot lock at all answers `flock` with.
+    fn no_locks(_: &Path) -> std::io::Result<crate::lock::Acquire> {
+        Err(std::io::Error::from_raw_os_error(libc::ENOLCK))
+    }
+
     #[test]
     fn unevaluable_lock_refuses_the_write_even_with_allow_policy() {
         let dir = temp_state_dir("unevaluable");
-        // A directory where the lock file belongs: opening it read-write fails with EISDIR, so
-        // try_acquire returns Err — the same shape as ENOLCK on a filesystem without lockd.
-        std::fs::create_dir_all(dir.join("dedcom.lock")).unwrap();
+        // dedcom's own directory — its lock file is there, and the attempt on it below fails.
+        std::fs::write(dir.join("dedcom.lock"), b"").unwrap();
         // The most permissive policy there is must not buy a way past it.
         std::fs::write(dir.join("config.json"), br#"{"concurrency":"allow"}"#).unwrap();
 
         // `match` rather than expect_err: the Ok side holds a lock guard, which is not Debug.
-        let err = match acquire_write_lock(&cli_for(&dir, false)) {
+        let err = match acquire_write_lock_with(&cli_for(&dir, false), no_locks) {
             Ok(_) => panic!("an unevaluable lock must refuse the write"),
             Err(err) => err.to_string(),
         };
@@ -2023,9 +2115,13 @@ mod acquire_write_lock_tests {
             err.contains("--force"),
             "the message must offer --force, got: {err}"
         );
+        assert!(
+            err.contains("No locks available") && err.contains("cannot provide the lock"),
+            "and say why, from the errno: {err}"
+        );
 
         // --force is the one documented way through, and it holds no guard.
-        let forced = match acquire_write_lock(&cli_for(&dir, true)) {
+        let forced = match acquire_write_lock_with(&cli_for(&dir, true), no_locks) {
             Ok(guard) => guard,
             Err(err) => panic!("--force must proceed, got: {err}"),
         };
@@ -2095,10 +2191,32 @@ mod acquire_write_lock_tests {
         std::fs::remove_dir_all(&dir).ok();
 
         let dir = temp_state_dir("unevaluable_ro");
-        std::fs::create_dir_all(dir.join("dedcom.lock")).unwrap();
-        let err = refused(&observer(&dir));
+        let err = match acquire_write_lock_with(&observer(&dir), no_locks) {
+            Ok(_) => panic!("the write must be refused"),
+            Err(err) => err.to_string(),
+        };
         assert!(err.contains("--read-only given"), "{err}");
         assert!(!err.contains("--force"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A directory under the lock's name is a file that is not ours, not a lock that could not be
+    /// evaluated: `--force` — the way past an unevaluable lock — does not take the write past it.
+    #[test]
+    fn a_directory_under_the_lock_name_refuses_the_write_whatever_the_flags() {
+        let dir = temp_state_dir("lock_dir");
+        std::fs::create_dir_all(dir.join("dedcom.lock")).unwrap();
+        for force in [false, true] {
+            let err = match acquire_write_lock(&cli_for(&dir, force)) {
+                Ok(_) => panic!("force={force}: a directory cannot be the lock"),
+                Err(err) => err.to_string(),
+            };
+            assert!(err.contains("is a directory"), "force={force}: {err}");
+            assert!(
+                err.contains("--force does not apply"),
+                "force={force}: {err}"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

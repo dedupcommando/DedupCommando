@@ -587,7 +587,10 @@ fn render_help(frame: &mut Frame) {
         Line::from("    d              deletion (move to quarantine)"),
         Line::from("    h              hardlink"),
         Line::from("    c              reflink (ZFS clone)"),
-        Line::from("    a              auto-select across all groups"),
+        // Two lines: the window is 64 columns and does not wrap, and one line was cut off before
+        // the word that matters.
+        Line::from("    a              keep the newest file of each group,"),
+        Line::from("                   mark every other file Delete (all groups)"),
         Line::from("    r              review actions (dry-run)"),
         Line::from(""),
         Line::from("  Other".bold()),
@@ -1044,6 +1047,32 @@ mod plan_surface_parity_tests {
         assert!(
             summary.contains("realized: guaranteed after quarantine purge: 0"),
             "and it says the realized figure is zero:\n{summary}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod help_window_tests {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// The help window neither wraps nor scrolls: every line has to fit its 64 columns, and every
+    /// row its height. The `a` line used to end at «mark the res».
+    #[test]
+    fn the_help_window_shows_what_a_marks_and_all_of_itself() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(super::render_help).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let shown: Vec<String> = (0..40)
+            .map(|y| (0..120).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let shown = shown.join("\n");
+        assert!(
+            shown.contains("mark every other file Delete (all groups)"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("[Esc] close"),
+            "the last line fits too:\n{shown}"
         );
     }
 }

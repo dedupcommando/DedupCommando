@@ -112,6 +112,28 @@ fn move_dir_item(
     }
 }
 
+/// Moves a duplicate into `dest_dir` under `{stem}.dupN{.ext}`.
+fn move_duplicate(src: &Path, dest_dir: &Path) -> crate::error::Result<PathBuf> {
+    crate::actions::move_file::move_to(src, &super::dup_dest(dest_dir, src))
+        .map_err(|err| dup_marker_too_long(src, err))
+}
+
+/// A name near the limit has no room for the `.dupN` marker. «File name too long» alone blamed the
+/// file; it is the marker that does not fit.
+fn dup_marker_too_long(src: &Path, err: crate::error::AppError) -> crate::error::AppError {
+    match &err {
+        crate::error::AppError::Io(io) if crate::actions::move_file::is_name_too_long(io) => {
+            crate::error::AppError::msg(format!(
+                "{} duplicates a file already there, and its name has no room for the «.dupN» \
+                 marker under {} — rename it first ({io})",
+                crate::textsan::path(src),
+                crate::actions::move_file::NAME_LIMIT
+            ))
+        }
+        _ => err,
+    }
+}
+
 /// Records a move failure: the reason goes to `dedcom.log` (previously `Err(_) =>
 /// failed += 1` silently lost it, including the `rsync` hint for a cross-dataset move).
 fn fail(out: &mut MoveBatchOutcome, src: &Path, err: &crate::error::AppError) {
@@ -348,7 +370,7 @@ fn move_file_item(
         }
     }
     let final_dest = if dup {
-        crate::actions::move_file::move_to(src, &super::dup_dest(dest_dir, src))
+        move_duplicate(src, dest_dir)
     } else {
         crate::actions::move_file::move_into_dir(src, dest_dir)
     };
@@ -460,6 +482,33 @@ mod tests {
             b"the very same bytes in both of them",
         );
         (root, file, dest)
+    }
+
+    /// A duplicate whose name has no room for `.dupN` is refused with that said, and stays put.
+    #[test]
+    fn a_duplicate_without_room_for_its_marker_is_named() {
+        let root = temp_dir("dup_long");
+        let src = root.join("src");
+        let dest = root.join("dest");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        // Three bytes short of the limit: the name fits, `.dup1` does not.
+        let stem = "p".repeat(crate::testfixtures::name_max(&root) - 3 - ".bin".len());
+        let file = src.join(format!("{stem}.bin"));
+        write(&file, b"twin");
+        write(&dest.join("twin.bin"), b"twin");
+
+        let err = move_duplicate(&file, &dest)
+            .expect_err("`.dup1` takes the name past the limit")
+            .to_string();
+        assert!(
+            err.contains("«.dupN»") && err.contains(crate::actions::move_file::NAME_LIMIT),
+            "{err}"
+        );
+        let too_long = std::io::Error::from_raw_os_error(libc::ENAMETOOLONG).to_string();
+        assert!(err.contains(&too_long), "the OS's words: {err}");
+        assert!(file.exists(), "the file stays put");
+        fs::remove_dir_all(&root).ok();
     }
 
     /// A destination that cannot be read must not pass for a destination with no duplicates.

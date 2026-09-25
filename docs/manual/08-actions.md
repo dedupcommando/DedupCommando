@@ -18,8 +18,9 @@ publication.
 | **Reflink**  | `C`   | **F6**  | In place of the target — a separate file sharing blocks with the keeper | Yes |
 | **Keeper**   | `K`   | **F7**  | The group's keeper file (one per group; not an action by itself) | —          |
 
-For `D`/`H`/`C` to take effect, the group must have a **Keeper** assigned. Without a
-keeper the actions are ignored (there is nothing for the target to be "linked" to).
+For `D`/`H`/`C` to take effect, the group must have a **Keeper** assigned. A group with
+marked files and no keeper stops the whole plan before anything runs:
+`the group <hash> has files marked for an action and no keeper — choose the file to keep`.
 
 ## 8.1. Delete — move to quarantine
 
@@ -190,12 +191,23 @@ leftover `.dedcom-tmp-…` is a link to, or a clone of, the keeper: once the tar
 place it can be deleted.
 
 All three steps are atomic at the kernel level (`renameat2(RENAME_NOREPLACE)`). If
-step 3 fails (someone claimed the slot between steps 2 and 3), the original is
-**automatically restored from quarantine**, with the error
-`<path> changed at the moment of applying — action cancelled, original restored`.
+step 3 fails, the error says why, and the original goes back from quarantine into its
+slot:
+`the replacement could not be published: the prepared replacement or its directory
+disappeared (No such file or directory (os error 2)) — action cancelled, original
+restored`. A full dataset, an exhausted quota, a read-only filesystem or an I/O error on
+the pool is named the same way.
 
-This means: **even mid-apply** the target is never in a "lost" state — it is either
-the original in place, or the original in quarantine + the replacement published.
+If another file claimed the slot between steps 2 and 3, the original cannot go back
+either: the slot keeps the other file, and the original stays in quarantine —
+`the replacement could not be published: another file took the path in the meantime
+(File exists (os error 17)); putting the original back failed as well: another file took
+the path in the meantime (File exists (os error 17)) — the original is kept in
+quarantine: <quarantine path>; its place: <path>`. Move it back by hand once the slot is
+clear ([§03](03-safety.md#2-quarantine-instead-of-unlink)).
+
+This means: **even mid-apply** the original is never lost — it is either in place, or in
+quarantine at the exact path the error names.
 
 ## 8.6. Revalidation — the final check before each action
 
@@ -301,8 +313,8 @@ dedcom --purge-quarantine --yes                    # removes every quarantine, f
 
 The Summary lists the exact commands to run, under
 `Space is released AFTER verifying and purging with the commands:` →
-`zfs destroy <snap>` / `dedcom --purge-quarantine` (on its own it only lists what it
-would remove; `--yes` removes it).
+`zfs destroy <snap>` for each snapshot, then the two purge lines of the ritual above: the
+one that shows what it would remove, and the one with `--yes` that removes it.
 
 After `--purge-quarantine --yes` the quarantine is gone for good (it is a final
 `rm -rf`); until you destroy the `@dedcom-…` snapshots the originals can still be copied

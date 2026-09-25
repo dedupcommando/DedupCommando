@@ -64,6 +64,22 @@ pub fn mode_bits(path: &Path) -> u32 {
         & 0o7777
 }
 
+/// The longest name the filesystem under `dir` takes, in bytes — 255 on most, 1023 on a ZFS dataset
+/// with `longname=on`. A test that needs a name at the limit asks rather than assumes.
+pub fn name_max(dir: &Path) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a valid C string and a zeroed repr(C) struct that statvfs fills in.
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::statvfs(c.as_ptr(), &mut vfs) },
+        0,
+        "statvfs {}",
+        dir.display()
+    );
+    vfs.f_namemax as usize
+}
+
 /// The names in `dir`, sorted — what a test compares to say nothing was created there.
 pub fn names_in(dir: &Path) -> Vec<std::ffi::OsString> {
     let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(dir)

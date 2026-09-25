@@ -38,6 +38,14 @@ pub fn delete_to_quarantine(
         match crate::actions::move_file::rename_noreplace(target, &candidate) {
             Ok(()) => return Ok(candidate),
             Err(err) if err.raw_os_error() == Some(libc::EEXIST) => n += 1,
+            // The quarantine already holds this pathname, and the name has no room for `.N`.
+            Err(err) if n > 0 && crate::actions::move_file::is_name_too_long(&err) => {
+                return Err(crate::actions::move_file::suffix_too_long(
+                    &base,
+                    &format!(".{n}"),
+                    &err,
+                ))
+            }
             Err(err) => return Err(err.into()),
         }
     }

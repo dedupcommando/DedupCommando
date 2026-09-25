@@ -47,10 +47,36 @@ pub fn move_to(src: &Path, dest: &Path) -> Result<PathBuf> {
             // Cross-dataset (EXDEV): rename is impossible. REFUSAL —
             // copying would lose metadata and inflate sparse; see cross_device_error.
             Err(err) if is_cross_device(&err) => return Err(cross_device_error(src, dest, false)),
+            Err(err) if n > 0 && is_name_too_long(&err) => {
+                return Err(suffix_too_long(dest, &format!(".{n}"), &err))
+            }
             Err(err) => return Err(err.into()),
         }
     }
 }
+
+/// `ENAMETOOLONG` — the one answer that means the NAME did not fit, not the file.
+pub(crate) fn is_name_too_long(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(libc::ENAMETOOLONG)
+}
+
+/// A name already at the filesystem's limit has no room for the suffix dedcom adds to settle a
+/// collision. The bare «File name too long» reads as if the file itself were at fault; it is the
+/// suffix that does not fit, and the way out is a shorter name for one of the two files. The name
+/// is not shortened here: the operator sees and keeps these names, so cutting one quietly is not
+/// ours to do.
+pub(crate) fn suffix_too_long(taken: &Path, suffix: &str, err: &std::io::Error) -> AppError {
+    AppError::msg(format!(
+        "{} is taken, and adding «{suffix}» to the name passes {NAME_LIMIT} — rename one of the \
+         two files first ({err})",
+        crate::textsan::path(taken)
+    ))
+}
+
+/// The limit a name ran into. Not a bare number: a ZFS dataset with `longname=on` takes 1023 bytes,
+/// and one with `normalization` holds the normalized form to the limit.
+pub(crate) const NAME_LIMIT: &str =
+    "the filesystem's name-length limit (255 bytes on most datasets)";
 
 /// Candidate name with a collision suffix: `n == 0` → `base`, otherwise `base.N`.
 ///
@@ -261,6 +287,43 @@ mod tests {
         assert_eq!(fs::read(dst_dir.join("a.txt")).unwrap(), b"old"); // original intact
         assert_eq!(fs::read(&final_dest).unwrap(), b"new");
         assert!(!src.exists());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A name one byte short of the limit has no room for the `.N` a collision needs. The bare «File
+    /// name too long» reads as if the file itself were at fault; it is the suffix that does not fit,
+    /// and the way out is to rename one of the two files.
+    #[test]
+    fn a_collision_suffix_that_does_not_fit_is_named() {
+        let root = temp_dir("coll_long");
+        let src_dir = root.join("src");
+        let dst_dir = root.join("dst");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&dst_dir).unwrap();
+        let name = "a".repeat(crate::testfixtures::name_max(&root) - 1);
+        let src = src_dir.join(&name);
+        write_file(&src, b"new");
+        write_file(&dst_dir.join(&name), b"old");
+        let too_long = std::io::Error::from_raw_os_error(libc::ENAMETOOLONG).to_string();
+
+        let err = move_into_dir(&src, &dst_dir)
+            .expect_err("`.1` takes the name past the limit")
+            .to_string();
+        assert!(err.contains("«.1»"), "which suffix did not fit: {err}");
+        assert!(err.contains(NAME_LIMIT), "and against what limit: {err}");
+        assert!(err.contains(&too_long), "the OS's words: {err}");
+        assert_eq!(fs::read(&src).unwrap(), b"new", "the file stays put");
+
+        // Quarantine settles a collision the same way, and says the same.
+        let q = root.join("q");
+        fs::create_dir_all(q.join("src")).unwrap();
+        write_file(&q.join("src").join(&name), b"quarantined earlier");
+        let err = crate::actions::delete::delete_to_quarantine(&src, &root, &q)
+            .expect_err("`.1` takes the name past the limit")
+            .to_string();
+        assert!(err.contains("«.1»") && err.contains(NAME_LIMIT), "{err}");
+        assert_eq!(fs::read(&src).unwrap(), b"new", "the file stays put");
 
         fs::remove_dir_all(&root).ok();
     }

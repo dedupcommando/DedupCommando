@@ -411,13 +411,10 @@ pub fn prepare_db_file(db_path: &Path) -> io::Result<()> {
         )
     };
     if fd < 0 {
-        let err = io::Error::last_os_error();
-        return Err(io::Error::new(
-            err.kind(),
-            format!(
-                "failed to open the DB file safely (symlink?): {}: {err}",
-                crate::textsan::terminal(&db_path.display().to_string())
-            ),
+        return Err(db_open_error(
+            DbOpen::Create,
+            db_path,
+            io::Error::last_os_error(),
         ));
     }
     // SAFETY: fd >= 0 and just obtained from open — we own it (closed on Drop).
@@ -493,13 +490,10 @@ pub fn probe_existing_db_file(db_path: &Path) -> io::Result<PathIdentity> {
         )
     };
     if fd < 0 {
-        let err = io::Error::last_os_error();
-        return Err(io::Error::new(
-            err.kind(),
-            format!(
-                "cannot verify the DB file (missing? symlink?): {}: {err}",
-                crate::textsan::terminal(&db_path.display().to_string())
-            ),
+        return Err(db_open_error(
+            DbOpen::Verify,
+            db_path,
+            io::Error::last_os_error(),
         ));
     }
     // SAFETY: fd >= 0 and just obtained from open — we own it (closed on Drop).
@@ -521,6 +515,48 @@ pub fn probe_existing_db_file(db_path: &Path) -> io::Result<PathIdentity> {
         device: st.st_dev as u64,
         inode: st.st_ino as u64,
     })
+}
+
+/// Which open of the DB file failed: the one that creates it if absent, or the one that only
+/// checks it. A missing name means a missing directory to the first and a missing file to the
+/// second.
+#[derive(Debug, Clone, Copy)]
+enum DbOpen {
+    Create,
+    Verify,
+}
+
+/// The `open` of the DB file that failed with `err` (taken at the call site, before anything else
+/// can touch errno), with what the name holds. «symlink?» used to be the guess for every errno,
+/// and it sent the operator looking for a link when the name held a directory, or nothing at all.
+fn db_open_error(open: DbOpen, db_path: &Path, err: io::Error) -> io::Error {
+    let (doing, what) = match (open, err.raw_os_error()) {
+        (DbOpen::Create, Some(libc::ENOENT)) => ("cannot create", "its directory does not exist"),
+        (DbOpen::Verify, Some(libc::ENOENT)) => ("cannot verify", "it does not exist"),
+        (open, errno) => (
+            match open {
+                DbOpen::Create => "cannot open",
+                DbOpen::Verify => "cannot verify",
+            },
+            match errno {
+                Some(libc::ELOOP) => "it is a symbolic link, and dedcom does not open one here",
+                Some(libc::EISDIR) => "it is a directory, not a database file",
+                Some(libc::EACCES | libc::EPERM) => {
+                    "permission denied (an immutable file or directory?)"
+                }
+                Some(libc::EROFS) => "the filesystem is read-only",
+                Some(libc::ENOSPC | libc::EDQUOT) => "there is no space or quota left to create it",
+                _ => "the open failed",
+            },
+        ),
+    };
+    io::Error::new(
+        err.kind(),
+        format!(
+            "{doing} the DB file {}: {what} ({err})",
+            crate::textsan::terminal(&db_path.display().to_string())
+        ),
+    )
 }
 
 fn cstring(path: &Path) -> io::Result<CString> {
@@ -1728,6 +1764,32 @@ mod tests {
         let base = temp_path("vf_dir");
         // open(O_RDONLY) on a directory succeeds on Linux — the S_ISREG check is what rejects it.
         assert!(verify_existing_db_file(&base).is_err());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Opening the DB file names what is under that name. «symlink?» was the guess for every errno,
+    /// and it sent the operator looking for a link when the name held a directory or nothing.
+    #[test]
+    fn a_db_file_that_cannot_be_opened_is_named_by_what_it_is() {
+        let base = temp_path("db_cause");
+        let dir_named_like_db = base.join("dedcom.db");
+        std::fs::create_dir_all(&dir_named_like_db).unwrap();
+        let err = prepare_db_file(&dir_named_like_db).unwrap_err().to_string();
+        assert!(err.contains("is a directory, not a database file"), "{err}");
+        assert!(!err.contains("symlink"), "{err}");
+
+        let missing = base.join("absent.db");
+        let err = probe_existing_db_file(&missing).unwrap_err().to_string();
+        assert!(
+            err.contains("cannot verify") && err.contains("it does not exist"),
+            "{err}"
+        );
+        assert!(!err.contains("symlink"), "{err}");
+
+        // Creating it, a missing name is a missing directory: the file is what open(O_CREAT) makes.
+        let orphan = base.join("no-such-dir").join("dedcom.db");
+        let err = prepare_db_file(&orphan).unwrap_err().to_string();
+        assert!(err.contains("its directory does not exist"), "{err}");
         std::fs::remove_dir_all(&base).ok();
     }
 

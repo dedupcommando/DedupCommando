@@ -333,7 +333,8 @@ The cancel semantics — [§03 Data Safety](03-safety.md#press-esc-during-apply)
 │                                                                         │
 │ Space is released AFTER verifying and purging with the commands:       │
 │   zfs destroy tank@dedcom-20260527-143215-0                            │
-│   dedcom --purge-quarantine                                            │
+│   dedcom --purge-quarantine       # shows what it would remove         │
+│   dedcom --purge-quarantine --yes # removes every quarantine, for good │
 ├─────────────────────────────────────────────────────────────────────────┤
 │ [Esc] to configuration · [Q] quit                                      │
 └─────────────────────────────────────────────────────────────────────────┘

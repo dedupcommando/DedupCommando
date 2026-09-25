@@ -42,6 +42,15 @@ use crate::zfs::ZfsEnvironment;
 pub const MARKS_NOT_SETTLED: &str =
     "WARNING: the saved marks were not updated — the plan on disk still lists what was applied";
 
+/// What a finished auto-select says. «N marked» never said with what: every file but the newest of
+/// each group is marked Delete, over whatever keeper or mark those groups carried.
+fn auto_select_done_status(groups: u64, marks: u64) -> String {
+    format!(
+        "Auto-select: kept the newest file in {groups} groups, {marks} files marked Delete \
+         (earlier marks replaced)"
+    )
+}
+
 /// Shown when browsing stopped while a mark write was still unacknowledged. The window goes back
 /// to what the database last said; the acknowledgement the operator was told to wait for is never
 /// arriving, so the wait has to be ended in words rather than left on screen.
@@ -2682,8 +2691,7 @@ impl App {
         }
         match outcome {
             AutoSelectOutcome::Completed { groups, marks } => {
-                self.status =
-                    format!("Auto-select: kept the newest file in {groups} groups, {marks} marked");
+                self.status = auto_select_done_status(groups, marks);
                 self.after_bulk_mark_write(false);
             }
             // Partial means SOME chunks are durable: the RAM marks are invalidated exactly as
@@ -2697,7 +2705,8 @@ impl App {
             } => {
                 self.status = format!(
                     "Auto-select stopped after {committed_groups} groups (last rank \
-                     {last_committed_rank}{}): {detail}",
+                     {last_committed_rank}{}): {detail} — in those groups every file but the \
+                     newest stays marked Delete",
                     if cancelled { ", cancelled" } else { "" }
                 );
                 self.after_bulk_mark_write(true);
@@ -5579,6 +5588,51 @@ where
         let result = crate::panics::guard("the purge worker", job);
         let _ = events.send(AppEvent::SessionDeleted(result));
     });
+}
+
+#[cfg(test)]
+mod auto_select_status_tests {
+    use super::*;
+
+    /// The count is of Delete marks, and the sweep wrote them over whatever was there: both are
+    /// said, because «N marked» read like a count of anything. Through the handler, so the line
+    /// that puts the sentence on the status line is covered too — and a sweep that stopped part
+    /// way says what the groups it reached are left with.
+    #[test]
+    fn a_finished_or_stopped_auto_select_says_what_it_marked() {
+        let (mut app, _rx) = test_app();
+        let act = app.installed_act;
+        app.on_auto_select_done(
+            act,
+            RequestId(1),
+            AutoSelectOutcome::Completed {
+                groups: 3,
+                marks: 7,
+            },
+        );
+        assert!(
+            app.status.contains("7 files marked Delete"),
+            "{}",
+            app.status
+        );
+        assert!(
+            app.status.contains("earlier marks replaced"),
+            "{}",
+            app.status
+        );
+
+        app.on_auto_select_done(
+            act,
+            RequestId(2),
+            AutoSelectOutcome::Partial {
+                committed_groups: std::num::NonZeroU64::new(2).unwrap(),
+                last_committed_rank: 2,
+                cancelled: true,
+                detail: "cancelled by Esc".to_string(),
+            },
+        );
+        assert!(app.status.contains("stays marked Delete"), "{}", app.status);
+    }
 }
 
 /// `Settled` is not by itself permission to say «saved».

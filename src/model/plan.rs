@@ -2572,4 +2572,21 @@ mod tests {
             }
         }
     }
+
+    /// A group with marked files and no keeper refuses the plan; it is not skipped. The manual
+    /// used to say the actions are ignored, so it quotes the refusal where an operator reads
+    /// about keepers and where they look the message up.
+    #[test]
+    fn the_manual_quotes_the_missing_keeper_refusal() {
+        let quoted = PlanRefusal::MissingKeeper {
+            hash: "HASH".to_string(),
+        }
+        .to_string()
+        .replace("HASH", "<hash>");
+        for chapter in ["08-actions.md", "13-troubleshooting.md"] {
+            let text = crate::testfixtures::manual(chapter);
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(text.contains(&quoted), "{chapter} must quote: {quoted}");
+        }
+    }
 }

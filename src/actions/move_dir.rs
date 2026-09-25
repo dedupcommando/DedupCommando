@@ -9,7 +9,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::actions::move_file::{cross_device_error, is_cross_device, rename_noreplace, suffixed};
+use crate::actions::move_file::{
+    cross_device_error, is_cross_device, is_name_too_long, rename_noreplace, suffix_too_long,
+    suffixed,
+};
 use crate::error::{AppError, Result};
 
 /// Moves directory `src` ONTO path `dest`, uniquifying on a name collision
@@ -52,6 +55,9 @@ pub fn move_dir_to(src: &Path, dest: &Path) -> Result<PathBuf> {
             // copying the tree would lose metadata, would inflate sparse and would break
             // hardlinks; see cross_device_error.
             Err(err) if is_cross_device(&err) => return Err(cross_device_error(src, dest, true)),
+            Err(err) if n > 0 && is_name_too_long(&err) => {
+                return Err(suffix_too_long(dest, &format!(".{n}"), &err))
+            }
             Err(err) => return Err(err.into()),
         }
     }
@@ -114,6 +120,28 @@ mod tests {
 
         let final_dest = move_dir_into(&src, &dst).unwrap();
         assert_eq!(final_dest, dst.join("data.1"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory whose name is one byte short of the limit has no room for `.1` either, and the
+    /// refusal says so rather than leaving the bare «File name too long».
+    #[test]
+    fn a_collision_suffix_that_does_not_fit_is_named() {
+        let root = temp_dir("coll_long");
+        let name = "d".repeat(crate::testfixtures::name_max(&root) - 1);
+        let src = root.join("src").join(&name);
+        let dst = root.join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(dst.join(&name)).unwrap();
+
+        let err = move_dir_into(&src, &dst)
+            .expect_err("`.1` takes the name past the limit")
+            .to_string();
+        assert!(
+            err.contains("«.1»") && err.contains(crate::actions::move_file::NAME_LIMIT),
+            "{err}"
+        );
+        assert!(src.is_dir(), "the directory stays put");
         fs::remove_dir_all(&root).ok();
     }
 

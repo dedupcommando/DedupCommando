@@ -368,15 +368,18 @@ quarantine and reversible. Details in
 │ Completed successfully: 9 operations      Errors: 0                    │
 │                                                                         │
 │ Safety snapshots created:                                              │
-│   zfs rollback tank@dedcom-20260527-143215-512874000-4821-0           │
+│   tank@dedcom-20260527-143215-512874000-4821-0                        │
 │                                                                         │
 │ Files moved to quarantine:                                             │
 │   /tank/.dedcom-quarantine/20260527-143215-512874000-4821-0/          │
 │                                                                         │
-│ Volume of successfully processed files: 232.0 MiB                      │
+│ planned: guaranteed after quarantine purge: 232.0 MiB                  │
+│ realized: guaranteed after quarantine purge: 232.0 MiB                 │
+│                                                                        │
 │ Space is released AFTER verifying and purging with the commands:       │
 │   zfs destroy tank@dedcom-20260527-143215-512874000-4821-0            │
-│   dedcom --purge-quarantine                                            │
+│   dedcom --purge-quarantine       # shows what it would remove         │
+│   dedcom --purge-quarantine --yes # removes every quarantine, for good │
 ├─────────────────────────────────────────────────────────────────────────┤
 │ [Esc] to configuration · [Q] quit                                     │
 └─────────────────────────────────────────────────────────────────────────┘

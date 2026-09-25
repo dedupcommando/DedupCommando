@@ -1095,6 +1095,17 @@ impl ScanStore {
         Self::with_identity(conn, None)
     }
 
+    /// The errno SQLite recorded with the last I/O or open failure on this connection; `0` if it
+    /// recorded none. SQLite reports a write it could not make as «disk I/O error» whatever stopped
+    /// it — a quota, a dead disk and a read-only remount all read the same — and this is what tells
+    /// them apart. It describes a failure only when read right after one that records it: a full
+    /// database records none, and a later success does not clear an older value.
+    pub fn last_os_errno(&self) -> i32 {
+        // SAFETY: `handle()` is this store's own open connection, alive for the whole call;
+        // `sqlite3_system_errno` only reads a field of it.
+        unsafe { rusqlite::ffi::sqlite3_system_errno(self.conn.handle()) }
+    }
+
     fn with_identity(
         conn: Connection,
         db_identity: Option<(PathBuf, crate::paths::PathIdentity)>,

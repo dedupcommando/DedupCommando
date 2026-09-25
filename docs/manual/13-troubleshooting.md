@@ -96,14 +96,16 @@ lives on — never on a plain directory, which is never a mount point
 
 ## Applying actions
 
-### F11 → Esc, nothing happened
+### "the group <hash> has files marked for an action and no keeper — choose the file to keep"
 
-**Cause:** no keeper is assigned in any group. With no keeper there is nothing to
-keep, so the actions are ignored.
+**Cause:** a group has files marked Delete, Hardlink or Reflink, and none of its files
+is the keeper. The plan is refused as a whole: nothing runs, no snapshot is taken, and
+the marks stay.
 
-**Fix:** in a GroupFiles view, mark one entry of each group with **F7** (or Enter
-in the classic browser). You can also mark keepers automatically with **A** in
-the browser — the keeper is chosen by the most recent `mtime`.
+**Fix:** in a GroupFiles view, mark the file to keep with **F7** (or Enter in the
+classic browser), or unmark the group's files. **a** in the classic browser picks the
+keepers itself — the newest file of each group — but it also marks every other file of
+every group Delete, replacing the marks already set ([§8.9](08-actions.md#89-backups-and-other-programs-stores)).
 
 ### "cannot hardlink or reflink across datasets (N marks) — mark DELETE, unmark, or pick a keeper on the same dataset; first: … (HARDLINK), keeper …"
 

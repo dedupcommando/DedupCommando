@@ -110,6 +110,14 @@ pub trait ApplyOps {
     /// Runs after an original has been evacuated to quarantine and before its replacement takes
     /// the freed slot.
     fn before_publication(&self, _target: &Path, _replacement: &Path) {}
+
+    /// Moves `from` onto `to` without replacing anything there: the publication of a replacement,
+    /// and the return of an original when that fails. Production is the kernel's
+    /// `renameat2(RENAME_NOREPLACE)`; a test hands back the errno a pool would have to produce on
+    /// cue — an I/O error or a full dataset is not something a test can make the kernel say.
+    fn rename_noreplace(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        move_file::rename_noreplace(from, to)
+    }
 }
 
 /// The real thing: a `zfs snapshot`, and no interference anywhere else.
@@ -784,8 +792,9 @@ fn refused(action: &PlanAction, detail: String) -> (ActionOutcome, ActionResult)
 /// delete was safe, via quarantine). Now: (1) build the replacement under a temporary
 /// name (`build`); (2) evacuate the current `target` to quarantine atomically (like
 /// delete — the original is recoverable, not overwritten); (3) publish the replacement into
-/// the freed slot. If publication fails (the slot is occupied/disappeared between steps),
-/// the original is restored from quarantine.
+/// the freed slot. If publication fails, the original goes back from quarantine — when its slot is
+/// still free. A slot somebody else took keeps it out as well, and the original stays in quarantine
+/// (`Stranded`).
 ///
 /// Every arm is a typed [`Publication`]: where the original is, and whether it moved at all, is not
 /// something the caller should have to read out of a sentence.
@@ -821,32 +830,95 @@ fn evacuate_then_publish(
     };
     ops.before_publication(target, &temp);
     // (3) Publish the replacement into the freed target slot.
-    match move_file::rename_noreplace(&temp, target) {
+    match ops.rename_noreplace(&temp, target) {
         Ok(()) => Publication::Published {
             quarantined: evacuated,
         },
-        Err(_) => {
-            // The target slot is occupied/disappeared between evacuation and publication — we roll
-            // back: return the original from quarantine, delete the temp replacement.
-            let _ = std::fs::remove_file(&temp);
-            if move_file::rename_noreplace(&evacuated, target).is_ok() {
-                Publication::RolledBack {
+        Err(publish) => {
+            // Roll back: the replacement is removed and the original returns from quarantine — the
+            // two syscalls first, the sentences after, so the slot stands empty no longer than it
+            // did. Each failed step says why in its own errno: a lost race, a full dataset and a
+            // dying disk need three different things from the operator, and one sentence served
+            // all three. The summary prints the target's pathname before this text.
+            let leftover = remove_replacement(&temp);
+            let back = ops.rename_noreplace(&evacuated, target);
+            let cause = rename_cause(Step::Publish, &publish);
+            match back {
+                Ok(()) => Publication::RolledBack {
                     detail: format!(
-                        "{} changed at the moment of applying — action cancelled, original restored",
-                        target.display()
+                        "the replacement could not be published: {cause} — action cancelled, \
+                         original restored{leftover}"
                     ),
-                }
-            } else {
-                Publication::Stranded {
-                    detail: format!(
-                        "{} occupied during publication — original preserved in quarantine: {}",
-                        target.display(),
-                        evacuated.display()
-                    ),
-                    quarantined: evacuated,
+                },
+                Err(back) => {
+                    // A put-back that found nothing to move cannot promise the original is still
+                    // there; everything else left it exactly where the evacuation put it. The line
+                    // that points a recovery at the quarantine prints only this text, so it names
+                    // the place the original belongs as well.
+                    let whereabouts = if back.raw_os_error() == Some(libc::ENOENT) {
+                        "was moved to quarantine"
+                    } else {
+                        "is kept in quarantine"
+                    };
+                    Publication::Stranded {
+                        detail: format!(
+                            "the replacement could not be published: {cause}; putting the original \
+                             back failed as well: {} — the original {whereabouts}: {}; its place: \
+                             {}{leftover}",
+                            rename_cause(Step::PutBack, &back),
+                            evacuated.display(),
+                            target.display()
+                        ),
+                        quarantined: evacuated,
+                    }
                 }
             }
         }
+    }
+}
+
+/// Which of the two renames of a publication failed. `ENOENT` means a different file went missing
+/// in each.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    /// The replacement onto the freed slot.
+    Publish,
+    /// The original back from quarantine, after the publication failed.
+    PutBack,
+}
+
+/// Why a rename of a publication failed, in words, then in the OS's own. Only `EEXIST` means
+/// somebody took the slot; the others are the pool or the directory, and each names which.
+fn rename_cause(step: Step, err: &std::io::Error) -> String {
+    let why = match (err.raw_os_error(), step) {
+        (Some(libc::EEXIST), _) => "another file took the path in the meantime",
+        (Some(libc::ENOENT), Step::Publish) => {
+            "the prepared replacement or its directory disappeared"
+        }
+        (Some(libc::ENOENT), Step::PutBack) => "the original or the target's directory disappeared",
+        (Some(libc::ENOSPC), _) => "no space left on the dataset",
+        (Some(libc::EDQUOT), _) => "the dataset's quota is exhausted",
+        (Some(libc::EROFS), _) => "the filesystem became read-only",
+        (Some(libc::EIO), _) => "an I/O error on the pool (check `zpool status`)",
+        (Some(libc::EPERM | libc::EACCES), _) => {
+            "permission denied (an immutable or append-only directory?)"
+        }
+        _ => return err.to_string(),
+    };
+    format!("{why} ({err})")
+}
+
+/// Removes the replacement a failed publication left under its temporary name, and names it if it
+/// stays. For a hardlink the leftover is one more name of the keeper — which the ledger would
+/// otherwise report as somebody else's link.
+fn remove_replacement(temp: &Path) -> String {
+    match std::fs::remove_file(temp) {
+        Ok(()) => String::new(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => format!(
+            "; the temporary file {} could not be removed ({err}) — delete it by hand",
+            temp.display()
+        ),
     }
 }
 
@@ -1026,6 +1098,9 @@ pub(crate) mod tests {
         after_snapshots: RefCell<Option<Box<dyn FnOnce()>>>,
         before_action: RefCell<ActionHook>,
         before_publication: RefCell<PublicationHook>,
+        /// What the next publication renames answer, in order: an errno, or `None` for the
+        /// kernel's own answer. Once it runs out, every rename goes to the kernel.
+        renames: RefCell<std::collections::VecDeque<Option<i32>>>,
     }
 
     impl FakeOps {
@@ -1036,7 +1111,13 @@ pub(crate) mod tests {
                 after_snapshots: RefCell::new(None),
                 before_action: RefCell::new(None),
                 before_publication: RefCell::new(None),
+                renames: RefCell::new(std::collections::VecDeque::new()),
             }
+        }
+
+        pub(crate) fn failing_renames(self, answers: &[Option<i32>]) -> Self {
+            *self.renames.borrow_mut() = answers.iter().copied().collect();
+            self
         }
 
         pub(crate) fn refusing(mut self, dataset: &str) -> Self {
@@ -1092,6 +1173,13 @@ pub(crate) mod tests {
         fn before_publication(&self, target: &Path, replacement: &Path) {
             if let Some(hook) = self.before_publication.borrow_mut().as_mut() {
                 hook(target, replacement);
+            }
+        }
+
+        fn rename_noreplace(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            match self.renames.borrow_mut().pop_front().flatten() {
+                Some(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+                None => move_file::rename_noreplace(from, to),
             }
         }
     }
@@ -1582,13 +1670,34 @@ pub(crate) mod tests {
             let batch = run(&ops, &plan, &[dataset_over(&scenario.root, "tank/test")]).unwrap();
 
             assert_eq!(batch.failed(), 1);
+            // The replacement vanished (ENOENT), and a stranded original also found its slot
+            // taken (EEXIST). Each is said as the OS said it — «changed at the moment of
+            // applying» used to stand for every errno, and «occupied» for every failed return.
+            let message = batch.outcomes[0].result.as_ref().unwrap_err();
+            assert!(
+                message.contains(&os(libc::ENOENT)),
+                "the publication's own error: {message}"
+            );
+            assert!(
+                !message.contains("changed at the moment of applying")
+                    && !message.contains("occupied during publication"),
+                "{message}"
+            );
             let (_, state) = &batch.realized[0];
             if stranded {
+                assert!(
+                    message.contains(&os(libc::EEXIST)),
+                    "the failed return's own error: {message}"
+                );
                 let ObjectRealization::Unknown { quarantine, .. } = state else {
                     panic!("a stranded original is not a plain zero: {state:?}");
                 };
                 let quarantine = quarantine.as_ref().expect("the exact path is the recovery");
                 assert!(quarantine.exists(), "{}", quarantine.display());
+                assert!(
+                    message.contains(&quarantine.display().to_string()),
+                    "and where the original is: {message}"
+                );
             } else {
                 assert!(
                     matches!(
@@ -1904,8 +2013,10 @@ pub(crate) mod tests {
             .result
             .as_ref()
             .expect_err("the publication failed");
+        // The target's own failure, in its own words; its pathname is not repeated — the summary
+        // prints it before the message.
         assert!(
-            message.contains(&alias_a.display().to_string()),
+            message.contains("the replacement could not be published"),
             "the target's own failure is there: {message}"
         );
         assert!(
@@ -2282,6 +2393,209 @@ pub(crate) mod tests {
         );
         assert!(!has_tmp_leftovers(&mount), "no leftovers remained");
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The OS's own words for an errno — what any libc prints, which a literal is not.
+    fn os(errno: i32) -> String {
+        std::io::Error::from_raw_os_error(errno).to_string()
+    }
+
+    /// A target slot under a mount, its original written, and the quarantine directory for it.
+    fn publication_rig(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let root = temp_dir(tag);
+        let mount = root.join("mount");
+        std::fs::create_dir_all(&mount).unwrap();
+        let target = mount.join("t.bin");
+        write_file(&target, b"ORIG");
+        let q = quarantine::quarantine_dir(&mount, "ts");
+        (root, mount, target, q)
+    }
+
+    /// A publication that fails says why, in the OS's words. The replacement that went missing here
+    /// is not a change of the target, and the sentence used to say it was.
+    #[test]
+    fn a_rolled_back_publication_names_the_os_error() {
+        let (root, mount, target, q) = publication_rig("evac_cause");
+
+        let published = evacuate_then_publish(&RealOps, &target, |_temp| Ok(()), &mount, &q);
+        let Publication::RolledBack { detail } = &published else {
+            panic!("{published:?}");
+        };
+        assert!(detail.contains(&os(libc::ENOENT)), "{detail}");
+        assert!(
+            !detail.contains("changed at the moment of applying"),
+            "{detail}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"ORIG");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An I/O error on the publication is named as one, and the original goes back into its slot.
+    #[test]
+    fn an_io_error_on_publication_is_named_and_the_original_goes_back() {
+        let (root, mount, target, q) = publication_rig("evac_eio");
+        let ops = FakeOps::new().failing_renames(&[Some(libc::EIO)]);
+
+        let published = evacuate_then_publish(
+            &ops,
+            &target,
+            |temp| Ok(std::fs::write(temp, b"NEW")?),
+            &mount,
+            &q,
+        );
+        let Publication::RolledBack { detail } = &published else {
+            panic!("{published:?}");
+        };
+        assert!(
+            detail.contains(&os(libc::EIO)) && detail.contains("zpool status"),
+            "{detail}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"ORIG");
+        assert!(!has_tmp_leftovers(&mount), "the replacement is removed");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// When the return fails as well, the slot is empty: both errors are named, and so are the exact
+    /// quarantine path — the recovery works from it — and the place the original belongs.
+    #[test]
+    fn a_failed_return_names_both_errors_and_where_the_original_is() {
+        let (root, mount, target, q) = publication_rig("evac_stranded");
+        let ops = FakeOps::new().failing_renames(&[Some(libc::EIO), Some(libc::ENOSPC)]);
+
+        let published = evacuate_then_publish(
+            &ops,
+            &target,
+            |temp| Ok(std::fs::write(temp, b"NEW")?),
+            &mount,
+            &q,
+        );
+        let Publication::Stranded {
+            detail,
+            quarantined,
+        } = &published
+        else {
+            panic!("{published:?}");
+        };
+        assert!(detail.contains(&os(libc::EIO)), "{detail}");
+        assert!(detail.contains(&os(libc::ENOSPC)), "{detail}");
+        assert!(
+            detail.contains(&format!(
+                "the original is kept in quarantine: {}; its place: {}",
+                quarantined.display(),
+                target.display()
+            )),
+            "{detail}"
+        );
+        assert!(!target.exists(), "nothing is in the slot");
+        assert_eq!(std::fs::read(quarantined).unwrap(), b"ORIG");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A return that found nothing to move cannot promise the original is still in quarantine.
+    #[test]
+    fn a_return_that_found_nothing_does_not_promise_the_original() {
+        let (root, mount, target, q) = publication_rig("evac_gone");
+        let ops = FakeOps::new().failing_renames(&[Some(libc::EIO), Some(libc::ENOENT)]);
+
+        let published = evacuate_then_publish(
+            &ops,
+            &target,
+            |temp| Ok(std::fs::write(temp, b"NEW")?),
+            &mount,
+            &q,
+        );
+        let Publication::Stranded { detail, .. } = &published else {
+            panic!("{published:?}");
+        };
+        assert!(detail.contains("was moved to quarantine"), "{detail}");
+        assert!(!detail.contains("is kept in quarantine"), "{detail}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A replacement that could not be removed is named, with the way out — for a hardlink it is one
+    /// more name of the keeper, which nothing else would point at.
+    #[test]
+    fn a_replacement_that_cannot_be_removed_is_named() {
+        let (root, mount, target, q) = publication_rig("evac_leftover");
+        let ops = FakeOps::new().failing_renames(&[Some(libc::EIO)]);
+
+        let published = evacuate_then_publish(
+            &ops,
+            &target,
+            |temp| {
+                // A directory with something in it: `unlink` refuses it with EISDIR.
+                std::fs::create_dir(temp)?;
+                std::fs::write(temp.join("inside"), b"x")?;
+                Ok(())
+            },
+            &mount,
+            &q,
+        );
+        let Publication::RolledBack { detail } = &published else {
+            panic!("{published:?}");
+        };
+        assert!(
+            detail.contains("could not be removed") && detail.contains("delete it by hand"),
+            "{detail}"
+        );
+        assert!(detail.contains(&os(libc::EISDIR)), "{detail}");
+        assert!(detail.contains(".dedcom-tmp-"), "which file: {detail}");
+        assert!(has_tmp_leftovers(&mount), "the leftover really is there");
+        assert_eq!(std::fs::read(&target).unwrap(), b"ORIG");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The manual quotes both endings of a failed publication exactly as a batch reports them: the
+    /// rollback, and the slot another file took — from which the original cannot return either.
+    #[test]
+    fn the_manual_quotes_a_rollback_and_a_taken_slot() {
+        let chapter = crate::testfixtures::manual("08-actions.md");
+        let chapter = chapter.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let (root, mount, target, q) = publication_rig("evac_quote_back");
+        let published = evacuate_then_publish(&RealOps, &target, |_temp| Ok(()), &mount, &q);
+        let Publication::RolledBack { detail } = &published else {
+            panic!("{published:?}");
+        };
+        assert!(
+            chapter.contains(detail.as_str()),
+            "08-actions.md must quote: {detail}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+
+        // The kernel's own answers, both of them: nothing here is injected.
+        let (root, mount, target, q) = publication_rig("evac_quote_taken");
+        let ops = FakeOps::new()
+            .on_before_publication(|slot, _| std::fs::write(slot, b"squatter").unwrap());
+        let published = evacuate_then_publish(
+            &ops,
+            &target,
+            |temp| Ok(std::fs::write(temp, b"NEW")?),
+            &mount,
+            &q,
+        );
+        let Publication::Stranded {
+            detail,
+            quarantined,
+        } = &published
+        else {
+            panic!("{published:?}");
+        };
+        let quoted = detail
+            .replace(&quarantined.display().to_string(), "<quarantine path>")
+            .replace(&target.display().to_string(), "<path>");
+        assert!(
+            chapter.contains(&quoted),
+            "08-actions.md must quote: {quoted}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"squatter");
+        assert_eq!(std::fs::read(quarantined).unwrap(), b"ORIG");
         std::fs::remove_dir_all(&root).ok();
     }
 
