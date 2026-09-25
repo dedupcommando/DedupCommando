@@ -8,7 +8,7 @@ Five flags run `dedcom` without the TUI:
 | `--stats`                     | Prints statistics for all scans and DB state            |
 | `--compact-db`                | Empties the session trash and compacts the DB (VACUUM)  |
 | `--export-csv <PATH>`         | Exports the newest active session's published groups to CSV (refuses if it has not finished) |
-| `--purge-quarantine`          | Deletes the `.dedcom-quarantine` directories in all datasets |
+| `--purge-quarantine`          | Lists the `.dedcom-quarantine` directories in all datasets; deletes them with `--yes` |
 
 All of them **exit immediately** once done (there is no interactive UI). If
 another `dedcom` is already working on this state directory, the headless mode

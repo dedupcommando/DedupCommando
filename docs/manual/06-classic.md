@@ -219,7 +219,7 @@ also carries the suffix `-> DELETE`, `-> HARDLINK`, or `-> REFLINK`.
 | **h**                  | Mark as Hardlink                                    |
 | **c**                  | Mark as Reflink (ZFS clone)                         |
 | **Space**              | Clear the mark                                       |
-| **a**                  | Auto-select across ALL groups (keeper by rule + the rest = default action) |
+| **a**                  | Auto-select across ALL groups, without asking: the newest file of each group (by modification time) stays, every other one is marked Delete, replacing any keeper or mark already set — never on a scan that reaches another program's store ([§8.9](08-actions.md#89-backups-and-other-programs-stores)) |
 | **v**                  | Switch the file-view style (name bright / name first / by tree) |
 | **r**                  | Go to the action review (ActionReview)              |
 | **?**                  | Keyboard help                                       |
@@ -331,7 +331,7 @@ The cancel semantics — [§03 Data Safety](03-safety.md#press-esc-during-apply)
 │ planned: guaranteed after quarantine purge: 232.0 MiB                  │
 │ realized: guaranteed after quarantine purge: 232.0 MiB                 │
 │                                                                         │
-│ Space is freed AFTER verifying and purging with the commands:          │
+│ Space is released AFTER verifying and purging with the commands:       │
 │   zfs destroy tank@dedcom-20260527-143215-0                            │
 │   dedcom --purge-quarantine                                            │
 ├─────────────────────────────────────────────────────────────────────────┤

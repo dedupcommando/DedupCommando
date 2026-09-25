@@ -287,7 +287,7 @@ a=auto · v=view · r=review · ?=help`.
 | **h** / **H**          | Mark Hardlink                                           |
 | **c** / **C**          | Mark Reflink                                            |
 | **Space**              | Unmark                                                  |
-| **a** / **A**          | Auto-select across all groups                           |
+| **a** / **A**          | Auto-select across all groups, without asking: the newest stays, the rest marked Delete, replacing earlier marks ([§8.9](08-actions.md#89-backups-and-other-programs-stores)) |
 | **r** / **R**          | Action review → ActionReview                            |
 | **v** / **V**          | Path display style                                      |
 | **Esc**                | Back to ScanConfig                                      |

@@ -368,6 +368,9 @@ zfs list -H -t snapshot -o name,creation -p | grep 'dedcom-' | \
   action for that specific file, but it will not warn you before you reach F11. On
   large datasets it is sensible to run apply in a maintenance window, when writing
   workloads are stopped.
+- **Files that belong to another program.** Revalidation proves a file did not change since
+  the scan; it cannot tell that a backup program or a virtual machine needs that file as it
+  is, at its path ([§8.9](08-actions.md#89-backups-and-other-programs-stores)).
 - **A disk error on the dataset.** That is a level below `dedcom`; check `zpool
   status` and run a ZFS scrub. On a damaged pool no guarantees from the tool hold.
 - **Concurrent ZFS operations (send/receive/destroy).** Do not run `apply` at the

@@ -421,7 +421,8 @@ cleanup older than N days is in [§03 Viewing dedcom snapshots](03-safety.md#vie
 
 ```text
 du -sh /tank/.dedcom-quarantine/*                # see what is taking how much
-dedcom --purge-quarantine                        # clear EVERYTHING in all datasets
+dedcom --purge-quarantine                        # list what would be removed
+dedcom --purge-quarantine --yes                  # clear EVERYTHING in all datasets
 ```
 
 Or a specific timestamp:
@@ -430,8 +431,8 @@ Or a specific timestamp:
 rm -rf /tank/.dedcom-quarantine/20260520-143215-0/
 ```
 
-(`dedcom --purge-quarantine` clears all of it at once — there is no selective
-mode.)
+(`dedcom --purge-quarantine --yes` clears all of it at once — there is no
+selective mode.)
 
 ## When nothing helped
 

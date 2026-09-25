@@ -87,8 +87,9 @@ Always skipped:
 - `**/.dedcom-quarantine/**` — our own quarantine (we don't deduplicate
   ourselves).
 
-Additional `exclude_globs` can be set in the code/checkpoint; not yet
-configurable in the UI.
+There is no way to add exclusions of your own: a root takes in everything below it,
+including every dataset mounted there, so choose roots that do not reach what must stay
+untouched ([§8.9](08-actions.md#89-backups-and-other-programs-stores)).
 
 ## Hash cache (`hash_cache`)
 

@@ -148,7 +148,7 @@ continues.
 - **It does not touch real files.** This deletes the scan's **records**: the
   file manifest, the marks, the groups. ZFS snapshots (`@dedcom-<ts>`) and the
   file quarantine (`.dedcom-quarantine/<ts>/`) stay in place — clearing them is
-  separate (`zfs destroy`, `dedcom --purge-quarantine`; see
+  separate (`zfs destroy`, `dedcom --purge-quarantine --yes`; see
   [§03 Data Safety](03-safety.md)).
 - **It does not free space immediately.** SQLite does not return space to the
   `dedcom.db` file after a `DELETE`; that requires a `VACUUM`

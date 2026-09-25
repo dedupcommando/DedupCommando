@@ -31,8 +31,8 @@ A group of 3 files:
 
 After apply:
   /tank/a.bin                                        (unchanged)
-  /tank/.dedcom-quarantine/<ts>/tank/b.bin           (was /tank/b.bin)
-  /tank/.dedcom-quarantine/<ts>/tank/c.bin           (was /tank/c.bin)
+  /tank/.dedcom-quarantine/<ts>/b.bin                (was /tank/b.bin)
+  /tank/.dedcom-quarantine/<ts>/c.bin                (was /tank/c.bin)
 ```
 
 - The target is not destroyed — it is moved into `.dedcom-quarantine/<timestamp>/...`
@@ -45,12 +45,13 @@ After apply:
 - The files are known junk: old builds, repeated downloads, temporary copies.
 - You do NOT need to preserve the file's path for other programs (that read from or
   write to that path).
-- After you have verified the result, `dedcom --purge-quarantine` reclaims the space.
+- After you have verified the result, `dedcom --purge-quarantine --yes` reclaims the
+  space.
 
 **What Delete does NOT do:**
 
 - It does NOT reclaim space immediately: the file sits in a quarantine on the same
-  dataset. Until `--purge-quarantine`, the space is still occupied.
+  dataset. Until `--purge-quarantine --yes`, the space is still occupied.
 - It does NOT work on a non-ZFS dataset without an explicit quarantine: if the
   automatic dataset detection by device fails (for example, a virtual filesystem
   nested inside another), the action is cancelled with the error
@@ -69,8 +70,8 @@ After apply:
   /tank/b.bin   (inode 12345, the same one)
   /tank/c.bin   (inode 12345, the same one)
 
-  /tank/.dedcom-quarantine/<ts>/tank/b.bin   (was the original /tank/b.bin)
-  /tank/.dedcom-quarantine/<ts>/tank/c.bin   (was the original /tank/c.bin)
+  /tank/.dedcom-quarantine/<ts>/b.bin   (was the original /tank/b.bin)
+  /tank/.dedcom-quarantine/<ts>/c.bin   (was the original /tank/c.bin)
 ```
 
 - The target AND the keeper share **ONE inode entry** in the filesystem. Metadata
@@ -90,7 +91,7 @@ After apply:
 | Limitation | Details |
 |---|---|
 | Only within a **single dataset** | If the target and keeper are in different datasets, the plan is refused before anything runs: `cannot hardlink or reflink across datasets (N marks) — mark DELETE, unmark, or pick a keeper on the same dataset; first: … (HARDLINK), keeper …`. A ZFS dataset is a separate filesystem, and a hardlink between filesystems is impossible in principle. |
-| The target takes on the keeper's metadata | After the action the path IS the keeper's inode, so its owner, permissions, ACL and xattrs are the keeper's. The target's own are not merged — they stay only on the original in quarantine, and `--purge-quarantine` removes them for good. If the two files must keep different metadata, choose reflink. |
+| The target takes on the keeper's metadata | After the action the path IS the keeper's inode, so its owner, permissions, ACL and xattrs are the keeper's. The target's own are not merged — they stay only on the original in quarantine, and `--purge-quarantine --yes` removes them for good. If the two files must keep different metadata, choose reflink. |
 | Metadata is merged | A change of permissions/owner through any path is seen by all — it is **one** inode entry. |
 | A write through one path = a write for all | That is exactly what a hardlink means, but if different copies are expected to diverge, choose reflink or do NOT deduplicate them. |
 | Backup software may count N paths of one inode as one file | Depends on the software (`rsync` understands this, as does GNU `cp -a`; some count each name separately). |
@@ -108,8 +109,8 @@ After apply:
   /tank/b.bin   (inode 99999, blocks B1-B100 [shared], owner=user, mode=0600 — DIFFERENT metadata is possible!)
   /tank/c.bin   (inode 99998, blocks B1-B100 [shared], ...)
 
-  /tank/.dedcom-quarantine/<ts>/tank/b.bin
-  /tank/.dedcom-quarantine/<ts>/tank/c.bin
+  /tank/.dedcom-quarantine/<ts>/b.bin
+  /tank/.dedcom-quarantine/<ts>/c.bin
 ```
 
 - The target AND the keeper share **BLOCKS** at the pool level (ZFS `block_cloning`),
@@ -172,12 +173,12 @@ step 1: build the replacement under a temporary name next to the target
 
 step 2: evacuate the original target to quarantine atomically
         → /tank/dup.bin                                     (gone)
-        → /tank/.dedcom-quarantine/<ts>/tank/dup.bin       (was /tank/dup.bin)
+        → /tank/.dedcom-quarantine/<ts>/dup.bin            (was /tank/dup.bin)
         → /tank/.dedcom-tmp-...-dup.bin                    (intact)
 
 step 3: publish the replacement into the freed target slot
         → /tank/dup.bin                                     (new hardlink/reflink)
-        → /tank/.dedcom-quarantine/<ts>/tank/dup.bin       (original, intact)
+        → /tank/.dedcom-quarantine/<ts>/dup.bin            (original, intact)
 ```
 
 The temporary name starts with the target's name — its first 64 bytes at most, never half
@@ -286,7 +287,7 @@ Right after the Summary:
    current state).
 2. **The quarantine occupies space** — every evacuated original sits on the same
    dataset in `.dedcom-quarantine/<ts>/`. Until an explicit
-   `dedcom --purge-quarantine`, the space is still occupied.
+   `dedcom --purge-quarantine --yes`, the space is still occupied.
 
 A typical post-apply ritual (after a few days of calm operation):
 
@@ -294,16 +295,72 @@ A typical post-apply ritual (after a few days of calm operation):
 zfs list -t snapshot | grep dedcom-                # see what to remove
 zfs destroy tank@dedcom-20260527-143215-512874000-4821-0   # one at a time; for each dataset
 zfs destroy tank/media@dedcom-20260527-143215-512874000-4821-0
-dedcom --purge-quarantine                          # reclaims all quarantines
+dedcom --purge-quarantine                          # shows what it would remove
+dedcom --purge-quarantine --yes                    # removes every quarantine, for good
 ```
 
 The Summary lists the exact commands to run, under
-`Space is freed AFTER verifying and purging with the commands:` →
-`zfs destroy <snap>` / `dedcom --purge-quarantine`.
+`Space is released AFTER verifying and purging with the commands:` →
+`zfs destroy <snap>` / `dedcom --purge-quarantine` (on its own it only lists what it
+would remove; `--yes` removes it).
 
-After `--purge-quarantine`, restoring the files is no longer possible (it is a final
-`rm -rf`). Snapshots after `destroy` are also unrecoverable. **Wait 1–2 weeks**
+After `--purge-quarantine --yes` the quarantine is gone for good (it is a final
+`rm -rf`); until you destroy the `@dedcom-…` snapshots the originals can still be copied
+back out of them, and a destroyed snapshot cannot be brought back. **Wait 1–2 weeks**
 before cleaning up, to be sure the result is stable.
+
+## 8.9. Backups and other programs' stores
+
+`dedcom` does not know which files belong to another program's store — a Time Machine sparse
+bundle; a restic, borg, kopia, Arq or Duplicacy repository; a Proxmox Backup Server datastore;
+an iPhone backup; a virtual machine's disk. Such a store needs every one of its files at its own
+path with its own content, and it keeps its copies on purpose: two backups are two backups
+because they share nothing, and restic, borg, kopia, Duplicacy, Arq and Proxmox Backup Server
+already store each piece of data only once inside their own repository. A folder of plain
+copies you made yourself — like `/tank/backup/photo` in [§04](04-quickstart.md) — is not a
+store: each file there stands on its own, and the actions work on it as §8.1–8.3 describe.
+
+- **Leave stores out of the scan.** Choose scan roots that do not reach them: a root takes in
+  every dataset mounted below it, and there is no way to exclude a path, so the roots are the
+  only fence.
+- **Stop the program first** — the backup job, the virtual machine, the database; for Time
+  Machine, turn off automatic backups on the Mac. Each file is re-checked right before its
+  action, but a program that still has the file open goes on writing to the original, which by
+  then is in quarantine — after a Reflink too. The store never sees those writes, and
+  `--purge-quarantine --yes` later deletes them with the original.
+- **Delete** inside a store breaks it at once: the file is gone from where the program looks
+  for it, and a restore of that backup fails — or, in a sparse bundle, the missing piece may
+  read as empty space, and the damage shows only later, inside the image. The file waits in
+  quarantine until `--purge-quarantine --yes`, and the `@dedcom-…` snapshot holds it too: put
+  it back ([§03](03-safety.md#2-quarantine-instead-of-unlink)) before the program runs again.
+- **Hardlink** makes the two copies one file, with the keeper's owner and permissions. A
+  program that later writes into a file in place — virtual machine disks and databases are
+  written that way, and Time Machine keeps changing the files in its `bands/` folder, most
+  likely the same way — then silently changes the other copy as well, and the damage shows
+  only when it is read back. Only a store that writes each piece once and never changes it is
+  safe from that: restic, kopia and Duplicacy are built that way.
+- **Reflink** keeps two independent files that share blocks, and a write to one copies only
+  what it changes. With the program stopped, it is the one action after which a store reads
+  what it read before: the content, owner, permissions, extended attributes and modification
+  time stay; only the inode number, ctime and creation time are new. Two backups that share
+  blocks are still one unreadable block away from damaging both, though.
+- **Apply with `Y`, not with a saved script.** A script saved with `S` in the `F11` overlay
+  checks each file's inode, size and times but not its content, and its reflink copy belongs
+  to whoever runs it, with the current time and without extended attributes or ACLs.
+- **`a` in the classic browser** marks every file except the newest of each group (by
+  modification time) for deletion, across all groups of the scan, without asking, replacing
+  any keeper or mark already set
+  ([§6.5](06-classic.md#65-browser--viewing-groups-and-marking-actions)). The marks are saved
+  with the scan, and `F11` in commando applies them too. Pressed by mistake: `Esc` stops it
+  (groups already marked stay marked), and `F9` → `Clear all marks` in commando removes every
+  mark of the scan. Never use it on a scan that reaches a store.
+- **Check with the program's own tool, and purge nothing until it passes** — keep the
+  quarantine and the `@dedcom-…` snapshots until then: `restic check --read-data`,
+  `borg check --verify-data`, `kopia snapshot verify --verify-files-percent=100`,
+  `duplicacy check -chunks`, a verify job on a Proxmox Backup Server datastore, or, for a
+  network Time Machine backup, "Verify Backups" (hold Option in the Time Machine menu) — Apple
+  does not say how much of the data it reads. If a check fails, put the files back before you
+  accept anything the program offers: Time Machine, for one, may offer to start a new backup.
 
 ## What's next
 

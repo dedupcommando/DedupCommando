@@ -133,6 +133,10 @@ opens (Screen::ScanConfig).
    from Turbo — twice; the cycle is `Turbo → Balanced → Idle → Turbo`).
 3. **S** — start.
 
+> ⚠️ **A backup program's store or a virtual machine's disks on this pool?** Then do not
+> mark the whole pool: mark the datasets, or add the folders with **F**, that do not reach
+> them ([§8.9](08-actions.md#89-backups-and-other-programs-stores)).
+
 > ⚠️ **Idle on production data is mandatory.** There are three profiles:
 > **Turbo** (all cores, disk at full — "it's my pool, I'm in a hurry"),
 > **Balanced** (the default: 2 threads, no seek-thrash), and **Idle** (1 thread
@@ -370,7 +374,7 @@ quarantine and reversible. Details in
 │   /tank/.dedcom-quarantine/20260527-143215-512874000-4821-0/          │
 │                                                                         │
 │ Volume of successfully processed files: 232.0 MiB                      │
-│ Space is freed AFTER verifying and purging with the commands:          │
+│ Space is released AFTER verifying and purging with the commands:       │
 │   zfs destroy tank@dedcom-20260527-143215-512874000-4821-0            │
 │   dedcom --purge-quarantine                                            │
 ├─────────────────────────────────────────────────────────────────────────┤
@@ -385,7 +389,7 @@ Done. What to do next:
 - **When you're confident** — delete the snapshot and the quarantine:
   ```text
   zfs destroy tank@dedcom-20260527-143215-512874000-4821-0
-  dedcom --purge-quarantine
+  dedcom --purge-quarantine --yes
   ```
 - **If something is wrong** — roll back:
   ```text
