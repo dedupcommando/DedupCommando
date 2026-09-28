@@ -2761,19 +2761,34 @@ impl App {
         if !self.is_current(act) {
             return;
         }
-        match window {
+        // A reflink the host or a pool cannot make is refused before the confirmation opens:
+        // once confirmed, the batch could only refuse it.
+        let refusal = crate::actions::preflight::reflink_refusal(
+            &plan,
+            &self.datasets(),
+            self.zfs.capabilities.reflink_safe,
+        );
+        match (window, refusal) {
             // The review opens over the group view it was asked from, or not at all: a plan kept
             // without its review is guarded by nothing, so one that cannot be shown now is
             // dropped, as F11's is, and r builds it again. The note offers no way back: from the
             // scan settings of the classic wizard there is none.
-            PlanWindow::Wizard
+            (PlanWindow::Wizard, _)
                 if (self.mode, self.screen) != (AppMode::Wizard, Screen::Browser) =>
             {
                 self.note_everywhere(
                     "The plan built after you left the group view was dropped".to_string(),
                 )
             }
-            PlanWindow::Wizard => {
+            // A plan is guarded only while its confirmation is seated, so one that cannot be
+            // seated now is dropped rather than kept aside: F11 builds it again.
+            (PlanWindow::Commander, _) if self.commander_window_open() => {
+                self.note_late_answer("F11 (or x)", "the plan was built")
+            }
+            (window, Some(refusal)) => {
+                self.show_plan_refusal(window, crate::textsan::terminal(&refusal))
+            }
+            (PlanWindow::Wizard, None) => {
                 let mut list = ListState::default();
                 list.select(Some(0));
                 self.review = ReviewState {
@@ -2785,12 +2800,28 @@ impl App {
                 self.status.clear();
                 self.screen = Screen::ActionReview;
             }
-            // A plan is guarded only while its confirmation is seated, so one that cannot be
-            // seated now is dropped rather than kept aside: F11 builds it again.
-            PlanWindow::Commander if self.commander_window_open() => {
-                self.note_late_answer("F11 (or x)", "the plan was built")
+            (PlanWindow::Commander, None) => crate::tui::commander::actions::seat_plan(self, plan),
+        }
+    }
+
+    /// Every dataset the host reported at startup — what a batch snapshots and quarantines on.
+    fn datasets(&self) -> Vec<Dataset> {
+        self.zfs
+            .pools
+            .iter()
+            .flat_map(|pool| pool.datasets.iter().cloned())
+            .collect()
+    }
+
+    /// A plan that is not going to its confirmation: the refusal goes where the operator is
+    /// looking, and the commander forgets the plan it was waiting for.
+    fn show_plan_refusal(&mut self, window: PlanWindow, message: String) {
+        match window {
+            PlanWindow::Wizard => self.status = message,
+            PlanWindow::Commander => {
+                crate::tui::commander::actions::clear_pending(self);
+                self.commander.status = message;
             }
-            PlanWindow::Commander => crate::tui::commander::actions::seat_plan(self, plan),
         }
     }
 
@@ -2816,13 +2847,7 @@ impl App {
             // into a link since the scan — and that name is whatever the directory held.
             other => crate::textsan::terminal(&other.to_string()),
         };
-        match window {
-            PlanWindow::Wizard => self.status = message,
-            PlanWindow::Commander => {
-                crate::tui::commander::actions::clear_pending(self);
-                self.commander.status = message;
-            }
-        }
+        self.show_plan_refusal(window, message);
     }
 
     fn on_reconcile_ack(
@@ -3290,7 +3315,11 @@ impl App {
 
     /// What a guarded refusal says to the operator. Every variant means the batch never began.
     fn refusal_message(refusal: &ApplyRefusal) -> String {
-        format!("The batch was refused before any change: {refusal:?}")
+        match refusal {
+            // Written for the operator already, and it says itself that nothing changed.
+            ApplyRefusal::NothingCanRun { reason } => reason.clone(),
+            other => format!("The batch was refused before any change: {other:?}"),
+        }
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -4795,8 +4824,10 @@ impl App {
             return;
         }
         if action == Some(ActionKind::Reflink) && !self.zfs.capabilities.reflink_safe {
-            self.status =
-                "reflink unavailable — requires ZFS 2.3+ with block cloning enabled".to_string();
+            self.status = format!(
+                "reflink unavailable — {}",
+                crate::actions::preflight::CLONE_NEEDS
+            );
             return;
         }
         let Some((_, file_index)) = self.current_group_file() else {
@@ -5273,12 +5304,7 @@ impl App {
         if plan.actions().is_empty() {
             return;
         }
-        let datasets: Vec<Dataset> = self
-            .zfs
-            .pools
-            .iter()
-            .flat_map(|pool| pool.datasets.iter().cloned())
-            .collect();
+        let datasets = self.datasets();
         self.apply_affected = plan
             .actions()
             .iter()
@@ -8571,5 +8597,143 @@ mod hostile_name_tests {
         let message = duplicates_of_cursor_empty_message(WatchEmpty::NameNotUtf8, Some(7));
         assert!(message.contains("not UTF-8"), "{message:?}");
         assert!(!message.contains("no dupes"), "{message:?}");
+    }
+}
+
+/// What cannot run is refused before anything changes: a reflink the host or a pool cannot make as
+/// soon as its plan arrives, in either window, and a batch in which no action can run with its plan
+/// handed back.
+#[cfg(test)]
+mod preflight_refusal_tests {
+    use super::*;
+    use crate::model::dataset::Pool;
+    use crate::state::browse::{BrowseEvent, RequestId};
+    use crate::testfixtures::PlanScenario;
+    use crate::tui::commander::state::Overlay;
+
+    /// One keeper and one twin marked Reflink, planned by the production authority.
+    fn reflink_plan(tag: &str) -> (PlanScenario, PathBuf, ActionPlan) {
+        let scenario = PlanScenario::new(tag);
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &twin, false, Some(ActionKind::Reflink));
+        drop(store);
+        let plan = crate::actions::tests::plan_of(&scenario, scan_id);
+        (scenario, twin, plan)
+    }
+
+    /// The plan answer as the actor delivers it, on the route `window` records.
+    fn deliver(app: &mut App, window: PlanWindow, plan: ActionPlan) {
+        let req = RequestId(u64::MAX - 97);
+        app.routes.plan = Some((req, window));
+        app.handle_event(AppEvent::Browse(Box::new(BrowseEvent::PlanReady {
+            act: app.installed_act,
+            req,
+            plan: Box::new(plan),
+        })));
+    }
+
+    /// The pool the scenario's files are on, with its block cloning as given.
+    fn pool_over(scenario: &PlanScenario, block_cloning: Option<bool>) -> Pool {
+        let mut dataset = crate::actions::tests::dataset_over(&scenario.root, "tank/test");
+        dataset.block_cloning = block_cloning;
+        Pool {
+            name: "tank".to_string(),
+            datasets: vec![dataset],
+        }
+    }
+
+    #[test]
+    fn a_host_that_cannot_clone_refuses_a_reflink_plan_in_the_commander() {
+        let (mut app, _rx) = test_app();
+        let (_scenario, twin, plan) = reflink_plan("k7a_host_commander");
+        deliver(&mut app, PlanWindow::Commander, plan);
+        assert_eq!(
+            app.commander.status,
+            format!(
+                "cannot reflink on this host (1 mark) — needs OpenZFS 2.2.1 or newer with \
+                 zfs_bclone_enabled=1; mark HARDLINK or DELETE, or unmark; first: {}",
+                twin.display()
+            )
+        );
+        assert_eq!(
+            app.commander.overlay,
+            Overlay::None,
+            "no confirmation opens"
+        );
+        assert!(app.commander.pending_plan.is_none());
+    }
+
+    #[test]
+    fn a_pool_that_cannot_clone_refuses_a_reflink_plan_in_the_review() {
+        let (mut app, _rx) = test_app();
+        app.zfs.capabilities.reflink_safe = true;
+        let (scenario, twin, plan) = reflink_plan("k7a_pool_review");
+        app.zfs.pools = vec![pool_over(&scenario, Some(false))];
+        app.mode = AppMode::Wizard;
+        app.screen = Screen::Browser;
+        deliver(&mut app, PlanWindow::Wizard, plan);
+        assert_eq!(
+            app.status,
+            format!(
+                "cannot reflink on pool tank (1 mark) — its block_cloning feature is disabled; \
+                 mark HARDLINK or DELETE, or unmark; first: {}",
+                twin.display()
+            )
+        );
+        assert_eq!(app.screen, Screen::Browser, "no review opens");
+        assert!(app.review.plan.is_none());
+    }
+
+    #[test]
+    fn a_pool_that_did_not_say_lets_a_reflink_plan_reach_its_confirmation() {
+        let (mut app, _rx) = test_app();
+        app.zfs.capabilities.reflink_safe = true;
+        let (scenario, _twin, plan) = reflink_plan("k7a_pool_unknown");
+        app.zfs.pools = vec![pool_over(&scenario, None)];
+        deliver(&mut app, PlanWindow::Commander, plan);
+        assert!(
+            matches!(app.commander.overlay, Overlay::Confirm { .. }),
+            "{}",
+            app.commander.status
+        );
+        assert!(app.commander.pending_plan.is_some());
+    }
+
+    /// A batch in which nothing can run comes back to its confirmation with its own line in the
+    /// status — no wrapper, no debug dump — so the operator can fix the cause and confirm again.
+    #[test]
+    fn a_plan_where_nothing_can_run_comes_back_with_its_reason() {
+        let (mut app, _rx) = test_app();
+        let (_scenario, _twin, plan) = reflink_plan("nothing_back");
+        app.commander.return_to_commander = true;
+        let reason = "nothing done — 1 action cannot run: read-only filesystem (tank/test); no \
+                      snapshot taken, marks kept; first: /tank/test/twin.bin";
+        app.on_apply_finished(ApplyOutcome::Refused {
+            refusal: ApplyRefusal::NothingCanRun {
+                reason: reason.to_string(),
+            },
+            plan: Box::new(plan),
+        });
+        assert_eq!(app.commander.status, reason);
+        assert!(
+            matches!(app.commander.overlay, Overlay::Confirm { .. }),
+            "the plan is seated again"
+        );
+        assert!(app.commander.pending_plan.is_some());
+    }
+
+    /// On a host that cannot clone, the classic browser's reflink mark says what the host needs.
+    #[test]
+    fn the_reflink_mark_names_what_the_host_needs() {
+        let (mut app, _rx) = test_app();
+        app.browser_mark(Some(ActionKind::Reflink));
+        assert_eq!(
+            app.status,
+            "reflink unavailable — needs OpenZFS 2.2.1 or newer with zfs_bclone_enabled=1"
+        );
     }
 }

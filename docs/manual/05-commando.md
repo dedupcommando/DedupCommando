@@ -14,8 +14,7 @@ cursor moves in a neighbouring panel.
 
 ```text
 ┌─ DedupCommando v0.9.0-beta.1 ────────────────────────  RAM 47.2M · CPU  3% ┐ ← header
-│ Multi-panel mode                                                            │ ← mode line
-│ ZFS: datasets 8 · block_cloning: tank, rpool · dedup: loaded                │ ← info line
+│ Multi-panel mode     ZFS: datasets 8     scan #5 · 2 h ago                  │ ← info line
 ├──────────────────────────┬──────────────────────────┬──────────────────────┤
 │ /tank · files · name     │ /tank · groups           │ Group files #5       │
 │ ▸ media/                 │ #1 ●●●●  72.4M × 23      │   /tank/IMG_3120.HEIC│ ← 2–4 panels
@@ -30,8 +29,9 @@ cursor moves in a neighbouring panel.
 ```
 
 - **Header** — the brand title, the version, and the process RAM/CPU badge.
-- **Info line** — an overview of ZFS (pools, datasets, capabilities) plus the
-  status of the dedup overlay (whether a scan result is loaded into the cache).
+- **Info line** — the mode, how many ZFS datasets the host reported (and how many
+  startup warnings, if any), and the active scan: its number and age, `(loading…)`
+  while its results load, or `no scan for <folder> · F12 — select`.
 - **Panels** — from 2 to 4; the ones that fit the window width are visible. If the
   window is narrow, the extra panels are "hidden", with a count in the status line.
 - **Status line** — a short hint for the active panel plus the relevant

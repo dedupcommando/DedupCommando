@@ -387,6 +387,7 @@ mod tests {
                 &std::fs::symlink_metadata(&scenario.root).unwrap(),
             )),
             snapdir_visible: false,
+            block_cloning: None,
         }];
         let render = |plan: &_| {
             let script = crate::actions::script_preview::render_script(

@@ -1018,6 +1018,7 @@ mod plan_surface_parity_tests {
             mountpoint: scenario.root.clone(),
             device_id: Some(std::fs::symlink_metadata(&scenario.root).unwrap().dev()),
             snapdir_visible: false,
+            block_cloning: None,
         }];
         let script = render_script(&plan, &datasets, Some("/usr/sbin/zfs"));
         assert!(script.contains(OUTSIDE), "script header:\n{script}");

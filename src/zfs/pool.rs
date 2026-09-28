@@ -5,7 +5,7 @@ use crate::model::scan::ScanEnvironment;
 
 /// Runs `zpool <args>` and returns stdout. `None` on any error —
 /// on a non-ZFS host the environment simply stays "unknown".
-fn zpool_output(args: &[&str]) -> Option<String> {
+pub(super) fn zpool_output(args: &[&str]) -> Option<String> {
     let output = Command::new(crate::zfs::zpool_bin())
         .args(args)
         .output()

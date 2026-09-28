@@ -330,6 +330,7 @@ mod tests {
             mountpoint: PathBuf::from(mountpoint),
             device_id: Some(device),
             snapdir_visible: false,
+            block_cloning: None,
         }
     }
 
@@ -640,6 +641,7 @@ mod tests {
             mountpoint: scenario.root.clone(),
             device_id: Some(std::fs::symlink_metadata(&scenario.root).unwrap().dev()),
             snapdir_visible: false,
+            block_cloning: None,
         }];
         // `echo` stands in for `zfs`: if the snapshot section is ever reached it says so on stdout.
         let script = render_script(&plan, &datasets, Some("/bin/echo"));

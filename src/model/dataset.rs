@@ -13,6 +13,9 @@ pub struct Dataset {
     pub device_id: Option<u64>,
     /// snapdir=visible — the `.zfs` directory is visible as a regular one.
     pub snapdir_visible: bool,
+    /// The pool's `feature@block_cloning`: `Some(true)` enabled or active, `Some(false)` disabled,
+    /// `None` when `zpool` did not say. Only `Some(false)` refuses a reflink.
+    pub block_cloning: Option<bool>,
 }
 
 impl Dataset {

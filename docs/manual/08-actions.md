@@ -127,9 +127,9 @@ After apply:
 
 | Limitation | Details |
 |---|---|
-| ZFS ≥ 2.3 with `block_cloning` enabled | `zpool get all <pool> \| grep block_cloning`; the scan configuration header shows on which pools it is active. If the host does not qualify, the action is cancelled with `reflink is unavailable on this host — needs ZFS 2.3+ with block cloning enabled`. |
+| The host and the pool must be able to clone | The host: OpenZFS 2.2.1 or newer with the module parameter `zfs_bclone_enabled` set to 1 — the scan configuration header shows `block cloning: supported=… enabled=…` and `reflink: available` or `unavailable`. The pool: `feature@block_cloning` enabled or active (`zpool get feature@block_cloning <pool>`). A plan with a reflink that either of them cannot make is refused before its confirmation opens — nothing is snapshotted, read or changed, and the marks stay: `cannot reflink on this host (N marks) — needs OpenZFS 2.2.1 or newer with zfs_bclone_enabled=1; mark HARDLINK or DELETE, or unmark; first: …` or `cannot reflink on pool <pool> (N marks) — its block_cloning feature is disabled; mark HARDLINK or DELETE, or unmark; first: …`. |
 | The target and keeper in the **same dataset** | As for a hardlink. `dedcom` clones with `FICLONE`, which the kernel refuses between two filesystems (`Invalid cross-device link`), and every ZFS dataset is a filesystem of its own — two datasets of one pool included. (ZFS itself can share blocks between datasets of one pool through `copy_file_range`, but where it cannot clone, that call quietly makes a full copy, so `dedcom` does not use it.) Such a plan is refused before anything runs, with no snapshot and nothing read: `cannot hardlink or reflink across datasets (N marks) — mark DELETE, unmark, or pick a keeper on the same dataset; first: … (REFLINK), keeper …`. |
-| `reflink_safe` is determined at startup | If `dedcom` did not establish at startup that `block_cloning` is safe for the pool, the action is cancelled (this is the same `reflink is unavailable …` refusal above). |
+| Both are read at startup | `dedcom` reads the OpenZFS version `zfs version` reports, `zfs_bclone_enabled` and every pool's `feature@block_cloning` once, when it starts: after changing them, restart it. A pool whose state `zpool` does not report is not refused for it — the kernel's own answer then comes at the action. |
 | The metadata has to be carryable | The replaced file's owner/mode/ACL/xattr are written onto the clone before it is published. If that cannot be done — no privilege to hand the file back to its owner, a filesystem that refuses an attribute — the action is cancelled with `cannot carry over the …` and the file is left untouched. Publishing a clone with the wrong owner would be the worse outcome. |
 
 **When to choose Reflink (over Hardlink):**
@@ -214,6 +214,35 @@ quarantine at the exact path the error names.
 Before each destructive action, the target and the keeper are re-checked against the
 hash from the last scan. If something is off, the action is cancelled with an error
 and the rest of the batch continues.
+
+### Before the snapshots — can the action be carried out at all
+
+Before the batch takes a single snapshot, every action is checked for what would stop it
+where its files are — without reading their content and without changing anything:
+
+- the file's dataset is one the host reported at startup, and the file is under that
+  dataset's mountpoint (the quarantine is made there);
+- the file's directory is on the same mount as the dataset's mountpoint, and for a
+  Hardlink the keeper's directory is on the same mount as the file's: a second mount of
+  the dataset (a bind mount) is refused, since neither a move into the quarantine nor a
+  link crosses mounts (a clone does, on Linux 5.18 and newer);
+- the filesystem is not read-only and has free space — a full pool or an exhausted quota
+  leaves no room for the quarantine (less than one record left counts as none);
+- neither the file, nor its directory, nor the directory the quarantine is made in is
+  immutable (`chattr +i`), and neither the file nor its directory is append-only
+  (`chattr +a`); for a Hardlink, the keeper is neither — the kernel refuses a link to such
+  a file;
+- a Reflink can be made by the host and by the pool ([§8.3](#83-reflink--an-independent-inode-with-shared-blocks)).
+
+An action that fails a check is refused with the reason, without its snapshot and without
+its files being read, and the rest of the batch goes on. A dataset gets a snapshot only
+when at least one of its actions can run. When no action of the batch can run, nothing is
+changed and no snapshot is taken, the plan goes back to its confirmation with its marks,
+and the status line says why — the first action's reason, then its path:
+`nothing done — N actions cannot run: …; no snapshot taken, marks kept; first: …`.
+Fix the cause and confirm again, or change the marks.
+What the kernel does not tell is never a reason to refuse: such an action meets the
+kernel's own answer at its moment, after its snapshot.
 
 ### Always checked (cheap)
 

@@ -55,7 +55,7 @@ beforehand. See [Safety](03-safety.md) for details.
 | Linux kernel ≥ 3.15         | Required               | Needed for `renameat2(RENAME_NOREPLACE)` for atomic publishing. On Proxmox it is certainly present.      |
 | ZFS                         | Strongly recommended   | Without ZFS, walk/hash work, but snapshot insurance is disabled. On Proxmox it is available out of the box. |
 | `zfs` in `PATH`             | Strongly recommended   | Needed for snapshots and dataset detection. See [Troubleshooting](13-troubleshooting.md) if it is not found. |
-| Reflink (block_cloning)     | Optional               | `zpool feature@block_cloning=active`. Without it, `delete` and `hardlink` are available, but not `reflink`. |
+| Reflink (block_cloning)     | Optional               | OpenZFS 2.2.1 or newer with `zfs_bclone_enabled=1`, and the pool's `feature@block_cloning` enabled or active. Without them, `delete` and `hardlink` are available, but not `reflink`. |
 | RAM                         | Depends on volume      | Walk/hash — tens of MB. Phase 3/3 — ~2.5 KiB/file; the `--merkle-dirs` alternative. Details in [Scanning](07-scanning.md). |
 | Terminal                    | UTF-8, 256 colors      | Unicode box-drawing (`┌┐└┘├┤─│`); ratatui works in most emulators. The Proxmox web shell has quirks ([Troubleshooting](13-troubleshooting.md)). |
 

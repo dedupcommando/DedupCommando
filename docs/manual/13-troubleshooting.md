@@ -128,23 +128,85 @@ link across datasets; the first of them is named, with `REFLINK` in place of
   to quarantine, freeing space without any link to the keeper;
 - unmark it (Space in either window).
 
-### "reflink is unavailable on this host — needs ZFS 2.3+ with block cloning enabled"
+### "cannot reflink on this host (N marks) — needs OpenZFS 2.2.1 or newer with zfs_bclone_enabled=1; mark HARDLINK or DELETE, or unmark; first: …"
 
-**Cause:** a ZFS pool without `block_cloning=active`. Check it:
+**Cause:** this host cannot clone blocks safely: the OpenZFS version `zfs version` reports
+is older than 2.2.1, or the module parameter `zfs_bclone_enabled` is 0. The scan
+configuration header shows what `dedcom` found: `block cloning: supported=… enabled=…` and
+`reflink: …`. The plan is refused before its confirmation opens: nothing is snapshotted,
+read or changed, and the marks stay.
+
+**Check:**
 
 ```text
-zpool get all | grep block_cloning
+zfs version
+cat /sys/module/zfs/parameters/zfs_bclone_enabled
 ```
 
-**Fix:**
+**Fix:** mark those files Hardlink (**F5** in the commander, **h** in the classic browser)
+or Delete, or unmark them. If the version is older than 2.2.1, the parameter does not help
+— upgrade OpenZFS. On 2.2.1 or newer, if you decide that block cloning is safe there, set
+the parameter to 1: `echo 1 > /sys/module/zfs/parameters/zfs_bclone_enabled` until the
+next boot; for good, `options zfs zfs_bclone_enabled=1` in `/etc/modprobe.d/zfs.conf` —
+and where the root filesystem is on ZFS, `update-initramfs -u -k all` as well, or the old
+value comes back at boot. Then restart `dedcom`: it reads the host's state once, at
+startup.
+
+### "cannot reflink on pool <pool> (N marks) — its block_cloning feature is disabled; mark HARDLINK or DELETE, or unmark; first: …"
+
+**Cause:** the host can clone, but the pool that holds the marked file has its
+`feature@block_cloning` disabled. The plan is refused before its confirmation opens, as
+above.
+
+**Check:**
 
 ```text
-zpool set feature@block_cloning=enabled <pool>   # enable it
-# a restart or reboot is needed for it to take effect
+zpool get feature@block_cloning <pool>
 ```
 
-If your ZFS version is older than 2.3, upgrade ZFS; otherwise only Hardlink/Delete
-are available.
+**Fix:** mark those files Hardlink or Delete, or unmark them — or enable the feature and
+restart `dedcom`:
+
+```text
+zpool set feature@block_cloning=enabled <pool>
+```
+
+Enabling a pool feature cannot be undone. Once a block is cloned, an OpenZFS older than 2.2
+opens the pool read-only.
+
+### "nothing done — N actions cannot run: …; no snapshot taken, marks kept; first: …"
+
+**Cause:** every action of the batch was refused by the checks made before the snapshots
+([§8.6](08-actions.md#before-the-snapshots--can-the-action-be-carried-out-at-all)); the reason
+printed is the first action's. Nothing was snapshotted, read or changed; the plan went
+back to its confirmation, and the marks stay. When only some actions cannot run, the
+others run as usual and the Summary lists each refused one with its reason.
+
+**Fix,** by the reason — then confirm again:
+
+- `read-only filesystem (<dataset>)` — `zfs get readonly <dataset>`; turn it off
+  (`zfs set readonly=off <dataset>`) or unmark the files there.
+- `no space left on <dataset> (full pool or quota)` — less than one record is free:
+  `zfs get quota,refquota,available,recordsize <dataset>`. Free some space or raise the
+  quota. A Delete does not help here — the file only moves to a quarantine on the same
+  dataset.
+- `the quarantine cannot be made in …: it is immutable (chattr +i)`,
+  `the directory is immutable (chattr +i)`, `the directory is append-only (chattr +a)`,
+  `the file is immutable (chattr +i)`, `the file is append-only (chattr +a)` —
+  `lsattr -d <path>`; clear the flag (`chattr -i`, `chattr -a`) or unmark the file.
+- `the keeper is immutable (chattr +i)`, `the keeper is append-only (chattr +a)` — the
+  kernel refuses a hardlink to such a file: clear the flag on the keeper, or mark the file
+  Reflink or Delete instead.
+- `reached through another mount of <dataset> (a bind mount?)`,
+  `the keeper is reached through another mount (a bind mount?)` — the scan went through a
+  second mount of the dataset: scan the dataset at its own mountpoint and mark the files
+  there. For the keeper, a Reflink does not mind.
+- `outside the mountpoint of <dataset> (…)` — the path does not begin with the dataset's
+  mountpoint: the scan went through a bind mount, a symbolic link or a relative root
+  (`--scan ./data`, `/data → /tank/data`). Scan the dataset at its own mountpoint.
+- `target file's dataset could not be determined` — the file is not on a ZFS dataset the
+  host reported when `dedcom` started: a non-ZFS filesystem, or a dataset mounted later
+  (restart `dedcom`).
 
 ### Apply cancelled half the actions (revalidation failed)
 

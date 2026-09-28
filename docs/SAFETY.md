@@ -9,9 +9,12 @@ keep backups.**
 Every destructive batch (delete / hardlink / reflink) runs behind layered guardrails:
 
 ### 1. ZFS snapshot before the batch
-Before the first action, `dedcom` snapshots **every dataset** the batch will touch, named
-`<dataset>@dedcom-<YYYYMMDD-HHMMSS>-<seq>`. **If any snapshot fails, the entire batch is aborted** — no action
-runs. Snapshots are never auto-removed; they remain as insurance until you delete them with `zfs destroy`.
+Before the first action, `dedcom` checks every action for what would stop it — a read-only or full
+filesystem, an immutable or append-only file or directory, a second mount of the dataset, a reflink the
+host or the pool cannot make — and refuses those actions untouched. It then snapshots **every dataset** an
+action will run on, named `<dataset>@dedcom-<YYYYMMDD-HHMMSS>-<seq>`; if no action can run, it takes none.
+**If any snapshot fails, the entire batch is aborted** — no action runs. Snapshots are never auto-removed; they
+remain as insurance until you delete them with `zfs destroy`.
 
 ### 2. Quarantine instead of unlink
 "Delete" does not call `unlink`. The file is moved into a per-dataset quarantine directory,
@@ -72,9 +75,10 @@ mitigated by the snapshot, the atomic publish, repeated symlink checks, and quar
 - **ZFS-dependent safety.** Snapshots, dataset detection, reflink, and quarantine resolution rely on ZFS. On
   non-ZFS filesystems, scanning works but there is no snapshot safety, so applying actions is not recommended.
 - **Root** is typically required (to take snapshots and to scan outside your home directory).
-- **Hardlink** works within a single dataset and shares one inode/metadata; **reflink** needs ZFS ≥ 2.3 with
-  `block_cloning` and, like hardlink, a single dataset. A plan that would link across datasets is refused
-  before anything runs.
+- **Hardlink** works within a single dataset and shares one inode/metadata; **reflink** needs OpenZFS 2.2.1
+  or newer with `zfs_bclone_enabled=1`, a pool with `feature@block_cloning` enabled and, like hardlink, a
+  single dataset. A plan that would link across datasets, or reflink where the host or the pool cannot
+  clone, is refused before anything runs.
 - **Grouping memory** can be large on big pools (≈ hashed files × 2.5 KiB, transient); `--merkle-dirs` reduces
   it to O(depth). `dedcom` estimates and warns before the grouping phase.
 - **One operator at a time** (the lock). The commander's group-files panel displays at most the first 200

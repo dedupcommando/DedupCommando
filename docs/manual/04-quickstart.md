@@ -96,22 +96,22 @@ opens (Screen::ScanConfig).
 ## Step 4. Scan configuration — choose roots and a profile
 
 ```text
-┌─ DedupCommando — scan configuration ───────────────────────────────────┐
-│ ZFS: 2.2.4 · block_cloning: tank, rpool · reflink: available           │
-│                                                                         │
-│ Filter by type: All files — all files                                  │
-│ Hash cache: on — repeat scans skip unchanged files                     │
-│ Intensity: Balanced — 2 threads, no seek-thrash                        │
-│                                                                         │
-│ Datasets and folders — Space select, F add folder                       │
-│   [ ] rpool        →  /rpool                                            │
-│ ▸ [x] tank         →  /tank                                             │
-│   [ ] tank/vm      →  /tank/vm                                          │
-│   [ ] tank/iso     →  /tank/iso                                         │
-│                                                                         │
-├─────────────────────────────────────────────────────────────────────────┤
+┌─ DedupCommando — scan configuration ─────────────────────────────────────────────────────┐
+│ ZFS: 2.2.4 · block cloning: supported=yes enabled=yes · reflink: available               │
+│                                                                                          │
+│ Filter by type: All files — all files                                                    │
+│ Hash cache: on — repeat scans skip unchanged files                                       │
+│ Intensity: Balanced — 2 threads, no seek-thrash                                          │
+│                                                                                          │
+│ Datasets and folders — Space select, F add folder                                        │
+│   [ ] rpool        →  /rpool                                                             │
+│ ▸ [x] tank         →  /tank                                                              │
+│   [ ] tank/vm      →  /tank/vm                                                           │
+│   [ ] tank/iso     →  /tank/iso                                                          │
+│                                                                                          │
+├──────────────────────────────────────────────────────────────────────────────────────────┤
 │ ↑↓ · Space · F folder · P preset · C cache · G intensity · Del remove · S start · Q quit │
-└─────────────────────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 | Key       | Action                                                                |
@@ -275,9 +275,10 @@ Alternatives, in the files panel:
 
 - **F8** on a copy → delete to quarantine (not a hardlink); marked `D`, shown as `x`
   in "group files".
-- **F6** → reflink (only if `block_cloning: active` for the dataset — see the
-  scan-configuration header); marked `C`, shown as `c`. Like a hardlink, only for a
-  copy on the keeper's dataset.
+- **F6** → reflink (only where the host can clone — the scan-configuration header says
+  `reflink: available` — and the pool has `feature@block_cloning` enabled,
+  [§8.3](08-actions.md#83-reflink--an-independent-inode-with-shared-blocks)); marked `C`,
+  shown as `c`. Like a hardlink, only for a copy on the keeper's dataset.
 - **Space** on a marked file — clear the mark.
 
 How `delete` differs from `hardlink` and which to pick when are in
@@ -350,8 +351,10 @@ audit trail).
 
 What happens:
 
-1. **Snapshots** — a ZFS snapshot of every affected dataset. A failure of any
-   one aborts the batch; no action is performed.
+1. **Snapshots** — first every action is checked for what would stop it
+   ([§8.6](08-actions.md#before-the-snapshots--can-the-action-be-carried-out-at-all)): one that
+   cannot run is refused untouched. Then a ZFS snapshot of every dataset where an action
+   will run. A failure of any one aborts the batch; no action is performed.
 2. **Applying** — per action: revalidate (re-hash the target + keeper; in Hybrid
    mode the keeper is read once per batch) → evacuate the original to quarantine
    → publish the hardlink/reflink via `renameat2(RENAME_NOREPLACE)`.

@@ -2026,8 +2026,10 @@ fn mark_cursor(app: &mut App, mark: Mark) {
         return;
     }
     if mark == Mark::Reflink && !app.zfs.capabilities.reflink_safe {
-        app.commander.status =
-            "reflink unavailable — needs ZFS 2.3+ with block cloning enabled".to_string();
+        app.commander.status = format!(
+            "reflink unavailable — {}",
+            crate::actions::preflight::CLONE_NEEDS
+        );
         return;
     }
     // One unacknowledged durable write at a time. Refused HERE, before the row is touched and
@@ -9501,6 +9503,22 @@ mod hostile_name_tests {
         assert!(
             shown.contains(&format!("Root: /tank/{}/{RETITLE_SHOWN}", "r".repeat(60))),
             "the root is there whole:\n{shown}"
+        );
+    }
+}
+
+/// F6 on a host that cannot clone says what the host needs, and no mark is set.
+#[cfg(test)]
+mod reflink_hint_tests {
+    use super::*;
+
+    #[test]
+    fn f6_names_what_the_host_needs() {
+        let (mut app, _rx) = crate::app::test_app();
+        mark_cursor(&mut app, Mark::Reflink);
+        assert_eq!(
+            app.commander.status,
+            "reflink unavailable — needs OpenZFS 2.2.1 or newer with zfs_bclone_enabled=1"
         );
     }
 }

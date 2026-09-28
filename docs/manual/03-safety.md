@@ -25,10 +25,13 @@ Each guardrail is described separately below.
 
 ### 1. ZFS snapshot of the action batch
 
-Before the apply phase begins, `dedcom` takes a ZFS snapshot of **every** dataset
-whose files are touched by this batch. The snapshots are created TOGETHER (before
-the first action). If creating any one of the snapshots fails — **the entire batch
-is aborted, no action runs.**
+Before the apply phase begins, `dedcom` checks every action for what would stop it
+where its files are ([§8.6](08-actions.md#before-the-snapshots--can-the-action-be-carried-out-at-all))
+and takes a ZFS snapshot of **every** dataset on which an action will run. An action
+that cannot run is refused untouched, and a dataset where none can run gets no
+snapshot; if no action of the batch can run, none is taken at all. The snapshots are
+created TOGETHER (before the first action). If creating any one of the snapshots
+fails — **the entire batch is aborted, no action runs.**
 
 The snapshot name is
 `<dataset>@dedcom-<YYYYMMDD-HHMMSS>-<nanos>-<pid>-<seq>`. For example:

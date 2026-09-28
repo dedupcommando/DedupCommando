@@ -19,6 +19,7 @@ pub mod hardlink;
 pub mod meta;
 pub mod move_dir;
 pub mod move_file;
+pub mod preflight;
 pub mod quarantine;
 pub mod reflink;
 pub mod script_preview;
@@ -118,6 +119,14 @@ pub trait ApplyOps {
     fn rename_noreplace(&self, from: &Path, to: &Path) -> std::io::Result<()> {
         move_file::rename_noreplace(from, to)
     }
+
+    /// What the filesystem says about `path` without anything being opened or changed — read
+    /// before the first snapshot, so an action that cannot be carried out is refused while nothing
+    /// exists yet. Production asks the kernel; a test answers «read-only», «immutable» or «full» on
+    /// cue, which no test can make a real filesystem say without root.
+    fn probe(&self, path: &Path, role: preflight::Role) -> preflight::Probe {
+        preflight::Probe::of(path, role)
+    }
 }
 
 /// The real thing: a `zfs snapshot`, and no interference anywhere else.
@@ -201,8 +210,8 @@ pub(crate) fn snapshot_suffix() -> String {
 // The guarded apply boundary — since R4B-2c the ONLY way a batch begins.
 //
 // `apply_worker::spawn` enters through `apply_guarded_with`: the lease is taken, the plan's own
-// witness is revalidated against the database, and only then is `apply_batch_with` reached. The
-// unguarded entry the worker used before the cutover is gone.
+// witness is revalidated against the database, and only then is the batch (`run_batch`) reached.
+// The unguarded entry the worker used before the cutover is gone.
 // ---------------------------------------------------------------------------------------------
 
 /// Why a batch never began. Pre-batch only: every variant means zero snapshots and zero actions,
@@ -249,6 +258,12 @@ pub enum ApplyRefusal {
     },
     Store {
         detail: String,
+    },
+    /// No action of the plan can be carried out where its files are (`preflight`): nothing is
+    /// snapshotted, read or changed, and the plan goes back to its window with its marks. The
+    /// reason is the operator's whole line, sanitized at construction.
+    NothingCanRun {
+        reason: String,
     },
 }
 
@@ -305,8 +320,7 @@ impl ApplyRefusal {
 pub enum GuardedApply {
     /// Nothing happened; the caller still owns the plan.
     Refused(ApplyRefusal),
-    /// `apply_batch_with` was entered — past this boundary exact plan preservation is not
-    /// promised.
+    /// The batch was entered — past this boundary exact plan preservation is not promised.
     Ran(Result<BatchResult>),
 }
 
@@ -326,8 +340,9 @@ pub enum ApplyOutcome {
 /// all of it, so no other writer can republish membership under a running batch.
 ///
 /// The plan is BORROWED: the caller keeps ownership, which is what lets a refusal hand the exact
-/// plan back to its window. A refusal is returned before `apply_batch_with` is called, so a
-/// refused run creates zero snapshots and applies zero actions.
+/// plan back to its window. A refusal is returned before the batch is entered — or, when no action
+/// of the plan can run, before its first snapshot — so a refused run creates zero snapshots and
+/// applies zero actions.
 pub fn apply_guarded_with(
     ops: &dyn ApplyOps,
     db_path: &Path,
@@ -347,25 +362,28 @@ pub fn apply_guarded_with(
     };
     // Lease held, nothing on the filesystem touched yet.
     ops.after_lease();
-    let result = apply_batch_with(ops, plan, datasets, reflink_safe, shared, mode);
+    let result = run_batch(ops, plan, datasets, reflink_safe, shared, mode);
     // Explicit rather than implicit: the lease is released HERE, after the batch, and the order
     // is the guarantee — not an artefact of where the binding happens to end.
     drop(lease);
-    GuardedApply::Ran(result)
+    match result {
+        // Nothing was snapshotted, read or changed, so the plan goes back as it would from any
+        // refusal before the batch.
+        Ok(Begun::NothingCanRun(reason)) => GuardedApply::Refused(ApplyRefusal::NothingCanRun {
+            reason: crate::textsan::terminal(&reason),
+        }),
+        Ok(Begun::Ran(batch)) => GuardedApply::Ran(Ok(*batch)),
+        Err(err) => GuardedApply::Ran(Err(err)),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
 // End of the R4B-1 staged guarded apply boundary.
 // ---------------------------------------------------------------------------------------------
 
-/// The batch itself, over an injectable set of outside operations.
-///
-/// The two whole-plan preflights are the shape of this function. The first runs before anything at
-/// all exists, so a plan that no longer describes the disk costs nothing; the second runs after the
-/// snapshots and immediately before the first mutation, because that is the last moment at which a
-/// claim spanning several pathnames can still be checked as a whole. The second one is also what
-/// the runtime ledger starts from — a scan-time row is stale the moment it is written.
-pub fn apply_batch_with(
+/// The batch as the tests drive it: a batch in which nothing can run is an error carrying its line.
+#[cfg(test)]
+pub(crate) fn apply_batch_with(
     ops: &dyn ApplyOps,
     plan: &ActionPlan,
     datasets: &[Dataset],
@@ -373,6 +391,37 @@ pub fn apply_batch_with(
     shared: &ApplyShared,
     mode: RevalidationMode,
 ) -> Result<BatchResult> {
+    match run_batch(ops, plan, datasets, reflink_safe, shared, mode)? {
+        Begun::Ran(batch) => Ok(*batch),
+        Begun::NothingCanRun(refusal) => Err(AppError::msg(refusal)),
+    }
+}
+
+/// How a batch that got past its first structural preflight ended.
+enum Begun {
+    Ran(Box<BatchResult>),
+    /// No action could run: nothing was snapshotted, read or changed. The line says why.
+    NothingCanRun(String),
+}
+
+/// The batch itself, over an injectable set of outside operations.
+///
+/// The two whole-plan preflights are the shape of this function. The first runs before anything at
+/// all exists, so a plan that no longer describes the disk costs nothing; the second runs after the
+/// snapshots and immediately before the first mutation, because that is the last moment at which a
+/// claim spanning several pathnames can still be checked as a whole. The second one is also what
+/// the runtime ledger starts from — a scan-time row is stale the moment it is written. Between the
+/// first one and the snapshots, each action is checked for what stands in its way ([`preflight`]):
+/// only a dataset where something can run gets a snapshot, and a batch in which nothing can run
+/// ends there, told apart from every other end so the guarded entry can hand its plan back.
+fn run_batch(
+    ops: &dyn ApplyOps,
+    plan: &ActionPlan,
+    datasets: &[Dataset],
+    reflink_safe: bool,
+    shared: &ApplyShared,
+    mode: RevalidationMode,
+) -> Result<Begun> {
     let timestamp = snapshot_suffix();
 
     // 1. Structural preflight over the whole plan. Before the first snapshot, so a refusal here
@@ -380,9 +429,20 @@ pub fn apply_batch_with(
     shared.set_phase(ApplyPhase::Snapshots);
     plan.preflight()?;
 
-    // 2. Affected datasets — by the device of each target allocation.
+    // 2. What stands in the way of each action, read before anything exists. An action with an
+    //    obstacle is refused without a snapshot and without its files being read; a batch in which
+    //    nothing can run refuses as a whole — no snapshot, no change, and the marks stay.
+    let obstacles = preflight::obstacles(ops, plan, datasets, reflink_safe);
+    if let Some(refusal) = preflight::nothing_can_run(plan, &obstacles) {
+        return Ok(Begun::NothingCanRun(refusal));
+    }
+
+    // 3. Affected datasets — by the device of each target that can still be acted on.
     let mut affected: Vec<&Dataset> = Vec::new();
-    for action in plan.actions() {
+    for (action, obstacle) in plan.actions().iter().zip(&obstacles) {
+        if obstacle.is_some() {
+            continue;
+        }
         let device = plan.target_object_of(action).key().device;
         if let Some(dataset) = dataset_by_device(datasets, device) {
             if !affected.iter().any(|known| known.name == dataset.name) {
@@ -391,7 +451,7 @@ pub fn apply_batch_with(
         }
     }
 
-    // 3. Safety snapshots. A failure before the first one is an ordinary error; a failure after it
+    // 4. Safety snapshots. A failure before the first one is an ordinary error; a failure after it
     //    still has to hand back the names of the snapshots that DO exist, or nobody can clean them
     //    up.
     let mut snapshots_made = Vec::new();
@@ -406,21 +466,25 @@ pub fn apply_batch_with(
                 if snapshots_made.is_empty() {
                     return Err(AppError::msg(detail));
                 }
-                return aborted_batch(plan, snapshots_made, detail);
+                return aborted_batch(plan, snapshots_made, detail)
+                    .map(|batch| Begun::Ran(Box::new(batch)));
             }
         }
     }
 
     ops.after_snapshots();
 
-    // 4. The same structural check again, now that the snapshots exist — the last look before the
+    // 5. The same structural check again, now that the snapshots exist — the last look before the
     //    first mutation. Its reading opens the ledger.
     let live = match plan.preflight() {
         Ok(live) => live,
-        Err(refusal) => return aborted_batch(plan, snapshots_made, refusal.to_string()),
+        Err(refusal) => {
+            return aborted_batch(plan, snapshots_made, refusal.to_string())
+                .map(|batch| Begun::Ran(Box::new(batch)))
+        }
     };
 
-    // 5. Applying actions. Cancellation (Esc) is checked at the action BOUNDARY — the snapshot
+    // 6. Applying actions. Cancellation (Esc) is checked at the action BOUNDARY — the snapshot
     //    already exists, what was applied to quarantine is reversible, the partial result is
     //    consistent.
     shared.set_phase(ApplyPhase::Applying);
@@ -431,6 +495,11 @@ pub fn apply_batch_with(
         timestamp,
         reflink_safe,
         mode,
+        obstacles,
+        guarded: affected
+            .iter()
+            .map(|dataset| dataset.name.clone())
+            .collect(),
         verified: HashMap::new(),
         quarantine_dirs: Vec::new(),
         ledger: RuntimeLedger::open(live),
@@ -453,7 +522,7 @@ pub fn apply_batch_with(
 
     shared.set_phase(ApplyPhase::Done);
     let (realized, realized_summary) = plan.realize(&results)?;
-    Ok(BatchResult {
+    Ok(Begun::Ran(Box::new(BatchResult {
         outcomes,
         snapshots: snapshots_made,
         quarantine_dirs: batch.quarantine_dirs,
@@ -464,7 +533,7 @@ pub fn apply_batch_with(
         realized,
         realized_summary,
         bytes_read: shared.bytes_done.load(Ordering::Relaxed),
-    })
+    })))
 }
 
 /// A batch that stopped as a whole once the snapshots existed: nothing was applied, and every
@@ -493,6 +562,10 @@ struct Batch<'a> {
     timestamp: String,
     reflink_safe: bool,
     mode: RevalidationMode,
+    /// Why an action was refused before the first snapshot; `None` for each one that can run.
+    obstacles: Vec<Option<String>>,
+    /// The datasets this batch took a snapshot of — no action runs anywhere else.
+    guarded: Vec<String>,
     /// Per-batch cache of re-checked files (Hybrid): the keeper is hashed once per batch, the
     /// repeat check is a re-stat by `FileIdentity` (we don't re-read).
     verified: HashMap<PathBuf, FileIdentity>,
@@ -500,7 +573,7 @@ struct Batch<'a> {
     ledger: RuntimeLedger,
 }
 
-impl Batch<'_> {
+impl<'a> Batch<'a> {
     fn apply_one(
         &mut self,
         index: usize,
@@ -508,6 +581,15 @@ impl Batch<'_> {
     ) -> (ActionOutcome, ActionResult) {
         self.ops.before_action(index);
         let action = &self.plan.actions()[index];
+        // Refused before the first snapshot: nothing of it is read or touched now.
+        if let Some(obstacle) = &self.obstacles[index] {
+            return refused(action, obstacle.clone());
+        }
+        // The plan's own answer and the batch's insurance, both before a byte is read.
+        let dataset = match self.guarded_place(action) {
+            Ok(dataset) => dataset,
+            Err(reason) => return refused(action, reason),
+        };
         // The ledger first: both allocations must still be the ones the batch has been driving.
         // The keeper as well as the target — a keeper somebody replaced underneath us is what a
         // per-target check cannot see.
@@ -524,19 +606,32 @@ impl Batch<'_> {
             return refused(action, err.to_string());
         }
         match action.kind() {
-            ActionKind::Delete => self.apply_delete(action),
-            ActionKind::Hardlink => self.apply_hardlink(action),
-            ActionKind::Reflink => self.apply_reflink(action),
+            ActionKind::Delete => self.apply_delete(action, dataset),
+            ActionKind::Hardlink => self.apply_hardlink(action, dataset),
+            ActionKind::Reflink => self.apply_reflink(action, dataset),
         }
     }
 
-    fn apply_delete(&mut self, action: &PlanAction) -> (ActionOutcome, ActionResult) {
-        let Some(dataset) = self.target_dataset(action) else {
-            return refused(
-                action,
-                "target file's dataset could not be determined".to_string(),
-            );
-        };
+    /// Where `action` runs: its dataset, when the plan allows the action there and this batch took
+    /// that dataset's snapshot. The pass before the snapshots keeps every action on a snapshotted
+    /// dataset; a disagreement is refused here, before anything is read or moved.
+    fn guarded_place(&self, action: &PlanAction) -> std::result::Result<&'a Dataset, String> {
+        let dataset = preflight::place(self.plan, action, self.datasets, self.reflink_safe)?;
+        if self.guarded.contains(&dataset.name) {
+            Ok(dataset)
+        } else {
+            Err(format!(
+                "no safety snapshot of {} was taken in this batch — the action is not performed",
+                dataset.name
+            ))
+        }
+    }
+
+    fn apply_delete(
+        &mut self,
+        action: &PlanAction,
+        dataset: &Dataset,
+    ) -> (ActionOutcome, ActionResult) {
         let dir = quarantine::quarantine_dir(&dataset.mountpoint, &self.timestamp);
         let moved = match delete::delete_to_quarantine(action.target(), &dataset.mountpoint, &dir) {
             Ok(path) => path,
@@ -546,69 +641,33 @@ impl Batch<'_> {
         self.after_move(action, &moved, None)
     }
 
-    fn apply_hardlink(&mut self, action: &PlanAction) -> (ActionOutcome, ActionResult) {
-        // The plan already refuses a link across datasets (`ActionPlan::try_new`); this is the
-        // last line, not the check an operator meets.
-        if self.plan.target_object_of(action).key().device
-            != self.plan.keeper_object_of(action).key().device
-        {
-            return refused(
-                action,
-                "cross-dataset hardlink is impossible — files are in different datasets"
-                    .to_string(),
-            );
-        }
-        // Without an identified ZFS dataset there will be neither a snapshot nor a quarantine to
-        // evacuate the original into — we refuse (symmetric to the Delete branch).
-        let Some(dataset) = self.target_dataset(action) else {
-            return refused(
-                action,
-                "target file's dataset could not be determined — hardlink is not performed without a ZFS snapshot".to_string(),
-            );
-        };
+    fn apply_hardlink(
+        &mut self,
+        action: &PlanAction,
+        dataset: &Dataset,
+    ) -> (ActionOutcome, ActionResult) {
         let dir = quarantine::quarantine_dir(&dataset.mountpoint, &self.timestamp);
-        let mountpoint = dataset.mountpoint.clone();
         let published = hardlink::hardlink(
             self.ops,
             action.target(),
             action.keeper(),
-            &mountpoint,
+            &dataset.mountpoint,
             &dir,
         );
         self.finish_publication(action, dir, published, Linkage::Hardlink)
     }
 
-    fn apply_reflink(&mut self, action: &PlanAction) -> (ActionOutcome, ActionResult) {
-        if !self.reflink_safe {
-            return refused(
-                action,
-                "reflink is unavailable on this host — needs ZFS 2.3+ with block cloning enabled"
-                    .to_string(),
-            );
-        }
-        // One pool is not enough: FICLONE answers EXDEV between two datasets of the same pool. As
-        // for a hardlink, the plan already refuses the pair and this is the last line.
-        if self.plan.target_object_of(action).key().device
-            != self.plan.keeper_object_of(action).key().device
-        {
-            return refused(
-                action,
-                "cross-dataset reflink is impossible — files are in different datasets".to_string(),
-            );
-        }
-        let Some(dataset) = self.target_dataset(action) else {
-            return refused(
-                action,
-                "target file's dataset could not be determined — reflink is not performed without a ZFS snapshot".to_string(),
-            );
-        };
+    fn apply_reflink(
+        &mut self,
+        action: &PlanAction,
+        dataset: &Dataset,
+    ) -> (ActionOutcome, ActionResult) {
         let dir = quarantine::quarantine_dir(&dataset.mountpoint, &self.timestamp);
-        let mountpoint = dataset.mountpoint.clone();
         let published = reflink::reflink(
             self.ops,
             action.target(),
             action.keeper(),
-            &mountpoint,
+            &dataset.mountpoint,
             &dir,
         );
         self.finish_publication(action, dir, published, Linkage::Reflink)
@@ -750,13 +809,6 @@ impl Batch<'_> {
                 Some(refusal.to_string())
             }
         }
-    }
-
-    fn target_dataset(&self, action: &PlanAction) -> Option<&'_ Dataset> {
-        dataset_by_device(
-            self.datasets,
-            self.plan.target_object_of(action).key().device,
-        )
     }
 
     fn note_quarantine(&mut self, dir: PathBuf) {
@@ -1090,6 +1142,8 @@ pub(crate) mod tests {
     type ActionHook = Option<Box<dyn FnMut(usize)>>;
     /// Fires between the evacuation and the publication, with the target and the replacement.
     type PublicationHook = Option<Box<dyn FnMut(&Path, &Path)>>;
+    /// Answers a probe for the pathnames it knows; the kernel answers the rest.
+    type ProbeHook = Option<Box<dyn Fn(&Path) -> Option<preflight::Probe>>>;
 
     pub(crate) struct FakeOps {
         snapshots: RefCell<Vec<String>>,
@@ -1101,6 +1155,7 @@ pub(crate) mod tests {
         /// What the next publication renames answer, in order: an errno, or `None` for the
         /// kernel's own answer. Once it runs out, every rename goes to the kernel.
         renames: RefCell<std::collections::VecDeque<Option<i32>>>,
+        probes: ProbeHook,
     }
 
     impl FakeOps {
@@ -1112,7 +1167,18 @@ pub(crate) mod tests {
                 before_action: RefCell::new(None),
                 before_publication: RefCell::new(None),
                 renames: RefCell::new(std::collections::VecDeque::new()),
+                probes: None,
             }
+        }
+
+        /// The filesystem answers `answer` wherever it has one — read-only, immutable, full, another
+        /// mount: what a test cannot make a real filesystem say without root.
+        pub(crate) fn probing(
+            mut self,
+            answer: impl Fn(&Path) -> Option<preflight::Probe> + 'static,
+        ) -> Self {
+            self.probes = Some(Box::new(answer));
+            self
         }
 
         pub(crate) fn failing_renames(self, answers: &[Option<i32>]) -> Self {
@@ -1182,6 +1248,13 @@ pub(crate) mod tests {
                 None => move_file::rename_noreplace(from, to),
             }
         }
+
+        fn probe(&self, path: &Path, role: preflight::Role) -> preflight::Probe {
+            self.probes
+                .as_ref()
+                .and_then(|answer| answer(path))
+                .unwrap_or_else(|| preflight::Probe::of(path, role))
+        }
     }
 
     /// A dataset covering the scenario's root, so the batch can find a mountpoint to quarantine
@@ -1192,6 +1265,7 @@ pub(crate) mod tests {
             mountpoint: root.to_path_buf(),
             device_id: Some(std::fs::symlink_metadata(root).unwrap().dev()),
             snapdir_visible: false,
+            block_cloning: None,
         }
     }
 
@@ -1255,9 +1329,45 @@ pub(crate) mod tests {
         (scenario, twin, plan)
     }
 
+    /// What a batch of one action that cannot run says: that nothing happened, the reason, and the
+    /// pathname.
+    fn nothing_runs(reason: &str, target: &Path) -> String {
+        format!(
+            "nothing done — 1 action cannot run: {reason}; no snapshot taken, marks kept; first: {}",
+            target.display()
+        )
+    }
+
+    /// The reason in a «nothing done» line as the troubleshooting chapter quotes it: the dataset as
+    /// `<dataset>`, each of `paths` — longest first — as `…`.
+    fn quoted_reason(refusal: &str, paths: &[PathBuf]) -> String {
+        let reason = refusal
+            .split_once(" cannot run: ")
+            .map_or(refusal, |(_, rest)| rest);
+        let reason = reason
+            .split_once("; no snapshot taken")
+            .map_or(reason, |(reason, _)| reason);
+        let mut quoted = reason.replace("tank/test", "<dataset>");
+        for path in paths {
+            quoted = quoted.replace(&path.display().to_string(), "…");
+        }
+        quoted
+    }
+
+    /// The troubleshooting chapter names `quoted` among the reasons a batch refuses an action.
+    fn assert_troubleshooting_quotes(quoted: &str) {
+        let text = crate::testfixtures::manual("13-troubleshooting.md");
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            text.contains(quoted),
+            "13-troubleshooting.md must quote: {quoted}"
+        );
+    }
+
     /// A target on a dataset the host did not report has neither a snapshot nor a quarantine, so
-    /// every kind refuses it — each in its own words. A link across datasets never reaches the
-    /// batch any more (`ActionPlan::try_new` refuses it), so this is what is left to meet here.
+    /// every kind refuses it — each in its own words, before anything exists. A link across
+    /// datasets never reaches the batch (`ActionPlan::try_new` refuses it), so this is what is
+    /// left to meet here.
     #[test]
     fn an_action_on_a_dataset_nobody_reported_is_refused_by_name() {
         for (kind, said) in [
@@ -1279,18 +1389,68 @@ pub(crate) mod tests {
             let (_scenario, twin, plan) =
                 twin_marked(&format!("no_dataset_{}", kind.as_str()), kind);
             let ops = FakeOps::new();
-            let batch = run(&ops, &plan, &[]).unwrap();
+            let refusal = run(&ops, &plan, &[]).expect_err("nothing can run");
             assert!(ops.made().is_empty(), "{kind:?}: no dataset, no snapshot");
-            assert_eq!(batch.outcomes.len(), 1, "{kind:?}");
-            assert_eq!(batch.outcomes[0].result, Err(said.to_string()), "{kind:?}");
+            assert_eq!(refusal.to_string(), nothing_runs(said, &twin), "{kind:?}");
             assert!(twin.exists(), "{kind:?}: the target stays where it was");
         }
     }
 
-    /// A host that cannot clone refuses a reflink by name, and the target stays where it was.
+    /// A batch in which no action can run takes no snapshot at all: the reflink a host cannot make
+    /// is refused before anything exists, and the batch refuses as a whole.
     #[test]
-    fn a_reflink_on_a_host_that_cannot_clone_is_refused_by_name() {
-        let (scenario, twin, plan) = twin_marked("no_clone", ActionKind::Reflink);
+    fn a_batch_where_nothing_can_run_takes_no_snapshot() {
+        let (scenario, twin, plan) = twin_marked("nothing_runs", ActionKind::Reflink);
+        let ops = FakeOps::new();
+        let result = apply_batch_with(
+            &ops,
+            &plan,
+            &[dataset_over(&scenario.root, "tank/test")],
+            false,
+            &ApplyShared::default(),
+            RevalidationMode::Hybrid,
+        );
+        assert!(
+            ops.made().is_empty(),
+            "a batch that cannot run takes no snapshot: {:?}",
+            ops.made()
+        );
+        let refusal = result
+            .expect_err("the batch refuses as a whole")
+            .to_string();
+        assert_eq!(
+            refusal,
+            nothing_runs(
+                "reflink is unavailable on this host — needs OpenZFS 2.2.1 or newer with \
+                 zfs_bclone_enabled=1",
+                &twin
+            )
+        );
+        assert!(twin.exists(), "the target stays where it was");
+    }
+
+    /// An action that cannot run is refused before anything of it is read: the reflink a host
+    /// cannot make does not re-hash its target first. Only the delete of the same batch reads —
+    /// its target, and the keeper once.
+    #[test]
+    fn a_refused_action_is_not_read_first() {
+        let scenario = PlanScenario::new("refused_unread");
+        let keeper = scenario.file("keeper.bin");
+        let gone = scenario.file("a_gone.bin");
+        let cloned = scenario.file("b_cloned.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), gone.clone(), cloned.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &gone, false, Some(ActionKind::Delete));
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &cloned,
+            false,
+            Some(ActionKind::Reflink),
+        );
+        drop(store);
+        let plan = plan_of(&scenario, scan_id);
         let ops = FakeOps::new();
         let batch = apply_batch_with(
             &ops,
@@ -1301,15 +1461,485 @@ pub(crate) mod tests {
             RevalidationMode::Hybrid,
         )
         .unwrap();
-        assert_eq!(batch.outcomes.len(), 1);
+        let size = std::fs::metadata(&keeper).unwrap().size();
         assert_eq!(
-            batch.outcomes[0].result,
+            batch.bytes_read,
+            2 * size,
+            "only the delete reads: its target and the keeper"
+        );
+        assert_eq!(batch.succeeded(), 1, "{:?}", batch.outcomes);
+        assert!(cloned.exists(), "the refused target stays where it was");
+    }
+
+    /// A directory on `/dev/shm` — a second real filesystem on the Linux gate — removed however
+    /// the test ends, whatever a failing run left inside it.
+    pub(crate) struct ShmDir {
+        pub(crate) path: PathBuf,
+    }
+
+    impl ShmDir {
+        pub(crate) fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path = PathBuf::from(format!(
+                "/dev/shm/dedcom_{tag}_{}_{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for ShmDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.path).ok();
+        }
+    }
+
+    /// A dataset where nothing can run gets no snapshot and keeps its file; the other dataset of
+    /// the same batch is snapshotted and acted on as before.
+    #[test]
+    fn a_read_only_dataset_gets_no_snapshot_and_keeps_its_file() {
+        let shm = ShmDir::new("read_only");
+        let scenario = PlanScenario::new("read_only");
+        let keeper = scenario.file("keeper.bin");
+        let here = scenario.file("here.bin");
+        let there = shm.path.join("there.bin");
+        std::fs::copy(&keeper, &there).unwrap();
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), here.clone(), there.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &here, false, Some(ActionKind::Delete));
+        scenario.mark(&mut store, scan_id, &there, false, Some(ActionKind::Delete));
+        drop(store);
+        let plan = plan_of(&scenario, scan_id);
+        let frozen = shm.path.clone();
+        let ops = FakeOps::new().probing(move |path| {
+            path.starts_with(&frozen).then(|| preflight::Probe {
+                read_only: true,
+                ..preflight::Probe::of(path, preflight::Role::Directory)
+            })
+        });
+        let datasets = [
+            dataset_over(&scenario.root, "tank/a"),
+            dataset_over(&shm.path, "tank/b"),
+        ];
+        let batch = run(&ops, &plan, &datasets).unwrap();
+
+        let made = ops.made();
+        assert_eq!(made.len(), 1, "only the dataset with work to do: {made:?}");
+        assert!(made[0].starts_with("tank/a@"), "{made:?}");
+        let refused = batch
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.target == there)
+            .expect("the read-only target is reported");
+        assert_eq!(
+            refused.result,
+            Err("read-only filesystem (tank/b)".to_string())
+        );
+        assert!(there.exists(), "the file on the read-only dataset stays");
+        assert!(
+            !shm.path
+                .join(crate::model::scan::QUARANTINE_DIR_NAME)
+                .exists(),
+            "no quarantine is made there"
+        );
+        assert!(!here.exists(), "the other dataset's delete ran");
+        assert_eq!(batch.succeeded(), 1, "{:?}", batch.outcomes);
+    }
+
+    /// One action on a dataset over the scenario's root: the keeper in `keep/`, the target in
+    /// `sub/`.
+    struct Layout {
+        scenario: PlanScenario,
+        keeper: PathBuf,
+        target: PathBuf,
+        plan: ActionPlan,
+    }
+
+    fn layout(tag: &str, kind: ActionKind) -> Layout {
+        let scenario = PlanScenario::new(tag);
+        std::fs::create_dir(scenario.root.join("keep")).unwrap();
+        std::fs::create_dir(scenario.root.join("sub")).unwrap();
+        let keeper = scenario.file("keep/keeper.bin");
+        let target = scenario.file("sub/twin.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), target.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &target, false, Some(kind));
+        drop(store);
+        let plan = plan_of(&scenario, scan_id);
+        Layout {
+            scenario,
+            keeper,
+            target,
+            plan,
+        }
+    }
+
+    /// Runs `layout`'s batch on a dataset mounted at `mountpoint`, with the filesystem answering
+    /// `answers` for those pathnames and the kernel for the rest.
+    fn run_probed(
+        layout: &Layout,
+        mountpoint: &Path,
+        answers: Vec<(PathBuf, preflight::Probe)>,
+    ) -> (FakeOps, Result<BatchResult>) {
+        let ops = FakeOps::new().probing(move |path| {
+            answers
+                .iter()
+                .find(|(known, _)| known == path)
+                .map(|(_, probe)| *probe)
+        });
+        let result = run(&ops, &layout.plan, &[dataset_over(mountpoint, "tank/test")]);
+        (ops, result)
+    }
+
+    /// Each thing the filesystem can say against an action refuses it before any snapshot, in its
+    /// own words — the whole batch here, since the action is its only one.
+    #[test]
+    fn what_the_filesystem_says_refuses_an_action_before_its_snapshot() {
+        use preflight::Probe;
+        let read_only = Probe {
+            read_only: true,
+            ..Probe::default()
+        };
+        let full = Probe {
+            full: true,
+            ..Probe::default()
+        };
+        let immutable = Probe {
+            immutable: true,
+            ..Probe::default()
+        };
+        let append_only = Probe {
+            append_only: true,
+            ..Probe::default()
+        };
+        let mount = |id| Probe {
+            mount: Some(id),
+            ..Probe::default()
+        };
+        type Answers = Box<dyn Fn(&Layout) -> Vec<(PathBuf, Probe)>>;
+        let sub = |l: &Layout| l.scenario.root.join("sub");
+        let cases: Vec<(&str, ActionKind, Answers, &str)> = vec![
+            (
+                "ro_home",
+                ActionKind::Delete,
+                Box::new(move |l| vec![(l.scenario.root.clone(), read_only)]),
+                "read-only filesystem (tank/test)",
+            ),
+            (
+                "ro_here",
+                ActionKind::Delete,
+                Box::new(move |l| vec![(sub(l), read_only)]),
+                "read-only filesystem (tank/test)",
+            ),
+            (
+                "full",
+                ActionKind::Delete,
+                Box::new(move |l| vec![(l.scenario.root.clone(), full)]),
+                "no space left on tank/test (full pool or quota)",
+            ),
+            (
+                "nest",
+                ActionKind::Delete,
+                Box::new(move |l| vec![(l.scenario.root.clone(), immutable)]),
+                "the quarantine cannot be made in <root>: it is immutable (chattr +i)",
+            ),
+            (
+                "dir_immutable",
+                ActionKind::Delete,
+                Box::new(move |l| vec![(sub(l), immutable)]),
+                "the directory is immutable (chattr +i)",
+            ),
+            (
+                "dir_append",
+                ActionKind::Delete,
+                Box::new(move |l| vec![(sub(l), append_only)]),
+                "the directory is append-only (chattr +a)",
+            ),
+            (
+                "file_immutable",
+                ActionKind::Delete,
+                Box::new(move |l| vec![(l.target.clone(), immutable)]),
+                "the file is immutable (chattr +i)",
+            ),
+            (
+                "file_append",
+                ActionKind::Hardlink,
+                Box::new(move |l| vec![(l.target.clone(), append_only)]),
+                "the file is append-only (chattr +a)",
+            ),
+            (
+                "bind",
+                ActionKind::Delete,
+                Box::new(move |l| vec![(l.scenario.root.clone(), mount(1)), (sub(l), mount(2))]),
+                "reached through another mount of tank/test (a bind mount?)",
+            ),
+            (
+                "keeper_mount",
+                ActionKind::Hardlink,
+                Box::new(move |l| {
+                    vec![
+                        (l.scenario.root.clone(), mount(1)),
+                        (sub(l), mount(1)),
+                        (l.scenario.root.join("keep"), mount(2)),
+                    ]
+                }),
+                "the keeper is reached through another mount (a bind mount?)",
+            ),
+            (
+                "keeper_immutable",
+                ActionKind::Hardlink,
+                Box::new(move |l| vec![(l.keeper.clone(), immutable)]),
+                "the keeper is immutable (chattr +i)",
+            ),
+            (
+                "keeper_append",
+                ActionKind::Hardlink,
+                Box::new(move |l| vec![(l.keeper.clone(), append_only)]),
+                "the keeper is append-only (chattr +a)",
+            ),
+        ];
+        for (tag, kind, answers, said) in cases {
+            let layout = layout(&format!("probe_{tag}"), kind);
+            let root = layout.scenario.root.clone();
+            let (ops, result) = run_probed(&layout, &root, answers(&layout));
+            let refusal = result.err().map(|err| err.to_string()).unwrap_or_default();
+            assert!(
+                ops.made().is_empty(),
+                "{tag}: no snapshot, {:?}",
+                ops.made()
+            );
+            let said = said.replace("<root>", &root.display().to_string());
+            assert_eq!(refusal, nothing_runs(&said, &layout.target), "{tag}");
+            assert!(
+                layout.target.exists(),
+                "{tag}: the target stays where it was"
+            );
+            // The reason as an operator looks it up — worded by the code, not by this table.
+            assert_troubleshooting_quotes(&quoted_reason(&refusal, &[root]));
+        }
+    }
+
+    /// The quarantine is made inside its root once that exists, so it is the root's flag that
+    /// counts then — not the mountpoint's.
+    #[test]
+    fn an_existing_quarantine_root_is_where_the_quarantine_is_made() {
+        use preflight::Probe;
+        let immutable = Probe {
+            immutable: true,
+            ..Probe::default()
+        };
+        let flagged = layout("probe_nest_root", ActionKind::Delete);
+        let root = flagged
+            .scenario
+            .root
+            .join(crate::model::scan::QUARANTINE_DIR_NAME);
+        std::fs::create_dir(&root).unwrap();
+        let (ops, result) = run_probed(
+            &flagged,
+            &flagged.scenario.root,
+            vec![(root.clone(), immutable)],
+        );
+        assert!(ops.made().is_empty());
+        assert_eq!(
+            result.err().map(|err| err.to_string()),
+            Some(nothing_runs(
+                &format!(
+                    "the quarantine cannot be made in {}: it is immutable (chattr +i)",
+                    root.display()
+                ),
+                &flagged.target
+            ))
+        );
+        // …and while the root is there, the mountpoint's own flag does not stop anything.
+        let clear = layout("probe_nest_mount", ActionKind::Delete);
+        std::fs::create_dir(
+            clear
+                .scenario
+                .root
+                .join(crate::model::scan::QUARANTINE_DIR_NAME),
+        )
+        .unwrap();
+        let (ops, result) = run_probed(
+            &clear,
+            &clear.scenario.root,
+            vec![(clear.scenario.root.clone(), immutable)],
+        );
+        assert_eq!(
+            ops.made().len(),
+            1,
+            "{:?}",
+            result.map(|batch| batch.outcomes)
+        );
+        assert!(!clear.target.exists(), "the delete ran");
+    }
+
+    /// A target that is not under its dataset's mountpoint cannot be moved into the quarantine
+    /// there, and is refused before anything exists.
+    #[test]
+    fn a_target_outside_its_mountpoint_is_refused_before_its_snapshot() {
+        let layout = layout("probe_outside", ActionKind::Delete);
+        let elsewhere = layout.scenario.root.join("keep");
+        let (ops, result) = run_probed(&layout, &elsewhere, Vec::new());
+        assert!(ops.made().is_empty());
+        let refusal = result.err().map(|err| err.to_string()).unwrap_or_default();
+        assert_eq!(
+            refusal,
+            nothing_runs(
+                &format!(
+                    "outside the mountpoint of tank/test ({})",
+                    elsewhere.display()
+                ),
+                &layout.target
+            )
+        );
+        assert!(layout.target.exists());
+        assert_troubleshooting_quotes(&quoted_reason(&refusal, &[elsewhere]));
+    }
+
+    /// What stands against one kind is no obstacle to another: a flagged keeper stops a hardlink,
+    /// not a delete and not a reflink — a clone only reads the keeper — and neither a delete nor a
+    /// reflink cares through which mount its keeper is reached: a clone crosses mounts of one
+    /// filesystem, a link does not.
+    #[test]
+    fn a_flagged_keeper_stops_only_a_hardlink() {
+        use preflight::Probe;
+        let at = |id| Probe {
+            mount: Some(id),
+            ..Probe::default()
+        };
+        for (kind, flagged) in [
+            (ActionKind::Delete, "immutable"),
+            (ActionKind::Delete, "mount"),
+            (ActionKind::Reflink, "immutable"),
+            (ActionKind::Reflink, "append"),
+            (ActionKind::Reflink, "mount"),
+        ] {
+            let layout = layout(&format!("keeper_{flagged}_{}", kind.as_str()), kind);
+            let answers = match flagged {
+                "immutable" => vec![(
+                    layout.keeper.clone(),
+                    Probe {
+                        immutable: true,
+                        ..Probe::default()
+                    },
+                )],
+                "append" => vec![(
+                    layout.keeper.clone(),
+                    Probe {
+                        append_only: true,
+                        ..Probe::default()
+                    },
+                )],
+                _ => vec![
+                    (layout.scenario.root.clone(), at(1)),
+                    (layout.scenario.root.join("sub"), at(1)),
+                    (layout.scenario.root.join("keep"), at(2)),
+                ],
+            };
+            let (ops, result) = run_probed(&layout, &layout.scenario.root, answers);
+            assert_eq!(
+                ops.made().len(),
+                1,
+                "{kind:?} with the keeper {flagged} passes the check: {:?}",
+                result.map(|batch| batch.outcomes)
+            );
+        }
+    }
+
+    /// A pool whose block cloning is disabled refuses a reflink before the snapshot, by the pool's
+    /// name; a pool that did not say does not.
+    #[test]
+    fn a_pool_that_cannot_clone_refuses_a_reflink_before_its_snapshot() {
+        let (scenario, twin, plan) = twin_marked("pool_off", ActionKind::Reflink);
+        let mut dataset = dataset_over(&scenario.root, "tank/test");
+        dataset.block_cloning = Some(false);
+        let ops = FakeOps::new();
+        let refusal = run(&ops, &plan, &[dataset])
+            .err()
+            .map(|err| err.to_string());
+        assert!(ops.made().is_empty(), "{:?}", ops.made());
+        assert_eq!(
+            refusal,
+            Some(nothing_runs(
+                "reflink is unavailable on pool tank — its block_cloning feature is disabled",
+                &twin
+            ))
+        );
+        assert!(twin.exists(), "the target stays where it was");
+
+        let (scenario, _twin, plan) = twin_marked("pool_unknown", ActionKind::Reflink);
+        let ops = FakeOps::new();
+        let _ = run(&ops, &plan, &[dataset_over(&scenario.root, "tank/test")]);
+        assert_eq!(ops.made().len(), 1, "a pool that did not say is no refusal");
+    }
+
+    /// No action runs on a dataset the batch holds no snapshot of: were the pass before the
+    /// snapshots and the list of snapshotted datasets ever to disagree, the action is refused
+    /// before a byte of it is read.
+    #[test]
+    fn an_action_on_a_dataset_without_its_snapshot_is_not_performed() {
+        let (scenario, twin, plan) = twin_marked("unguarded", ActionKind::Delete);
+        let datasets = [dataset_over(&scenario.root, "tank/test")];
+        let ops = FakeOps::new();
+        let mut batch = Batch {
+            ops: &ops,
+            plan: &plan,
+            datasets: &datasets,
+            timestamp: snapshot_suffix(),
+            reflink_safe: true,
+            mode: RevalidationMode::Hybrid,
+            obstacles: vec![None],
+            guarded: Vec::new(),
+            verified: HashMap::new(),
+            quarantine_dirs: Vec::new(),
+            ledger: RuntimeLedger::open(plan.preflight().unwrap()),
+        };
+        let read = AtomicU64::new(0);
+        let (outcome, result) = batch.apply_one(0, &read);
+        assert_eq!(
+            outcome.result,
             Err(
-                "reflink is unavailable on this host — needs ZFS 2.3+ with block cloning enabled"
+                "no safety snapshot of tank/test was taken in this batch — the action is not \
+                 performed"
                     .to_string()
             )
         );
+        assert_eq!(result, ActionResult::Refused { rolled_back: false });
+        assert_eq!(read.load(Ordering::Relaxed), 0, "nothing was read");
         assert!(twin.exists(), "the target stays where it was");
+    }
+
+    /// The manual quotes the refusal of a batch in which nothing can run, the reason, the count
+    /// and the pathname aside, where it describes the checks and where an operator looks it up.
+    #[test]
+    fn the_manual_quotes_a_batch_where_nothing_can_run() {
+        let (scenario, twin, plan) = twin_marked("nothing_manual", ActionKind::Delete);
+        let reason = "the file is immutable (chattr +i)";
+        let target = twin.clone();
+        let ops = FakeOps::new().probing(move |path| {
+            (path == target).then_some(preflight::Probe {
+                immutable: true,
+                ..preflight::Probe::default()
+            })
+        });
+        let refusal = run(&ops, &plan, &[dataset_over(&scenario.root, "tank/test")])
+            .expect_err("nothing can run")
+            .to_string();
+        let quoted = refusal
+            .replace(reason, "…")
+            .replace("1 action cannot", "N actions cannot")
+            .replace(&twin.display().to_string(), "…");
+        for chapter in ["08-actions.md", "13-troubleshooting.md"] {
+            let text = crate::testfixtures::manual(chapter);
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(text.contains(&quoted), "{chapter} must quote: {quoted}");
+        }
     }
 
     /// The C5 defect in the accounting: two pathnames of ONE allocation are one allocation's worth,
