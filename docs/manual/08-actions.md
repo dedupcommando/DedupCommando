@@ -385,9 +385,12 @@ store: each file there stands on its own, and the actions work on it as §8.1–
   what it read before: the content, owner, permissions, extended attributes and modification
   time stay; only the inode number, ctime and creation time are new. Two backups that share
   blocks are still one unreadable block away from damaging both, though.
-- **Apply with `Y`, not with a saved script.** A script saved with `S` in the `F11` overlay
-  checks each file's inode, size and times but not its content, and its reflink copy belongs
-  to whoever runs it, with the current time and without extended attributes or ACLs.
+- **A saved script takes the same care as `Y`.** A script saved with `S` in the `F11` overlay
+  compares each file with its keeper byte for byte before touching it, puts a file back when
+  its replacement cannot take its place, and gives a Reflink copy the owner, permissions,
+  times, extended attributes and ACL of the file it replaces. Run it as root: a copy whose
+  owner it may not set is refused, not published
+  ([§13](13-troubleshooting.md#dedcom-n-of-m-actions-not-carried-out--each-is-named-above-a-saved-script)).
 - **`a` in the classic browser** marks every file except the newest of each group (by
   modification time) for deletion, across all groups of the scan, without asking, replacing
   any keeper or mark already set

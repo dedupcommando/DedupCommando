@@ -412,16 +412,20 @@ that it can be read to the end. The overlay title carries the position as
 `lines X-Y of N`, or `no script lines` when there is nothing to show.
 
 ```text
-┌─ Confirmation — F11 · lines 18-34 of 217 ───────────────────────────────┐
-│   Summary     Commands                                                  │
+┌ Confirmation — F11 · lines 105-112 of 118 ──────────────────────────────┐
+│   Summary    Commands                                                   │
 │                                                                         │
-│  mkdir -p '/tank/ds_a/.dedcom-quarantine/20260729-113540/dup'           │
-│  mv -n -- '/tank/dup/copy1.bin' '/tank/ds_a/.dedcom-quarantine/…'       │
-│  cp --reflink=always -- '/tank/dup/orig.bin' '/tank/dup/copy1.bin'      │
-│   …                                                                     │
+│ # 4. Actions: 3 total.                                                  │
+│ dedcom_failed=0                                                         │
+│ # reflink (clone beside it, then the file to quarantine): /tank/dup/copy│
+│ dedcom_reflink '/tank/dup/copy1.bin' '/tank/dup/orig.bin' '/tank/.dedcom│
+│ # reflink (clone beside it, then the file to quarantine): /tank/dup/copy│
+│ dedcom_reflink '/tank/dup/copy2.bin' '/tank/dup/orig.bin' '/tank/.dedcom│
+│ # reflink (clone beside it, then the file to quarantine): /tank/dup/copy│
+│ dedcom_reflink '/tank/dup/copy3.bin' '/tank/dup/orig.bin' '/tank/.dedcom│
 │                                                                         │
-│   ↑↓ · PgUp/PgDn · Home/End — scroll                                    │
-│   [Tab] tab  [S] save .sh (whole script)  [Y] execute  [N]/[Esc] cancel │
+│  ↑↓ · PgUp/PgDn · Home/End — scroll                                     │
+│  [Tab] tab  [S] save .sh (whole script)  [Y] execute  [N]/[Esc] cancel  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 

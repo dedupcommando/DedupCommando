@@ -251,6 +251,36 @@ rsync -aHAX --sparse <src> <dest> && rm -f <src>
 **Fix:** keep the move within a single dataset, or run the suggested `rsync`
 command by hand (it preserves hardlinks, ACLs, xattrs, and sparseness).
 
+### "dedcom: N of M actions not carried out — each is named above" (a saved script)
+
+**Cause:** a script saved with `S` in the `F11` overlay went on past the actions it could
+not carry out and ended with exit status 1. Each of them has its own line above this one,
+after the line that gives the reason: the line of the tool that failed (`cmp`, `mv`, `ln`,
+`cp`, `findmnt`) or, for a quarantine on another mount, the script's own. None of these lines
+means a file was lost:
+
+| Line | What happened |
+|---|---|
+| `skip …: it or its keeper is a symbolic link` | One of the two was replaced by a symbolic link after the script checked the plan; both were left alone. |
+| `skip …: its content is no longer the keeper's` | The file was rewritten after the scan and was left alone. |
+| `skip …: it could not be compared with its keeper` | `cmp` could not read one of the two; the file was left alone. |
+| `skip …: its dataset was not determined` | As in ["target file's dataset could not be determined"](#target-files-dataset-could-not-be-determined); nothing was done. |
+| `…: the quarantine is on another mount than the file (a bind mount?)` | The file is reached through a second mount of its dataset — a bind mount — or the quarantine directory is a link to another filesystem, and a move there would copy the file and delete it. Nothing was moved; scan the dataset at its own mountpoint. The next line names the action. |
+| `not moved to the quarantine: …` | A Delete could not move the file: a read-only dataset, `chattr +i` or `+a`, no space or quota, a file already at its place in the quarantine, or a quarantine on another mount (the line above). The file is where it was. |
+| `not replaced: … — the link could not be made beside it` | `ln` failed: too many links, an immutable keeper, a second mount of the dataset. The file is where it was. |
+| `not replaced: … — the clone could not be made beside it` | The host or the pool cannot clone ([§8.3](08-actions.md#83-reflink--an-independent-inode-with-shared-blocks)), or the copy came out short. The file is where it was. |
+| `not replaced: … — its owner, mode, times or extended attributes could not be carried over` | The script ran as a user who may not give the copy the file's owner. The file is where it was; run the script as root. |
+| `not replaced: … — it could not be moved to the quarantine` | As for a Delete, before anything took the file's place. |
+| `not replaced: … — the replacement could not be published; the original is back in its place` | The last rename failed, and the file was put back. |
+| `not replaced: … — the replacement could not be published; the original stays in the quarantine: …` | The file could not be put back either; it is at the path the line ends with. |
+| `…: the temporary file .dedcom-….tmp beside it is left behind — delete it by hand` | The script removes only a replacement it made itself, and this file was no longer that one. |
+
+**Fix:** remove the cause the tool's own line names, scan again and apply the new plan. A
+script that carried out any action refuses to run a second time: its structural check sees
+the files it changed. A file left in the quarantine goes back with
+`mv -n -- '<path in the quarantine>' '<its place>'` while its place is free; look at a
+left-behind `.dedcom-….tmp` before you delete it.
+
 ## Concurrency and locking
 
 ### "another instance is already running" — but I'm sure it isn't
