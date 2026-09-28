@@ -221,8 +221,11 @@ minutes, not hours. NOTHING on the filesystem is changed.
 
 ### …press **Esc** during a scan
 
-Equivalent to the cable, but gentler: `dedcom` finishes writing the current chunk
-cleanly, then exits. Resume works the same way.
+Equivalent to the cable, but gentler: during hashing `dedcom` stops reading within
+about a second, even in the middle of a large file, writes the hashes of the files
+it read to the end and returns to the scan settings (or to commando, if the scan
+was started there). Resume works the same way; the files it was reading get no
+hash and are read again from the start.
 
 ### …pull the cable during **apply** (between actions)
 

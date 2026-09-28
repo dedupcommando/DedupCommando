@@ -2,12 +2,21 @@
 use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::safe_open::open_regular_nofollow;
 use crate::model::action::FileIdentity;
 
 const BUFFER_SIZE: usize = 256 * 1024;
+
+/// What reading one file on the scan path came to.
+pub enum Hashed {
+    /// Read to the end: the digest of the whole content and the identity by descriptor after the read.
+    Whole([u8; 32], FileIdentity),
+    /// The stop came before the end of the file. There is no field for a digest on purpose: a digest
+    /// of part of a file must never pass for the file's.
+    Stopped,
+}
 
 /// Computes the blake3 hash over the entire file contents (by path, without fd identity guarantees).
 /// `progress` is incremented by the number of bytes read — for live progress.
@@ -39,11 +48,14 @@ pub fn hash_file(path: &Path, progress: &AtomicU64) -> io::Result<[u8; 32]> {
 /// an in-place edit within the same second of the same length via `mtime_nsec`/`ctime`), and checks
 /// that the path still resolves to the same `dev/inode` (path swap via `unlink`+`create`).
 /// Returns (hash, identity by descriptor AFTER reading) — trusts no walk metadata whatsoever.
+/// `stop` is the scan's stop flag: it is looked at before the file is opened and before every
+/// chunk, so a stop ends even the read of a huge file within one chunk — as `Hashed::Stopped`.
 pub fn hash_file_verified(
     path: &Path,
     progress: &AtomicU64,
-) -> io::Result<([u8; 32], FileIdentity)> {
-    hash_file_verified_hooked(path, progress, || {})
+    stop: &AtomicBool,
+) -> io::Result<Hashed> {
+    hash_file_verified_hooked(path, progress, stop, || {})
 }
 
 /// Implementation of `hash_file_verified` with a deterministic test seam `after_before_snapshot`,
@@ -54,8 +66,14 @@ pub fn hash_file_verified(
 fn hash_file_verified_hooked(
     path: &Path,
     progress: &AtomicU64,
+    stop: &AtomicBool,
     after_before_snapshot: impl FnOnce(),
-) -> io::Result<([u8; 32], FileIdentity)> {
+) -> io::Result<Hashed> {
+    // A stop that came before this file was reached: it is not even opened, so the rest of a
+    // batch after a stop costs no I/O.
+    if stop.load(Ordering::Relaxed) {
+        return Ok(Hashed::Stopped);
+    }
     let file = open_regular_nofollow(path)?;
     // One full read of this path's content is about to happen. Recorded for the Phase 2 tests that
     // must count reads per physical object rather than per pathname; compiled out of a release
@@ -70,18 +88,26 @@ fn hash_file_verified_hooked(
     let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut reader = &file;
     loop {
+        // Before every chunk: the stop is seen within one chunk however large the file is, and
+        // what was read so far goes away with the hasher — it never becomes a digest.
+        if stop.load(Ordering::Relaxed) {
+            return Ok(Hashed::Stopped);
+        }
         let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
         progress.fetch_add(read as u64, Ordering::Relaxed);
+        // Lets a test put the stop exactly between two chunks; compiled out of a release build.
+        #[cfg(test)]
+        crate::testfixtures::note_chunk_read(path);
     }
 
     let after = FileIdentity::from_metadata(&file.metadata()?);
     identity_stable(&before, &after)?;
     path_object_matches(path, before.dev, before.ino)?;
-    Ok((*hasher.finalize().as_bytes(), after))
+    Ok(Hashed::Whole(*hasher.finalize().as_bytes(), after))
 }
 
 /// The full identity by descriptor did not change during the read (an in-place edit
@@ -127,9 +153,55 @@ mod tests {
         let dir = temp_dir("ok");
         let p = dir.join("a.bin");
         fs::write(&p, b"hello").unwrap();
-        let (h, id) = hash_file_verified(&p, &AtomicU64::new(0)).unwrap();
+        let outcome = hash_file_verified(&p, &AtomicU64::new(0), &AtomicBool::new(false)).unwrap();
+        let Hashed::Whole(h, id) = outcome else {
+            panic!("nothing asked this read to stop");
+        };
         assert_eq!(h, *blake3::hash(b"hello").as_bytes());
         assert_eq!(id.size, 5);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A stop that comes while a file is being read ends the read at the next chunk, and the read
+    /// gives no digest — a digest of the first chunk must never pass for the whole file's.
+    #[test]
+    fn a_read_stopped_midway_gives_no_digest() {
+        let dir = temp_dir("stop_mid");
+        let p = dir.join("big.bin");
+        // Four chunks and a byte: a stop after the first chunk leaves most of the file unread.
+        let size = 4 * BUFFER_SIZE + 1;
+        fs::write(&p, vec![7u8; size]).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let progress = AtomicU64::new(0);
+        let outcome = {
+            let _armed = crate::testfixtures::StopMidRead::arm(&p, std::sync::Arc::clone(&stop));
+            hash_file_verified(&p, &progress, &stop).unwrap()
+        };
+        assert!(
+            matches!(outcome, Hashed::Stopped),
+            "a read the stop cut short must not produce a digest"
+        );
+        let read = progress.load(Ordering::Relaxed);
+        assert!(
+            read > 0 && read <= BUFFER_SIZE as u64,
+            "the read stops at the chunk after the stop, not at the end: read {read} of {size}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// And a file the stop came before is not even opened: the rest of a batch costs no I/O. A path
+    /// that does not exist proves it — opening it would be an error, not `Stopped`.
+    #[test]
+    fn a_stop_before_the_read_does_not_open_the_file() {
+        let dir = temp_dir("stop_before");
+        let missing = dir.join("not-there.bin");
+        let progress = AtomicU64::new(0);
+        let outcome = hash_file_verified(&missing, &progress, &AtomicBool::new(true));
+        assert!(
+            matches!(outcome, Ok(Hashed::Stopped)),
+            "the file the stop came before is not opened"
+        );
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -141,7 +213,7 @@ mod tests {
         fs::write(&target, b"data").unwrap();
         let link = dir.join("link.bin");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(hash_file_verified(&link, &AtomicU64::new(0)).is_err());
+        assert!(hash_file_verified(&link, &AtomicU64::new(0), &AtomicBool::new(false)).is_err());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -149,7 +221,7 @@ mod tests {
     fn non_regular_is_rejected() {
         // A directory is not a regular file: open succeeds, but the fstat type rejects it.
         let dir = temp_dir("nonreg");
-        assert!(hash_file_verified(&dir, &AtomicU64::new(0)).is_err());
+        assert!(hash_file_verified(&dir, &AtomicU64::new(0), &AtomicBool::new(false)).is_err());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -198,7 +270,8 @@ mod tests {
         let p = dir.join("f.bin");
         fs::write(&p, b"original").unwrap();
         let p2 = p.clone();
-        let res = hash_file_verified_hooked(&p, &AtomicU64::new(0), move || {
+        let stop = AtomicBool::new(false);
+        let res = hash_file_verified_hooked(&p, &AtomicU64::new(0), &stop, move || {
             use std::io::Write;
             // Same inode (without unlink): overwrite with larger content → size+mtime change.
             let mut f = fs::OpenOptions::new().write(true).open(&p2).unwrap();
@@ -217,7 +290,8 @@ mod tests {
         let p = dir.join("f.bin");
         fs::write(&p, b"one").unwrap();
         let p2 = p.clone();
-        let res = hash_file_verified_hooked(&p, &AtomicU64::new(0), move || {
+        let stop = AtomicBool::new(false);
+        let res = hash_file_verified_hooked(&p, &AtomicU64::new(0), &stop, move || {
             fs::remove_file(&p2).unwrap();
             fs::write(&p2, b"two different bytes").unwrap();
         });
@@ -237,7 +311,7 @@ mod tests {
         // SAFETY: cpath is a valid C-string of an existing path; mode 0o600.
         let rc = unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) };
         assert_eq!(rc, 0, "mkfifo did not create the FIFO");
-        assert!(hash_file_verified(&fifo, &AtomicU64::new(0)).is_err());
+        assert!(hash_file_verified(&fifo, &AtomicU64::new(0), &AtomicBool::new(false)).is_err());
         fs::remove_dir_all(&dir).ok();
     }
 }

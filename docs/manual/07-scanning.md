@@ -17,8 +17,12 @@ tree walk      BLAKE3          group assembly
 | 3/3 Grouping| SQL aggregation into groups + directory signatures  | seconds–minutes   | ~2.5 KiB/file = GiB |
 
 Phases 1 and 2 stream and checkpoint progress in chunks — you can interrupt and
-resume. Phase 3 is a single transient memory peak; if RAM is tight, see
-`--merkle-dirs` below.
+resume. During hashing a stop takes effect within about a second, even in the
+middle of a large file — Esc on the scan screen, Ctrl+C in `--scan`, `SIGTERM`,
+or `SIGHUP` from a dropped SSH session (so run a long scan over SSH in `tmux` or
+`screen`: `nohup` does not keep it going); the files being read at that moment
+get no hash and are read again from the start on resume. Phase 3 is a single
+transient memory peak; if RAM is tight, see `--merkle-dirs` below.
 
 ## Intensity profiles (Resource Governor)
 
@@ -200,7 +204,9 @@ dedcom --scan /tank --verify
 
 It doubles the scan time (each file is read twice: hash + comparison). In
 practice a BLAKE3 collision has never been observed on real data and this check
-is redundant — but if you are paranoid, the flag enables it.
+is redundant — but if you are paranoid, the flag enables it. A stop that comes
+during the comparison is not seen: the comparison runs to the end and the scan
+completes.
 
 ## Re-validation before actions (`--strict-verify`)
 

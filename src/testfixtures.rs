@@ -31,7 +31,8 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::model::scan::ScanConfig;
 
@@ -363,6 +364,51 @@ fn slot() -> MutexGuard<'static, Option<Vec<PathBuf>>> {
 pub fn note_content_read(path: &Path) {
     if let Some(reads) = slot().as_mut() {
         reads.push(path.to_path_buf());
+    }
+}
+
+/// The file and the flag a [`StopMidRead`] watches.
+static STOP_MID_READ: Mutex<Option<(PathBuf, Arc<AtomicBool>)>> = Mutex::new(None);
+/// Serializes the tests that arm it.
+static STOP_MID_READ_LOCK: Mutex<()> = Mutex::new(());
+
+/// Raises a stop flag right after the first chunk of one file is read — the moment a Ctrl+C lands
+/// in the middle of a large file, made deterministic. Process-wide for the reason [`ReadLog`] is,
+/// and keyed by the path, so a parallel test hashing its own files is not stopped.
+pub struct StopMidRead {
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl StopMidRead {
+    /// Arms the stop for `path`. Blocks while another `StopMidRead` is alive.
+    pub fn arm(path: &Path, flag: Arc<AtomicBool>) -> Self {
+        let guard = STOP_MID_READ_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *stop_slot() = Some((path.to_path_buf(), flag));
+        StopMidRead { _guard: guard }
+    }
+}
+
+impl Drop for StopMidRead {
+    fn drop(&mut self) {
+        *stop_slot() = None;
+    }
+}
+
+fn stop_slot() -> MutexGuard<'static, Option<(PathBuf, Arc<AtomicBool>)>> {
+    STOP_MID_READ
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Called by the hashing path after every chunk it read. A no-op unless a [`StopMidRead`] is armed
+/// for this path, and compiled out entirely in a release build.
+pub fn note_chunk_read(path: &Path) {
+    if let Some((armed, flag)) = stop_slot().as_ref() {
+        if armed == path {
+            flag.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -837,7 +883,7 @@ mod tests {
         let log = ReadLog::start();
         let progress = AtomicU64::new(0);
         for alias in forest.aliases.iter().take(2) {
-            hash_file_verified(alias, &progress).expect("hash an alias");
+            hash_file_verified(alias, &progress, &AtomicBool::new(false)).expect("hash an alias");
         }
 
         assert_eq!(
@@ -916,7 +962,8 @@ mod tests {
         {
             let _log = ReadLog::start();
         }
-        hash_file_verified(&forest.twin_a, &progress).expect("hash twin_a");
+        hash_file_verified(&forest.twin_a, &progress, &AtomicBool::new(false))
+            .expect("hash twin_a");
         let log = ReadLog::start();
         assert_eq!(
             log.count_under(forest.base()),

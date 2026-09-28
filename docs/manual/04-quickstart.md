@@ -153,7 +153,7 @@ opens (Screen::ScanConfig).
 │ Hashed:  412,765 / 1,201,034 files                                     │
 │ Read:  423 GiB / 1234 GiB                                              │
 │ Speed:  92 MiB/s · remaining ~02:14:30                                 │
-│ Chunk:  8765 / 50000 files  (Esc stops after the chunk)                │
+│ Chunk:  41 / 64 files                                                  │
 │                                                                         │
 ├─────────────────────────────────────────────────────────────────────────┤
 │ [Esc] stop — progress is saved, you can resume later                   │

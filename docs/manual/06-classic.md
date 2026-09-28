@@ -172,8 +172,10 @@ Help does not hold it back — the groups open under it.
 
 The phase line changes through the run: `Phase 1/3 · walking files`,
 `Phase 1/3 · writing manifest`, `Phase 2/3: hashing content`,
-`Phase 3/3: grouping`, and `Preparing…`. While hashing a chunked resume
-also shows `Chunk:  {} / {} files  (Esc stops after the chunk)`.
+`Phase 3/3: grouping`, and `Preparing…`. While hashing it also shows
+`Chunk:  {} / {} files` — the current chunk, up to 64 files. Esc does not wait for
+the chunk: the scan stops within about a second, even in the middle of a large
+file.
 
 | Key         | Action                                                              |
 |-------------|---------------------------------------------------------------------|

@@ -15,6 +15,7 @@ use crate::model::scan::{
     ScanSummary, WalkStage,
 };
 use crate::state::{ManifestRow, MembershipMode, PublishMode, Retention, ScanStore};
+use hash::Hashed;
 use walk::{OmissionSnapshot, SnapshotUnavailable, WalkOutcome};
 
 pub mod governor;
@@ -832,7 +833,9 @@ fn manifest_matches(opened: &crate::model::action::FileIdentity, row: &ManifestR
 }
 
 /// Hashing phase: hashes candidates in batches, checkpointing the result.
-/// Returns `false` if cancelled (the status stays `hashing` — resumable).
+/// Returns `false` if cancelled (the status stays `hashing` — resumable). The stop is seen between
+/// two chunks of any read, so it does not wait for a large file; the file it cut short gets no
+/// digest and is read again on resume.
 fn hash_phase(
     store: &mut ScanStore,
     scan_id: i64,
@@ -930,6 +933,8 @@ fn hash_phase(
         // Live counters for the current batch: bytes read and files processed.
         let live = AtomicU64::new(0);
         let live_files = AtomicU64::new(0);
+        // Files of this batch the stop came before the end of: neither committed nor failed.
+        let stopped = AtomicU64::new(0);
 
         // The batch is hashed in a background thread on the bounded pool; this thread
         // meanwhile ticks the progress — so the counter moves even on a
@@ -944,18 +949,26 @@ fn hash_phase(
                                 "hashing {}",
                                 crate::textsan::terminal(&row.path.display().to_string())
                             );
-                            let result = match hash::hash_file_verified(&row.path, &live) {
+                            let result = match hash::hash_file_verified(&row.path, &live, cancel) {
                                 // The open object matched the walk manifest → commit.
-                                Ok((digest, opened)) if manifest_matches(&opened, row) => {
+                                Ok(Hashed::Whole(digest, opened))
+                                    if manifest_matches(&opened, row) =>
+                                {
                                     Some((row.clone(), digest))
                                 }
                                 // The hash was computed, but the identity diverged from the walk — the file
                                 // was changed/swapped between walk and hashing: skip.
-                                Ok(_) => {
+                                Ok(Hashed::Whole(..)) => {
                                     tracing::warn!(
                                         "skip {}: identity changed after the walk",
                                         crate::textsan::terminal(&row.path.display().to_string())
                                     );
+                                    None
+                                }
+                                // The stop came before the end of this file: no digest, and no
+                                // failure either — the file stays a candidate for the resume.
+                                Ok(Hashed::Stopped) => {
+                                    stopped.fetch_add(1, Ordering::Relaxed);
                                     None
                                 }
                                 Err(err) => {
@@ -1029,8 +1042,10 @@ fn hash_phase(
         objects_read += chunk_total;
         // Against the REPRESENTATIVES, never against `files`: one representative can complete
         // several pathnames, so `files` may exceed the batch size and the subtraction would
-        // underflow. A failure is a candidate object whose representative did not commit.
-        hash_failures_seen += chunk_total - persisted.representatives;
+        // underflow. A failure is a candidate object whose representative did not commit and whose
+        // read was not stopped: a stopped read failed at nothing, and the resume reads it again.
+        let stopped = stopped.into_inner();
+        hash_failures_seen += chunk_total - stopped - persisted.representatives;
         // Candidate progress in the DB — DB-accurate (persisted delta), for an honest
         // % in the session list.
         let _ = store.update_candidate_progress(
@@ -1066,6 +1081,14 @@ fn hash_phase(
             });
         }
         tracing::info!("hash progress: {files_done}/{files_total} files");
+        // A batch the stop cut short ends the phase here, not complete: the files it did not read to
+        // the end have no digest, so neither grouping nor its announcement may follow.
+        if cancel.load(Ordering::Relaxed) {
+            tracing::info!(
+                "hashing stopped: {stopped} files not read to the end, read again on resume"
+            );
+            return Ok(false);
+        }
     }
 
     bench.set_entries(objects_read);
@@ -2224,6 +2247,155 @@ mod hash_failures_tests {
             store.scan_status(id).unwrap(),
             ScanStatus::Complete,
             "Complete, not CompleteWithWarnings — no residual warning"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// End to end: a stop that lands while a file is being read ends the scan there. The file gets
+    /// no digest, so nothing of it reaches the checkpoint; the stopped read is not reported as a
+    /// failure to hash; the grouping phase is not announced. The resume reads the file again, whole.
+    #[test]
+    fn a_stop_in_the_middle_of_a_file_records_no_digest_and_the_resume_reads_it_again() {
+        let dir = unique_temp_dir("stop_mid_read");
+        // Three chunks and a byte, so the read the stop lands in always has a chunk left.
+        let content: Vec<u8> = (0..3 * 256 * 1024 + 1).map(|i| (i % 251) as u8).collect();
+        let big_a = dir.join("big_a.bin");
+        std::fs::write(&big_a, &content).unwrap();
+        std::fs::write(dir.join("big_b.bin"), &content).unwrap();
+
+        let mut cfg = ScanConfig::new(vec![dir.clone()]);
+        cfg.min_size = 0;
+        cfg.exclude_globs = Vec::new();
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store.begin_scan(&cfg).unwrap();
+        let digest_of_a = |store: &ScanStore| {
+            store
+                .file_hash_status(id)
+                .unwrap()
+                .into_iter()
+                .find(|(path, ..)| *path == big_a)
+                .map(|(.., hash)| hash)
+        };
+
+        // Run 1: the stop arrives right after the first chunk of `big_a` is read.
+        let cancel1 = Arc::new(AtomicBool::new(false));
+        let mut failures_shown = 0u64;
+        let mut grouping_announced = false;
+        let outcome1 = {
+            let _armed = crate::testfixtures::StopMidRead::arm(&big_a, Arc::clone(&cancel1));
+            run_scan(&mut store, &cfg, Some(id), false, &cancel1, |p| match p {
+                ScanProgress::Hashing { hash_failures, .. } => {
+                    failures_shown = failures_shown.max(hash_failures);
+                }
+                ScanProgress::Phase(ScanPhase::Grouping) => grouping_announced = true,
+                _ => {}
+            })
+            .unwrap()
+        };
+        assert!(
+            matches!(outcome1, ScanOutcome::Cancelled),
+            "the stop ends the scan"
+        );
+        assert_eq!(
+            store.scan_status(id).unwrap(),
+            ScanStatus::Hashing,
+            "the stopped scan is resumable"
+        );
+        assert_eq!(
+            digest_of_a(&store),
+            Some(None),
+            "the file the stop cut short has no digest in the checkpoint"
+        );
+        // The report after the stopped batch is certain here because it is also the last batch; the
+        // count it carries is the one that must not include the stopped reads.
+        assert_eq!(failures_shown, 0, "a stopped read is not a failure to hash");
+        assert!(
+            !grouping_announced,
+            "a hashing phase the stop cut short does not announce grouping"
+        );
+
+        // Run 2: the resume reads `big_a` again, from the start to the end.
+        let log = crate::testfixtures::ReadLog::start();
+        let cancel2 = Arc::new(AtomicBool::new(false));
+        let outcome2 = run_scan(&mut store, &cfg, Some(id), false, &cancel2, |_| {}).unwrap();
+        let reads_of_a = log.count_of(&big_a);
+        drop(log);
+        let results = match outcome2 {
+            ScanOutcome::Completed(r) => r,
+            ScanOutcome::Cancelled => panic!("the resume completes"),
+        };
+        assert_eq!(reads_of_a, 1, "the resume reads the stopped file again");
+        assert_eq!(results.summary.hash_failures, 0);
+        assert_eq!(
+            results.summary.groups_found, 1,
+            "the two copies are one group"
+        );
+        assert_eq!(
+            digest_of_a(&store),
+            Some(Some(*blake3::hash(&content).as_bytes())),
+            "the digest is the whole file's"
+        );
+        assert_eq!(store.scan_status(id).unwrap(), ScanStatus::Complete);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// And the files a stopped batch did read to the end keep their digests: the stop throws away
+    /// only the reads it cut short, so the resume does not read the finished files again.
+    ///
+    /// Relies on one reader thread (the Idle profile) going through the batch in its
+    /// `(device, inode)` order, one file after the other — how a rayon pool of one thread runs a
+    /// parallel iterator. The stop is armed on the file read second.
+    #[test]
+    fn a_stop_keeps_the_digests_of_the_files_read_to_the_end() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = unique_temp_dir("stop_keeps");
+        let content: Vec<u8> = (0..3 * 256 * 1024 + 1).map(|i| (i % 251) as u8).collect();
+        let one = dir.join("one.bin");
+        let two = dir.join("two.bin");
+        std::fs::write(&one, &content).unwrap();
+        std::fs::write(&two, &content).unwrap();
+        let mut cfg = ScanConfig::new(vec![dir.clone()]);
+        cfg.min_size = 0;
+        cfg.exclude_globs = Vec::new();
+        cfg.hash_profile = HashProfile::Idle;
+        let key = |path: &std::path::Path| {
+            let meta = std::fs::metadata(path).unwrap();
+            (meta.dev(), meta.ino())
+        };
+        let (read_first, read_second) = if key(&one) < key(&two) {
+            (one, two)
+        } else {
+            (two, one)
+        };
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let id = store.begin_scan(&cfg).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let outcome = {
+            let _armed = crate::testfixtures::StopMidRead::arm(&read_second, Arc::clone(&cancel));
+            run_scan(&mut store, &cfg, Some(id), false, &cancel, |_| {}).unwrap()
+        };
+        assert!(
+            matches!(outcome, ScanOutcome::Cancelled),
+            "the stop ends the scan"
+        );
+        let recorded = store.file_hash_status(id).unwrap();
+        let digest = |path: &std::path::Path| {
+            recorded
+                .iter()
+                .find(|(recorded_path, ..)| recorded_path.as_path() == path)
+                .map(|(.., hash)| *hash)
+        };
+        assert_eq!(
+            digest(&read_second),
+            Some(None),
+            "the file the stop cut short has no digest"
+        );
+        assert_eq!(
+            digest(&read_first),
+            Some(Some(*blake3::hash(&content).as_bytes())),
+            "the file read to the end before the stop keeps its digest"
         );
 
         std::fs::remove_dir_all(&dir).ok();

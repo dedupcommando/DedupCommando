@@ -3484,9 +3484,9 @@ impl App {
 
     /// A shutdown signal arrived (SIGHUP from a dropped SSH session, SIGTERM, SIGINT).
     ///
-    /// Arms the same cancellation Esc uses — finish the current action, then stop — instead of
-    /// dying between a quarantine evacuation and its publish. `forced` (a second signal) stops
-    /// waiting and leaves the threads detached, exactly as before.
+    /// Arms the same cancellation Esc uses — an apply finishes the current action, a scan stops at
+    /// the next chunk it reads — instead of dying between a quarantine evacuation and its publish.
+    /// `forced` (a second signal) stops waiting and leaves the threads detached, exactly as before.
     ///
     /// Called from the event loop on every iteration, so it must stay idempotent.
     pub fn request_shutdown(&mut self, forced: bool) {

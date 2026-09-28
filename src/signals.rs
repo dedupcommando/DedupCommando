@@ -7,8 +7,9 @@
 //! move worker, mid-`purge_scan`. Snapshots and quarantine keep the outcome recoverable, but the
 //! `BatchResult` is lost, so the operator who reconnects cannot tell what actually applied.
 //!
-//! `ApplyShared::cancel` and `ScanHandle::cancel` already mean «finish the current action, then
-//! stop». A signal now arms exactly those, so there is no second, separate shutdown path.
+//! `ApplyShared::cancel` already means «finish the current action, then stop», and
+//! `ScanHandle::cancel` «stop at the next check» — while a file is hashed, that is the next chunk.
+//! A signal now arms exactly those, so there is no second, separate shutdown path.
 //!
 //! `libc` directly rather than a signal crate, for the reason given in `lock`: the project is
 //! Linux-only and already depends on `libc`. The handler does the one thing that is safe inside
@@ -78,8 +79,8 @@ fn set_sigpipe(disposition: libc::sighandler_t, what: &'static str) {
 /// Installs the handler for SIGINT, SIGTERM and SIGHUP.
 ///
 /// `SA_RESTART` on purpose: an interrupted `read` should resume rather than fail, so a signal
-/// during hashing does not surface as a spurious I/O error. Cancellation is noticed at the
-/// action boundary, which is where it is safe.
+/// during hashing does not surface as a spurious I/O error. Cancellation is noticed where it is
+/// safe: between two actions, or between two chunks of a file being hashed.
 pub fn install() {
     // SAFETY: `handler` only stores to atomics, `act` is fully initialised before use, and the
     // old-action pointer is null because we do not chain to a previous handler.

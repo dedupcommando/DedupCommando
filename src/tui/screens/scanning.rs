@@ -109,7 +109,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
     if scanning.chunk_total > 0 {
         stat_lines.push(Line::from(format!(
-            "Chunk:             {} / {} files  (Esc stops after the chunk)",
+            "Chunk:             {} / {} files",
             scanning.chunk_done, scanning.chunk_total
         )));
     }
