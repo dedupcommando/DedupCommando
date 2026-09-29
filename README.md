@@ -1,6 +1,6 @@
 # DedupCommando
 
-> **⚠️ Beta (v0.9.1).** DedupCommando performs destructive operations (delete, hardlink, reflink)
+> **⚠️ Beta (v0.9.2).** DedupCommando performs destructive operations (delete, hardlink, reflink)
 > on real files. Read **[docs/SAFETY.md](docs/SAFETY.md)** before applying any action, and keep backups.
 
 > **With the release of 0.9.1, 0.9.0-beta.1 to 0.9.0-beta.4 are no longer supported.** If you run one of
