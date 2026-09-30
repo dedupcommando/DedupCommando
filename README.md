@@ -28,7 +28,8 @@ quarantine instead of being unlinked, and file content is re-validated immediate
 - **Three reclaim actions:** delete-to-quarantine, **hardlink** (same dataset), and **reflink** / CoW
   block-clone (ZFS `block_cloning`, same dataset).
 - **Exact matching** via BLAKE3 hashing, with an optional byte-for-byte re-compare (`--verify`).
-- **Directory dedup ("twin folders")** — find directory trees whose scanned contents are recursively identical.
+- **Twin folders** (shown for review; actions apply to files) — find directory trees whose scanned contents are
+  recursively identical.
 - **Two interfaces:** a multi-panel "commander" (default) or a classic stepwise wizard (`--classic`).
 - **Resumable scans** with on-disk checkpoints and a hash cache for near-instant re-scans.
 - **Headless scan mode** for cron, plus CSV export and stats.
@@ -66,7 +67,7 @@ apt update && apt install dedcom
 
 ```sh
 tar xzf dedcom-<version>-<triple>.tar.gz
-install -m 755 dedcom /usr/local/bin/dedcom
+install -m 755 dedcom-<version>-<triple>/dedcom /usr/local/bin/dedcom
 ```
 
 Both pre-built channels need glibc ≥ 2.39 (Debian 13 / Ubuntu 24.04 / Proxmox VE 9+). To build from source

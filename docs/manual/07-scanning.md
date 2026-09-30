@@ -38,10 +38,9 @@ Turbo → Balanced → Idle → Turbo
 | **Balanced** ◀ default | 2 threads, no seek-thrash            | `min(2, nproc)` | default                    |
 | **Idle**      | 1 thread, nice+ionice idle                    | 1               | `nice 19` + `ionice idle`  |
 
-> ⚠️ **Idle is mandatory on live data.** A concurrent VM or backup will only see
-> the dedup run when the disk is idle (the `ionice idle` class on Linux). Turbo
-> on `/tank` with running VMs means they slow down for the whole duration of the
-> scan.
+> ⚠️ **Idle is mandatory on live data.** It hashes with one thread at the lowest
+> CPU and disk priority (`nice 19`, `ionice idle`). Turbo on `/tank` with running
+> VMs means they slow down for the whole duration of the scan.
 
 The profile is persisted in the scan's checkpoint DB — resume uses the same
 profile. There is no command-line flag for it: a headless `--scan` starts every
@@ -97,9 +96,11 @@ untouched ([§8.9](08-actions.md#89-backups-and-other-programs-stores)).
 
 ## Hash cache (`hash_cache`)
 
-The DB holds a `hash_cache` table keyed by `(device, inode, size, mtime)` — on a
-repeat scan of the same file, if those four attributes are unchanged, BLAKE3 is
-not recomputed but taken from the cache.
+On a repeat scan, a file takes its hash from an earlier scan in `dedcom.db` when it
+has the same path, size, `mtime` and `ctime` (both to the nanosecond) — BLAKE3 is
+not recomputed. `device` and `inode` are deliberately not part of the key: the
+device number of a ZFS dataset can change after a pool import or a reboot. (The
+old `hash_cache` table is no longer read.)
 
 | Enabled | Repeat-scan speed | When to disable                                |
 |---------|-------------------|------------------------------------------------|
@@ -115,10 +116,9 @@ The flag's help string:
 
 > `--no-hash-reuse` — Disable the hash cache — re-hash all files
 
-> The cache survives a reboot (the `stat` fields are stable). It does not
-> survive: a rename by external software (`mv` keeps the inode, but `ctime`
-> changes — irrelevant to us, we look only at `mtime`), a copy (a new inode = a
-> cache miss), a filesystem change.
+> The cache survives a reboot and a pool import. It does not survive: a rename or
+> a move (a new path, and `ctime` changes), a copy (a new file), anything else
+> that changes `ctime` (`chmod`, `chown`, a new hardlink), a filesystem change.
 
 ## Directory-signature algorithm
 
@@ -262,15 +262,15 @@ a new one".
 
 ## Storage-type override (`--storage-type`)
 
-DedupCommando auto-detects a dataset's storage type (HDD / SSD / NVMe) for:
-
-- the read order in phase 2 (for HDD: sorting candidates by `(device, inode)` —
-  −21% off the cold-scan time on 2×HDD, by reducing seeks; not needed for
-  SSD/NVMe);
-- statistics (`--stats` shows the type on the scan line).
+DedupCommando auto-detects a dataset's storage type (HDD / SSD / NVMe) for
+statistics only: `--stats` shows the type on the scan line. The type does not
+change how a scan reads — phase 2 always reads candidates sorted by
+`(device, inode)`, on any storage (on HDD this cuts seeks: −21% off the cold-scan
+time on 2×HDD; on SSD/NVMe it does no harm).
 
 If auto-detection is wrong (for example, the host is in a VM and the disks are
-reported as SSD but are in reality HDD-backed) — override it:
+reported as SSD but are in reality HDD-backed) — override it, so the statistics
+say what the disks are:
 
 The flag's help string:
 
@@ -278,7 +278,7 @@ The flag's help string:
 > (overrides auto-detection)
 
 ```text
-dedcom --scan /tank --storage-type hdd       # force the HDD strategy
+dedcom --scan /tank --storage-type hdd       # record the storage as HDD
 dedcom --scan /tank --storage-type ssd
 dedcom --scan /tank --storage-type nvme
 ```

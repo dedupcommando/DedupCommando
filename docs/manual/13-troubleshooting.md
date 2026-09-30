@@ -44,23 +44,25 @@ See [§07 Intensity profiles](07-scanning.md#intensity-profiles-resource-governo
 
 ### The hash cache is not used (a repeat scan is slow)
 
-**Cause:** `dedcom` looks up rows in `hash_cache` by `(device, inode, size,
-mtime)` that match the current file exactly. Any change is a cache miss:
+**Cause:** `dedcom` takes a hash from an earlier scan only for the same path with
+the same size, `mtime` and `ctime`, both to the nanosecond. `device` and `inode` are
+not part of the key, so a reboot or a pool import does not matter. Any other change
+is a cache miss:
 
-1. **File renamed/moved** — the `inode` is usually preserved (it is just an `mv`
-   within the same filesystem) and `mtime` is unchanged → **cache hit**.
-2. **File copied** — new `inode` → **cache miss**, re-hash.
-3. **External software touched `mtime`** (`touch`, a rebuild from source, etc.) →
-   **cache miss**, re-hash.
-4. **File moved to another dataset** — different `device` → **cache miss**.
+1. **File renamed/moved** — a new path, and `ctime` changes → **cache miss**,
+   re-hash.
+2. **File copied** — a new file → **cache miss**, re-hash.
+3. **External software touched `mtime` or `ctime`** (`touch`, `chmod`, `chown`, a
+   new hardlink, a rebuild from source, etc.) → **cache miss**, re-hash.
+4. **File moved to another dataset** — a new path → **cache miss**.
 
 **Fix:**
 
-- Make sure `mtime` is stable between scans on your typical files:
+- Make sure `mtime` and `ctime` are stable between scans on your typical files:
   ```text
-  stat -c '%n %Y' /tank/some-file
+  stat -c '%n %y %z' /tank/some-file
   ```
-- If something touches `mtime`, disable that process or accept the cache miss as
+- If something touches them, disable that process or accept the cache miss as
   unavoidable.
 
 ### `--no-hash-reuse` is off right now — but I want it on
@@ -285,8 +287,11 @@ left-behind `.dedcom-….tmp` before you delete it.
 
 ### "another instance is already running" — but I'm sure it isn't
 
-**Cause:** the lock file `dedcom.lock` was left behind after an unclean exit (an
-OOM kill, a yanked cable, `kill -9`). The interactive message is:
+**Cause:** another `dedcom` process is still running and holds the lock — a
+`--scan` from cron, or a session left open in `tmux`, `screen` or another SSH
+window. The lock is an advisory `flock` on `dedcom.lock`, and the kernel releases
+it the moment its process exits, even after an OOM kill or `kill -9`: it is never
+left behind. The interactive message is:
 
 ```text
 dedcom: another instance is already running (PID 12345, since 2026-06-20 14:32:15).
@@ -296,21 +301,23 @@ Run with --read-only to observe, or terminate that process.
 **Fix:**
 
 ```text
-# confirm no process with the recorded PID exists:
-cat ~/.local/state/dedcom/dedcom.lock          # shows the PID
-ps -p <PID>                                     # no match = the lock is orphaned
+# find the process that holds the lock (the message names its PID too):
+pgrep -a dedcom
+fuser -v ~/.local/state/dedcom/dedcom.lock
 
-# remove the lock file by hand
-rm ~/.local/state/dedcom/dedcom.lock
+# let it finish, or stop it (an apply finishes its current action first):
+kill <PID>
 dedcom                                          # start again
 ```
 
-If a process with that PID exists but is **not** `dedcom` (the PID was reused by
-the system), the lock is also safe to remove by hand.
+Never delete `dedcom.lock` to get past the message: the running process keeps its
+lock on the deleted file, the next `dedcom` locks a new one, and two writers then
+work on the same state.
 
 To only observe the running instance without touching the lock, start with
-`dedcom --read-only`. An alternative is the `--force` flag, but it does not remove
-an orphaned lock — it **seizes** the state on top (which is less clean).
+`dedcom --read-only`. An alternative is the `--force` flag, but it does not stop
+the other process — it **seizes** the state on top of it, and two operators then
+write at once.
 
 ### Headless from cron does not run, it says "cancelled"
 
@@ -534,8 +541,10 @@ selective mode.)
 2. **`dedcom -V`** — record the version (e.g. `dedcom 0.9.0-beta.1`).
 3. **`dedcom --stats`** — the state of the database and sessions; it helps you see
    what has accumulated.
-4. **A test pool:** `make-test-pool.sh` (from the bundle) creates a pool on an
-   image file. Reproduce the problem there so you do not risk production data.
+4. **A test pool:** `scripts/make-test-pool.sh` from the source repository (not in
+   the release tarball or the `.deb`) creates a pool on an image file
+   ([§03](03-safety.md#a-dry-run-on-a-test-pool-before-the-real-one)). Reproduce the
+   problem there so you do not risk production data.
 
 ## What's next
 

@@ -41,7 +41,7 @@ it**, then install it into `PATH`:
 
 ```sh
 tar xzf dedcom-<version>-<triple>.tar.gz
-install -m 755 dedcom /usr/local/bin/dedcom
+install -m 755 dedcom-<version>-<triple>/dedcom /usr/local/bin/dedcom
 dedcom -V                                  # check: should print the version
 ```
 
@@ -81,8 +81,8 @@ again, see [CONTRIBUTING.md](../../CONTRIBUTING.md).
 
 > ⚠️ **Running as `root`.** Scanning directories outside `~` requires the corresponding
 > permissions, so `dedcom` is typically run as `root`. If you run it as an unprivileged
-> user, ZFS snapshots will be unavailable (you need `zfs allow` or sudo), and without
-> snapshot safety, applying actions is **not recommended**.
+> user, ZFS snapshots will be unavailable (you need `zfs allow` or sudo), and a batch
+> whose snapshot cannot be taken is **cancelled** before any file is touched.
 
 ### State directory
 
@@ -182,8 +182,9 @@ instance, a role-selection overlay appears at startup:
 
 > ⚠️ **`F` / `--force` is dangerous.** The previous operator keeps running, but two processes
 > must not write to the same database at once — you would overwrite each other's progress or
-> results. Use it only when you are sure the previous process is dead and the lock file was
-> left behind by mistake (this can happen after `kill -9` or an OOM crash).
+> results. A lock is never left behind: the kernel releases it when its process exits, even
+> after `kill -9` or an OOM kill. If the lock is held, that `dedcom` is still running — find it
+> (`pgrep -a dedcom`) and stop it instead.
 
 In read-only mode, a badge stays lit in the top-right corner:
 

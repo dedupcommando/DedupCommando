@@ -10,10 +10,12 @@ available (`--classic`).
 
 The process has three phases:
 
-1. **Walk** — traverse the tree and store the file list in SQLite (`dedcom.db`).
-2. **Hash** — BLAKE3 of every file, reading in `(device, inode)` order (inode-order on
-   HDD gives −21% cold-scan time on 2×HDD). Hashes are cached by
-   `(path, size, mtime)` — re-scanning the same directory is almost instant.
+1. **Walk** — traverse the tree and store the file list in SQLite (`dedcom.db`); files
+   under 4096 bytes are skipped.
+2. **Hash** — BLAKE3 of every file whose size another file shares, reading in
+   `(device, inode)` order (inode-order on HDD gives −21% cold-scan time on 2×HDD).
+   Hashes are reused from earlier scans by `(path, size, mtime, ctime)` — re-scanning
+   the same directory is almost instant.
 3. **Group** — merge files with the same hash into groups; optionally, build directory
    signatures for "twin folders".
 
@@ -22,8 +24,10 @@ identical contents, sorted "by payoff" — how much space deduplicating each gro
 free.
 
 Every destructive action (`delete`, `hardlink`, `reflink`) runs under a ZFS snapshot of
-the dataset (`@dedcom-<timestamp>`), with the target and keeper re-validated (re-hashed)
-beforehand. See [Safety](03-safety.md) for details.
+the dataset (`@dedcom-<timestamp>`), with the target and keeper re-validated beforehand:
+the target is re-hashed; the keeper is re-hashed on its first use in the batch and
+re-checked with `stat` after that (`--strict-verify` re-hashes it every time). See
+[Safety](03-safety.md) for details.
 
 ## What DedupCommando does NOT do
 
@@ -34,9 +38,9 @@ beforehand. See [Safety](03-safety.md) for details.
   blocks.
 - **It does not look for "similar" files.** Only byte-for-byte identical ones (the same
   BLAKE3). No fuzzy matching or perceptual hashing.
-- **It does not provide snapshot safety on non-ZFS filesystems.** On ext4/xfs/btrfs the
-  walk and hash run fine, but the snapshot insurance before a destructive action is
-  unavailable. Applying actions in that mode is NOT recommended.
+- **It does not act on non-ZFS filesystems.** On ext4/xfs/btrfs the walk and hash run
+  fine, but there is no snapshot insurance there, so delete, hardlink and reflink are
+  refused: `dedcom` acts only where it can take a ZFS snapshot first.
 - **It is not meant for several operators at once.** A single-instance lock keeps one
   active session; a second one can only be opened as an observer (`--read-only`) or with
   an explicit risk (`--force`) — which is always a bad idea.
@@ -53,8 +57,8 @@ beforehand. See [Safety](03-safety.md) for details.
 |-----------------------------|------------------------|----------------------------------------------------------------------------------------------------------|
 | Linux                       | Required               | Binary is Linux-only (`x86_64-unknown-linux-gnu` / `aarch64-unknown-linux-gnu`).                          |
 | Linux kernel ≥ 3.15         | Required               | Needed for `renameat2(RENAME_NOREPLACE)` for atomic publishing. On Proxmox it is certainly present.      |
-| ZFS                         | Strongly recommended   | Without ZFS, walk/hash work, but snapshot insurance is disabled. On Proxmox it is available out of the box. |
-| `zfs` in `PATH`             | Strongly recommended   | Needed for snapshots and dataset detection. See [Troubleshooting](13-troubleshooting.md) if it is not found. |
+| ZFS                         | Required for actions   | Without ZFS, walk/hash work, but delete, hardlink and reflink are refused. On Proxmox it is available out of the box. |
+| `zfs` in `PATH`             | Required for actions   | Needed for snapshots and dataset detection. See [Troubleshooting](13-troubleshooting.md) if it is not found. |
 | Reflink (block_cloning)     | Optional               | OpenZFS 2.2.1 or newer with `zfs_bclone_enabled=1`, and the pool's `feature@block_cloning` enabled or active. Without them, `delete` and `hardlink` are available, but not `reflink`. |
 | RAM                         | Depends on volume      | Walk/hash — tens of MB. Phase 3/3 — ~2.5 KiB/file; the `--merkle-dirs` alternative. Details in [Scanning](07-scanning.md). |
 | Terminal                    | UTF-8, 256 colors      | Unicode box-drawing (`┌┐└┘├┤─│`); ratatui works in most emulators. The Proxmox web shell has quirks ([Troubleshooting](13-troubleshooting.md)). |
@@ -71,10 +75,11 @@ MANDATORY. The minimum:
 - A **quarantine** (`.dedcom-quarantine/<timestamp>/` at the dataset root) — every
   deleted file goes here instead of being `unlink`ed. They are restored by hand like
   ordinary files, from the subdirectory stamped with the apply time.
-- **Revalidate** before each destructive action: the target and the keeper are re-hashed;
-  if anything changed since the scan, the action is aborted. The default mode is Hybrid
-  (faster, safe for typical use); the strict mode is `--strict-verify`
-  ([Actions](08-actions.md)).
+- **Revalidate** before each destructive action: the target is re-hashed, and so is the
+  keeper on its first use in the batch (after that it is re-checked with `stat`); if
+  anything changed since the scan, the action is aborted. The default mode is Hybrid
+  (faster, safe for typical use); the strict mode is `--strict-verify`, which re-hashes
+  the keeper before every action too ([Actions](08-actions.md)).
 - **Single-instance** — only one writing `dedcom` per state directory
   (`~/.local/state/dedcom/`). A second window can only be `--read-only`.
 - **Cross-device — refused.** If a move would cross a dataset boundary (i.e. a device),

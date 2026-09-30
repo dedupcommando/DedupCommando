@@ -12,16 +12,18 @@ Every destructive batch (delete / hardlink / reflink) runs behind layered guardr
 Before the first action, `dedcom` checks every action for what would stop it — a read-only or full
 filesystem, an immutable or append-only file or directory, a second mount of the dataset, a reflink the
 host or the pool cannot make — and refuses those actions untouched. It then snapshots **every dataset** an
-action will run on, named `<dataset>@dedcom-<YYYYMMDD-HHMMSS>-<seq>`; if no action can run, it takes none.
+action will run on, named `<dataset>@dedcom-<YYYYMMDD-HHMMSS>-<nanos>-<pid>-<seq>` (a plan saved as a shell
+script uses `<YYYYMMDD-HHMMSS>` alone, here and in the quarantine); if no action can run, it takes none.
 **If any snapshot fails, the entire batch is aborted** — no action runs. Snapshots are never auto-removed; they
 remain as insurance until you delete them with `zfs destroy`.
 
 ### 2. Quarantine instead of unlink
 "Delete" does not call `unlink`. The file is moved into a per-dataset quarantine directory,
-`.dedcom-quarantine/<YYYYMMDD-HHMMSS>-<seq>/<path-relative-to-dataset>`, preserving permissions, owner, and
-extended attributes. Space is reclaimed only when you purge the quarantine. The same quarantine is used to
-publish hardlinks/reflinks atomically (the original is evacuated first, the link is published into the freed
-slot, and on failure the original is restored).
+`.dedcom-quarantine/<YYYYMMDD-HHMMSS>-<nanos>-<pid>-<seq>/<path-relative-to-dataset>`, preserving permissions,
+owner, and extended attributes. Space is reclaimed only when you purge the quarantine. The same quarantine is
+used to publish hardlinks/reflinks atomically (the original is evacuated first, the link is published into the
+freed slot, and on failure the original is renamed back; if that fails too — say, another file took its path
+meanwhile — the original stays in the quarantine, and the summary prints its exact path).
 
 ### 3. Content revalidation before each action
 Immediately before each destructive action, `dedcom` re-checks the target and the keeper against the last
@@ -44,7 +46,8 @@ if the lock is held.
 
 ### 6. Consent gating and resource governor
 A one-time disclaimer must be accepted before first use. On busy hosts the scan's resource profile
-(Turbo / Balanced / **Idle**) caps threads and I/O priority so a scan does not starve VMs or backups.
+(Turbo / Balanced / **Idle**) caps threads and I/O priority; Idle hashes with one thread at the lowest CPU and
+disk priority (`nice 19`, `ionice idle`).
 
 ### 7. Cross-dataset moves are refused
 A move that would cross a dataset boundary is rejected (with an `rsync` hint) rather than performed as a
@@ -58,11 +61,14 @@ mitigated by the snapshot, the atomic publish, repeated symlink checks, and quar
 
 ## Recovery
 
-- **Restore one file:** move it back from `/<pool>/.dedcom-quarantine/<timestamp>/…` to its original path. If
-  a hardlink now occupies that path, remove the link first, then move the original back.
+- **Restore one file:** move it back from `<mountpoint>/.dedcom-quarantine/<timestamp>/…` — the quarantine of
+  the file's own dataset, each dataset has its own — to its original path. If a hardlink now occupies that
+  path, remove the link first, then move the original back.
 - **Roll back a whole batch:** run `zfs rollback <dataset>@dedcom-<timestamp>` for each affected dataset.
   ⚠️ Rollback reverts the **entire** dataset to snapshot time — anything written since is also lost. Prefer
-  restore-from-quarantine when other writes happened concurrently.
+  restore-from-quarantine when other writes happened concurrently. If the dataset has newer snapshots,
+  `zfs rollback` refuses unless given `-r`, which destroys those newer snapshots — list them first with
+  `zfs list -t snapshot <dataset>`.
 - **Purge quarantine:** `dedcom --purge-quarantine` reports the size; it deletes only with `--yes`
   (irreversible). Purge does not touch snapshots — remove those separately with `zfs destroy`. Waiting a week
   or two before purging/destroying is recommended.

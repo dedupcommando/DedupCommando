@@ -53,9 +53,9 @@ After apply:
 
 - It does NOT reclaim space immediately: the file sits in a quarantine on the same
   dataset. Until `--purge-quarantine --yes`, the space is still occupied.
-- It does NOT work on a non-ZFS dataset without an explicit quarantine: if the
-  automatic dataset detection by device fails (for example, a virtual filesystem
-  nested inside another), the action is cancelled with the error
+- It does NOT work outside ZFS: the quarantine lives on the file's own dataset, so if
+  the file's dataset cannot be determined (a non-ZFS filesystem, or a virtual
+  filesystem nested inside another), the action is cancelled with the error
   `target file's dataset could not be determined`.
 
 ## 8.2. Hardlink — a shared inode to the keeper
@@ -288,9 +288,10 @@ dedcom --strict-verify  # Strict
 | `<role> <path> changed after the scan (content) — action cancelled` | The size matched, the hash did not |
 | `<role> <path>: <io_error>` | The file is gone / no permission / the disk dropped out |
 
-Each error affects a single action; it does not affect the rest of the batch. Every
-item that was "cancelled" comes back in the file with its mark and can be reviewed
-after a fresh scan.
+Each error affects a single action; it does not affect the rest of the batch. Its mark
+does not survive the batch: a batch that runs to its end clears every mark of the scan,
+keepers included, and only the actions a cancelled batch (Esc) never reached keep theirs.
+Review a "cancelled" item after a fresh scan and mark it again.
 
 > TOCTOU note: operations act by PATH, not by an open file descriptor, so the
 > theoretical "check → act" window exists. Mitigations: the ZFS snapshot, the atomic

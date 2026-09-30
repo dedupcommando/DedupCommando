@@ -47,7 +47,7 @@ form:
      # Download the release binary from GitHub Releases (amd64/arm64),
      # verify it (see ../VERIFYING-RELEASES.md), then install:
      tar xzf dedcom-<version>-<triple>.tar.gz
-     sudo install -m 755 dedcom /usr/local/bin/dedcom
+     sudo install -m 755 dedcom-<version>-<triple>/dedcom /usr/local/bin/dedcom
      # (Debian / Proxmox VE: the APT repository, see 02-install.md. A Cargo install is planned.)
 
 2. First run:

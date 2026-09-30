@@ -140,7 +140,7 @@ opens (Screen::ScanConfig).
 > ⚠️ **Idle on production data is mandatory.** There are three profiles:
 > **Turbo** (all cores, disk at full — "it's my pool, I'm in a hurry"),
 > **Balanced** (the default: 2 threads, no seek-thrash), and **Idle** (1 thread
-> + nice 19 + ionice idle — does not starve VMs or backups of I/O). More in
+> + nice 19 + ionice idle — the lowest CPU and disk priority). More in
 > [§07 Scanning](07-scanning.md).
 
 ## Step 5. Scanning

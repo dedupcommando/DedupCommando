@@ -47,7 +47,7 @@ This is SQLite in WAL mode. The main tables:
 | `file_mark`   | Action marks (keeper/delete/hardlink/reflink) — `(scan_id, path)` | bytes × marks |
 | `file_group`  | Materialized duplicate-group summaries (for fast loading)       | hundreds of bytes/group |
 | `dir_dedup`   | Directory signatures (for twin folders)                        | hundreds of bytes/directory |
-| `hash_cache`  | Hash cache: `(device, inode, size, mtime)` → BLAKE3            | bytes × files |
+| `hash_cache`  | Old cache `(device, inode, size, mtime)` → BLAKE3, no longer read; a repeat scan reuses hashes from `file` (same path, size, `mtime`, `ctime`) | bytes × files |
 | `move_event`  | Move journal (Triage Board); pathnames stored as raw bytes since schema v6 | bytes × moves |
 
 ### Size estimate
@@ -431,4 +431,4 @@ the session's memory only and does not survive a restart.
 - [§11 Headless](11-headless.md) — `--stats`, `--compact-db`, `--purge-quarantine`
   for automation.
 - [§13 Troubleshooting](13-troubleshooting.md) — common problems (DB locked,
-  a stale lock, and so on).
+  a lock held by another instance, and so on).

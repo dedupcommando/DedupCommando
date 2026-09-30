@@ -16,7 +16,7 @@ the same guardrails.
 | Threat class                                          | What parries it                                            |
 |-------------------------------------------------------|-------------------------------------------------------------|
 | Loss of **data** (deleted the wrong thing)            | ZFS snapshot of the batch + file quarantine + revalidation  |
-| Loss of **scan result** (reboot, OOM, Esc)            | SQLite checkpoint + resume + hash reuse by `mtime`          |
+| Loss of **scan result** (reboot, OOM, Esc)            | SQLite checkpoint + resume + hash reuse by `mtime`+`ctime`  |
 | Corruption of **state** (two operators at once)       | Single-instance lock + `consent.json` / `dedcom.lock`       |
 
 Each guardrail is described separately below.
@@ -69,16 +69,18 @@ exists" error).
 ### 2. Quarantine instead of unlink
 
 When `dedcom` "deletes" a file, it does not call `unlink` — it **moves** the file
-into a quarantine directory at the root of the dataset:
+into a quarantine directory at the root of the file's own dataset (each dataset has
+its own):
 
 ```text
 <mountpoint>/.dedcom-quarantine/<timestamp>/<path-relative-to-dataset>
 ```
 
-The `<timestamp>` matches the timestamp of the batch's snapshot. Example:
+The `<timestamp>` matches the timestamp of the batch's snapshot. Example, with
+`tank/media` a dataset of its own:
 
 ```text
-/tank/.dedcom-quarantine/20260527-143215-512874000-4821-0/media/photo/IMG_0001.JPG
+/tank/media/.dedcom-quarantine/20260527-143215-512874000-4821-0/photo/IMG_0001.JPG
 /tank/.dedcom-quarantine/20260527-143215-512874000-4821-0/backup/old/notes.txt
 ```
 
@@ -86,14 +88,17 @@ These are **ordinary files** on the ZFS dataset — permissions, owner, and exte
 attributes are preserved. Restore is a plain `mv`:
 
 ```text
-mv /tank/.dedcom-quarantine/20260527-143215-512874000-4821-0/media/photo/IMG_0001.JPG \
+mv /tank/media/.dedcom-quarantine/20260527-143215-512874000-4821-0/photo/IMG_0001.JPG \
    /tank/media/photo/IMG_0001.JPG
 ```
 
 The quarantine is also used for **atomic publication** of hardlinks/reflinks: the
 original is first evacuated into quarantine, then the link is published into the
 freed slot via `renameat2(RENAME_NOREPLACE)` — if anything fails midway, the
-original is restored to its place.
+original goes back to its place, unless putting it back fails too (for example,
+another file took that place in the meantime): then the original stays in
+quarantine, and the Summary prints its exact path
+([§8.5](08-actions.md#85-what-hardlink-and-reflink-share--atomic-publication)).
 
 Space is reclaimed only when you purge the quarantine.
 
@@ -158,9 +163,10 @@ write cancelled: held by another instance — terminate that process or retry wi
 
 > ⚠️ **`--force` is dangerous.** It seizes the lock, but the previous instance keeps
 > running. Two processes then write to the same SQLite database and may call
-> `apply_batch` simultaneously — the consequences are unpredictable. Use `--force`
-> only when you are certain the previous process is dead (for example, an orphaned
-> lock file left behind after an OOM kill).
+> `apply_batch` simultaneously — the consequences are unpredictable. A lock is never
+> left behind: the kernel releases it when its process exits, even after `kill -9`
+> or an OOM kill. If the lock is held, that process is alive — find it
+> (`pgrep -a dedcom`) and stop it instead of using `--force`.
 
 ### 6. Cross-device — refusal (not "work around it by copying")
 
@@ -195,20 +201,22 @@ model this tool targets.
 
 The list of walked files is saved to `dedcom.db` in chunks. Resume picks the scan
 back up where it stopped (to within a `WALK_BATCH` batch of files). No actions are
-taken on files in this phase — NOTHING on the filesystem is changed.
+taken on files in this phase — no file content is changed (access times can change
+on a dataset with `atime=on`).
 
 ### …pull the cable during **hash** (phase 2/3)
 
 Hashes are computed in chunks of 64 files; after each chunk they are written to the
 database (`record_hashes` + `update_candidate_progress`). Resume continues from the
-next chunk. NOTHING on the filesystem is changed (hashing is read-only).
+next chunk. No file content is changed (hashing only reads; access times can change
+on a dataset with `atime=on`).
 
 ### …pull the cable during **group** (phase 3/3)
 
 Grouping is done by SQL aggregation (`materialize_file_groups`) and writes no
 intermediate results — on reboot this phase simply starts from scratch. The hashes
 from phase 2 are intact; phase 3 on 2 million files takes on the order of seconds to
-minutes, not hours. NOTHING on the filesystem is changed.
+minutes, not hours. No file content is changed.
 
 > ⚠️ **Memory peak in 3/3.** This is the most RAM-intensive phase (~2.5 KiB/file;
 > on 2 million files, ~5 GiB). If RAM runs out, the OOM killer kills the process.
@@ -245,10 +253,12 @@ After restart:
   zfs rollback tank@dedcom-<ts>
   zfs rollback tank/media@dedcom-<ts>
   ```
-- If you want to **finish the remaining actions** — open the scan in `dedcom`; the
-  files marked for an action are still marked (the file_mark is alive), then
-  F11 → apply. The already-applied actions are filtered out by revalidation (the
-  target is absent or already a hardlink — the action is skipped).
+- If you want to **finish the remaining actions** — run a **new scan** of the same
+  roots, mark the remaining files again and press F11. The old scan's marks are all
+  still there (the file_mark is alive), but a plan built from them is refused as a
+  whole: a file the batch already moved or relinked stops it with
+  `… is gone since the scan — rescan required` or
+  `… changed since the scan (…) — rescan required`.
 - Either way, the actions already performed are NOT lost: the originals are in
   quarantine and can be restored by hand (`mv`).
 
@@ -278,7 +288,9 @@ zfs rollback tank@dedcom-<ts>
 
 After rollback the dataset returns to its state **at the moment the snapshot was
 created**. That means: everything written to the dataset AFTER the snapshot is also
-lost — not just the result of `dedcom`.
+lost — not just the result of `dedcom`. If the dataset has newer snapshots,
+`zfs rollback` refuses unless given `-r`, which destroys those newer snapshots —
+list them first with `zfs list -t snapshot <dataset>`.
 
 If something was writing to the dataset in parallel (which violates the
 single-operator model), use targeted restore instead of rollback: pull only the
@@ -291,10 +303,13 @@ mv  /tank/.dedcom-quarantine/<ts>/path/to/file  /tank/path/to/file
 
 ### …want to bring back one specific file from quarantine
 
+Look in the quarantine of the file's own dataset — here `tank/media`, mounted at
+`/tank/media`:
+
 ```text
-find /tank/.dedcom-quarantine -type f -name 'photo.jpg'
-# showed /tank/.dedcom-quarantine/20260527-143215-512874000-4821-0/media/photo.jpg
-mv /tank/.dedcom-quarantine/20260527-143215-512874000-4821-0/media/photo.jpg /tank/media/photo.jpg
+find /tank/media/.dedcom-quarantine -type f -name 'photo.jpg'
+# showed /tank/media/.dedcom-quarantine/20260527-143215-512874000-4821-0/photo.jpg
+mv /tank/media/.dedcom-quarantine/20260527-143215-512874000-4821-0/photo.jpg /tank/media/photo.jpg
 ```
 
 If a hardlink already occupies the path (quarantine = deletion as part of a
@@ -302,7 +317,7 @@ hardlink batch) — remove the link first, then restore the original:
 
 ```text
 rm /tank/media/photo.jpg               # removes the hardlink, not the original in the group
-mv /tank/.dedcom-quarantine/.../photo.jpg /tank/media/photo.jpg
+mv /tank/media/.dedcom-quarantine/.../photo.jpg /tank/media/photo.jpg
 ```
 
 ### …corrupted the state with two operators
@@ -327,16 +342,20 @@ period.
 
 ### A dry run on a test pool before the real one
 
-The bundle includes `scripts/make-test-pool.sh`. It creates `/testpool` on a file
-image (it does not touch real disks) and is removed by `teardown-test-pool.sh`. It
-is worth running every destructive scenario on it first.
+The source repository has `scripts/make-test-pool.sh` (the release tarball and the
+`.deb` do not). Run as root, with `DEDCOM_E2E_ROOT` set to an existing directory
+that will hold everything it creates and `DEDCOM_E2E_OWNER_UID` to the numeric uid
+that may own that directory besides root, it creates the pool `testpool` on a file
+image (it does not touch real disks), mounted at
+`$DEDCOM_E2E_ROOT/pools/testpool/mount`; `teardown-test-pool.sh`, with the same two
+variables, removes it. It is worth running every destructive scenario on it first.
 
 ### The Idle profile on production data
 
 When scanning a production pool with active VMs/backups — the **Idle** profile is
 mandatory (F9 → "Configure and start a scan…" → the `G` key cycles through to
-Idle). It does not take I/O away from other consumers; see
-[§07 Scanning](07-scanning.md).
+Idle). It hashes with one thread at the lowest CPU and disk priority (`nice 19`,
+`ionice idle`); see [§07 Scanning](07-scanning.md).
 
 ### The file-panel cap in a giant group
 
@@ -363,8 +382,8 @@ zfs list -H -t snapshot -o name,creation -p | grep 'dedcom-' | \
 ## What the guardrails do NOT cover
 
 - **Non-ZFS filesystems.** On ext4/xfs/btrfs, `dedcom` will run walk and hash, but
-  it will not take a snapshot insurance (there is no ZFS). Applying actions on
-  non-ZFS is technically possible, but there are no guarantees — NOT recommended.
+  it cannot take a snapshot insurance there (there is no ZFS), so it refuses delete,
+  hardlink and reflink on such files: results there are for review and CSV export only.
 - **You deleted a snapshot by hand and then made a mistake.** `zfs destroy` of a
   snapshot is a separate, irreversible operation. Do not destroy snapshots right
   after `apply` — wait a week or two until you are sure the result is stable.
