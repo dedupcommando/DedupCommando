@@ -72,7 +72,7 @@ impl ApplyShared {
         self.phase.store(phase as u8, Ordering::Relaxed);
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
 

@@ -136,7 +136,7 @@ fn run(cli: &cli::Cli) -> i32 {
             // on a terminal: stderr now, the log at the next `cat`.
             let shown = textsan::terminal(&err.to_string());
             tracing::error!("exiting with error: {shown}");
-            eprintln!("dedcom: error: {shown}");
+            say(&format!("dedcom: error: {shown}"));
             1
         }
     }
@@ -933,10 +933,62 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
         cli.merkle_dirs,
     );
 
+    let end = event_loop(&mut app, &rx, |app| {
+        let drawn = guard
+            .terminal()
+            .draw(|frame| tui::draw(frame, app))
+            .map(|_| ());
+        if drawn.is_err() {
+            tui::event::silence_input();
+        }
+        drawn
+    });
+    match end {
+        LoopEnd::Quit => {
+            tracing::info!("normal shutdown");
+            Ok(())
+        }
+        LoopEnd::Panicked => Err(panic_shutdown_error()),
+        LoopEnd::TerminalLost => Err(terminal_lost_error(signals::count() > 1)),
+    }
+}
+
+/// The exit after a lost terminal says which way it went: waited for, or cut short by a second
+/// SIGINT or SIGTERM.
+fn terminal_lost_error(forced: bool) -> AppError {
+    AppError::msg(if forced {
+        "the terminal was lost, and a second signal ended the wait — the action that was \
+         running may be cut short: check its target and the quarantine"
+    } else {
+        "the terminal was lost — what was running was finished before exiting"
+    })
+}
+
+/// How the event loop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopEnd {
+    /// The operator quit, or the exit a signal staged has run its course.
+    Quit,
+    /// A background thread panicked; the hook already gave the terminal back.
+    Panicked,
+    /// Drawing failed — an SSH drop hung the terminal up — and the staged exit ran without it.
+    TerminalLost,
+}
+
+/// Logged when drawing fails; §03 of the manual quotes it.
+const TERMINAL_LOST_LOG: &str = "the terminal is gone — finishing the current action, then exiting";
+
+/// The TUI's event loop, apart from the terminal it draws on, so a test can hand it one that dies.
+fn event_loop(
+    app: &mut App,
+    rx: &crossbeam_channel::Receiver<AppEvent>,
+    mut draw: impl FnMut(&mut App) -> std::io::Result<()>,
+) -> LoopEnd {
     let mut panicked = false;
+    let mut lost = false;
     while !app.should_quit {
         // A signal arrived: arm the same cancellation Esc uses and leave once the current action
-        // is done. A second signal means the operator has stopped waiting.
+        // is done. A second SIGINT or SIGTERM means the operator has stopped waiting.
         if signals::requested() {
             app.request_shutdown(signals::count() > 1);
         }
@@ -947,18 +999,32 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
         if panics::tui_dead() {
             if !panicked {
                 panicked = true;
-                eprintln!("dedcom: a background thread panicked — finishing the current action, then exiting");
+                say("dedcom: a background thread panicked — finishing the current action, then exiting");
             }
+            app.request_shutdown(false);
+        }
+        // The terminal is gone. Leaving at the failed frame killed a batch between a quarantine
+        // evacuation and its publish, so the exit is staged like a signal's, with nothing drawn —
+        // and asked again on every pass: the completion handlers re-ask only after a signal or a
+        // panic (`shutdown_pending`), so without this the last work lands and the exit never ends.
+        if lost {
             app.request_shutdown(false);
         }
         app.tick = app.tick.wrapping_add(1);
         // Resource sampling before the frame — self-throttles by interval.
         app.resource.sample();
-        if !panicked {
-            guard.terminal().draw(|frame| tui::draw(frame, &mut app))?;
+        if !panicked && !lost {
+            if let Err(err) = draw(app) {
+                lost = true;
+                tracing::warn!("{TERMINAL_LOST_LOG} ({err})");
+                app.request_shutdown(false);
+            }
         }
 
         match rx.recv_timeout(Duration::from_millis(200)) {
+            // A terminal can outlive its frame — a closed pipe on stdout — and keys still arrive,
+            // but nobody sees what they act on: F10 or `q` quits at once and cuts the work short.
+            Ok(AppEvent::Key(_) | AppEvent::Mouse(_) | AppEvent::Resize) if lost => {}
             Ok(event) => app.handle_event(event),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -966,16 +1032,211 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
     }
 
     if panicked {
-        return Err(panic_shutdown_error());
+        LoopEnd::Panicked
+    } else if lost {
+        LoopEnd::TerminalLost
+    } else {
+        LoopEnd::Quit
     }
-    tracing::info!("normal shutdown");
-    Ok(())
+}
+
+/// A line on stderr that may have nowhere to go: after an SSH drop stderr is the hung-up terminal,
+/// and `eprintln!` panics on a failed write.
+fn say(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{line}");
 }
 
 /// A panic in a background thread has already restored the terminal and printed its message, so
 /// nothing may be drawn afterwards — and the process must not pretend it exited cleanly.
 fn panic_shutdown_error() -> AppError {
     AppError::msg("a background thread panicked — see the message above")
+}
+
+#[cfg(test)]
+mod terminal_loss_tests {
+    use super::*;
+    use crate::actions::{apply_worker, ApplyOutcome};
+    use crate::model::action::BatchResult;
+    use crate::tui::commander::move_batch::MoveBatchOutcome;
+    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, MutexGuard};
+
+    /// A frame drawn on a hung-up terminal.
+    fn hung_up() -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::EIO))
+    }
+
+    /// Signal and panic state is process-wide: the loop reads both, so it runs alone and from quiet.
+    fn quiet() -> (MutexGuard<'static, ()>, MutexGuard<'static, ()>) {
+        let locks = (crate::signals::test_lock(), crate::panics::test_lock());
+        crate::signals::test_reset();
+        crate::panics::clear_tui_dead();
+        locks
+    }
+
+    /// Runs the loop on its own thread under a deadline: a loop that never ends must fail its test
+    /// rather than hang the run and every test queued on the shared locks.
+    fn run_to_the_end(
+        mut app: App,
+        rx: crossbeam_channel::Receiver<AppEvent>,
+        mut draw: impl FnMut(&mut App) -> std::io::Result<()> + Send + 'static,
+    ) -> (LoopEnd, App) {
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let end = event_loop(&mut app, &rx, &mut draw);
+            let _ = done_tx.send((end, app));
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the loop must end once the work in flight has landed")
+    }
+
+    /// A move batch — work with no cancel flag of its own that has to land, as an action has to
+    /// between its evacuation and its publish — that reports `after` the loop has started.
+    fn move_lands_after(app: &App, after: Duration) -> std::thread::JoinHandle<()> {
+        let events = app.events.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            let outcome = MoveBatchOutcome {
+                error: Some("landed while the terminal was gone".to_string()),
+                ..Default::default()
+            };
+            events
+                .send(AppEvent::CommanderMoveDone(Box::new(outcome)))
+                .unwrap();
+        })
+    }
+
+    /// An SSH drop hangs the terminal up while work is in flight, and every frame fails from then
+    /// on. The loop has to stage the exit and wait for that work: leaving at the first failed frame
+    /// killed a batch between a quarantine evacuation and its publish (the target's path stood
+    /// empty, the replacement left under its temporary name).
+    #[test]
+    fn a_lost_terminal_waits_for_the_work_in_flight() {
+        let _quiet = quiet();
+        let (mut app, rx) = crate::app::test_app();
+        app.commander.move_pending = 1;
+        let lands = move_lands_after(&app, Duration::from_millis(300));
+
+        let frames = Arc::new(AtomicUsize::new(0));
+        let counted = frames.clone();
+        let (end, app) = run_to_the_end(app, rx, move |_app| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            hung_up()
+        });
+
+        assert_eq!(
+            app.commander.move_pending, 0,
+            "the loop left before the work in flight landed"
+        );
+        assert_eq!(end, LoopEnd::TerminalLost);
+        assert_eq!(
+            frames.load(Ordering::SeqCst),
+            1,
+            "nothing more is drawn on a terminal that is gone"
+        );
+        lands.join().unwrap();
+    }
+
+    /// Losing the terminal raises the batch's own cancel flag: the action running is carried to its
+    /// end, and the next one never starts.
+    #[test]
+    fn a_lost_terminal_stops_the_batch_after_the_current_action() {
+        let _quiet = quiet();
+        let (mut app, rx) = crate::app::test_app();
+        let started = Arc::new(AtomicUsize::new(0));
+        let (finish_tx, finish_rx) = crossbeam_channel::unbounded::<()>();
+        let job_started = started.clone();
+        app.apply = Some(apply_worker::spawn_job(app.events.clone(), move |shared| {
+            let mut done = 0;
+            for _ in 0..3 {
+                if shared.is_cancelled() {
+                    break;
+                }
+                job_started.fetch_add(1, Ordering::SeqCst);
+                // The action in flight, until the test lets it finish.
+                let _ = finish_rx.recv_timeout(Duration::from_secs(10));
+                done += 1;
+            }
+            ApplyOutcome::Finished(BatchResult {
+                planned: 3,
+                cancelled: done < 3,
+                ..Default::default()
+            })
+        }));
+        let finishes = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            for _ in 0..3 {
+                let _ = finish_tx.send(());
+            }
+        });
+
+        let (end, app) = run_to_the_end(app, rx, |_app| hung_up());
+
+        assert_eq!(end, LoopEnd::TerminalLost);
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "the action running was finished and the next one never started"
+        );
+        assert!(
+            app.apply.is_none(),
+            "the loop ended before the batch reported"
+        );
+        finishes.join().unwrap();
+    }
+
+    /// Keys can still arrive when the terminal outlives its frame (a closed pipe on stdout), but
+    /// nobody sees what they act on: F10 in the commander would quit at once and cut the move short.
+    #[test]
+    fn keys_after_the_loss_do_not_cut_the_wait_short() {
+        let _quiet = quiet();
+        let (mut app, rx) = crate::app::test_app();
+        // Past the consent notice, which would take every key but Esc for itself.
+        app.show_disclaimer = false;
+        app.commander.move_pending = 1;
+        for key in [KeyCode::F(10), KeyCode::Char('q')] {
+            app.events
+                .send(AppEvent::Key(KeyEvent::new(key, KeyModifiers::NONE)))
+                .unwrap();
+        }
+        let lands = move_lands_after(&app, Duration::from_millis(300));
+
+        let (end, app) = run_to_the_end(app, rx, |_app| hung_up());
+
+        assert_eq!(
+            app.commander.move_pending, 0,
+            "a key nobody could see ended the wait before the move landed"
+        );
+        assert_eq!(end, LoopEnd::TerminalLost);
+        lands.join().unwrap();
+    }
+
+    /// Nothing in flight: the lost terminal ends the loop on the same pass — nobody is left to wait
+    /// for, and nobody is there to press a key.
+    #[test]
+    fn a_lost_terminal_with_nothing_in_flight_leaves_at_once() {
+        let _quiet = quiet();
+        let (app, rx) = crate::app::test_app();
+
+        let (end, app) = run_to_the_end(app, rx, |_app| hung_up());
+
+        assert_eq!(end, LoopEnd::TerminalLost);
+        assert!(app.should_quit);
+    }
+
+    /// §03 quotes the two lines an SSH drop leaves in the log, so the operator who reconnects can
+    /// find them.
+    #[test]
+    fn the_manual_quotes_the_terminal_lost_log_lines() {
+        let chapter = crate::testfixtures::manual("03-safety.md");
+        let waited = terminal_lost_error(false).to_string();
+        for line in [TERMINAL_LOST_LOG, waited.as_str()] {
+            assert!(chapter.contains(line), "03-safety.md must quote: {line}");
+        }
+    }
 }
 
 #[cfg(test)]

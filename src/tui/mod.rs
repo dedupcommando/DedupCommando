@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::io::{self, Stdout};
+use std::mem::ManuallyDrop;
 
 use ratatui::{
     backend::CrosstermBackend,
@@ -35,7 +36,10 @@ pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 /// Owns the terminal in raw + alternate-screen mode; restores it on Drop.
 pub struct TerminalGuard {
-    terminal: Tui,
+    /// Never dropped. ratatui's own `Drop` reports a failed cursor restore with `eprintln!`, which
+    /// panics once the terminal is gone — an SSH drop hangs stderr up with it — and turned an
+    /// orderly exit into code 101 without its last log line. The guard's `Drop` restores instead.
+    terminal: ManuallyDrop<Tui>,
     /// Whether the keyboard enhancement protocol is enabled — so it can be correctly disabled on Drop.
     keyboard_enhanced: bool,
 }
@@ -55,7 +59,7 @@ impl TerminalGuard {
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self {
-            terminal,
+            terminal: ManuallyDrop::new(terminal),
             keyboard_enhanced: false,
         })
     }
@@ -82,19 +86,27 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        // The terminal is going away, so the reason for ignoring SIGPIPE goes with it: whatever
-        // prints after this is an ordinary command-line write and should end at a closed pipe.
-        crate::signals::restore_default_sigpipe();
+        // Any step may fail — the terminal can be hung up or be a closed pipe — and none may end
+        // the process: SIGPIPE stays ignored until the last write, or the first one into a dead
+        // pipe would kill it before raw mode is off.
         if self.keyboard_enhanced {
             let _ = execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags);
         }
         let _ = disable_raw_mode();
-        let _ = execute!(
+        let closed_pipe = execute!(
             self.terminal.backend_mut(),
             DisableMouseCapture,
             LeaveAlternateScreen
-        );
+        )
+        .is_err_and(|err| err.kind() == io::ErrorKind::BrokenPipe);
         let _ = self.terminal.show_cursor();
+        // The terminal is going away, so the reason for ignoring SIGPIPE goes with it: whatever
+        // prints after this is an ordinary command-line write and should end at a closed pipe.
+        // Unless the terminal itself was that pipe: the bytes its frames left in stdout's buffer
+        // are flushed at exit, and the signal would end an orderly exit there instead.
+        if !closed_pipe {
+            crate::signals::restore_default_sigpipe();
+        }
     }
 }
 

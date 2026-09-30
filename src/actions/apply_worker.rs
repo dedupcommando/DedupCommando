@@ -88,8 +88,8 @@ fn spawn_on(
 
 /// The worker itself: poller, panic containment, terminal event. `spawn` hands it the real
 /// guarded batch; the tests hand it a job that panics, which is the only way in to the
-/// containment.
-fn spawn_job<F>(events: Sender<AppEvent>, job: F) -> ApplyHandle
+/// containment, or one that stops at the cancel flag the way a batch does.
+pub(crate) fn spawn_job<F>(events: Sender<AppEvent>, job: F) -> ApplyHandle
 where
     F: FnOnce(&ApplyShared) -> ApplyOutcome + Send + 'static,
 {

@@ -106,3 +106,21 @@ pub fn spawn_input_thread(tx: Sender<AppEvent>) {
         }
     });
 }
+
+/// Points stdin at a pipe nobody writes to, once the terminal is gone.
+///
+/// A hung-up terminal reads as an endless end-of-file, and the reader above never returns from
+/// `event::read` on it: it spins on the empty reads, a core busy for as long as the exit waits for
+/// the work in flight. A read from a silent pipe blocks instead. The write end stays open on
+/// purpose — a pipe without a writer would read as end-of-file too.
+pub fn silence_input() {
+    let mut ends = [0 as libc::c_int; 2];
+    // SAFETY: `pipe` fills the two descriptors it is given, and `dup2`/`close` touch only
+    // descriptors this function owns plus stdin, which it replaces whole.
+    unsafe {
+        if libc::pipe(ends.as_mut_ptr()) == 0 {
+            libc::dup2(ends[0], libc::STDIN_FILENO);
+            libc::close(ends[0]);
+        }
+    }
+}

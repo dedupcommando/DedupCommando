@@ -288,8 +288,10 @@ left-behind `.dedcom-….tmp` before you delete it.
 ### "another instance is already running" — but I'm sure it isn't
 
 **Cause:** another `dedcom` process is still running and holds the lock — a
-`--scan` from cron, or a session left open in `tmux`, `screen` or another SSH
-window. The lock is an advisory `flock` on `dedcom.lock`, and the kernel releases
+`--scan` from cron, a session left open in `tmux`, `screen` or another SSH
+window, or a session whose SSH connection has just dropped and that is finishing
+the action it was running ([§03](03-safety.md#lose-the-ssh-connection-during-apply)).
+The lock is an advisory `flock` on `dedcom.lock`, and the kernel releases
 it the moment its process exits, even after an OOM kill or `kill -9`: it is never
 left behind. The interactive message is:
 

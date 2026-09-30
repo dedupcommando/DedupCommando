@@ -20,13 +20,19 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// Armed by the handler; read by the scan/apply cancellation checks.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-/// How many shutdown signals have arrived. The second one means the operator is no longer
+/// How many SIGINT and SIGTERM have arrived. The second one means the operator is no longer
 /// willing to wait for a graceful stop, so the TUI stops waiting for the worker.
+///
+/// SIGHUP is not counted. A dropped SSH session delivers it twice — from the shell that owned the
+/// terminal, then from the kernel as that shell exits — and nobody is at the keyboard to mean «stop
+/// waiting». Counted, the pair forced the exit in the middle of an action.
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 
-extern "C" fn handler(_signal: libc::c_int) {
+extern "C" fn handler(signal: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
-    COUNT.fetch_add(1, Ordering::SeqCst);
+    if signal != libc::SIGHUP {
+        COUNT.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// Puts SIGPIPE back to its default disposition, for the headless modes.
@@ -103,9 +109,25 @@ pub fn requested() -> bool {
     SHUTDOWN.load(Ordering::SeqCst)
 }
 
-/// Number of shutdown signals so far. `> 1` — stop waiting for the current action.
+/// Number of SIGINT and SIGTERM so far. `> 1` — stop waiting for the current action.
 pub fn count() -> usize {
     COUNT.load(Ordering::SeqCst)
+}
+
+/// Signal state is process-wide: every test that raises a signal or reads the flags takes this
+/// lock — the tests below and the main loop's.
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    tests::SIGNAL_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Forgets every signal so far, for a test that starts from a quiet process.
+#[cfg(test)]
+pub(crate) fn test_reset() {
+    SHUTDOWN.store(false, Ordering::SeqCst);
+    COUNT.store(0, Ordering::SeqCst);
 }
 
 /// The flag itself, for the cancellation checks that already take an `&AtomicBool`
@@ -120,7 +142,7 @@ mod tests {
 
     /// Signals are process-wide, so the tests that raise them share one lock and put the state
     /// back afterwards.
-    static SIGNAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static SIGNAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn reset() {
         SHUTDOWN.store(false, Ordering::SeqCst);
@@ -283,10 +305,33 @@ mod tests {
             requested(),
             "the flag the cancellation checks read is armed"
         );
-        assert_eq!(count(), 1);
+        assert_eq!(count(), 0, "SIGHUP asks for the stop but never forces it");
         // The headless scan watches this very flag.
         assert!(shutdown_flag().load(Ordering::SeqCst));
 
+        reset();
+    }
+
+    /// A dropped SSH session delivers SIGHUP twice: the shell that owned the terminal resends it to
+    /// its jobs, then the kernel sends it to the foreground group as that shell exits (a real drop
+    /// shows `SI_USER` from bash, then `SI_KERNEL`). Counted, the pair forced the exit and left a
+    /// batch between a quarantine evacuation and its publish.
+    #[test]
+    fn a_hung_up_terminal_never_forces_the_exit() {
+        let _lock = SIGNAL_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reset();
+        install();
+        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        assert!(requested(), "the graceful stop is armed");
+        assert_eq!(count(), 0, "nobody at the keyboard has stopped waiting");
+        // The operator's own signals still count: Ctrl+C twice is a deliberate choice.
+        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+        assert_eq!(count(), 2);
+        restore_default_disposition();
         reset();
     }
 

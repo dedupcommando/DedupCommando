@@ -262,6 +262,31 @@ After restart:
 - Either way, the actions already performed are NOT lost: the originals are in
   quarantine and can be restored by hand (`mv`).
 
+### …lose the SSH connection during **apply**
+
+A dropped SSH session hangs up the terminal: `dedcom` gets `SIGHUP` (usually twice —
+from the shell and from the kernel) and every write to the screen fails from then on.
+It treats that like Esc: the current action is carried through to completion, the
+batch stops after it, and the program exits by itself. Nothing is drawn and no key is
+read any more — there is no screen left. `dedcom.log` gets the lines
+
+```text
+the terminal is gone — finishing the current action, then exiting
+exiting with error: the terminal was lost — what was running was finished before exiting
+```
+
+Reconnect, start `dedcom` again and open the scan to see where the batch stopped. If
+you are back while the old process is still finishing its action, the new one stops
+with `another instance is already running` — wait for that PID to exit
+(`pgrep -a dedcom`).
+
+`SIGHUP` never cuts that wait short, however often it arrives. Two `SIGTERM`s from
+another session (`kill <PID>` twice) do: the process exits at once, and the action it
+was running may be left halfway — the original in `.dedcom-quarantine/<ts>/`, its
+replacement next to the target as `.dedcom-tmp-…`. Put the original back by hand
+(`mv`). Inside the interface `Ctrl+C` is an ordinary key, not a signal. To keep the
+screen across a drop, run `dedcom` over SSH inside `tmux` or `screen`.
+
 ### …press **Esc** during apply
 
 The worker checks the cancellation flag **at action boundaries** (between files,
