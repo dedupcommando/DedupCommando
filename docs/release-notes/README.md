@@ -14,6 +14,9 @@ subject since the previous tag, and a list of subjects cannot say what a release
 2. Write `docs/release-notes/<tag>.md`.
 3. Commit `VERSION`, `Cargo.toml`, `Cargo.lock`, `README.md` and the notes, and push.
 4. Push the tag.
+5. Once the release run is green, bump `upstream.lock` in the site repository
+   ([dedupcommando/site](https://github.com/dedupcommando/site)), so that
+   https://dedcom.dequzzy.io/ publishes the new manual and notes.
 
 The release run refuses to start if the notes file is missing or empty, or if the tag,
 `VERSION`, `Cargo.toml` and `Cargo.lock` name different versions, before anything is

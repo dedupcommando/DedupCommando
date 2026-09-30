@@ -73,7 +73,8 @@ mitigated by the snapshot, the atomic publish, repeated symlink checks, and quar
 - **No headless apply.** `--scan` only scans; applying actions is interactive (`F11`) or via a saved
   shell-script plan. This is deliberate — applying needs visual keeper/mark confirmation.
 - **ZFS-dependent safety.** Snapshots, dataset detection, reflink, and quarantine resolution rely on ZFS. On
-  non-ZFS filesystems, scanning works but there is no snapshot safety, so applying actions is not recommended.
+  non-ZFS filesystems, scanning works, but delete, hardlink and reflink are refused: `dedcom` acts only where
+  it can take a ZFS snapshot first.
 - **Root** is typically required (to take snapshots and to scan outside your home directory).
 - **Hardlink** works within a single dataset and shares one inode/metadata; **reflink** needs OpenZFS 2.2.1
   or newer with `zfs_bclone_enabled=1`, a pool with `feature@block_cloning` enabled and, like hardlink, a

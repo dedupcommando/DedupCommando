@@ -3,11 +3,14 @@ name = "dedupcommando"
 version = "0.9.2"
 edition = "2021"
 rust-version = "1.82"
-description = "ZFS-aware multi-panel duplicate-file deduplication tool for Linux"
+description = "Safety-first duplicate file finder and deduplicator for Linux and ZFS"
 license = "Apache-2.0"
 repository = "https://github.com/dedupcommando/DedupCommando"
-homepage = "https://github.com/dedupcommando/DedupCommando"
+homepage = "https://dedcom.dequzzy.io/"
+documentation = "https://dedcom.dequzzy.io/en/manual/"
 readme = "README.md"
+keywords = ["deduplication", "duplicate-files", "zfs", "tui", "proxmox"]
+categories = ["command-line-utilities", "filesystem"]
 
 # Crate id stays `dedupcommando` (defensive reservation); the public package/command/binary is
 # `dedcom` (owner decision 2026-06-23). The .deb Package is `dedcom` via [package.metadata.deb].

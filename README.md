@@ -1,5 +1,15 @@
 # DedupCommando
 
+[![Latest release](https://img.shields.io/github/v/release/dedupcommando/DedupCommando)](https://github.com/dedupcommando/DedupCommando/releases/latest)
+[![CI](https://github.com/dedupcommando/DedupCommando/actions/workflows/ci.yml/badge.svg)](https://github.com/dedupcommando/DedupCommando/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
+**[Website](https://dedcom.dequzzy.io/)** · **[Manual](https://dedcom.dequzzy.io/en/manual/)** ·
+**[Release notes](https://dedcom.dequzzy.io/en/changelog/)** · **[Install](#install)** ·
+**[Compare with other tools](https://dedcom.dequzzy.io/en/compare/)**
+
+![dedcom 0.9.2 on a ZFS pool: duplicate groups by savings, marks, the F11 plan as a shell script that takes a ZFS snapshot first, then apply](docs/img/dedcom-review-apply.gif)
+
 > **⚠️ Beta (v0.9.2).** DedupCommando performs destructive operations (delete, hardlink, reflink)
 > on real files. Read **[docs/SAFETY.md](docs/SAFETY.md)** before applying any action, and keep backups.
 
@@ -22,7 +32,8 @@ quarantine instead of being unlinked, and file content is re-validated immediate
 - **Two interfaces:** a multi-panel "commander" (default) or a classic stepwise wizard (`--classic`).
 - **Resumable scans** with on-disk checkpoints and a hash cache for near-instant re-scans.
 - **Headless scan mode** for cron, plus CSV export and stats.
-- **Resource governor** (Turbo / Balanced / Idle) so a scan won't starve VMs or backups on a busy host.
+- **Resource governor** (Turbo / Balanced / Idle); on a busy host, Idle scans with one thread at the lowest
+  CPU and disk priority (`nice 19`, `ionice idle`).
 
 It intentionally does **not** do: compression, ZFS block-level dedup (`zfs set dedup`), fuzzy/perceptual
 matching, or background daemon/watch indexing. Linux only.
@@ -32,8 +43,8 @@ matching, or background daemon/watch indexing. Linux only.
 - **Linux**, kernel ≥ 3.15 (requires `renameat2`). x86_64 or aarch64.
 - **Pre-built packages need glibc ≥ 2.39** — Debian 13 (trixie), Ubuntu 24.04, or Proxmox VE 9 or newer.
   On older systems (e.g. Proxmox VE 8 / Debian 12), build from source.
-- **ZFS strongly recommended** — snapshot safety, dataset detection and reflink depend on it. On non-ZFS
-  filesystems scanning works, but applying actions has **no snapshot safety and is not recommended**.
+- **ZFS is required for actions** — snapshot safety, dataset detection and reflink depend on it. On other
+  filesystems scanning works, but delete, hardlink and reflink are **refused**.
 - `zfs` available in `PATH`; typically run as **root** (to take snapshots and scan outside `$HOME`).
 - A UTF-8, 256-color terminal.
 
@@ -97,7 +108,8 @@ guardrails (full detail in **[docs/SAFETY.md](docs/SAFETY.md)**):
 - A **ZFS snapshot** is taken of every dataset the batch touches *before* the first action; if any snapshot
   fails, the **entire batch is aborted**.
 - **"Delete" moves files to a per-dataset quarantine**, not `unlink` — reversible until you explicitly purge.
-- Content is **re-validated** (re-hash / re-stat) before each destructive action; a mismatch aborts that action.
+- Content is **re-validated** before each destructive action (identity re-stat between actions, a re-hash once
+  per batch — or before every action with `--strict-verify`); a mismatch aborts that action.
 - Files are published atomically with **`renameat2(RENAME_NOREPLACE)`** — no check-then-rename race.
 - A **single-instance lock** prevents concurrent writers; cross-dataset moves are **refused**, never a silent
   copy-and-delete.
@@ -120,6 +132,7 @@ roughly **(hashed files) × ~2.5 KiB** at peak (freed when the phase ends):
 
 ## Documentation
 
+- **[dedcom.dequzzy.io](https://dedcom.dequzzy.io/)** — the website: the manual, release notes and guides online.
 - **[docs/SAFETY.md](docs/SAFETY.md)** — safety model, recovery, and limitations (read this).
 - **[docs/VERIFYING-RELEASES.md](docs/VERIFYING-RELEASES.md)** — checksums, signatures, SBOM, attestation.
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — building from source and contributing (DCO).
