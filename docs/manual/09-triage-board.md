@@ -8,6 +8,10 @@ a source directory and, with each press of 1–4, drop a file into one of four
 
 Opened with **Shift+F12**, or `` ` `` `F12` from commando.
 
+![The Triage Board in dedcom 0.9.2: files from a source directory go to receivers with the keys 1–4, and u undoes a move](img/dedcom-scan-triage.gif)
+
+The same recording as in [§07](07-scanning.md): the Board appears after about 25 seconds.
+
 ## Anatomy of the screen
 
 ```text

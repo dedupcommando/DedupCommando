@@ -31,7 +31,8 @@ GPG-signed, and `signed-by` ensures `apt` trusts only packages signed with the k
 
 > **Requires glibc ≥ 2.39 — Debian 13 (trixie), Ubuntu 24.04, or Proxmox VE 9 or newer.** The
 > pre-built packages are compiled against glibc 2.39, so on older systems (e.g. Proxmox VE 8 /
-> Debian 12) the install refuses with an unmet `libc6` dependency — build from source (below) there.
+> Debian 12) the install refuses with an unmet `libc6` dependency — build from source there, on that
+> system, with a Rust toolchain (below).
 
 ## Install from a GitHub Release (any Linux with glibc ≥ 2.39)
 
@@ -63,8 +64,10 @@ build from source (below). DedupCommando is **Linux-only** (it uses `libc`/`rena
 
 To build from source without a local Rust toolchain, use the Docker-based wrapper. It runs
 the `rust:1.95.0` image, but the actual toolchain follows `rust-toolchain.toml`
-(`channel = "stable"`), so it tracks current stable. Full details — including the gates your
-change must pass — are in [CONTRIBUTING.md](../../CONTRIBUTING.md).
+(`channel = "stable"`), so it tracks current stable. The image is Debian 13, so the binary it
+builds needs the same newer glibc and will not run on an older system such as Proxmox VE 8 —
+build there with a local toolchain instead (next paragraph). Full details — including the gates
+your change must pass — are in [CONTRIBUTING.md](../../CONTRIBUTING.md).
 
 ```text
 pwsh scripts/build.ps1 check       # fast compile

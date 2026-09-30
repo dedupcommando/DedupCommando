@@ -24,6 +24,11 @@ or `SIGHUP` from a dropped SSH session (so run a long scan over SSH in `tmux` or
 get no hash and are read again from the start on resume. Phase 3 is a single
 transient memory peak; if RAM is tight, see `--merkle-dirs` below.
 
+![dedcom 0.9.2: the scan form cycling Turbo, Balanced and Idle, a scan of a test ZFS pool, the duplicate groups it found, then the Triage Board](img/dedcom-scan-triage.gif)
+
+A scan of a test pool, recorded with dedcom 0.9.2; the scan itself is sped up three times. The Triage
+Board at the end is described in [§09](09-triage-board.md).
+
 ## Intensity profiles (Resource Governor)
 
 In the scan configuration wizard the **G** key cycles the profile:

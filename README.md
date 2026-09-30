@@ -70,8 +70,9 @@ tar xzf dedcom-<version>-<triple>.tar.gz
 install -m 755 dedcom-<version>-<triple>/dedcom /usr/local/bin/dedcom
 ```
 
-Both pre-built channels need glibc ≥ 2.39 (Debian 13 / Ubuntu 24.04 / Proxmox VE 9+). To build from source
-(Docker-based, no local Rust toolchain needed — works on older systems too), see [CONTRIBUTING.md](CONTRIBUTING.md).
+Both pre-built channels need glibc ≥ 2.39 (Debian 13 / Ubuntu 24.04 / Proxmox VE 9+). On an older system, build
+from source on that system with a Rust toolchain (MSRV 1.82), see [CONTRIBUTING.md](CONTRIBUTING.md): a binary from
+the Docker build is linked against its image's newer glibc and will not run there.
 A `cargo install dedcom` is planned once the crate is published.
 
 ## Quickstart
