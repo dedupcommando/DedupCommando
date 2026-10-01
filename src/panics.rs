@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Panic containment for the background workers.
+//! Panic containment for the background workers and for the interface thread.
 //!
 //! A panic in a worker thread does not kill the process: that thread unwinds alone, its terminal
 //! event is never sent, and whatever waits for that event waits forever. Applying is the worst
@@ -12,6 +12,9 @@
 //! alternate screen left — while the main loop happily keeps drawing frames over the panic
 //! message. The hook therefore also marks the TUI dead, and the loop stops drawing and shuts down
 //! the way it does on a signal: finish the current action, then leave.
+//!
+//! A panic on the interface thread itself would unwind the loop and `main`, and the process would
+//! end with the work in flight. The loop catches it here too and takes the same way out.
 
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static TUI_DEAD: AtomicBool = AtomicBool::new(false);
 
 /// Runs `job` so that a panic comes back as an error instead of a lost event. `what` names the
-/// worker in the text the operator ends up seeing.
+/// worker, or the interface, in the text the operator ends up seeing.
 pub fn guard_value<T>(what: &str, job: impl FnOnce() -> T) -> std::result::Result<T, String> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
         Ok(value) => Ok(value),

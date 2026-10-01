@@ -811,7 +811,7 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
     // A background thread may already have panicked: the hook has restored the terminal, so the
     // splash must not paint over the message either. The same check guards every later frame.
     if panics::tui_dead() {
-        return Err(panic_shutdown_error());
+        return Err(panic_exit_error(false, false));
     }
     guard
         .terminal()
@@ -850,7 +850,7 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
 
     let (zfs, host, sessions) = loop {
         if panics::tui_dead() {
-            return Err(panic_shutdown_error());
+            return Err(panic_exit_error(false, false));
         }
         tick = tick.wrapping_add(1);
         guard
@@ -933,23 +933,35 @@ fn run_tui(cli: &cli::Cli) -> Result<()> {
         cli.merkle_dirs,
     );
 
-    let end = event_loop(&mut app, &rx, |app| {
-        let drawn = guard
-            .terminal()
-            .draw(|frame| tui::draw(frame, app))
-            .map(|_| ());
-        if drawn.is_err() {
-            tui::event::silence_input();
-        }
-        drawn
-    });
+    let end = event_loop(
+        &mut app,
+        &rx,
+        |app| {
+            let drawn = guard
+                .terminal()
+                .draw(|frame| tui::draw(frame, app))
+                .map(|_| ());
+            if drawn.is_err() {
+                tui::event::silence_input();
+            }
+            drawn
+        },
+        App::handle_event,
+        say,
+    );
+    loop_result(end, signals::count() > 1)
+}
+
+/// How the loop's ending reaches `main`. `forced`: a second SIGINT or SIGTERM ended the wait.
+fn loop_result(end: LoopEnd, forced: bool) -> Result<()> {
     match end {
         LoopEnd::Quit => {
             tracing::info!("normal shutdown");
             Ok(())
         }
-        LoopEnd::Panicked => Err(panic_shutdown_error()),
-        LoopEnd::TerminalLost => Err(terminal_lost_error(signals::count() > 1)),
+        LoopEnd::Panicked => Err(panic_exit_error(false, forced)),
+        LoopEnd::InterfacePanicked => Err(panic_exit_error(true, forced)),
+        LoopEnd::TerminalLost => Err(terminal_lost_error(forced)),
     }
 }
 
@@ -971,6 +983,9 @@ enum LoopEnd {
     Quit,
     /// A background thread panicked; the hook already gave the terminal back.
     Panicked,
+    /// The interface itself panicked — in a frame, in an event handler or in the bookkeeping
+    /// around them — and the staged exit ran without it.
+    InterfacePanicked,
     /// Drawing failed — an SSH drop hung the terminal up — and the staged exit ran without it.
     TerminalLost,
 }
@@ -978,65 +993,116 @@ enum LoopEnd {
 /// Logged when drawing fails; §03 of the manual quotes it.
 const TERMINAL_LOST_LOG: &str = "the terminal is gone — finishing the current action, then exiting";
 
-/// The TUI's event loop, apart from the terminal it draws on, so a test can hand it one that dies.
+/// The TUI's event loop, apart from the terminal it draws on, the handler it feeds and the stderr
+/// it speaks to once the screen is gone — so a test can hand it a terminal that dies or a handler
+/// that panics, and read back what it said.
 fn event_loop(
     app: &mut App,
     rx: &crossbeam_channel::Receiver<AppEvent>,
     mut draw: impl FnMut(&mut App) -> std::io::Result<()>,
+    mut handle: impl FnMut(&mut App, AppEvent),
+    mut say: impl FnMut(&str),
 ) -> LoopEnd {
     let mut panicked = false;
+    // The first panic to take the screen away was this thread's own: a frame, an event handler or
+    // the bookkeeping around them. Kept here, not in the process-wide flag: in production the hook
+    // raises that one anyway, and a test must not leave it raised for the tests after it.
+    let mut ours = false;
     let mut lost = false;
+    // A panic hands the terminal back to the shell, so Ctrl+C is a signal again, and the second
+    // one ends the wait at once. The first one says so, once.
+    let mut warned = false;
     while !app.should_quit {
-        // A signal arrived: arm the same cancellation Esc uses and leave once the current action
-        // is done. A second SIGINT or SIGTERM means the operator has stopped waiting.
-        if signals::requested() {
-            app.request_shutdown(signals::count() > 1);
-        }
-        // A thread panicked. The hook has already given the terminal back to the shell and printed
-        // the message, so another frame would only scribble over it. We leave the same way a signal
-        // does — the batch in flight still has its snapshot and quarantine to finish into, and
-        // keys still work if the operator would rather quit now.
-        if panics::tui_dead() {
-            if !panicked {
-                panicked = true;
-                say("dedcom: a background thread panicked — finishing the current action, then exiting");
+        // A panic on this thread used to unwind the loop and `main` with it: the process could end
+        // under a batch between a quarantine evacuation and its publish. Caught, it leaves the way
+        // a worker's panic does; the pass still waits for an event after it, so a panic that comes
+        // back on every pass cannot spin.
+        let pass = panics::guard_value(INTERFACE, || {
+            // A signal arrived: arm the same cancellation Esc uses and leave once the current
+            // action is done. A second SIGINT or SIGTERM means the operator has stopped waiting.
+            if signals::requested() {
+                if panicked && !warned && signals::count() < 2 {
+                    warned = true;
+                    say(SECOND_SIGNAL_WARNING);
+                }
+                app.request_shutdown(signals::count() > 1);
             }
-            app.request_shutdown(false);
-        }
-        // The terminal is gone. Leaving at the failed frame killed a batch between a quarantine
-        // evacuation and its publish, so the exit is staged like a signal's, with nothing drawn —
-        // and asked again on every pass: the completion handlers re-ask only after a signal or a
-        // panic (`shutdown_pending`), so without this the last work lands and the exit never ends.
-        if lost {
-            app.request_shutdown(false);
-        }
-        app.tick = app.tick.wrapping_add(1);
-        // Resource sampling before the frame — self-throttles by interval.
-        app.resource.sample();
-        if !panicked && !lost {
-            if let Err(err) = draw(app) {
-                lost = true;
-                tracing::warn!("{TERMINAL_LOST_LOG} ({err})");
+            // A thread panicked. The hook has already given the terminal back to the shell and
+            // printed the message, so another frame would only scribble over it. We leave the same
+            // way a signal does — the batch in flight still has its snapshot and quarantine to
+            // finish into.
+            if panics::tui_dead() || ours {
+                if !panicked {
+                    panicked = true;
+                    say(panic_notice(ours));
+                }
                 app.request_shutdown(false);
             }
+            // The terminal is gone. Leaving at the failed frame killed a batch between a
+            // quarantine evacuation and its publish, so the exit is staged like a signal's, with
+            // nothing drawn — and asked again on every pass: the completion handlers re-ask only
+            // after a signal or a panic (`shutdown_pending`), so without this the last work lands
+            // and the exit never ends.
+            if lost {
+                app.request_shutdown(false);
+            }
+            app.tick = app.tick.wrapping_add(1);
+            // Resource sampling before the frame — self-throttles by interval.
+            app.resource.sample();
+            if !panicked && !lost {
+                if let Err(err) = draw(app) {
+                    lost = true;
+                    tracing::warn!("{TERMINAL_LOST_LOG} ({err})");
+                    app.request_shutdown(false);
+                }
+            }
+        });
+        if pass.is_err() && !panicked {
+            ours = true;
         }
 
         match rx.recv_timeout(Duration::from_millis(200)) {
-            // A terminal can outlive its frame — a closed pipe on stdout — and keys still arrive,
-            // but nobody sees what they act on: F10 or `q` quits at once and cuts the work short.
-            Ok(AppEvent::Key(_) | AppEvent::Mouse(_) | AppEvent::Resize) if lost => {}
-            Ok(event) => app.handle_event(event),
+            // Keys can still arrive with no screen to show what they act on: a terminal that
+            // outlives its frame (a closed pipe on stdout), or one a panic handed back to the shell,
+            // where a line typed blind reaches us at Enter. F10 or `q` would quit at once and cut
+            // the work short.
+            Ok(AppEvent::Key(_) | AppEvent::Mouse(_) | AppEvent::Resize)
+                if lost || ours || panics::tui_dead() => {}
+            Ok(event) => {
+                if panics::guard_value(INTERFACE, || handle(app, event)).is_err() && !panicked {
+                    ours = true;
+                }
+            }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
     }
 
-    if panicked {
+    if ours {
+        LoopEnd::InterfacePanicked
+    } else if panicked {
         LoopEnd::Panicked
     } else if lost {
         LoopEnd::TerminalLost
     } else {
         LoopEnd::Quit
+    }
+}
+
+/// Names this thread in `dedcom.log` when it panics: `the interface panicked: …`.
+const INTERFACE: &str = "the interface";
+
+/// Said once, at the first signal after a panic has handed the terminal back.
+const SECOND_SIGNAL_WARNING: &str =
+    "dedcom: still finishing the current action — a second Ctrl+C exits at once and may leave it half done";
+
+/// What stderr gets once a panic has taken the screen away: whose panic it was, and that the work
+/// in flight is finished first.
+fn panic_notice(ours: bool) -> &'static str {
+    if ours {
+        "dedcom: the interface panicked — finishing the current action, then exiting"
+    } else {
+        "dedcom: a background thread panicked — finishing the current action, then exiting"
     }
 }
 
@@ -1047,10 +1113,24 @@ fn say(line: &str) {
     let _ = writeln!(std::io::stderr(), "{line}");
 }
 
-/// A panic in a background thread has already restored the terminal and printed its message, so
-/// nothing may be drawn afterwards — and the process must not pretend it exited cleanly.
-fn panic_shutdown_error() -> AppError {
-    AppError::msg("a background thread panicked — see the message above")
+/// A panic has already restored the terminal and printed its message, so nothing may be drawn
+/// afterwards — and the process must not pretend it exited cleanly. `ours`: the interface's own
+/// panic rather than a worker's; `forced`: a second SIGINT or SIGTERM ended the wait for the work
+/// in flight.
+fn panic_exit_error(ours: bool, forced: bool) -> AppError {
+    let who = if ours {
+        "the interface"
+    } else {
+        "a background thread"
+    };
+    AppError::msg(if forced {
+        format!(
+            "{who} panicked, and a second signal ended the wait — the action that was running may \
+             be cut short: check its target and the quarantine"
+        )
+    } else {
+        format!("{who} panicked — see the message above")
+    })
 }
 
 #[cfg(test)]
@@ -1068,29 +1148,93 @@ mod terminal_loss_tests {
         Err(std::io::Error::from_raw_os_error(libc::EIO))
     }
 
-    /// Signal and panic state is process-wide: the loop reads both, so it runs alone and from quiet.
-    fn quiet() -> (MutexGuard<'static, ()>, MutexGuard<'static, ()>) {
-        let locks = (crate::signals::test_lock(), crate::panics::test_lock());
+    /// Signal and panic state is process-wide: the loop reads both, so it runs alone and from quiet —
+    /// and leaves quiet behind, or a raised flag stages an exit in whichever test runs next.
+    struct Quiet {
+        _signals: MutexGuard<'static, ()>,
+        _panics: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Quiet {
+        fn drop(&mut self) {
+            crate::signals::test_reset();
+            crate::panics::clear_tui_dead();
+        }
+    }
+
+    fn quiet() -> Quiet {
+        let quiet = Quiet {
+            _signals: crate::signals::test_lock(),
+            _panics: crate::panics::test_lock(),
+        };
         crate::signals::test_reset();
         crate::panics::clear_tui_dead();
-        locks
+        quiet
     }
 
     /// Runs the loop on its own thread under a deadline: a loop that never ends must fail its test
     /// rather than hang the run and every test queued on the shared locks.
     fn run_to_the_end(
+        app: App,
+        rx: crossbeam_channel::Receiver<AppEvent>,
+        draw: impl FnMut(&mut App) -> std::io::Result<()> + Send + 'static,
+    ) -> (LoopEnd, App) {
+        let (end, app, _said) = run_handled(app, rx, draw, App::handle_event);
+        (end, app)
+    }
+
+    /// The same, with the event handler in the test's hands too — and what the loop said on stderr,
+    /// read back rather than printed into the test output.
+    fn run_handled(
         mut app: App,
         rx: crossbeam_channel::Receiver<AppEvent>,
         mut draw: impl FnMut(&mut App) -> std::io::Result<()> + Send + 'static,
-    ) -> (LoopEnd, App) {
+        mut handle: impl FnMut(&mut App, AppEvent) + Send + 'static,
+    ) -> (LoopEnd, App, Vec<String>) {
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
         std::thread::spawn(move || {
-            let end = event_loop(&mut app, &rx, &mut draw);
-            let _ = done_tx.send((end, app));
+            let mut said = Vec::new();
+            let end = event_loop(&mut app, &rx, &mut draw, &mut handle, |line: &str| {
+                said.push(line.to_string())
+            });
+            let _ = done_tx.send((end, app, said));
         });
         done_rx
             .recv_timeout(Duration::from_secs(20))
             .expect("the loop must end once the work in flight has landed")
+    }
+
+    /// A batch of three actions that checks its cancel flag between them, as the real one does.
+    /// Each action runs until the test lets it finish, 300 ms from now. Returns how many actions
+    /// started, and the thread that lets them finish.
+    fn batch_of_three(app: &mut App) -> (Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
+        let started = Arc::new(AtomicUsize::new(0));
+        let (finish_tx, finish_rx) = crossbeam_channel::unbounded::<()>();
+        let job_started = started.clone();
+        app.apply = Some(apply_worker::spawn_job(app.events.clone(), move |shared| {
+            let mut done = 0;
+            for _ in 0..3 {
+                if shared.is_cancelled() {
+                    break;
+                }
+                job_started.fetch_add(1, Ordering::SeqCst);
+                // The action in flight, until the test lets it finish.
+                let _ = finish_rx.recv_timeout(Duration::from_secs(10));
+                done += 1;
+            }
+            ApplyOutcome::Finished(BatchResult {
+                planned: 3,
+                cancelled: done < 3,
+                ..Default::default()
+            })
+        }));
+        let finishes = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            for _ in 0..3 {
+                let _ = finish_tx.send(());
+            }
+        });
+        (started, finishes)
     }
 
     /// A move batch — work with no cancel flag of its own that has to land, as an action has to
@@ -1146,32 +1290,7 @@ mod terminal_loss_tests {
     fn a_lost_terminal_stops_the_batch_after_the_current_action() {
         let _quiet = quiet();
         let (mut app, rx) = crate::app::test_app();
-        let started = Arc::new(AtomicUsize::new(0));
-        let (finish_tx, finish_rx) = crossbeam_channel::unbounded::<()>();
-        let job_started = started.clone();
-        app.apply = Some(apply_worker::spawn_job(app.events.clone(), move |shared| {
-            let mut done = 0;
-            for _ in 0..3 {
-                if shared.is_cancelled() {
-                    break;
-                }
-                job_started.fetch_add(1, Ordering::SeqCst);
-                // The action in flight, until the test lets it finish.
-                let _ = finish_rx.recv_timeout(Duration::from_secs(10));
-                done += 1;
-            }
-            ApplyOutcome::Finished(BatchResult {
-                planned: 3,
-                cancelled: done < 3,
-                ..Default::default()
-            })
-        }));
-        let finishes = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            for _ in 0..3 {
-                let _ = finish_tx.send(());
-            }
-        });
+        let (started, finishes) = batch_of_three(&mut app);
 
         let (end, app) = run_to_the_end(app, rx, |_app| hung_up());
 
@@ -1236,6 +1355,319 @@ mod terminal_loss_tests {
         for line in [TERMINAL_LOST_LOG, waited.as_str()] {
             assert!(chapter.contains(line), "03-safety.md must quote: {line}");
         }
+    }
+
+    /// A frame that panics. The panic used to unwind the loop and `main` with it, so the process
+    /// could end under a batch between a quarantine evacuation and its publish — the damage of an
+    /// SSH drop by another road. Contained, it stages the exit the way a worker's panic does and
+    /// waits, and stderr names whose panic it was.
+    #[test]
+    fn a_panicking_frame_waits_for_the_work_in_flight() {
+        let _quiet = quiet();
+        let (mut app, rx) = crate::app::test_app();
+        app.commander.move_pending = 1;
+        let lands = move_lands_after(&app, Duration::from_millis(300));
+
+        let frames = Arc::new(AtomicUsize::new(0));
+        let counted = frames.clone();
+        let (end, app, said) = run_handled(
+            app,
+            rx,
+            move |_app| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                panic!("a frame that panics")
+            },
+            App::handle_event,
+        );
+
+        assert_eq!(
+            app.commander.move_pending, 0,
+            "the loop left before the work in flight landed"
+        );
+        assert_eq!(end, LoopEnd::InterfacePanicked);
+        assert_eq!(
+            frames.load(Ordering::SeqCst),
+            1,
+            "nothing more is drawn once a frame has panicked"
+        );
+        assert_eq!(said, [panic_notice(true)]);
+        lands.join().unwrap();
+    }
+
+    /// The same panic under a batch raises its cancel flag: the action running is carried to its
+    /// end, and the next one never starts.
+    #[test]
+    fn a_panicking_frame_stops_the_batch_after_the_current_action() {
+        let _quiet = quiet();
+        let (mut app, rx) = crate::app::test_app();
+        let (started, finishes) = batch_of_three(&mut app);
+
+        let (end, app) = run_to_the_end(app, rx, |_app| panic!("a frame that panics"));
+
+        assert_eq!(end, LoopEnd::InterfacePanicked);
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "the action running was finished and the next one never started"
+        );
+        assert!(
+            app.apply.is_none(),
+            "the loop ended before the batch reported"
+        );
+        finishes.join().unwrap();
+    }
+
+    /// A key whose handler panics while a batch runs is contained the same way as a frame.
+    #[test]
+    fn a_panicking_key_handler_stops_the_batch_after_the_current_action() {
+        let _quiet = quiet();
+        let (mut app, rx) = crate::app::test_app();
+        let (started, finishes) = batch_of_three(&mut app);
+        app.events
+            .send(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        let (end, app, _said) = run_handled(
+            app,
+            rx,
+            |_app| Ok(()),
+            |app: &mut App, event: AppEvent| match event {
+                AppEvent::Key(_) => panic!("a key handler that panics"),
+                event => app.handle_event(event),
+            },
+        );
+
+        assert_eq!(end, LoopEnd::InterfacePanicked);
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "the action running was finished and the next one never started"
+        );
+        assert!(
+            app.apply.is_none(),
+            "the loop ended before the batch reported"
+        );
+        finishes.join().unwrap();
+    }
+
+    /// Nothing in flight: a panicking frame ends the loop without waiting for anything.
+    #[test]
+    fn a_panicking_frame_with_nothing_in_flight_leaves_at_once() {
+        let _quiet = quiet();
+        let (app, rx) = crate::app::test_app();
+
+        let (end, app) = run_to_the_end(app, rx, |_app| panic!("a frame that panics"));
+
+        assert_eq!(end, LoopEnd::InterfacePanicked);
+        assert!(app.should_quit);
+    }
+
+    /// A worker's panic keeps its own ending: the loop tells it apart from the interface's.
+    #[test]
+    fn a_background_panic_still_ends_as_one() {
+        let _quiet = quiet();
+        let (mut app, rx) = crate::app::test_app();
+        app.commander.move_pending = 1;
+        let lands = move_lands_after(&app, Duration::from_millis(300));
+        crate::panics::mark_tui_dead();
+
+        let (end, app, said) = run_handled(app, rx, |_app| Ok(()), App::handle_event);
+
+        assert_eq!(
+            app.commander.move_pending, 0,
+            "the loop left before the work in flight landed"
+        );
+        assert_eq!(end, LoopEnd::Panicked);
+        assert_eq!(said, [panic_notice(false)]);
+        lands.join().unwrap();
+    }
+
+    /// A worker's panic that came first stays the cause when the interface panics after it: the
+    /// line on stderr and the last line in the log name the same thread.
+    #[test]
+    fn the_first_panic_stays_the_cause() {
+        let _quiet = quiet();
+        let (mut app, rx) = crate::app::test_app();
+        app.commander.move_pending = 1;
+        app.events
+            .send(AppEvent::CommanderDirSize(
+                std::path::PathBuf::from("/x"),
+                0,
+            ))
+            .unwrap();
+        let lands = move_lands_after(&app, Duration::from_millis(300));
+        crate::panics::mark_tui_dead();
+
+        let (end, app, said) = run_handled(
+            app,
+            rx,
+            |_app| Ok(()),
+            |app: &mut App, event: AppEvent| match event {
+                AppEvent::CommanderDirSize(..) => panic!("a handler that panics after a worker"),
+                event => app.handle_event(event),
+            },
+        );
+
+        assert_eq!(
+            app.commander.move_pending, 0,
+            "the loop left before the work in flight landed"
+        );
+        assert_eq!(end, LoopEnd::Panicked);
+        assert_eq!(said, [panic_notice(false)]);
+        lands.join().unwrap();
+    }
+
+    /// Keys typed after a panic reach no screen: the hook has handed the terminal back to the shell,
+    /// and a line typed blind arrives at Enter. F10 or `q` in the commander would quit at once and
+    /// cut the move short.
+    #[test]
+    fn keys_after_a_panic_do_not_cut_the_wait_short() {
+        let _quiet = quiet();
+        let (mut app, rx) = crate::app::test_app();
+        // Past the consent notice, which would take every key but Esc for itself.
+        app.show_disclaimer = false;
+        app.commander.move_pending = 1;
+        for key in [KeyCode::F(10), KeyCode::Char('q')] {
+            app.events
+                .send(AppEvent::Key(KeyEvent::new(key, KeyModifiers::NONE)))
+                .unwrap();
+        }
+        let lands = move_lands_after(&app, Duration::from_millis(300));
+
+        let (end, app) = run_to_the_end(app, rx, |_app| panic!("a frame that panics"));
+
+        assert_eq!(
+            app.commander.move_pending, 0,
+            "a key nobody could see ended the wait before the move landed"
+        );
+        assert_eq!(end, LoopEnd::InterfacePanicked);
+        lands.join().unwrap();
+    }
+
+    /// The same after a worker's panic: the screen is gone either way.
+    #[test]
+    fn keys_after_a_background_panic_do_not_cut_the_wait_short() {
+        let _quiet = quiet();
+        let (mut app, rx) = crate::app::test_app();
+        app.show_disclaimer = false;
+        app.commander.move_pending = 1;
+        for key in [KeyCode::F(10), KeyCode::Char('q')] {
+            app.events
+                .send(AppEvent::Key(KeyEvent::new(key, KeyModifiers::NONE)))
+                .unwrap();
+        }
+        let lands = move_lands_after(&app, Duration::from_millis(300));
+        crate::panics::mark_tui_dead();
+
+        let (end, app) = run_to_the_end(app, rx, |_app| Ok(()));
+
+        assert_eq!(
+            app.commander.move_pending, 0,
+            "a key nobody could see ended the wait before the move landed"
+        );
+        assert_eq!(end, LoopEnd::Panicked);
+        lands.join().unwrap();
+    }
+
+    /// A caught panic leaves the pass waiting for an event as before: the loop does not spin while
+    /// the work in flight lands.
+    #[test]
+    fn a_contained_panic_does_not_spin_the_loop() {
+        let _quiet = quiet();
+        let (mut app, rx) = crate::app::test_app();
+        app.commander.move_pending = 1;
+        let lands = move_lands_after(&app, Duration::from_millis(1000));
+
+        let (end, app) = run_to_the_end(app, rx, |_app| panic!("a frame that panics"));
+
+        assert_eq!(end, LoopEnd::InterfacePanicked);
+        // One pass per event or per 200 ms of waiting: a handful in the second the move takes to
+        // land. A loop that stopped waiting would make thousands.
+        assert!(app.tick < 50, "the loop spun: {} passes", app.tick);
+        lands.join().unwrap();
+    }
+
+    /// After a panic Ctrl+C is a signal again, and the second one ends the wait at once. The first
+    /// one says so, once, and the wait goes on.
+    #[test]
+    fn the_first_signal_after_a_panic_warns_and_keeps_waiting() {
+        let _quiet = quiet();
+        let (mut app, rx) = crate::app::test_app();
+        app.commander.move_pending = 1;
+        let lands = move_lands_after(&app, Duration::from_millis(700));
+        let signal = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            crate::signals::test_deliver(libc::SIGINT);
+        });
+
+        let (end, app, said) = run_handled(
+            app,
+            rx,
+            |_app| panic!("a frame that panics"),
+            App::handle_event,
+        );
+
+        assert_eq!(
+            app.commander.move_pending, 0,
+            "one signal ended the wait before the move landed"
+        );
+        assert_eq!(end, LoopEnd::InterfacePanicked);
+        assert_eq!(said, [panic_notice(true), SECOND_SIGNAL_WARNING]);
+        signal.join().unwrap();
+        lands.join().unwrap();
+    }
+
+    /// How each ending reaches `main`: a quit is no error, the others name their cause — and
+    /// whether a second signal cut the wait short.
+    #[test]
+    fn each_ending_reaches_main_as_itself() {
+        assert!(loop_result(LoopEnd::Quit, false).is_ok());
+        for forced in [false, true] {
+            let text = |end| loop_result(end, forced).unwrap_err().to_string();
+            assert_eq!(
+                text(LoopEnd::Panicked),
+                panic_exit_error(false, forced).to_string()
+            );
+            assert_eq!(
+                text(LoopEnd::InterfacePanicked),
+                panic_exit_error(true, forced).to_string()
+            );
+            assert_eq!(
+                text(LoopEnd::TerminalLost),
+                terminal_lost_error(forced).to_string()
+            );
+        }
+        let waited = panic_exit_error(true, false).to_string();
+        let forced = panic_exit_error(true, true).to_string();
+        assert!(waited.starts_with("the interface panicked") && !waited.contains("cut short"));
+        assert!(forced.starts_with("the interface panicked") && forced.contains("cut short"));
+        assert!(panic_exit_error(false, false)
+            .to_string()
+            .starts_with("a background thread panicked"));
+    }
+
+    /// §03 quotes how either panic ends — whole lines, as `dedcom.log` has them — so an operator who
+    /// finds the line can look it up.
+    #[test]
+    fn the_manual_quotes_the_panic_exits() {
+        let chapter = crate::testfixtures::manual("03-safety.md");
+        for ours in [true, false] {
+            let line = format!("exiting with error: {}", panic_exit_error(ours, false));
+            assert!(
+                chapter.lines().any(|quoted| quoted == line),
+                "03-safety.md must quote the whole line: {line}"
+            );
+        }
+    }
+
+    /// The line on stderr says whose panic it was: the interface's own, or a worker's.
+    #[test]
+    fn the_notice_names_whose_panic_it_was() {
+        assert!(panic_notice(true).contains("the interface panicked"));
+        assert!(panic_notice(false).contains("a background thread panicked"));
     }
 }
 

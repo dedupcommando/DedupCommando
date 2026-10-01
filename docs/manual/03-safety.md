@@ -287,6 +287,27 @@ replacement next to the target as `.dedcom-tmp-…`. Put the original back by ha
 (`mv`). Inside the interface `Ctrl+C` is an ordinary key, not a signal. To keep the
 screen across a drop, run `dedcom` over SSH inside `tmux` or `screen`.
 
+### …`dedcom` itself fails during **apply**
+
+An internal error (a panic) hands the terminal back to the shell and prints its message
+there and in `dedcom.log`. Apply is then stopped the way Esc stops it: the current
+action is carried through to completion, the batch stops after it, and the program exits
+by itself with an error. Keys typed meanwhile are ignored. `Ctrl+C` is a signal again
+from here on: the first one only prints a reminder, a second one exits at once and can
+leave the running action half done — the original in `.dedcom-quarantine/<ts>/`, its
+replacement next to the target as `.dedcom-tmp-…`. Wait for the prompt. If the panic is
+in the batch itself, the action it was running stops where it was: the original is
+either still in place or in `.dedcom-quarantine/<ts>/`, and a half-built replacement may
+be left next to the target as `.dedcom-tmp-…` — delete it. The last line in
+`dedcom.log` is one of
+
+```text
+exiting with error: the interface panicked — see the message above
+exiting with error: a background thread panicked — see the message above
+```
+
+Please report the message as a bug.
+
 ### …press **Esc** during apply
 
 The worker checks the cancellation flag **at action boundaries** (between files,

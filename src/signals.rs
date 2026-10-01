@@ -130,6 +130,12 @@ pub(crate) fn test_reset() {
     COUNT.store(0, Ordering::SeqCst);
 }
 
+/// Delivers `signal` the way the kernel would, without raising it: only the handler runs.
+#[cfg(test)]
+pub(crate) fn test_deliver(signal: libc::c_int) {
+    handler(signal);
+}
+
 /// The flag itself, for the cancellation checks that already take an `&AtomicBool`
 /// (`pipeline::run_scan` in headless mode watches this instead of a flag nobody ever armed).
 pub fn shutdown_flag() -> &'static AtomicBool {

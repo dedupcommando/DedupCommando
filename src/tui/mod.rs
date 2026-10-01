@@ -114,6 +114,14 @@ impl Drop for TerminalGuard {
 pub fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // The log keeps the message where a terminal that is gone (an SSH drop) cannot, with the
+        // place in the code a bug report needs — for every thread, guarded or not.
+        let thread = std::thread::current();
+        tracing::error!(
+            "thread '{}' {}",
+            thread.name().unwrap_or("<unnamed>"),
+            info.to_string().replace('\n', " ")
+        );
         let _ = disable_raw_mode();
         let mut out = io::stdout();
         let _ = execute!(
