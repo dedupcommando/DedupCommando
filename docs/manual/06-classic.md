@@ -153,6 +153,13 @@ another screen, or the trash question is open, the result opens without taking
 you to it, and the status line names it: Enter on it in the list opens it again.
 Help does not hold it back — the groups open under it.
 
+The list is read again after every scan and after a restore from the trash.
+While you are in it — or in the trash or a comparison opened from it — the
+cursor stays on the scan it was on, wherever that scan now is; if the scan is
+gone, on the same row, or the last one if the list got shorter. Coming back to
+the list after a scan, the cursor starts on the newest scan, at the top. The
+question Del asks names the scan (§6.10).
+
 ## 6.4. Scanning — scan progress
 
 ```text
@@ -181,6 +188,12 @@ file.
 | Key         | Action                                                              |
 |-------------|---------------------------------------------------------------------|
 | **Esc**     | Stop the scan cleanly (progress is saved to the database for resume) |
+
+When the scan finishes, its result opens in the Browser. If it cannot be opened,
+the screen goes back by itself — to ScanConfig, or to commando if the scan was
+started there — and the status line says why; if another scan's result was still
+opening, this one opens right after it. Esc after the scan has ended waits while
+the result opens, and otherwise goes back the same way.
 
 The three phases and what they save — [§03 Data Safety](03-safety.md#what-happens-if-you).
 
@@ -411,12 +424,12 @@ Opened from Resume with the **t** key — softly deleted scans:
 | **Del**                | Purge PERMANENTLY (modal confirmation)                |
 | **Esc**                | Return to Resume                                       |
 
-Moving to trash and purging both go through a confirmation modal —
-` Move to trash? ` with body
-`The session will be moved to the trash — it can be restored (t).`, or
-` Purge from trash? ` with body
-`The session will be deleted PERMANENTLY — this is irreversible.`; both
-offer `[Y] yes    ·    [N] no`.
+Moving to trash and purging both go through a confirmation modal that names the
+scan — a line such as `Scan #138 · 2026-02-01 10:00:00 · /tank/media` — and then
+says what happens: ` Move to trash? ` —
+`will be moved to the trash — it can be restored (t).`, or
+` Purge from trash? ` — `will be deleted PERMANENTLY — this is irreversible.`;
+both offer `[Y] yes    ·    [N] no`.
 
 Purging is heavy (millions of rows are removed from `file`) — it runs in the
 background, with status shown in the status line.

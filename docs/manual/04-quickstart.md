@@ -175,8 +175,10 @@ The phases:
 next launch the wizard will offer to resume. Exactly what is saved at each phase
 is in [§03 Safety](03-safety.md#what-happens-if-you).
 
-When the scan finishes it returns to commando automatically; the header will
-show a "scan loaded" indicator — meaning the panels are ready to display groups.
+When the scan finishes, its result opens in the wizard's group view (the Browser,
+[§06](06-classic.md#65-browser--viewing-groups-and-marking-actions)); Esc returns
+to commando, where the header shows a "scan loaded" indicator — meaning the panels
+are ready to display groups.
 
 ## Step 6. Switch a panel to "duplicate groups"
 

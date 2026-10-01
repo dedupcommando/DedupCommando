@@ -123,8 +123,9 @@ file has its size, it is never opened.
 
 How a scan reports them:
 
-- At the end, one notice — on the scan screen until the result opens, in the
-  `--scan` output and in `dedcom.log`; counts that are zero are left out:
+- At the end, one notice — on the scan screen until the result opens or fails to
+  open, in the `--scan` output and in `dedcom.log`; counts that are zero are left
+  out:
 
   ```text
   Scan left gaps: 3919 files omitted, 2 walk errors (unknown files hidden), 1 unsupported entries — affected directories are not exact twins

@@ -68,6 +68,15 @@ pub const RESULTS_UNPUBLISHED: &str = "results not published — rescan required
 /// The same fact where the width does not allow the sentence.
 pub const RESULTS_UNPUBLISHED_COMPACT: &str = "unpublished · rescan required";
 
+/// The note that retention kept the older scans of a root found empty, put in front of `status`:
+/// first on the line, where counts and gaps that run past the screen cannot take it with them.
+fn history_kept_line(root: &Path, status: &str) -> String {
+    format!(
+        "⚠ no files under {}: the older scans that hold some were kept · {status}",
+        crate::textsan::path(root)
+    )
+}
+
 /// What every surface says once the checkpoint at the configured path stopped being the one the
 /// view was opened over. Only a fresh open recovers, so the wording names that.
 pub const REOPEN_REQUIRED: &str = "the checkpoint database was replaced — reopen required";
@@ -482,6 +491,9 @@ pub struct App {
     /// in the status line when that scan's result opens. The scan screen, which got the notice,
     /// closes as soon as the result is there.
     pub history_kept_note: Option<(i64, PathBuf)>,
+    /// A finished scan whose result could not be asked for because another scan was still
+    /// opening. The scan screen asks for it once that open settles (`settle_scan_screen`).
+    pub scan_screen_owes: Option<i64>,
 }
 
 /// Where the browsing actor's replies enter the application's event loop.
@@ -825,6 +837,7 @@ impl App {
             opening_started: None,
             results_from_sessions: false,
             history_kept_note: None,
+            scan_screen_owes: None,
         };
         // The initial auto-switch to a covering scan
         // is done by render via `maybe_auto_switch_scan` on the first frame — we don't
@@ -933,10 +946,33 @@ impl App {
                 if generation == self.session_load_generation {
                     match result {
                         Ok(list) => {
+                            // While the list is in use — it, or the trash or a comparison opened
+                            // from it — the cursor holds a scan, not a row: a list read again under
+                            // the operator may have a new scan on top, and Enter and Del act on
+                            // whatever is under the cursor. Its scan keeps it; a scan that is gone
+                            // leaves it on its row. A list read while the operator was elsewhere
+                            // starts on the newest scan, at the top.
+                            let in_list = self.mode == AppMode::Wizard
+                                && matches!(
+                                    self.screen,
+                                    Screen::Resume | Screen::Trash | Screen::ScanDiff
+                                );
+                            let picked = self.sessions.get(self.session_cursor).map(|s| s.scan_id);
                             self.sessions = list;
                             self.sessions_loading = false;
                             self.sessions_loaded = true;
-                            self.session_cursor = 0;
+                            self.session_cursor = if in_list {
+                                picked
+                                    .and_then(|id| {
+                                        self.sessions.iter().position(|s| s.scan_id == id)
+                                    })
+                                    .unwrap_or_else(|| {
+                                        self.session_cursor
+                                            .min(self.sessions.len().saturating_sub(1))
+                                    })
+                            } else {
+                                0
+                            };
                             // Take back the refusal this lifecycle installed — but only if it is
                             // still the one on screen. Clearing unconditionally would swallow a
                             // scan's own status whenever the session list refreshed behind it.
@@ -1262,11 +1298,7 @@ impl App {
             if let Some((_, root)) = self.history_kept_note.take() {
                 // First on the line: counts and gaps can run past any screen, and it would go with
                 // them.
-                self.status = format!(
-                    "⚠ no files under {}: the older scans that hold some were kept · {}",
-                    crate::textsan::path(&root),
-                    self.status
-                );
+                self.status = history_kept_line(&root, &self.status);
             }
         }
         self.commander.status = self.status.clone();
@@ -1650,6 +1682,8 @@ impl App {
                 self.commander.status = message;
             }
         }
+        // A scan's own result that failed to open leaves the scan screen with nothing behind it.
+        self.settle_scan_screen();
     }
 
     fn on_panel_data(
@@ -2936,6 +2970,7 @@ impl App {
 
     fn on_finished(&mut self, result: std::result::Result<ScanOutcome, String>) {
         self.scan = None;
+        self.scan_screen_owes = None;
         // We were only staying alive to let this finish — but other background work may still
         // be in flight, so re-ask rather than quitting outright.
         if shutdown_pending() {
@@ -2956,6 +2991,13 @@ impl App {
                 self.history_kept_note =
                     results.history_kept_for.map(|root| (results.scan_id, root));
                 self.open_via_actor(results.scan_id, OpenIntent::Wizard);
+                // Refused because another scan is still opening: asked for again once it settles.
+                self.scan_screen_owes = self
+                    .routes
+                    .open
+                    .as_ref()
+                    .filter(|open| open.scan_id != results.scan_id)
+                    .map(|_| results.scan_id);
             }
             Ok(ScanOutcome::Cancelled) => {
                 self.status = "Scan stopped — progress saved, you can continue".to_string();
@@ -2991,6 +3033,8 @@ impl App {
         // returning to `/tank` goes by a cache hit and returns a stale decision. The
         // `latest_scan_covering` queries are dirt cheap — we'll rebuild the cache on subsequent navigations.
         self.commander.scan_coverage_cache.clear();
+        // A completed scan whose result could not even be asked for is not left on its screen.
+        self.settle_scan_screen();
     }
 
     /// Updates the application progress bar from a worker progress snapshot. A late
@@ -3071,6 +3115,7 @@ impl App {
             );
             self.status = message.clone();
             self.commander.status = message;
+            self.settle_scan_screen();
         }
         // Exactly once: `take_terminal` hands the pair over on the first terminal only.
         let _ = join.join();
@@ -4273,9 +4318,61 @@ impl App {
                 if let Some(handle) = &self.scan {
                     handle.cancel();
                     self.status = "Stopping the scan…".to_string();
+                } else if !self
+                    .routes
+                    .open
+                    .as_ref()
+                    .is_some_and(|open| open.asked_from == (AppMode::Wizard, Screen::Scanning))
+                {
+                    // The scan has ended and nothing is opening for this screen. While its result
+                    // is on the way, Esc waits for it: the result decides where it shows by the
+                    // screen it was asked from, and a new scan started here meanwhile would be
+                    // that screen again.
+                    self.leave_scan_screen();
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The scan screen is there for a scan that runs and for the result it is opening. With
+    /// neither left — the result could not be opened, or the request to open it never left — it
+    /// held the operator where Esc had nothing to stop. A result refused because another scan
+    /// was opening is asked for again first; otherwise back to where a new scan starts.
+    fn settle_scan_screen(&mut self) {
+        let on_it = self.mode == AppMode::Wizard && self.screen == Screen::Scanning;
+        if !on_it || self.scan.is_some() || self.routes.open.is_some() {
+            return;
+        }
+        if let Some(scan_id) = self.scan_screen_owes {
+            self.open_via_actor(scan_id, OpenIntent::Wizard);
+            if self.routes.open.is_some() {
+                self.scan_screen_owes = None;
+                return;
+            }
+        }
+        self.leave_scan_screen();
+    }
+
+    /// Leaves the scan screen as a stopped or failed scan does in `on_finished`: for the scan
+    /// settings, or for the commander when the scan was started there, the status line kept. A
+    /// result that was owed and never opened is named on it, and the note that older scans were
+    /// kept, meant for the result, goes there too.
+    fn leave_scan_screen(&mut self) {
+        if let Some(scan_id) = self.scan_screen_owes.take() {
+            self.status = format!(
+                "the results of scan #{scan_id} were not opened: {}",
+                self.status
+            );
+        }
+        if let Some((_, root)) = self.history_kept_note.take() {
+            self.status = history_kept_line(&root, &self.status);
+        }
+        self.screen = Screen::ScanConfig;
+        if self.commander.return_to_commander {
+            self.mode = AppMode::Commander;
+            self.commander.return_to_commander = false;
+            self.commander.status = std::mem::take(&mut self.status);
         }
     }
 
@@ -7712,6 +7809,285 @@ mod session_store_failures_are_never_empty_data_tests {
             before,
             "bytes, user_version and the sidecar census are untouched"
         );
+    }
+
+    /// One finished scan of `/tank/<id>`, as the list of scans holds it.
+    fn listed(scan_id: i64) -> ResumeInfo {
+        ResumeInfo {
+            scan_id,
+            created_at: format!("2026-09-{:02} 10:00:00", scan_id),
+            status: crate::model::scan::ScanStatus::Complete,
+            roots: vec![PathBuf::from(format!("/tank/{scan_id}"))],
+            files_total: 1,
+            files_hashed: 1,
+            cand_bytes_total: 1,
+            cand_bytes_hashed: 1,
+            files_scanned: 1,
+            reclaim: crate::model::reclaim::ReclaimEstimate::unknown(),
+            already_linked_sets: None,
+        }
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            code,
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        )));
+    }
+
+    /// The whole screen as drawn at 80×24.
+    fn drawn(app: &mut App) -> String {
+        let buffer = crate::tui::hostile::frame_of(80, 24, |frame| crate::tui::draw(frame, app));
+        crate::tui::hostile::rows(&buffer).join("\n")
+    }
+
+    /// The list of scans is read again after every scan and after a restore from the trash,
+    /// and the answer put the cursor on the first row: when it landed while the list was in use,
+    /// the next Enter or Del acted on the newest scan, not the one picked. While the list is in
+    /// use the cursor keeps its scan; when that scan is gone, its row. A list read while the
+    /// operator was elsewhere starts on the newest scan. Red on the parent: row 0.
+    #[test]
+    fn a_reloaded_scan_list_keeps_the_cursor_on_its_scan() {
+        let (mut app, _rx) = test_app();
+        app.show_disclaimer = false;
+        app.mode = AppMode::Wizard;
+        app.screen = Screen::Resume;
+        app.sessions = vec![listed(2), listed(1)];
+        app.sessions_loaded = true;
+        app.session_cursor = 1;
+        let generation = app.session_load_generation;
+
+        app.handle_event(AppEvent::SessionsReady {
+            generation,
+            result: Ok(vec![listed(3), listed(2), listed(1)]),
+        });
+        assert_eq!(
+            app.sessions[app.session_cursor].scan_id, 1,
+            "a new scan on top moves #1 down a row, and the cursor with it"
+        );
+
+        app.handle_event(AppEvent::SessionsReady {
+            generation,
+            result: Ok(vec![listed(4), listed(3), listed(2)]),
+        });
+        assert_eq!(
+            app.session_cursor, 2,
+            "#1 is gone: the cursor stays on its row, now the last one"
+        );
+        press(&mut app, KeyCode::Delete);
+        assert!(
+            matches!(app.confirm, Some(ConfirmAction::TrashScan(2))),
+            "Del asks about the scan under the cursor: {:?}",
+            app.confirm
+        );
+        app.confirm = None;
+
+        // A scan gone from the middle: the cursor keeps its row, not the last one.
+        app.sessions = vec![listed(3), listed(2), listed(1)];
+        app.session_cursor = 1;
+        app.handle_event(AppEvent::SessionsReady {
+            generation,
+            result: Ok(vec![listed(4), listed(3), listed(1)]),
+        });
+        assert_eq!(
+            app.session_cursor, 1,
+            "#2 is gone: the cursor stays on row 1"
+        );
+
+        // Read while the operator was in the group view: the newest scan, at the top.
+        app.screen = Screen::Browser;
+        app.handle_event(AppEvent::SessionsReady {
+            generation,
+            result: Ok(vec![listed(5), listed(4), listed(3), listed(1)]),
+        });
+        assert_eq!(app.session_cursor, 0, "away from the list: the newest scan");
+    }
+
+    /// «Move to trash?» and «Purge from trash?» named no scan, and purging cannot be undone:
+    /// a cursor that had moved under the operator deleted a scan nobody looked at. Each question
+    /// names the scan — number, date, roots — and its text fits the window at 80 columns. Red on
+    /// the parent: no scan in either window, and the end of the trash text cut off by the frame.
+    #[test]
+    fn the_trash_and_purge_questions_name_the_scan() {
+        let (mut app, _rx) = test_app();
+        app.show_disclaimer = false;
+        app.mode = AppMode::Wizard;
+        app.sessions_loading = false;
+        app.sessions = vec![listed(7), listed(5)];
+        app.screen = Screen::Resume;
+        app.confirm = Some(ConfirmAction::TrashScan(5));
+        let screen = drawn(&mut app);
+        for shown in [
+            "Scan #5 · 2026-09-05 10:00:00 · /tank/5",
+            "will be moved to the trash — it can be restored (t).",
+            "[Y] yes",
+        ] {
+            assert!(screen.contains(shown), "«{shown}» in:\n{screen}");
+        }
+
+        app.trashed = vec![listed(3)];
+        app.screen = Screen::Trash;
+        app.confirm = Some(ConfirmAction::PurgeScan(3));
+        let screen = drawn(&mut app);
+        for shown in [
+            "Scan #3 · 2026-09-03 10:00:00 · /tank/3",
+            "will be deleted PERMANENTLY — this is irreversible.",
+            "[Y] yes",
+        ] {
+            assert!(screen.contains(shown), "«{shown}» in:\n{screen}");
+        }
+    }
+
+    /// Once the scan has ended — its result could not be opened, or the request never left —
+    /// the scan screen has nothing left to stop, and Esc there did nothing: only q, which quits
+    /// dedcom. Esc goes back to where a new scan starts: the scan settings, or the commander that
+    /// started it, with the status line kept. Red on the parent: the scan screen stayed.
+    #[test]
+    fn esc_leaves_the_scan_screen_once_no_scan_runs() {
+        for from_commander in [false, true] {
+            let (mut app, _rx) = test_app();
+            app.show_disclaimer = false;
+            app.mode = AppMode::Wizard;
+            app.screen = Screen::Scanning;
+            app.commander.return_to_commander = from_commander;
+            app.status = "the results of scan #7 could not be opened".to_string();
+            press(&mut app, KeyCode::Esc);
+            assert!(!app.should_quit, "Esc does not quit");
+            if from_commander {
+                assert_eq!(app.mode, AppMode::Commander, "back to the commander");
+                assert!(!app.commander.return_to_commander);
+                assert_eq!(
+                    app.commander.status,
+                    "the results of scan #7 could not be opened"
+                );
+            } else {
+                assert_eq!(
+                    (app.mode, app.screen),
+                    (AppMode::Wizard, Screen::ScanConfig),
+                    "back to the scan settings"
+                );
+                assert_eq!(app.status, "the results of scan #7 could not be opened");
+            }
+        }
+    }
+
+    /// The scan screen goes back only when no scan runs. An open asked for from the list lands
+    /// while a scan the operator resumed meanwhile runs on the scan screen; the scan screen stays.
+    /// Red without the check: the failed open took the operator away from the running scan.
+    #[test]
+    fn a_running_scan_keeps_the_scan_screen_when_an_open_lands() {
+        let _role = crate::state::store::role_guard();
+        let dir = scratch("scan-screen-scan-runs");
+        let (mut app, rx) = test_app_with_db(current_db(dir.path()));
+        app.show_disclaimer = false;
+        app.mode = AppMode::Wizard;
+        app.screen = Screen::Resume;
+        app.open_via_actor(1, OpenIntent::Wizard);
+        assert!(app.routes.open.is_some(), "the open is on its way");
+        app.screen = Screen::Scanning;
+        app.scan = Some(crate::scan::worker::ScanHandle::without_worker());
+
+        pump_until(&mut app, &rx, "the Open reply", |app| {
+            app.routes.open.is_none()
+        });
+
+        assert_eq!(
+            (app.mode, app.screen),
+            (AppMode::Wizard, Screen::Scanning),
+            "the running scan keeps its screen: {}",
+            app.status
+        );
+        app.scan = None;
+        drain(&mut app, &rx);
+    }
+
+    /// A finished scan whose result could not even be asked for — here the browsing counter is
+    /// spent — leaves the scan screen at once, in both interfaces, the reason on the status line.
+    /// Red without the check at the end of `on_finished`: the scan screen stayed.
+    #[test]
+    fn a_result_that_could_not_be_asked_for_leaves_the_scan_screen() {
+        for from_commander in [false, true] {
+            let (mut app, _rx) = test_app();
+            app.show_disclaimer = false;
+            app.mode = AppMode::Wizard;
+            app.screen = Screen::Scanning;
+            app.commander.return_to_commander = from_commander;
+            app.installed_act = Activation(u64::MAX);
+            app.handle_event(AppEvent::ScanFinished(Ok(ScanOutcome::Completed(
+                crate::model::scan::ScanResults {
+                    scan_id: 1,
+                    summary: Default::default(),
+                    history_kept_for: None,
+                },
+            ))));
+            let said = if from_commander {
+                assert_eq!(app.mode, AppMode::Commander, "back to the commander");
+                app.commander.status.clone()
+            } else {
+                assert_eq!(
+                    (app.mode, app.screen),
+                    (AppMode::Wizard, Screen::ScanConfig),
+                    "back to the scan settings"
+                );
+                app.status.clone()
+            };
+            assert!(
+                said.contains("exhausted"),
+                "the reason is on the status line: {said}"
+            );
+        }
+    }
+
+    /// The scan ended and its result could not be opened — here the checkpoint is newer than
+    /// this build. The failure only changed the status line, and the operator was left on the scan
+    /// screen with no scan behind it. It now takes them back by itself, the reason on the status
+    /// line. Red on the parent: the scan screen stayed.
+    #[test]
+    fn a_result_that_cannot_be_opened_leaves_the_scan_screen() {
+        let _role = crate::state::store::role_guard();
+        for from_commander in [false, true] {
+            let dir = scratch(if from_commander {
+                "scan-screen-from-commander"
+            } else {
+                "scan-screen-from-wizard"
+            });
+            let (mut app, rx) = test_app_with_db(future_db(dir.path()));
+            app.show_disclaimer = false;
+            app.mode = AppMode::Wizard;
+            app.screen = Screen::Scanning;
+            app.commander.return_to_commander = from_commander;
+            // The scan found its root empty and retention kept the older scans: the note meant for
+            // the result goes on the status line it leaves with.
+            app.history_kept_note = Some((1, PathBuf::from("/tank/empty")));
+
+            open_and_settle(&mut app, &rx, 1, OpenIntent::Wizard);
+
+            let said = if from_commander {
+                assert_eq!(app.mode, AppMode::Commander, "back to the commander");
+                assert!(!app.commander.return_to_commander);
+                app.commander.status.clone()
+            } else {
+                assert_eq!(
+                    (app.mode, app.screen),
+                    (AppMode::Wizard, Screen::ScanConfig),
+                    "back to the scan settings"
+                );
+                app.status.clone()
+            };
+            assert!(
+                said.contains("the results of scan #1 could not be opened")
+                    && said.contains("newer version"),
+                "the reason is on the status line: {said}"
+            );
+            assert!(
+                said.starts_with(
+                    "⚠ no files under /tank/empty: the older scans that hold some were kept · "
+                ),
+                "and the note meant for the result, first: {said}"
+            );
+            assert!(app.history_kept_note.is_none(), "said once");
+            drain(&mut app, &rx);
+        }
     }
 
     // ------------------------------------------------------------------ F2 / resume probe

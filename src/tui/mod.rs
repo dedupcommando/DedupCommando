@@ -331,6 +331,43 @@ mod hostile_name_tests {
             assert!(wizard.contains(&shown), "{screen:?}:\n{wizard}");
         }
     }
+
+    /// The question before a scan goes to the trash names it, roots included, and a root is
+    /// whatever the scan was given. A scan no longer in the list is named by its number alone.
+    #[test]
+    fn the_trash_question_shows_a_root_escaped() {
+        let (mut app, _rx) = crate::app::test_app();
+        app.show_disclaimer = false;
+        app.mode = AppMode::Wizard;
+        app.screen = Screen::Resume;
+        app.sessions_loading = false;
+        app.sessions = vec![crate::model::scan::ResumeInfo {
+            scan_id: 7,
+            created_at: "2026-07-31 10:00:00".to_string(),
+            status: crate::model::scan::ScanStatus::Complete,
+            roots: vec![std::path::PathBuf::from(RETITLE)],
+            files_total: 1,
+            files_hashed: 1,
+            cand_bytes_total: 1,
+            cand_bytes_hashed: 1,
+            files_scanned: 1,
+            reclaim: crate::model::reclaim::ReclaimEstimate::unknown(),
+            already_linked_sets: None,
+        }];
+        app.confirm = Some(crate::app::ConfirmAction::TrashScan(7));
+        let shown = hostile::inert_text(80, 24, "trash question", |frame| render(frame, &mut app));
+        assert!(
+            shown.contains(&format!("Scan #7 · 2026-07-31 10:00:00 · {RETITLE_SHOWN}")),
+            "{shown}"
+        );
+
+        app.confirm = Some(crate::app::ConfirmAction::TrashScan(9));
+        let shown = hostile::inert_text(80, 24, "trash question", |frame| render(frame, &mut app));
+        assert!(
+            shown.contains("Scan #9") && !shown.contains("Scan #9 ·"),
+            "{shown}"
+        );
+    }
 }
 
 /// Render dispatcher by current screen; on top — the help overlay.
@@ -358,7 +395,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
     // Modal confirmation — over the screen.
     if let Some(action) = app.confirm {
-        render_confirm_modal(frame, action);
+        render_confirm_modal(frame, app, action);
     }
     // Loading animation for a finished scan's result (E2E feedback) — while it loads in the
     // background, and not over a window that waits for a key: the box would hide what the window
@@ -442,21 +479,52 @@ fn render_resource_badge(
 
 /// Modal confirmation window — yes/no for a reversible (trash) and
 /// an irreversible (purge) action on sessions.
-fn render_confirm_modal(frame: &mut Frame, action: ConfirmAction) {
-    let (title, body) = match action {
-        ConfirmAction::TrashScan(_) => (
+///
+/// It names the scan it is about. The cursor it was asked from can move while the operator is not
+/// looking — the list is read again after every scan — and a purge cannot be undone.
+fn render_confirm_modal(frame: &mut Frame, app: &App, action: ConfirmAction) {
+    let (title, listed, scan_id, body) = match action {
+        ConfirmAction::TrashScan(id) => (
             " Move to trash? ",
-            "The session will be moved to the trash — it can be restored (t).",
+            &app.sessions,
+            id,
+            "will be moved to the trash — it can be restored (t).",
         ),
-        ConfirmAction::PurgeScan(_) => (
+        ConfirmAction::PurgeScan(id) => (
             " Purge from trash? ",
-            "The session will be deleted PERMANENTLY — this is irreversible.",
+            &app.trashed,
+            id,
+            "will be deleted PERMANENTLY — this is irreversible.",
         ),
+    };
+    // 64 wide: 62 inside the frame, less the two-column indent.
+    const LINE: usize = 60;
+    let scan = match listed.iter().find(|scan| scan.scan_id == scan_id) {
+        Some(scan) => {
+            let head = format!(
+                "Scan #{scan_id} · {} · ",
+                crate::textsan::terminal(&scan.created_at)
+            );
+            let roots = scan
+                .roots
+                .iter()
+                .map(|root| crate::textsan::path(root))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // A long root keeps its end, the part that tells two scans apart, and is marked as cut.
+            let room = LINE.saturating_sub(head.chars().count());
+            format!(
+                "{head}{}",
+                crate::tui::commander::panel::ellipsize_left(&roots, room)
+            )
+        }
+        None => format!("Scan #{scan_id}"),
     };
     let area = centered(frame.area(), 64, 7);
     frame.render_widget(Clear, area);
     let lines = vec![
         Line::from(""),
+        Line::from(format!("  {scan}")),
         Line::from(format!("  {body}")),
         Line::from(""),
         Line::from("  [Y] yes    ·    [N] no".bold()),

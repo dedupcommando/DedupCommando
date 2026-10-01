@@ -8113,6 +8113,123 @@ mod dir_watch_tests {
                 crate::app::drain(&mut app, &events);
             }
 
+            /// Esc on the scan screen while the finished scan's result is still opening waits
+            /// for it. Leaving then let a new scan, started from the screen Esc led to, stand on
+            /// the scan screen again — and the late result, shown where it was asked from, took
+            /// that screen over while the new scan ran on unseen.
+            #[test]
+            fn esc_waits_while_the_finished_scan_opens() {
+                let _role = crate::state::store::role_guard();
+                let (_db, mut app, events) = open_app();
+                let scan_id = app.current_scan_id.expect("a scan is installed");
+                app.open_wizard(Screen::Scanning);
+                app.handle_event(AppEvent::ScanFinished(Ok(
+                    crate::pipeline::ScanOutcome::Completed(crate::model::scan::ScanResults {
+                        scan_id,
+                        summary: Default::default(),
+                        history_kept_for: None,
+                    }),
+                )));
+                assert!(app.routes.open.is_some(), "the result is opening");
+                key(&mut app, KeyCode::Esc);
+                assert_eq!(
+                    (app.mode, app.screen),
+                    (AppMode::Wizard, Screen::Scanning),
+                    "Esc waits for the result"
+                );
+                crate::app::pump_until(&mut app, &events, "the open", open_landed);
+                assert_eq!((app.mode, app.screen), (AppMode::Wizard, Screen::Browser));
+                assert_eq!(app.current_scan_id, Some(scan_id));
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// The scan ended while another scan's results were still opening, so asking
+            /// for its own was refused — on a screen with no status line. It is asked for again
+            /// once the other open settles, and shown. Red without the second request: the scan
+            /// screen gave up and the finished scan was never opened.
+            #[test]
+            fn a_result_refused_while_another_scan_opens_is_asked_for_again() {
+                let _role = crate::state::store::role_guard();
+                let (db, mut app, events) = open_app();
+                let scan_id = app.current_scan_id.expect("a scan is installed");
+                let mut store = ScanStore::open(&db).unwrap();
+                let other = store
+                    .begin_scan(&ScanConfig::new(vec![PathBuf::from("/srv")]))
+                    .unwrap();
+                store.set_status(other, ScanStatus::Complete).unwrap();
+                drop(store);
+                app.open_via_actor(other, crate::app::OpenIntent::Commander);
+                app.open_wizard(Screen::Scanning);
+                app.handle_event(AppEvent::ScanFinished(Ok(
+                    crate::pipeline::ScanOutcome::Completed(crate::model::scan::ScanResults {
+                        scan_id,
+                        summary: Default::default(),
+                        history_kept_for: None,
+                    }),
+                )));
+                assert!(
+                    matches!(&app.routes.open, Some(open) if open.scan_id == other),
+                    "the other scan is still opening"
+                );
+                crate::app::pump_until(&mut app, &events, "the other open", |app| {
+                    app.routes
+                        .open
+                        .as_ref()
+                        .is_none_or(|open| open.scan_id != other)
+                });
+                crate::app::pump_until(&mut app, &events, "the owed open", open_landed);
+                assert_eq!(
+                    (app.mode, app.screen),
+                    (AppMode::Wizard, Screen::Browser),
+                    "the finished scan's results are shown: {}",
+                    app.status
+                );
+                assert_eq!(app.current_scan_id, Some(scan_id));
+                crate::app::drain(&mut app, &events);
+            }
+
+            /// Esc while the finished scan waits for another scan's open: nothing is opening
+            /// for this screen, so Esc goes back — and says the finished scan's results were not
+            /// opened, rather than leaving that to a status line about the other scan. The late
+            /// open of the other scan does not ask for the finished one any more.
+            #[test]
+            fn esc_names_a_result_that_was_still_owed() {
+                let _role = crate::state::store::role_guard();
+                let (db, mut app, events) = open_app();
+                let scan_id = app.current_scan_id.expect("a scan is installed");
+                let mut store = ScanStore::open(&db).unwrap();
+                let other = store
+                    .begin_scan(&ScanConfig::new(vec![PathBuf::from("/srv")]))
+                    .unwrap();
+                store.set_status(other, ScanStatus::Complete).unwrap();
+                drop(store);
+                app.open_via_actor(other, crate::app::OpenIntent::Commander);
+                app.open_wizard(Screen::Scanning);
+                app.handle_event(AppEvent::ScanFinished(Ok(
+                    crate::pipeline::ScanOutcome::Completed(crate::model::scan::ScanResults {
+                        scan_id,
+                        summary: Default::default(),
+                        history_kept_for: None,
+                    }),
+                )));
+                key(&mut app, KeyCode::Esc);
+                assert_eq!(app.mode, AppMode::Commander, "back to the commander");
+                assert!(
+                    app.commander
+                        .status
+                        .starts_with(&format!("the results of scan #{scan_id} were not opened: ")),
+                    "{}",
+                    app.commander.status
+                );
+                crate::app::pump_until(&mut app, &events, "the other open", open_landed);
+                assert_eq!(app.mode, AppMode::Commander, "still in the commander");
+                assert!(
+                    app.routes.open.is_none(),
+                    "the finished scan is not asked for again"
+                );
+                crate::app::drain(&mut app, &events);
+            }
+
             /// B34. A scan that found a root empty, whose older scans retention kept, says so beside
             /// its result: the scan screen that got the notice closes as soon as the result opens,
             /// so without this the interface never shows why nothing went to the trash. First on the

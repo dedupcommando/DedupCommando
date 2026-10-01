@@ -126,22 +126,23 @@ Resume — list of active sessions
 ### The purge confirmation
 
 ```text
-┌─ Purge from trash? ─────────────────────────────────────────────────────┐
-│  The session will be deleted PERMANENTLY — this is irreversible.        │
-│                                                                          │
-│  The related rows in the DB (file, file_mark, file_group) number in the │
-│  millions. The deletion runs in the background; the UI is not blocked.  │
-│                                                                          │
-│  [Y] yes    ·    [N] no                                                  │
-└──────────────────────────────────────────────────────────────────────────┘
+┌ Purge from trash? ───────────────────────────────────────────┐
+│                                                              │
+│  Scan #138 · 2026-02-01 10:00:00 · /tank/media               │
+│  will be deleted PERMANENTLY — this is irreversible.         │
+│                                                              │
+│  [Y] yes    ·    [N] no                                      │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-The matching modal when you first send a session to the trash from Resume is
-titled ` Move to trash? ` with the body
-`The session will be moved to the trash — it can be restored (t).`
+The question names the scan — its number, date and roots — so you see which one
+goes before you answer: a purge cannot be undone. The matching modal when you
+first send a session to the trash from Resume is titled ` Move to trash? `: the
+same line with the scan, then `will be moved to the trash — it can be restored (t).`
 
 After **Y**, the status reads "Purging from trash in the background…" and work
-continues.
+continues: the related rows in the DB (`file`, `file_mark`, `file_group`) can
+number in the millions, and the interface is not blocked while they go.
 
 ### What "purge permanently" does NOT do
 

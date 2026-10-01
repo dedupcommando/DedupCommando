@@ -23,6 +23,14 @@ impl ScanHandle {
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
+
+    /// A handle with no worker behind it, for tests of what the interface does while a scan runs.
+    #[cfg(test)]
+    pub(crate) fn without_worker() -> Self {
+        Self {
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 /// Starts the scan in a background thread. Progress and result go to `events`.

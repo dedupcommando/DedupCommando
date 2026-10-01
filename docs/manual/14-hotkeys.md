@@ -269,6 +269,9 @@ Cancel hint: `[Esc] stop — progress is saved, you can resume later`.
 | **Esc**      | Cancel the scan (progress is saved to the DB for resume)   |
 | **q** / **Q**| Quit the application                                       |
 
+After the scan has ended, Esc waits while its result opens, and otherwise goes back to
+ScanConfig — or to commando, if the scan was started there.
+
 ### Browser (viewing groups and marking)
 
 Tabs `[1] Folders` / `[2] Files`. Footer: `1=Folders 2=Files · Tab ·
