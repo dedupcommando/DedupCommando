@@ -129,7 +129,8 @@ of previously performed scans:
 ```
 
 Entries are sorted newest to oldest. The status column shows `walking`,
-`hashing {pct}%`, `ready`, `ready ⚠` (finished with read warnings), or
+`hashing {pct}%`, `ready`, `ready ⚠` (finished with warnings: a hash failed, or the
+walk left something out — [§07](07-scanning.md#what-a-scan-leaves-out)), or
 `aborted`.
 
 | Key                    | Action                                                |
@@ -325,16 +326,16 @@ The cancel semantics — [§03 Data Safety](03-safety.md#press-esc-during-apply)
 │ Completed successfully: 9 operations      Errors: 0                     │
 │                                                                         │
 │ Safety snapshots created:                                              │
-│   tank@dedcom-20260527-143215-0                                        │
+│   tank@dedcom-20260527-143215-512874000-4821-0                         │
 │                                                                         │
 │ Files moved to quarantine:                                             │
-│   /tank/.dedcom-quarantine/20260527-143215-0/                          │
+│   /tank/.dedcom-quarantine/20260527-143215-512874000-4821-0            │
 │                                                                         │
 │ planned: guaranteed after quarantine purge: 232.0 MiB                  │
 │ realized: guaranteed after quarantine purge: 232.0 MiB                 │
 │                                                                         │
 │ Space is released AFTER verifying and purging with the commands:       │
-│   zfs destroy tank@dedcom-20260527-143215-0                            │
+│   zfs destroy tank@dedcom-20260527-143215-512874000-4821-0             │
 │   dedcom --purge-quarantine       # shows what it would remove         │
 │   dedcom --purge-quarantine --yes # removes every quarantine, for good │
 ├─────────────────────────────────────────────────────────────────────────┤

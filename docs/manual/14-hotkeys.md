@@ -34,7 +34,7 @@ Overlay title ` Concurrent launch `.
 | Key         | Action                                                      |
 |-------------|-------------------------------------------------------------|
 | **R**       | Open read-only (observer)                                   |
-| **F**       | Become operator (take the lock — **dangerous**)            |
+| **F**       | Become operator — without the lock if held (**dangerous**)  |
 | **Esc**     | Exit                                                        |
 
 ## Commando — the default mode

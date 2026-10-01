@@ -41,9 +41,14 @@ tank@dedcom-20260527-143215-512874000-4821-0
 tank/media@dedcom-20260527-143215-512874000-4821-0
 ```
 
-The nanosecond, PID, and sequence suffix guarantees a unique name even when two
-batches land in the same second (an earlier scheme could collide with an "already
-exists" error).
+The nanosecond, PID and sequence suffix makes it unlikely that two batches pick
+the same name. If the name is taken anyway, `dedcom` adds `-r1`, `-r2`, … and
+tries again, so a collision does not cancel the batch; the quarantine directory
+keeps the name without `-rN`. A plan saved as a shell script (`S` in the `F11`
+overlay) names its snapshots `<dataset>@dedcom-<YYYYMMDD-HHMMSS>` alone — the time
+the plan was shown — and its quarantine directory uses the same stamp. The script
+does not retry: if its snapshot name already exists, `zfs snapshot` fails and the
+script stops before its first action.
 
 **What to do with these snapshots:**
 
@@ -144,28 +149,34 @@ check-then-rename window on the destination.
 ### 5. Single-instance lock
 
 The state directory (`~/.local/state/dedcom/`) holds a lock file, `dedcom.lock`,
-held by the active operator via an advisory `flock`. A second operator cannot start
-in parallel: on the attempt, an overlay is shown (see
-[§02 Install](02-install.md)) offering a choice — `R`
-read-only / `F` force-seize / `Esc` exit. The interactive message is:
+held by the active operator via an advisory `flock`. By default (the `ask` policy) a
+second start shows an overlay (see [§02 Install](02-install.md)) offering a choice —
+`R` read-only / `F` become the operator anyway / `Esc` exit. The other policies
+([§12](12-maintenance.md#concurrency-policy)) do not ask: `readonly` opens an
+observer, `allow` an operator without the lock, and `block` ends the start with:
 
 ```text
-dedcom: another instance is already running. Run with --read-only to observe, or terminate that process.
+dedcom: another instance is already running (PID 12345, since 2026-06-20 14:32:15).
+Run with --read-only to observe, or terminate that process.
 ```
 
-Headless modes (`--scan`, `--stats`, `--compact-db`, `--export-csv`,
-`--purge-quarantine`) ALWAYS block without asking when the lock is held — there is
-nothing to answer interactively:
+`--stats` and `--export-csv` only read and take no lock. The headless modes that
+write (`--scan`, `--compact-db`, `--purge-quarantine`) never ask — there is
+nothing to answer interactively: when the lock is held they refuse, unless
+`--force` or the `allow` policy sends them in without it. The refusal:
 
 ```text
-write cancelled: held by another instance — terminate that process or retry with --force
+dedcom: error: write cancelled (PID 12345, since 2026-06-20 14:32:15): held by another instance — terminate that process or retry with --force
 ```
 
-> ⚠️ **`--force` is dangerous.** It seizes the lock, but the previous instance keeps
-> running. Two processes then write to the same SQLite database and may call
-> `apply_batch` simultaneously — the consequences are unpredictable. A lock is never
-> left behind: the kernel releases it when its process exits, even after `kill -9`
-> or an OOM kill. If the lock is held, that process is alive — find it
+> ⚠️ **`--force` is dangerous.** It does not take the lock away: the previous
+> instance keeps it and keeps running, and the new one works as the operator with
+> no lock at all. Two processes then write to the same SQLite database and work
+> on the same files — the consequences are unpredictable. Nor does the
+> lock guard against the forced instance later: once the first one exits, the next
+> `dedcom` finds the lock free and becomes a second operator beside it. A lock is
+> never left behind: the kernel releases it when its process exits, even after
+> `kill -9` or an OOM kill. If the lock is held, that process is alive — find it
 > (`pgrep -a dedcom`) and stop it instead of using `--force`.
 
 ### 6. Cross-device — refusal (not "work around it by copying")
@@ -276,9 +287,10 @@ exiting with error: the terminal was lost — what was running was finished befo
 ```
 
 Reconnect, start `dedcom` again and open the scan to see where the batch stopped. If
-you are back while the old process is still finishing its action, the new one stops
-with `another instance is already running` — wait for that PID to exit
-(`pgrep -a dedcom`).
+you are back while the old process is still finishing its action, the new one shows
+the "Concurrent launch" overlay (under the `block` policy it stops with
+`another instance is already running`) — choose `R` or `Esc` and wait for that PID
+to exit (`pgrep -a dedcom`).
 
 `SIGHUP` never cuts that wait short, however often it arrives. Two `SIGTERM`s from
 another session (`kill <PID>` twice) do: the process exits at once, and the action it

@@ -76,7 +76,9 @@ started with, so the flag alone is refused.
 
 **Cause:** `min_size = 4096` by default — files smaller than one filesystem block
 are skipped. If all your files are tiny (config files, for example), none of them
-enter the scan. Headless output simply prints `Files scanned:        0`.
+enter the scan. Headless output prints `Files scanned:        0`, and its
+`Scan left gaps:` and `Omissions:` lines count the files left out by size
+([§07](07-scanning.md#what-a-scan-leaves-out)).
 
 **Fix:** the scan configuration wizard does not expose `min_size` — it is fixed
 in code. If you need to deduplicate tiny files you have to change
@@ -293,7 +295,8 @@ window, or a session whose SSH connection has just dropped and that is finishing
 the action it was running ([§03](03-safety.md#lose-the-ssh-connection-during-apply)).
 The lock is an advisory `flock` on `dedcom.lock`, and the kernel releases
 it the moment its process exits, even after an OOM kill or `kill -9`: it is never
-left behind. The interactive message is:
+left behind. Under the default `ask` policy the start shows the "Concurrent launch"
+overlay ([§02](02-install.md)); under the `block` policy it ends with:
 
 ```text
 dedcom: another instance is already running (PID 12345, since 2026-06-20 14:32:15).
@@ -317,9 +320,9 @@ lock on the deleted file, the next `dedcom` locks a new one, and two writers the
 work on the same state.
 
 To only observe the running instance without touching the lock, start with
-`dedcom --read-only`. An alternative is the `--force` flag, but it does not stop
-the other process — it **seizes** the state on top of it, and two operators then
-write at once.
+`dedcom --read-only`. An alternative is the `--force` flag, but it neither stops
+the other process nor takes its lock: the new one runs as the operator **without
+any lock** beside it, and two operators then write at once.
 
 ### Headless from cron does not run, it says "cancelled"
 
@@ -328,8 +331,7 @@ the `ask` concurrency policy, headless behaves like `block` (there is no UI to
 ask the question), so it simply refuses to start. The headless message is:
 
 ```text
-write cancelled (PID 12345, since 2026-06-20 14:32:15): held by another instance
-— terminate that process or retry with --force
+dedcom: error: write cancelled (PID 12345, since 2026-06-20 14:32:15): held by another instance — terminate that process or retry with --force
 ```
 
 (If the cron line itself carries `--read-only`, the message says so instead:
@@ -341,8 +343,8 @@ without --read-only`.)
 - Run cron at a different time.
 - Or set `"concurrency": "block"` in `config.json` explicitly — the behavior is
   unchanged, but explicit.
-- As a last resort, retry with `--force` to seize the state — only do this when
-  you are certain no other instance is actually writing.
+- As a last resort, retry with `--force`, which runs without the lock — only do
+  this when you are certain no other instance is actually writing.
 - Do NOT set `"concurrency": "allow"` for cron — that would write to the database
   in parallel with the TUI and **corrupt your data**.
 
@@ -507,12 +509,14 @@ the insurance snapshot was not created, the action was cancelled
 **Fix:**
 
 ```text
-zfs list -t snapshot | grep dedcom-              # look at them
-zfs destroy tank@dedcom-20260520-143215-12345-0  # delete a specific one
+zfs list -t snapshot | grep dedcom-                        # look at them
+zfs destroy tank@dedcom-20260520-143215-512874000-12345-0  # delete a specific one
 ```
 
 A snapshot name looks like
-`<dataset>@dedcom-<YYYYMMDD-HHMMSS>-<nanos>-<pid>-<seq>`. A script for batch
+`<dataset>@dedcom-<YYYYMMDD-HHMMSS>-<nanos>-<pid>-<seq>`, with `-r1`, `-r2`, …
+after it if that name was taken; a plan saved as a shell script uses
+`<dataset>@dedcom-<YYYYMMDD-HHMMSS>` alone. A script for batch
 cleanup older than N days is in [§03 Viewing dedcom snapshots](03-safety.md#viewing-dedcom-snapshots).
 
 ### The quarantine `.dedcom-quarantine/` is taking space on the pool
@@ -531,7 +535,7 @@ dedcom --purge-quarantine --yes                  # clear EVERYTHING in all datas
 Or a specific timestamp:
 
 ```text
-rm -rf /tank/.dedcom-quarantine/20260520-143215-0/
+rm -rf /tank/.dedcom-quarantine/20260520-143215-512874000-12345-0/
 ```
 
 (`dedcom --purge-quarantine --yes` clears all of it at once — there is no

@@ -95,9 +95,54 @@ Always skipped:
 - `**/.dedcom-quarantine/**` — our own quarantine (we don't deduplicate
   ourselves).
 
+These two are skipped silently: nothing under them is counted among the omissions
+below.
+
 There is no way to add exclusions of your own: a root takes in everything below it,
 including every dataset mounted there, so choose roots that do not reach what must stay
 untouched ([§8.9](08-actions.md#89-backups-and-other-programs-stores)).
+
+## What a scan leaves out
+
+Besides the filters above, the walk leaves out what it cannot record or open. It
+does not stop for them; it counts them:
+
+| Left out | Counted as |
+|----------|------------|
+| A symbolic link — to a file, to a directory or to nothing. Links below a root are never followed | unsupported entry |
+| A FIFO, a socket, a block or character device | unsupported entry |
+| A file whose path is not valid UTF-8 — every file under a directory whose name is not UTF-8, too (one the size or extension filter rejects counts under that filter instead) | file |
+| A file that disappears, or whose metadata cannot be read, after its directory was listed | file |
+| A directory that cannot be opened (no permission), one that disappears before the walk reaches it, a path longer than 4095 bytes — everything under it, so how many files it hides is unknown | walk error |
+| A file below the size limit or outside the extension filter (the filters above) | file |
+
+A file whose content cannot be read is not left out: the walk reads only metadata.
+If another file has its size, reading it fails at the hash: it counts under
+`Failed to hash`, and `dedcom.log` gets a `skip <path>: <cause>` line. If no other
+file has its size, it is never opened.
+
+How a scan reports them:
+
+- At the end, one notice — on the scan screen until the result opens, in the
+  `--scan` output and in `dedcom.log`; counts that are zero are left out:
+
+  ```text
+  Scan left gaps: 3919 files omitted, 2 walk errors (unknown files hidden), 1 unsupported entries — affected directories are not exact twins
+  ```
+
+- When the result is opened, the status line adds
+  `⚠ gaps: 3919 files omitted, 2 walk errors, 1 unsupported entries`, and
+  `⚠ failed to hash: N` when a hash failed. `--scan` prints the counts on its
+  `Omissions:` line ([§11.1](11-headless.md)).
+- Anything in the table except the size and extension filters, and any failed hash,
+  finishes the scan as `complete_with_warnings` — `ready ⚠` in the list of scans.
+- A directory with anything left out under it, a file below the size limit
+  included, is not offered among the twin folders. This holds for roots given as
+  absolute paths; with a relative `--scan` root such directories are listed as
+  unverified, and the notice ends with
+  `(details not persisted: no completeness authority)`.
+- Each walk error is written to `dedcom.log` as `walk error: <path>: <cause>` — the
+  first 1000 of each walk, then one line with the count of the rest.
 
 ## Hash cache (`hash_cache`)
 
@@ -172,11 +217,11 @@ dedcom --scan /tank --merkle-dirs       # headless
 
 > **When you need `--merkle-dirs`:** on a host where `~2.5 KiB × file_count` is
 > close to free RAM or exceeds it. Before phase 3/3 dedcom prints a forecast and
-> compares it with free RAM — if you get a red warning, or a previous scan was
-> killed by OOM on 3/3, turn it on. A scan killed that way is still unfinished,
-> and a resume keeps the algorithm it was started with, so start a new one:
-> `dedcom --scan /tank --merkle-dirs --no-resume` (without `--no-resume` the
-> flag is refused, see [§11](11-headless.md)).
+> compares it with free RAM — if the forecast says `⚠ LOW, OOM risk`, or a previous
+> scan was killed by OOM on 3/3, turn it on. A scan killed that way is still
+> unfinished, and a resume keeps the algorithm it was started with, so start a
+> new one: `dedcom --scan /tank --merkle-dirs --no-resume` (without `--no-resume`
+> the flag is refused, see [§11](11-headless.md)).
 
 The algorithm is persisted in the checkpoint — resume uses the same one.
 
@@ -248,6 +293,7 @@ A scan is saved into `dedcom.db` in chunks:
 | **Walking**  | Interrupted in phase 1                               | ✅       |
 | **Hashing**  | Interrupted in phase 2                               | ✅       |
 | **Complete** | Scan finished (including phase 3)                   | —       |
+| **CompleteWithWarnings** | Finished, but a hash failed or the walk left out something no filter chose ([above](#what-a-scan-leaves-out)); `ready ⚠` in the list | — |
 | **Aborted**  | Interrupted after phase 3 or an invariant was broken | ❌ — new scan |
 
 On the next start of the wizard for the same roots, a Resume overlay appears (see
@@ -292,15 +338,18 @@ Not configurable in the TUI — CLI only.
 
 ## Messages and warnings during a scan
 
-`ScanProgress::Notice(String)` — the Scanning screen and `dedcom.log` print
-additional messages, the most important being:
+`ScanProgress::Notice(String)` — the Scanning screen, the `--scan` output and
+`dedcom.log` print additional messages, the most important being:
 
-- **"Phase 3/3 peak estimate: X GiB, free: Y GiB"** — the `files × 2.5 KiB`
-  calculation from the phase-2 results vs `available_ram_bytes`. If X > Y it is
-  printed in yellow: a risk of OOM, and you are advised to interrupt (Esc) and
+- **`Phase 3/3: estimated peak memory ~X (N files × ~2.5 KiB); free RAM ~Y`** —
+  before phase 3, with the default directory algorithm: the `files × 2.5 KiB`
+  calculation from the phase-2 results vs `available_ram_bytes`. If X > Y the line
+  ends with `— ⚠ LOW, OOM risk: free memory or abort (Esc)`: interrupt (Esc) and
   start a new scan with `--merkle-dirs` — "new" rather than "resume" in the
   interface, `--no-resume` with `--scan`: a resume keeps the algorithm it was
   started with.
+- **`Scan left gaps: …`** — at the end, when the walk left something out
+  ([What a scan leaves out](#what-a-scan-leaves-out)).
 
 ## Summary — typical flag combinations
 

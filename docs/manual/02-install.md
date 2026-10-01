@@ -164,11 +164,11 @@ instance, a role-selection overlay appears at startup:
 
 ```text
 ┌─ Concurrent launch ────────────────────────────────────────────────────┐
-│  Another running instance was detected                                 │
+│  Another running instance detected                                     │
 │                                                                         │
 │  Operator: PID 12345, since 2026-05-27 14:23                           │
 │                                                                         │
-│  Working with the same state from two operators can                    │
+│  Working on the same state with two operators may                      │
 │  corrupt data. Choose a launch mode:                                   │
 │                                                                         │
 │  [R] Read-only — observe the map and progress (safe)                  │
@@ -180,14 +180,16 @@ instance, a role-selection overlay appears at startup:
 | Key     | Action                                                                                  |
 |---------|-----------------------------------------------------------------------------------------|
 | **R**   | Open as an observer (equivalent to the `--read-only` flag). Safe.                       |
-| **F**   | Seize the lock and become operator (equivalent to `--force`). See the warning below.    |
+| **F**   | Become the operator anyway (like `--force`). See the warning below.                     |
 | **Esc** | Exit `dedcom`.                                                                          |
 
-> ⚠️ **`F` / `--force` is dangerous.** The previous operator keeps running, but two processes
-> must not write to the same database at once — you would overwrite each other's progress or
-> results. A lock is never left behind: the kernel releases it when its process exits, even
-> after `kill -9` or an OOM kill. If the lock is held, that `dedcom` is still running — find it
-> (`pgrep -a dedcom`) and stop it instead.
+> ⚠️ **`F` / `--force` is dangerous.** Neither takes the lock away: the previous operator keeps
+> it and keeps running, and the new one works with no lock at all (`F` first tries the lock once
+> more and takes it if that `dedcom` has exited meanwhile). Two processes must not write to the
+> same database at once — you would overwrite each other's progress or results. A lock is never
+> left behind: the kernel releases it when its process exits, even after `kill -9` or an OOM
+> kill. If the lock is held, that `dedcom` is still running — find it (`pgrep -a dedcom`) and
+> stop it instead.
 
 In read-only mode, a badge stays lit in the top-right corner:
 
@@ -195,9 +197,10 @@ In read-only mode, a badge stays lit in the top-right corner:
                                                        ● READ-ONLY
 ```
 
-Headless modes (`--scan`, `--stats`, `--compact-db`, `--export-csv`, `--purge-quarantine`)
-are ALWAYS blocked when the lock is held, with no interactive prompt (there is nothing to
-answer). For that reason, scripts launched from cron should not compete with an interactive
+`--stats` and `--export-csv` only read and take no lock. The headless modes that write
+(`--scan`, `--compact-db`, `--purge-quarantine`) never ask (there is nothing to answer): while
+the lock is held they refuse, unless `--force` or the `allow` policy sends them in without it.
+For that reason, scripts launched from cron should not compete with an interactive
 session — see [§11 Headless](11-headless.md).
 
 ### 3. Main screen

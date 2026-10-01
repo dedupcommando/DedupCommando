@@ -41,8 +41,9 @@ single kernel operation — there is no check-then-rename window on the destinat
 
 ### 5. Single-instance lock
 A writing instance holds an advisory `flock` on `~/.local/state/dedcom/dedcom.lock`. A second instance can
-only run read-only (or force-seize, which is dangerous). Headless writers never prompt — they exit non-zero
-if the lock is held.
+only run read-only (or as a second operator with `--force` or the `allow` policy — without a lock, which is
+dangerous). Headless writers never prompt: while the lock is held they exit non-zero, unless one of those two
+lets them in.
 
 ### 6. Consent gating and resource governor
 A one-time disclaimer must be accepted before first use. On busy hosts the scan's resource profile

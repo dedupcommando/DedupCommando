@@ -422,9 +422,12 @@ sqlite3 aside-<stamp>/dedcom.db \
      FROM move_event ORDER BY id;"
 ```
 
-To roll the files themselves back, use the ZFS snapshot the Triage Board takes before
-each batch (`zfs list -t snapshot | grep dedcom`, see §03). Undo inside the TUI lives in
-the session's memory only and does not survive a restart.
+To roll the files themselves back, use the ZFS snapshot of their dataset
+(`zfs list -t snapshot | grep dedcom`, see §03). The Triage Board takes it at the first
+move out of that dataset since `dedcom` started, not before every batch, so a rollback
+returns the whole dataset to that moment: every later move is undone too, and so is
+everything else written there since. Undo inside the TUI lives in the session's memory
+only and does not survive a restart.
 
 ## What's next
 

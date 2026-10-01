@@ -11,9 +11,11 @@ Five flags run `dedcom` without the TUI:
 | `--purge-quarantine`          | Lists the `.dedcom-quarantine` directories in all datasets; deletes them with `--yes` |
 
 All of them **exit immediately** once done (there is no interactive UI). If
-another `dedcom` is already working on this state directory, the headless mode
-**does not prompt** — it exits with an error right away (there is no way to
-answer interactively).
+another `dedcom` is already working on this state directory, the modes that write
+(`--scan`, `--compact-db`, `--purge-quarantine`) **do not prompt** — they exit
+with an error right away (there is no way to answer interactively), unless
+`--force` or the `allow` policy lets them in; `--stats` and `--export-csv` take
+no lock.
 
 A run does **one** of them: two different modes in one run are refused before
 anything starts (exit code 2) — run them one after another. `--scan` may still
@@ -27,7 +29,8 @@ All headless modes:
 - Read/write `~/.local/state/dedcom/` (or the directory from `--state-dir`).
 - Take the single-instance lock (for the writing modes: `--scan`,
   `--compact-db`, `--purge-quarantine`). If it is held, they **do not ask for
-  permission** — they print an error and exit non-zero.
+  permission** — they print an error and exit non-zero, unless `--force` or the
+  `allow` policy lets them in without it.
 - Return **0** on success, **non-zero** on error (typical: held lock,
   unavailable DB, ZFS that dropped out).
 
@@ -113,7 +116,8 @@ The output is line-by-line text for logging:
 [hash] 2/5230 files, ...
 ...
 [phase] Grouping
-RSS probe: build_dir_groups before=…  free=… peak estimate=…
+Phase 3/3: estimated peak memory ~12.8 MiB (5230 files × ~2.5 KiB); free RAM ~41.2 GiB
+Scan left gaps: 3919 files omitted — affected directories are not exact twins
 
 === Done ===
 Files scanned:        5230
@@ -138,7 +142,9 @@ Omissions:            3919 files, 0 walk errors, 0 unsupported entries
 > extension filter, names that are not UTF-8, and files whose metadata could not
 > be read; then walk errors (one may stand for a whole unreadable subtree) and
 > entries that are neither files nor directories (symbolic links, FIFOs, sockets,
-> devices).
+> devices). The `Scan left gaps:` line above `=== Done ===` gives the same counts
+> as one notice, written to `dedcom.log` too; §07 lists what each kind covers
+> ([What a scan leaves out](07-scanning.md#what-a-scan-leaves-out)).
 >
 > A walk error is most often a directory the walk could not open — no permission,
 > a path longer than 4095 bytes, or a directory removed before the walk reached it
@@ -237,7 +243,7 @@ $ dedcom --stats
 | File             | Size of `dedcom.db` + the WAL journal                       |
 | Sessions         | Active + in-trash counted separately                        |
 | Manifest rows    | Sum of `file` rows across all scans (to gauge DB weight)    |
-| Session status   | `walking` / `hashing` / `complete` / `aborted`              |
+| Session status   | `walking` / `hashing` / `complete` / `complete_with_warnings` / `aborted` |
 | Environment      | Media type, ZFS layout, version — for analytics             |
 | Speed            | Accumulated hashed volume / accumulated active time         |
 
@@ -481,7 +487,7 @@ scans and applies nothing, so `--no-resume`, `--verify`, `--merkle-dirs` and
 | `--yes`                    | Confirm the deletion (§11.5)                              | `--purge-quarantine` |
 | `--classic`, `--commando`  | Open the step-by-step wizard, or the Commando interface   | either interface, not both |
 | `--read-only`              | Observer (§11.6)                                          | every run, not with `--force` |
-| `--force`                  | Seize the lock (dangerous)                                | every run, not with `--read-only` |
+| `--force`                  | Operator when the lock is held — without it (dangerous)   | every run, not with `--read-only` |
 | `-V` / `--version`         | Version → stdout, exit 0                                  | — |
 | `-h` / `--help`            | Help → stdout, exit 0                                     | — |
 
