@@ -376,6 +376,9 @@ pub(crate) fn apply_auto_switch(app: &mut App, cwd: &Path, target: Option<i64>) 
             app.commander.groups_loaded_for = None;
             app.commander.watch_cache = Vec::new();
             app.commander.watch_dir_cache = Vec::new();
+            // The panels' saved marks belong to the scan just set aside: with no scan, Space on
+            // one would clear it on screen only, and the next scan would bring it back.
+            app.drop_durable_marks();
         }
     }
 }
@@ -1197,7 +1200,7 @@ fn on_key_overlay(app: &mut App, key: KeyEvent) {
 }
 
 /// F9 → «Clear all marks». The F11 plan is built from every mark the database holds for the scan,
-/// and a files panel holds only the ones set while it was open, so the item clears them in the
+/// and a files panel shows only the ones of the files it lists, so the item clears them in the
 /// database — after a yes. Refused before the question to an observer, without a loaded scan, while
 /// a mark is still being saved, and while anything is still on its way that would put a window of
 /// its own over the question or install another scan under it.
@@ -4170,9 +4173,9 @@ mod u4c_enter_is_not_execute_tests {
 mod u2_execute_reachability_tests {
     use super::*;
 
-    /// `prepare_execution` ran and found nothing marked. Any other outcome (empty status, an
-    /// overlay) means the key never reached it.
-    const NOTHING_MARKED: &str = "No marked files (F5/F6/F7/F8)";
+    /// `prepare_execution` ran and found no scan to plan against. Any other outcome (empty status,
+    /// an overlay) means the key never reached it.
+    const EXECUTE_REACHED: &str = "No scan is loaded — load one (F2/F12) before executing actions";
 
     fn commander_app() -> App {
         let (app, _rx) = crate::app::test_app();
@@ -4188,7 +4191,7 @@ mod u2_execute_reachability_tests {
         for code in [KeyCode::Char('x'), KeyCode::Char('X')] {
             let mut app = commander_app();
             press(&mut app, code);
-            assert_eq!(app.commander.status, NOTHING_MARKED, "{code:?}");
+            assert_eq!(app.commander.status, EXECUTE_REACHED, "{code:?}");
         }
     }
 
@@ -4198,7 +4201,7 @@ mod u2_execute_reachability_tests {
         let mut app = commander_app();
         press(&mut app, KeyCode::Char('`'));
         press(&mut app, KeyCode::Char('-'));
-        assert_eq!(app.commander.status, NOTHING_MARKED);
+        assert_eq!(app.commander.status, EXECUTE_REACHED);
         assert!(
             !app.commander.second_layer,
             "the layer disarms after the key"
@@ -4240,7 +4243,7 @@ mod u2_execute_reachability_tests {
 
         let mut app = commander_app();
         run_menu_action(&mut app, MENU[index].1);
-        assert_eq!(app.commander.status, NOTHING_MARKED);
+        assert_eq!(app.commander.status, EXECUTE_REACHED);
     }
 
     #[test]

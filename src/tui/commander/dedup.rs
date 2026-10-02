@@ -103,8 +103,10 @@ impl DirDedup {
     /// directory signatures — so no row here can describe a different database state than its
     /// neighbour.
     pub fn from_panel(data: PanelData) -> Self {
+        // The marks are not dedup evidence: they go to the panels, not into this cache.
         let PanelData {
             files,
+            marks: _,
             dir_sizes,
             dir_signatures,
         } = data;
@@ -474,6 +476,7 @@ mod tests {
         dir_sizes.insert(PathBuf::from("/tank/d\u{FFFD}"), 4096);
         let dir = DirDedup::from_panel(PanelData {
             files,
+            marks: Vec::new(),
             dir_sizes,
             dir_signatures: HashMap::new(),
         });

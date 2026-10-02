@@ -1056,6 +1056,9 @@ pub enum Presentation {
 #[derive(Debug)]
 pub struct PanelData {
     pub files: std::collections::HashMap<PathBuf, PanelFile>,
+    /// The saved mark of each listed file, read in the same snapshot as `files` — the shape a
+    /// mark write returns its after-image in.
+    pub marks: Vec<(PathBuf, Option<MarkIntent>)>,
     pub dir_sizes: std::collections::HashMap<PathBuf, u64>,
     pub dir_signatures: std::collections::HashMap<PathBuf, LiveDirSignature>,
 }
@@ -2771,24 +2774,27 @@ mod arms {
                 return;
             };
             (|| {
-                let file_answers = {
+                let (file_answers, marks) = {
                     let snapshot = door
                         .membership_snapshot(scan_id)
                         .map_err(PanelFailure::Snapshot)?;
                     let refs: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
-                    snapshot.panel_files(&refs).map_err(|miss| {
-                        // The batch itself refused (per-row misses are typed INSIDE the
-                        // answers) — that is the file half failing, with the miss preserved
-                        // where it carries a reopen.
-                        match miss {
-                            MembershipMiss::ReopenRequired { detail } => {
-                                PanelFailure::PathChanged { detail }
-                            }
-                            other => PanelFailure::Files {
-                                detail: super::miss_text(&other),
-                            },
+                    // The batch itself refused (per-row misses are typed INSIDE the answers) —
+                    // that is the file half failing, with the miss preserved where it carries a
+                    // reopen.
+                    let file_fail = |miss| match miss {
+                        MembershipMiss::ReopenRequired { detail } => {
+                            PanelFailure::PathChanged { detail }
                         }
-                    })?
+                        other => PanelFailure::Files {
+                            detail: super::miss_text(&other),
+                        },
+                    };
+                    let answers = snapshot.panel_files(&refs).map_err(file_fail)?;
+                    // The marks come from the same snapshot, so a marks statement that fails
+                    // fails the file half with it: one database state, all of it or none.
+                    let marks = snapshot.panel_marks(&refs).map_err(file_fail)?;
+                    (answers, marks)
                 };
                 let dir_fail = |err: AppError| match err.path_mismatch() {
                     Some(detail) => PanelFailure::PathChanged {
@@ -2803,6 +2809,7 @@ mod arms {
                     .map_err(dir_fail)?;
                 Ok(PanelData {
                     files: file_answers,
+                    marks,
                     dir_sizes,
                     dir_signatures,
                 })

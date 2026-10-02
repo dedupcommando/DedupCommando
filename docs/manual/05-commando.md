@@ -266,6 +266,12 @@ The panel header shows the current key.
 ## File marks
 
 A mark lives on the absolute path — moving to another directory does not lose it.
+Marks are saved with the scan: a files panel shows the saved mark of every file it
+lists, marks set in an earlier session or in the classic interface included, and
+opening another scan shows that scan's marks. A saved mark takes the place of a
+Space/Insert selection on the same file. F11 plans every saved mark of the scan,
+those in folders no panel shows included, so it can open a confirmation while no
+panel shows a mark.
 
 | Mark    | Glyph| Key               | Meaning                                               |
 |---------|------|-------------------|-------------------------------------------------------|
@@ -512,7 +518,7 @@ scans shows its groups. Help does not hold it back — the groups open under it.
 
 The F11 plan is built from every mark the database holds for the scan, marks
 set in an earlier session or in the classic interface included, and a files
-panel shows only the marks set while it was open. So item 5 clears them in the
+panel shows only the marks of the files it lists. So item 5 clears them in the
 database, all of them, after a question that names the scan:
 
 ```text
@@ -529,8 +535,8 @@ The count is of the files marked for an action; keepers are not in it and go
 too. When that count is not known yet, the line is left out. On **Y** the
 status line reads `Marks cleared: N`, N being the marks the database held, and
 no panel or group shows a mark of that scan any more. Marks of other scans stay
-in the database; a panel that still held one drops it. The selection made with
-**Space** or **Insert** is not a mark and stays.
+in the database. The selection made with **Space** or **Insert** is not a mark
+and stays.
 
 The item is refused in read-only mode, without a loaded scan, while a mark is
 still being saved or the marks are still being cleared, and while something

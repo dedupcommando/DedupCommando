@@ -625,6 +625,30 @@ fn durable_meaning(intent: Option<&MarkIntent>) -> &'static str {
     }
 }
 
+/// Writes what the database holds for one pathname into one panel's marks. `Selected` is a triage
+/// selection, not a durable mark — the database says nothing about it and must not clear it; a
+/// saved mark on the same pathname takes its place.
+fn settle_mark(
+    marks: &mut HashMap<PathBuf, crate::tui::commander::state::Mark>,
+    path: &Path,
+    intent: Option<MarkIntent>,
+) {
+    use crate::tui::commander::state::Mark;
+    let mark = match intent {
+        None => {
+            if marks.get(path).is_some_and(|mark| *mark != Mark::Selected) {
+                marks.remove(path);
+            }
+            return;
+        }
+        Some(MarkIntent::Keeper) => Mark::Keeper,
+        Some(MarkIntent::Act(ActionKind::Delete)) => Mark::Delete,
+        Some(MarkIntent::Act(ActionKind::Hardlink)) => Mark::Hardlink,
+        Some(MarkIntent::Act(ActionKind::Reflink)) => Mark::Reflink,
+    };
+    marks.insert(path.to_path_buf(), mark);
+}
+
 /// The durable meaning a keystroke asked for. A triage selection is not durable, so it reads as
 /// «cleared»: the database holds no row for it either way.
 fn requested_meaning(mark: Option<crate::tui::commander::state::Mark>) -> &'static str {
@@ -1292,6 +1316,10 @@ impl App {
         self.commander.dedup = DedupCache::default();
         self.commander.watch_cache = Vec::new();
         self.commander.watch_dir_cache = Vec::new();
+        // The marks the panels hold belong to the scan this open replaces, or to an earlier open
+        // of this one. The refresh every panel asks for below brings back what the database holds
+        // for the files it lists.
+        self.drop_durable_marks();
 
         self.status = self.completion_status(published, status);
         if matches!(&self.history_kept_note, Some((id, _)) if *id == scan_id) {
@@ -1468,6 +1496,9 @@ impl App {
         self.commander.watch_cache = Vec::new();
         self.commander.watch_dir_cache = Vec::new();
         self.commander.scan_coverage_cache.clear();
+        // The panels' marks are that scan's too: Space on one would clear it on screen only, and
+        // the next open would bring it back.
+        self.drop_durable_marks();
         self.invalidate_confirmation(REOPEN_REQUIRED);
         // A «Clear all marks» question names the scan that is gone: it closes, and the status
         // below says why.
@@ -1695,12 +1726,12 @@ impl App {
         let Some((target, cwd)) = self.routes.panels.remove(&req.0) else {
             return;
         };
-        let _ = target;
         if !self.is_current(act) {
             return;
         }
         match result {
-            Ok(data) => {
+            Ok(mut data) => {
+                self.settle_listed_marks(target, &cwd, std::mem::take(&mut data.marks));
                 let dir = crate::tui::commander::dedup::DirDedup::from_panel(*data);
                 let mut keep: std::collections::HashSet<PathBuf> = self
                     .commander
@@ -2480,7 +2511,7 @@ impl App {
     /// Writes the durable after-image the store returned into every window that shows those
     /// pathnames. This is the authoritative state — never the optimistic one the UI guessed.
     fn apply_mark_image(&mut self, after: &[(PathBuf, Option<MarkIntent>)]) {
-        use crate::tui::commander::state::{Mark, WatchResult};
+        use crate::tui::commander::state::WatchResult;
         // A group on screen shows each member's mark: the classic browser's open group, and the
         // file group of a commander watching panel («group files», «duplicates of the cursor»).
         let settle = |files: &mut [FileEntry]| {
@@ -2502,32 +2533,64 @@ impl App {
                 settle(&mut group.files);
             }
         }
+        self.settle_panel_marks(after);
+    }
+
+    /// The panel half of [`Self::apply_mark_image`]: every panel shows what the database holds
+    /// for each of these pathnames.
+    fn settle_panel_marks(&mut self, after: &[(PathBuf, Option<MarkIntent>)]) {
         for panel in &mut self.commander.panels {
             for (path, intent) in after {
-                match intent {
-                    // `Selected` is a triage selection, not a durable mark — the database says
-                    // nothing about it and must not clear it.
-                    None => {
-                        if panel
-                            .marks
-                            .get(path)
-                            .is_some_and(|mark| *mark != Mark::Selected)
-                        {
-                            panel.marks.remove(path);
-                        }
-                    }
-                    Some(MarkIntent::Keeper) => {
-                        panel.marks.insert(path.clone(), Mark::Keeper);
-                    }
-                    Some(MarkIntent::Act(ActionKind::Delete)) => {
-                        panel.marks.insert(path.clone(), Mark::Delete);
-                    }
-                    Some(MarkIntent::Act(ActionKind::Hardlink)) => {
-                        panel.marks.insert(path.clone(), Mark::Hardlink);
-                    }
-                    Some(MarkIntent::Act(ActionKind::Reflink)) => {
-                        panel.marks.insert(path.clone(), Mark::Reflink);
-                    }
+                settle_mark(&mut panel.marks, path, *intent);
+            }
+        }
+    }
+
+    /// The saved marks of the files one panel refresh listed, written the way a write's answer is
+    /// into every panel that shows that folder.
+    ///
+    /// The answer covers exactly what the panel that asked lists, so that panel keeps nothing
+    /// else: no saved mark of another folder, and none of this one that it no longer lists — the
+    /// plan needs no more, it is built from every mark the database holds. Another panel on the
+    /// folder may list more than that (a «directories» panel lists no file at all) and only hears
+    /// about the files named.
+    ///
+    /// Two things on a panel are not the refresh's to settle: a Space/Insert selection, and the
+    /// glyph of a keystroke on that panel whose write has not been answered — the refresh may have
+    /// been read before the write, and the write's own answer settles the row. Every other write
+    /// lands after any refresh read before it: the actor answers in the order it was asked.
+    fn settle_listed_marks(
+        &mut self,
+        asked: LoadTarget,
+        cwd: &Path,
+        marks: Vec<(PathBuf, Option<MarkIntent>)>,
+    ) {
+        use crate::tui::commander::state::Mark;
+        let writing: Vec<(usize, PathBuf)> = self
+            .pending_marks
+            .values()
+            .filter_map(|origin| match origin {
+                MarkOrigin::CommanderMark { panel, path, .. } => Some((*panel, path.clone())),
+                _ => None,
+            })
+            .collect();
+        for (index, panel) in self.commander.panels.iter_mut().enumerate() {
+            if panel.cwd != cwd {
+                continue;
+            }
+            let held = |path: &Path| {
+                writing
+                    .iter()
+                    .any(|(on, pending)| *on == index && pending == path)
+            };
+            if asked == LoadTarget::Commander(index) {
+                panel
+                    .marks
+                    .retain(|path, mark| *mark == Mark::Selected || held(path));
+            }
+            for (path, intent) in &marks {
+                if !held(path) {
+                    settle_mark(&mut panel.marks, path, *intent);
                 }
             }
         }
@@ -2605,12 +2668,21 @@ impl App {
                 self.apply_mark_image(&after);
                 self.report_mark_failure(&error, clearing);
             }
-            // No authoritative image exists at all — the window goes back to what it showed.
+            // No authoritative image exists at all — the window goes back to what it showed. That
+            // panel may have held back its folder's answer for this row while the write was out,
+            // so what it showed can be older than the database: it asks again.
             MarkOutcome::Unreadable { error } => {
+                let panel = match &origin {
+                    Some(MarkOrigin::CommanderMark { panel, .. }) => Some(*panel),
+                    _ => None,
+                };
                 if let Some(origin) = origin {
                     self.restore_mark_origin(origin);
                 }
                 self.report_mark_failure(&error, clearing);
+                if let Some(panel) = panel {
+                    crate::tui::commander::fetch_panel_dedup(self, LoadTarget::Commander(panel));
+                }
             }
         }
         let _ = self.refresh_marked_count();
@@ -2651,9 +2723,9 @@ impl App {
 
     /// After «Clear all marks» the database holds no mark of the installed scan, so no window may
     /// show one: every file of every group on screen — the classic browser's open group and the
-    /// file group of each watching panel — loses its mark, and every panel drops its durable marks,
-    /// another scan's left from before a switch included. The cost is the rows on screen, whatever
-    /// the number cleared. A triage selection is not a mark and stays.
+    /// file group of each watching panel — loses its mark, and every panel drops its durable marks.
+    /// The cost is the rows on screen, whatever the number cleared. A triage selection is not a
+    /// mark and stays.
     fn settle_cleared_marks(&mut self, cleared: u64) {
         use crate::tui::commander::state::{Mark, WatchResult};
         let unmark = |files: &mut [FileEntry]| {
@@ -2766,9 +2838,17 @@ impl App {
     /// What follows a write the UI did not see row by row: every named RAM representation of a
     /// mark is dropped, and the authoritative rows are re-read behind the gate.
     fn after_bulk_mark_write(&mut self, unsettled: bool) {
+        self.drop_durable_marks();
+        self.marks_unsettled = unsettled;
+        self.invalidate_confirmation("the marks were rewritten");
+        self.start_gate_reload();
+    }
+
+    /// Every panel forgets the durable marks it holds; the triage selection is not a durable mark
+    /// and stays.
+    pub(crate) fn drop_durable_marks(&mut self) {
         use crate::tui::commander::state::Mark;
         for panel in &mut self.commander.panels {
-            // The durable marks are stale; the triage selection is not a durable mark.
             panel.marks.retain(|_, mark| *mark == Mark::Selected);
         }
         if let Some(board) = self.commander.board.as_mut() {
@@ -2777,9 +2857,6 @@ impl App {
                 receiver.marks.retain(|_, mark| *mark == Mark::Selected);
             }
         }
-        self.marks_unsettled = unsettled;
-        self.invalidate_confirmation("the marks were rewritten");
-        self.start_gate_reload();
     }
 
     fn on_plan_ready(&mut self, act: Activation, req: RequestId, plan: ActionPlan) {
@@ -6217,7 +6294,12 @@ mod cancel_tests {
         if commander {
             app.commander.return_to_commander = true;
         }
-        // The open fans out panel and group reads; none of them is what these tests observe.
+        // The open fans out panel and group reads; none of them is what these tests observe, so
+        // the panels' answers are in before a test puts marks on a panel — one landing later
+        // would settle that panel to the folder it lists.
+        pump_until(&mut app, &rx, "the panels' answers", |app| {
+            app.routes.panels.is_empty()
+        });
         drain(&mut app, &rx);
         (dir, app, rx, scan_id)
     }

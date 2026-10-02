@@ -15,13 +15,12 @@ use super::state::{ConfirmScript, ConfirmScroll, ConfirmTab, Mark, Overlay};
 /// panel would promise one allocation's worth of space that no purge would ever return. Files whose
 /// hash could not be resolved used to be dropped into a status-line count; now nothing is dropped:
 /// the whole plan is refused and the pathname is named.
+///
+/// Panels with no marks are not «nothing marked»: the plan is built from every mark the database
+/// holds for the scan, a panel shows only those of the files it lists, and only the database can
+/// say there are none — so without a loaded scan nothing can be said about marks at all.
 pub fn prepare_execution(app: &mut App) {
     if app.deny_if_read_only("executing actions") {
-        return;
-    }
-    let requested = requested_marks(app);
-    if requested.is_empty() {
-        app.commander.status = "No marked files (F5/F6/F7/F8)".to_string();
         return;
     }
     if app.commander.dedup_scan_id.is_none() {
@@ -29,6 +28,7 @@ pub fn prepare_execution(app: &mut App) {
             "No scan is loaded — load one (F2/F12) before executing actions".to_string();
         return;
     }
+    let requested = requested_marks(app);
     // A plan may not overtake a mark the database has not accepted yet.
     if let Some(reason) = app.plan_gate_refusal() {
         app.commander.status = reason;
@@ -151,7 +151,7 @@ mod tests {
     use crate::testfixtures::PlanScenario;
     use crate::tui::event::AppEvent;
     use crossbeam_channel::Receiver;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     /// A commander over a scenario's database, with the same marks in the panel and in the DB —
     /// which is what F11 now requires: the window submits what it believes, and the store checks
@@ -525,5 +525,598 @@ mod tests {
         let status = &app.commander.status;
         assert!(!status.chars().any(char::is_control), "{status:?}");
         assert!(status.contains(RETITLE_SHOWN), "{status:?}");
+    }
+
+    /// Points panel `index` at `dir` and settles the refresh: the directory read, then the
+    /// database's answer about every file it lists.
+    fn list_in_panel(app: &mut App, rx: &Receiver<AppEvent>, index: usize, dir: &Path) {
+        super::super::navigate_panel(app, index, dir.to_path_buf());
+        pump_until(app, rx, "the panel listing and its answer", |app| {
+            !app.commander.panels[index].loading && app.routes.panels.is_empty()
+        });
+    }
+
+    /// A scan whose keeper and one copy an earlier session marked, and nothing of it in memory:
+    /// what a restart leaves behind.
+    fn marked_before_a_restart(tag: &str) -> (PlanScenario, i64, PathBuf, PathBuf) {
+        let scenario = PlanScenario::new(tag);
+        let keeper = scenario.file("keeper.bin");
+        let copy = scenario.file("copy.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), copy.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &copy, false, Some(ActionKind::Delete));
+        drop(store);
+        (scenario, scan_id, keeper, copy)
+    }
+
+    /// The marks outlive the program: a panel that lists the marked files after a restart shows
+    /// what the database kept, and F11 plans it.
+    #[test]
+    fn a_restarted_commander_shows_the_saved_marks_and_plans_them() {
+        let _role = role_guard();
+        let (scenario, scan_id, keeper, copy) = marked_before_a_restart("restart_shows");
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        list_in_panel(&mut app, &rx, 0, &scenario.root);
+
+        let marks = &app.commander.panels[0].marks;
+        assert_eq!(marks.get(&keeper), Some(&Mark::Keeper), "{marks:?}");
+        assert_eq!(marks.get(&copy), Some(&Mark::Delete), "{marks:?}");
+
+        prepare_and_settle(&mut app, &rx);
+        assert!(
+            matches!(app.commander.overlay, Overlay::Confirm { .. }),
+            "the saved marks are planned: {}",
+            app.commander.status
+        );
+        assert_eq!(
+            app.commander.confirm_digest.counts,
+            vec![(ActionKind::Delete, 1)]
+        );
+    }
+
+    /// F11 plans the saved marks even when no panel lists them. The plan is built from the
+    /// database anyway; «No marked files» over a database that holds marks tells the operator
+    /// they are gone.
+    #[test]
+    fn f11_plans_saved_marks_that_no_panel_lists() {
+        let _role = role_guard();
+        let (scenario, scan_id, _keeper, copy) = marked_before_a_restart("restart_unlisted");
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        drain(&mut app, &rx);
+        assert!(
+            app.commander
+                .panels
+                .iter()
+                .all(|panel| panel.marks.is_empty()),
+            "no panel lists the scanned folder"
+        );
+
+        prepare_and_settle(&mut app, &rx);
+        assert!(
+            matches!(app.commander.overlay, Overlay::Confirm { .. }),
+            "{}",
+            app.commander.status
+        );
+        let named: Vec<&PathBuf> = app
+            .commander
+            .confirm_digest
+            .samples
+            .iter()
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(named, vec![&copy]);
+    }
+
+    /// A saved mark whose file has left the disk since is planned like any other, and the plan
+    /// refuses it by name — the answer the operator got when the panel still held the mark.
+    #[test]
+    fn a_saved_mark_on_a_vanished_file_refuses_the_plan_by_name() {
+        let _role = role_guard();
+        let (scenario, scan_id, _keeper, copy) = marked_before_a_restart("restart_vanished");
+        std::fs::remove_file(&copy).unwrap();
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        list_in_panel(&mut app, &rx, 0, &scenario.root);
+
+        prepare_and_settle(&mut app, &rx);
+        assert!(
+            matches!(app.commander.overlay, Overlay::None),
+            "{}",
+            app.commander.status
+        );
+        assert!(
+            app.commander.status.contains(&copy.display().to_string()),
+            "the refusal names the file: {}",
+            app.commander.status
+        );
+    }
+
+    /// Marks belong to their scan. Opening another one leaves none of the first one's on screen —
+    /// F11 would refuse them as never saved — and the panels show what the new one holds.
+    #[test]
+    fn opening_another_scan_shows_its_marks_not_the_ones_before() {
+        let _role = role_guard();
+        let (scenario, first, keeper, copy) = marked_before_a_restart("switch_scans");
+        let second = {
+            let mut store = scenario.store();
+            let second = scenario.seed(&mut store, &[keeper.clone(), copy.clone()]);
+            scenario.mark(&mut store, second, &copy, true, None);
+            scenario.mark(&mut store, second, &keeper, false, Some(ActionKind::Delete));
+            second
+        };
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, first, OpenIntent::Commander);
+        list_in_panel(&mut app, &rx, 0, &scenario.root);
+        assert_eq!(
+            app.commander.panels[0].marks.get(&keeper),
+            Some(&Mark::Keeper)
+        );
+        // A Space/Insert selection is not a mark of either scan.
+        let picked = scenario.outside.clone();
+        app.commander.panels[0]
+            .marks
+            .insert(picked.clone(), Mark::Selected);
+
+        // Installed, every panel asked again, no answer in yet: nothing of the first scan is
+        // left even before the panels hear from the second.
+        open_and_settle(&mut app, &rx, second, OpenIntent::Commander);
+        let held: Vec<(&PathBuf, &Mark)> = app
+            .commander
+            .panels
+            .iter()
+            .flat_map(|panel| panel.marks.iter())
+            .collect();
+        assert_eq!(held, vec![(&picked, &Mark::Selected)]);
+
+        pump_until(&mut app, &rx, "the panels' answers", |app| {
+            app.routes.panels.is_empty()
+        });
+        let marks = &app.commander.panels[0].marks;
+        assert_eq!(marks.get(&copy), Some(&Mark::Keeper), "{marks:?}");
+        assert_eq!(marks.get(&keeper), Some(&Mark::Delete), "{marks:?}");
+        assert_eq!(marks.get(&picked), Some(&Mark::Selected), "{marks:?}");
+        prepare_and_settle(&mut app, &rx);
+        let named: Vec<&PathBuf> = app
+            .commander
+            .confirm_digest
+            .samples
+            .iter()
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(named, vec![&keeper], "{}", app.commander.status);
+    }
+
+    /// A refresh the database answered before a keystroke's write reached it leaves the glyph on
+    /// the panel that took the keystroke — the write's own answer settles that row — while another
+    /// panel listing the same folder shows what the database holds meanwhile.
+    #[test]
+    fn a_keystroke_keeps_its_glyph_until_its_write_answers() {
+        let _role = role_guard();
+        let (scenario, scan_id, _keeper, copy) = marked_before_a_restart("refresh_in_flight");
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        list_in_panel(&mut app, &rx, 0, &scenario.root);
+
+        // Panel 1 lists the folder and asks about it; then the operator, on panel 0, turns the copy
+        // into a hardlink.
+        super::super::navigate_panel(&mut app, 1, scenario.root.clone());
+        pump_until(&mut app, &rx, "panel 1's listing", |app| {
+            !app.commander.panels[1].loading
+        });
+        assert!(!app.routes.panels.is_empty(), "panel 1's refresh is asked");
+        app.commander.panels[0]
+            .marks
+            .insert(copy.clone(), Mark::Hardlink);
+        let file = crate::model::duplicate::FileEntry {
+            path: copy.clone(),
+            action: Some(ActionKind::Hardlink),
+            ..Default::default()
+        };
+        app.send_commander_mark(0, file, Some(Mark::Delete), Some(Mark::Hardlink))
+            .unwrap();
+
+        pump_until(&mut app, &rx, "the refresh", |app| {
+            app.routes.panels.is_empty()
+        });
+        assert_eq!(
+            app.commander.panels[0].marks.get(&copy),
+            Some(&Mark::Hardlink),
+            "the refresh was answered before the write"
+        );
+        assert_eq!(
+            app.commander.panels[1].marks.get(&copy),
+            Some(&Mark::Delete),
+            "the other panel shows the database"
+        );
+        pump_until(&mut app, &rx, "the write's answer", |app| {
+            app.pending_marks.is_empty()
+        });
+        for panel in &app.commander.panels {
+            assert_eq!(panel.marks.get(&copy), Some(&Mark::Hardlink));
+        }
+        assert!(
+            app.commander.status.starts_with("Mark saved"),
+            "{}",
+            app.commander.status
+        );
+    }
+
+    /// Every file a panel lists shows what the database holds for it: a mark the database no
+    /// longer has goes, as it does when a write's answer says so. A Space/Insert selection is not
+    /// the database's and stays.
+    #[test]
+    fn a_listed_file_loses_a_mark_the_database_no_longer_holds() {
+        let _role = role_guard();
+        let (scenario, scan_id, keeper, copy) = marked_before_a_restart("mark_gone");
+        let loose = scenario.file("loose.bin");
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        list_in_panel(&mut app, &rx, 0, &scenario.root);
+        app.commander.panels[0]
+            .marks
+            .insert(loose.clone(), Mark::Selected);
+        {
+            // Another writer clears the copy's mark.
+            let mut store = scenario.store();
+            scenario.mark(&mut store, scan_id, &copy, false, None);
+        }
+
+        list_in_panel(&mut app, &rx, 0, &scenario.root);
+        let marks = &app.commander.panels[0].marks;
+        assert_eq!(marks.get(&copy), None, "{marks:?}");
+        assert_eq!(marks.get(&keeper), Some(&Mark::Keeper), "{marks:?}");
+        assert_eq!(marks.get(&loose), Some(&Mark::Selected), "{marks:?}");
+    }
+
+    /// Every panel that shows a folder shows its saved marks, and a panel keeps none from a folder
+    /// it no longer lists: the panels hold the marks on screen, not every mark ever browsed.
+    #[test]
+    fn panels_hold_the_saved_marks_of_the_folders_they_list() {
+        let _role = role_guard();
+        let (scenario, scan_id, keeper, copy) = marked_before_a_restart("two_panels");
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        list_in_panel(&mut app, &rx, 0, &scenario.root);
+        list_in_panel(&mut app, &rx, 1, &scenario.root);
+        {
+            // Another writer turns the copy into a hardlink.
+            let mut store = scenario.store();
+            scenario.mark(
+                &mut store,
+                scan_id,
+                &copy,
+                false,
+                Some(ActionKind::Hardlink),
+            );
+        }
+
+        // One panel's refresh is the folder's answer for both.
+        list_in_panel(&mut app, &rx, 0, &scenario.root);
+        for panel in &app.commander.panels {
+            assert_eq!(panel.marks.get(&keeper), Some(&Mark::Keeper));
+            assert_eq!(panel.marks.get(&copy), Some(&Mark::Hardlink));
+        }
+
+        list_in_panel(&mut app, &rx, 1, &scenario.outside);
+        // And the folder's next answer is not news to a panel showing another one.
+        list_in_panel(&mut app, &rx, 0, &scenario.root);
+        assert!(
+            app.commander.panels[1].marks.is_empty(),
+            "{:?}",
+            app.commander.panels[1].marks
+        );
+        let marks = &app.commander.panels[0].marks;
+        assert_eq!(marks.get(&keeper), Some(&Mark::Keeper), "{marks:?}");
+        assert_eq!(marks.get(&copy), Some(&Mark::Hardlink), "{marks:?}");
+    }
+
+    /// A panel that lists no file of the folder — here a «directories» panel — answers about none,
+    /// and that is no news about the marks a files panel on the same folder shows.
+    #[test]
+    fn a_directories_panel_on_the_same_folder_leaves_the_saved_marks() {
+        let _role = role_guard();
+        let (scenario, scan_id, keeper, copy) = marked_before_a_restart("dirs_neighbour");
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        list_in_panel(&mut app, &rx, 0, &scenario.root);
+        list_in_panel(&mut app, &rx, 1, &scenario.root);
+        app.commander.active = 1;
+        super::super::cycle_view(&mut app);
+        pump_until(&mut app, &rx, "panel 1's reload and its answer", |app| {
+            !app.commander.panels[1].loading && app.routes.panels.is_empty()
+        });
+
+        let marks = &app.commander.panels[0].marks;
+        assert_eq!(marks.get(&keeper), Some(&Mark::Keeper), "{marks:?}");
+        assert_eq!(marks.get(&copy), Some(&Mark::Delete), "{marks:?}");
+    }
+
+    /// A keystroke made before its folder's answer arrived, whose write then fails with nothing
+    /// read back, does not hide the saved mark: the panel asks the database again.
+    #[test]
+    fn a_failed_write_before_the_folders_answer_asks_again() {
+        let _role = role_guard();
+        let (scenario, scan_id, keeper, _copy) = marked_before_a_restart("failed_write");
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        rusqlite::Connection::open(&scenario.db_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_marks BEFORE INSERT ON file_mark
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .unwrap();
+        super::super::navigate_panel(&mut app, 0, scenario.root.clone());
+        pump_until(&mut app, &rx, "panel 0's listing", |app| {
+            !app.commander.panels[0].loading
+        });
+        assert!(
+            !app.routes.panels.is_empty(),
+            "the folder's answer is on its way"
+        );
+        // The panel has not heard the database yet: to it the keeper is unmarked.
+        app.commander.panels[0]
+            .marks
+            .insert(keeper.clone(), Mark::Delete);
+        let file = crate::model::duplicate::FileEntry {
+            path: keeper.clone(),
+            action: Some(ActionKind::Delete),
+            ..Default::default()
+        };
+        app.send_commander_mark(0, file, None, Some(Mark::Delete))
+            .unwrap();
+        // The folder's answer, read before the write, lands on the panel that asked for it: the
+        // glyph of the keystroke stays until the write is answered.
+        pump_until(&mut app, &rx, "the folder's answer", |app| {
+            app.routes.panels.is_empty()
+        });
+        assert!(!app.pending_marks.is_empty(), "the write is still out");
+        assert_eq!(
+            app.commander.panels[0].marks.get(&keeper),
+            Some(&Mark::Delete)
+        );
+        pump_until(
+            &mut app,
+            &rx,
+            "the refused write and the asking again",
+            |app| app.pending_marks.is_empty() && app.routes.panels.is_empty(),
+        );
+
+        assert!(
+            app.commander.status.contains("not saved"),
+            "{}",
+            app.commander.status
+        );
+        assert_eq!(
+            app.commander.panels[0].marks.get(&keeper),
+            Some(&Mark::Keeper)
+        );
+    }
+
+    /// When the active panel enters a folder no scan covers, the scan is set aside and its marks
+    /// leave the panels with it: with no scan, Space would clear one on screen only.
+    #[test]
+    fn setting_the_scan_aside_takes_its_marks_off_the_panels() {
+        let _role = role_guard();
+        let (scenario, scan_id, keeper, _copy) = marked_before_a_restart("scan_aside");
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        list_in_panel(&mut app, &rx, 0, &scenario.root);
+        assert_eq!(
+            app.commander.panels[0].marks.get(&keeper),
+            Some(&Mark::Keeper)
+        );
+
+        super::super::apply_auto_switch(&mut app, &scenario.outside, None);
+        assert!(app.commander.dedup_scan_id.is_none());
+        assert!(
+            app.commander
+                .panels
+                .iter()
+                .all(|panel| panel.marks.is_empty()),
+            "{:?}",
+            app.commander.panels[0].marks
+        );
+    }
+
+    /// After a batch stopped with Esc, the panel showing the folder shows what the database kept:
+    /// the keeper, and the marks of the actions never reached — the work F11 can still do.
+    #[test]
+    fn a_stopped_batch_leaves_the_unreached_marks_on_the_panel() {
+        let _role = role_guard();
+        let scenario = PlanScenario::new("stopped_batch");
+        let keeper = scenario.file("keeper.bin");
+        let done = scenario.file("done.bin");
+        let left = scenario.file("left.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), done.clone(), left.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        for copy in [&done, &left] {
+            scenario.mark(&mut store, scan_id, copy, false, Some(ActionKind::Delete));
+        }
+        drop(store);
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        list_in_panel(&mut app, &rx, 0, &scenario.root);
+        app.commander.return_to_commander = true;
+
+        // The batch deleted the first copy, then Esc.
+        let reached = crate::model::action::ActionOutcome {
+            kind: ActionKind::Delete,
+            target: done.clone(),
+            quarantine: None,
+            result: Ok(()),
+        };
+        app.handle_event(AppEvent::ApplyFinished(Box::new(
+            crate::actions::ApplyOutcome::Finished(crate::model::action::BatchResult {
+                outcomes: vec![reached],
+                planned: 2,
+                cancelled: true,
+                ..Default::default()
+            }),
+        )));
+        pump_until(
+            &mut app,
+            &rx,
+            "the settlement and the panels' answers",
+            |app| {
+                app.routes.reconcile.is_none()
+                    && app.commander.panels.iter().all(|panel| !panel.loading)
+                    && app.routes.panels.is_empty()
+            },
+        );
+
+        let marks = &app.commander.panels[0].marks;
+        assert_eq!(marks.get(&keeper), Some(&Mark::Keeper), "{marks:?}");
+        assert_eq!(marks.get(&done), None, "{marks:?}");
+        assert_eq!(marks.get(&left), Some(&Mark::Delete), "{marks:?}");
+    }
+
+    /// Reopening the same scan shows what the database holds now — the classic interface's
+    /// auto-select comes back to the commander this way — and drops the panels' marks before
+    /// they hear from it again.
+    #[test]
+    fn a_reopen_shows_the_marks_the_database_holds_now() {
+        let _role = role_guard();
+        let (scenario, scan_id, keeper, copy) = marked_before_a_restart("reopen_same");
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        list_in_panel(&mut app, &rx, 0, &scenario.root);
+        {
+            let mut store = scenario.store();
+            scenario.mark(&mut store, scan_id, &copy, false, Some(ActionKind::Reflink));
+        }
+
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        assert!(
+            app.commander
+                .panels
+                .iter()
+                .all(|panel| panel.marks.is_empty()),
+            "{:?}",
+            app.commander.panels[0].marks
+        );
+        pump_until(&mut app, &rx, "the panels' answers", |app| {
+            app.routes.panels.is_empty()
+        });
+        let marks = &app.commander.panels[0].marks;
+        assert_eq!(marks.get(&keeper), Some(&Mark::Keeper), "{marks:?}");
+        assert_eq!(marks.get(&copy), Some(&Mark::Reflink), "{marks:?}");
+    }
+
+    /// A refresh answered while «Clear all marks» is on its way is settled like any other: a clear
+    /// the database refuses changes nothing, and the panel goes on showing the saved marks.
+    #[test]
+    fn a_refused_clear_leaves_the_saved_marks_on_the_panels() {
+        let _role = role_guard();
+        let (scenario, scan_id, keeper, copy) = marked_before_a_restart("refused_clear");
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        list_in_panel(&mut app, &rx, 0, &scenario.root);
+        rusqlite::Connection::open(&scenario.db_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_clear BEFORE DELETE ON file_mark
+                 BEGIN SELECT RAISE(ABORT, 'clearing refused'); END;",
+            )
+            .unwrap();
+        // A reopen drops the panels' marks and asks every panel again; the clear queues behind.
+        app.open_via_actor(scan_id, OpenIntent::Commander);
+        pump_until(&mut app, &rx, "the reopen", |app| app.routes.open.is_none());
+        app.send_commander_clear().unwrap();
+        pump_until(&mut app, &rx, "the refreshes and the clear", |app| {
+            app.routes.panels.is_empty() && app.pending_marks.is_empty()
+        });
+
+        assert!(
+            app.commander.status.contains("not cleared"),
+            "{}",
+            app.commander.status
+        );
+        let marks = &app.commander.panels[0].marks;
+        assert_eq!(marks.get(&keeper), Some(&Mark::Keeper), "{marks:?}");
+        assert_eq!(marks.get(&copy), Some(&Mark::Delete), "{marks:?}");
+    }
+
+    /// A database replaced under the open view takes its marks off the panels with the rest of
+    /// it: a mark left on screen could be cleared there only, and the next open would bring it
+    /// back. F11 then says there is no scan — not that nothing is marked: the marks are in a
+    /// database nobody can read now.
+    #[test]
+    fn a_replaced_database_takes_its_marks_off_the_panels() {
+        let _role = role_guard();
+        let (scenario, scan_id, keeper, _copy) = marked_before_a_restart("replaced_db");
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        list_in_panel(&mut app, &rx, 0, &scenario.root);
+        assert_eq!(
+            app.commander.panels[0].marks.get(&keeper),
+            Some(&Mark::Keeper)
+        );
+
+        std::fs::remove_file(&scenario.db_path).unwrap();
+        std::fs::create_dir(&scenario.db_path).unwrap();
+        list_in_panel(&mut app, &rx, 0, &scenario.root);
+
+        assert!(
+            app.commander.dedup_scan_id.is_none(),
+            "the view is uninstalled: {}",
+            app.commander.status
+        );
+        assert!(
+            app.commander
+                .panels
+                .iter()
+                .all(|panel| panel.marks.is_empty()),
+            "{:?}",
+            app.commander.panels[0].marks
+        );
+        prepare_execution(&mut app);
+        assert_eq!(
+            app.commander.status,
+            "No scan is loaded — load one (F2/F12) before executing actions"
+        );
+    }
+
+    /// A saved mark this program could not have written — keeper and action at once — stays off
+    /// the panel, the rest of the panel's answer still lands, and F11 refuses it by name.
+    #[test]
+    fn a_corrupt_saved_mark_stays_off_the_panel_and_refuses_by_name() {
+        let _role = role_guard();
+        let scenario = PlanScenario::new("corrupt_saved_mark");
+        let keeper = scenario.file("keeper.bin");
+        let copy = scenario.file("copy.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), copy.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &copy, true, Some(ActionKind::Delete));
+        drop(store);
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        list_in_panel(&mut app, &rx, 0, &scenario.root);
+
+        let marks = &app.commander.panels[0].marks;
+        assert_eq!(marks.get(&keeper), Some(&Mark::Keeper), "{marks:?}");
+        assert_eq!(marks.get(&copy), None, "{marks:?}");
+        assert!(
+            app.commander.dedup.dir(&scenario.root).is_some(),
+            "the panel's answer landed: {}",
+            app.commander.status
+        );
+
+        prepare_and_settle(&mut app, &rx);
+        assert!(
+            matches!(app.commander.overlay, Overlay::None),
+            "{}",
+            app.commander.status
+        );
+        assert!(
+            app.commander.status.contains(&copy.display().to_string()),
+            "the refusal names the file: {}",
+            app.commander.status
+        );
     }
 }

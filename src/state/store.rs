@@ -2921,11 +2921,11 @@ impl ScanStore {
     /// Clears every mark of the scan and says how many there were, after checking inside the same
     /// transaction that none is left.
     ///
-    /// The operator's «Clear all marks». A panel does not hold every saved mark — one from an
-    /// earlier session or from the classic browser was never loaded into it — and the F11 plan is
-    /// built from all of them, so the clear has to happen here, for the whole scan, and nowhere
-    /// else. Another scan's marks are not touched. The answer is a number, not the pathnames: a
-    /// scan can hold millions of marks, and every window can drop all of its own without a list.
+    /// The operator's «Clear all marks». A panel shows only the saved marks of the files it
+    /// lists, and the F11 plan is built from all of them, so the clear has to happen here, for
+    /// the whole scan, and nowhere else. Another scan's marks are not touched. The answer is a
+    /// number, not the pathnames: a scan can hold millions of marks, and every window can drop
+    /// all of its own without a list.
     pub fn clear_marks_settled(
         &mut self,
         scan_id: i64,
@@ -7159,6 +7159,14 @@ impl MembershipSnapshot<'_> {
                   WHERE p.scan_id = ?1 AND p.size = un.size AND p.mtime = un.mtime)
            FROM un";
 
+    /// The statement of `panel_marks`. A `LEFT JOIN` keeps `want` the outer loop, and `m.rowid`
+    /// is the row-presence bit the strict decoder needs, as in the read-back of a mark write.
+    pub(crate) const PANEL_MARKS_SQL: &'static str =
+        "WITH want(path) AS (SELECT value FROM json_each(?2))
+         SELECT want.path, m.rowid IS NOT NULL, m.is_keeper, m.action
+           FROM want
+           LEFT JOIN file_mark m ON m.scan_id = ?1 AND m.path = want.path";
+
     /// The pathnames of a panel as the one JSON array its statements bind.
     pub(crate) fn panel_batch(paths: &[&Path]) -> String {
         serde_json::Value::Array(
@@ -7273,6 +7281,46 @@ impl MembershipSnapshot<'_> {
                 if let Some(entry) = out.get_mut(Path::new(&path)) {
                     entry.status = PanelFileStatus::LikelyBySizeMtime { peers };
                 }
+            }
+        }
+        Ok(out)
+    }
+
+    /// What the database holds as the mark of each pathname of a panel, in the shape a mark write
+    /// returns its after-image: `None` is a pathname nobody marked.
+    ///
+    /// One statement for the whole panel, read by the decoder the plan and the write use. A row
+    /// the plan would refuse as corrupt is left out — the decoder refuses it, or it is present and
+    /// means neither a keeper nor an action, which `save_marks` never leaves behind — so the panel
+    /// shows no mark there and F11 names the pathname. So is a name that is not UTF-8: no mark can
+    /// be saved for one, and its lossy spelling may be another file's name.
+    pub fn panel_marks(
+        &self,
+        paths: &[&Path],
+    ) -> std::result::Result<Vec<(PathBuf, Option<MarkIntent>)>, MembershipMiss> {
+        let named: Vec<&Path> = paths
+            .iter()
+            .copied()
+            .filter(|path| path.to_str().is_some())
+            .collect();
+        let want = Self::panel_batch(&named);
+        let mut stmt = self.tx.prepare(Self::PANEL_MARKS_SQL)?;
+        let rows = stmt.query_map(params![self.scan_id, &want], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? != 0,
+                row.get::<_, Value>(2)?,
+                row.get::<_, Value>(3)?,
+            ))
+        })?;
+        let mut out = Vec::with_capacity(named.len());
+        for row in rows {
+            let (path, present, is_keeper, action) = row?;
+            let path = PathBuf::from(path);
+            match decode_mark(&path, present, &is_keeper, &action) {
+                Ok(None) if present => {}
+                Ok(intent) => out.push((path, intent)),
+                Err(_) => {}
             }
         }
         Ok(out)
@@ -22169,6 +22217,69 @@ mod membership_staging_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The saved mark of each pathname a panel lists, as the database holds it: a keeper, an
+    /// action, nothing. A row the plan would refuse as corrupt is left out rather than read as
+    /// something — one the decoder refuses, and one that means neither a keeper nor an action — and
+    /// so is a name that is not UTF-8: its lossy spelling is a namesake's name, and the namesake's
+    /// mark is not its own.
+    #[test]
+    fn panel_marks_answer_for_each_listed_pathname() {
+        let _role = role_guard();
+        let dir = temp_dir("panel_marks");
+        let mut store = ScanStore::open_in_memory().unwrap();
+        let (scan_id, x1, x2, y1) = published_split(&dir, &mut store);
+        let y2 = dir.join("y2.bin");
+        let namesake = write(&dir, "a\u{FFFD}.bin", b"SAME");
+        let unmarked = write(&dir, "z.bin", b"ZZZZ");
+        store
+            .record_files(scan_id, &[manifest_row(&namesake), manifest_row(&unmarked)])
+            .unwrap();
+        let entry = |path: &Path, is_keeper: bool, action: Option<ActionKind>| FileEntry {
+            path: path.to_path_buf(),
+            is_keeper,
+            action,
+            ..Default::default()
+        };
+        let marks = [
+            entry(&x1, true, None),
+            entry(&x2, false, Some(ActionKind::Hardlink)),
+            // Keeper and action at once: no window writes that.
+            entry(&y1, true, Some(ActionKind::Delete)),
+            entry(&namesake, false, Some(ActionKind::Delete)),
+        ];
+        store.save_marks(scan_id, marks.iter()).unwrap();
+        // Present, and neither: `save_marks` deletes such a row instead of writing it.
+        store.corrupt_directly(
+            "INSERT INTO file_mark(scan_id, path, is_keeper, action) VALUES (?1, ?2, 0, NULL)",
+            params![scan_id, y2.to_str().unwrap()],
+        );
+        let raw = dir.join(std::ffi::OsStr::from_bytes(b"a\x80.bin"));
+        let outside = dir.join("never.bin");
+
+        let snapshot = store.membership_snapshot(scan_id).unwrap();
+        let listed = [&x1, &x2, &y1, &y2, &unmarked, &raw, &outside];
+        let refs: Vec<&Path> = listed.iter().map(|path| path.as_path()).collect();
+        let answer: HashMap<PathBuf, Option<MarkIntent>> =
+            snapshot.panel_marks(&refs).unwrap().into_iter().collect();
+        assert_eq!(answer.get(&x1), Some(&Some(MarkIntent::Keeper)));
+        assert_eq!(
+            answer.get(&x2),
+            Some(&Some(MarkIntent::Act(ActionKind::Hardlink)))
+        );
+        assert_eq!(answer.get(&unmarked), Some(&None), "nobody marked it");
+        assert_eq!(answer.get(&outside), Some(&None), "not even in the scan");
+        assert!(!answer.contains_key(&y1), "{answer:?}");
+        assert!(!answer.contains_key(&y2), "{answer:?}");
+        assert!(!answer.contains_key(&raw), "{answer:?}");
+        assert!(
+            !answer.contains_key(&namesake),
+            "the namesake was not asked about: {answer:?}"
+        );
+        assert_eq!(answer.len(), 4, "{answer:?}");
+        drop(snapshot);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Without authority a hashed row is unavailable, not «not grouped»: nothing may vouch for it.
     #[test]
     fn panel_files_marks_an_unknown_scan_unavailable() {
@@ -22414,6 +22525,22 @@ mod membership_staging_tests {
                 "explicit",
                 "candidate",
                 MembershipSnapshot::PANEL_CANDIDATE_SQL,
+            );
+            // Every pair marked, so a statement that walked the marks would grow with the scan.
+            let marked: Vec<FileEntry> = (0..100 * scale)
+                .flat_map(|i| [format!("p{i}a.bin"), format!("p{i}b.bin")])
+                .map(|name| FileEntry {
+                    path: dir.join(name),
+                    action: Some(ActionKind::Delete),
+                    ..Default::default()
+                })
+                .collect();
+            store.save_marks(scan_id, marked.iter()).unwrap();
+            measure(
+                &store,
+                "explicit",
+                "marks",
+                MembershipSnapshot::PANEL_MARKS_SQL,
             );
             costs.push(at_scale);
             std::fs::remove_dir_all(&dir).ok();
