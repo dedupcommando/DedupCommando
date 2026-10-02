@@ -695,6 +695,9 @@ impl RequestIds {
 /// only constructor and a second source of truth in the fleet would eventually disagree.
 fn next_actor_id() -> ActorId {
     static NEXT_ACTOR: AtomicU64 = AtomicU64::new(0);
+    // Rust 1.99 deprecates `fetch_update`. Its replacement `try_update` is stable only from 1.95,
+    // and `Cargo.toml` still declares Rust 1.82 (`rust-version`), so the old name stays for now.
+    #[allow(deprecated)]
     let id = NEXT_ACTOR
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
             current.checked_add(1)
