@@ -1205,11 +1205,11 @@ mod terminal_loss_tests {
     }
 
     /// A batch of three actions that checks its cancel flag between them, as the real one does.
-    /// Each action runs until the test lets it finish, 300 ms from now. Returns how many actions
-    /// started, and the thread that lets them finish.
-    fn batch_of_three(app: &mut App) -> (Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
+    /// Each action runs until the batch is told to stop (5 s at most), and the batch is handed
+    /// back only once its first action is in flight: what the test sees no longer depends on
+    /// which thread a slow runner schedules first. Returns how many actions started.
+    fn batch_of_three(app: &mut App) -> Arc<AtomicUsize> {
         let started = Arc::new(AtomicUsize::new(0));
-        let (finish_tx, finish_rx) = crossbeam_channel::unbounded::<()>();
         let job_started = started.clone();
         app.apply = Some(apply_worker::spawn_job(app.events.clone(), move |shared| {
             let mut done = 0;
@@ -1218,8 +1218,14 @@ mod terminal_loss_tests {
                     break;
                 }
                 job_started.fetch_add(1, Ordering::SeqCst);
-                // The action in flight, until the test lets it finish.
-                let _ = finish_rx.recv_timeout(Duration::from_secs(10));
+                // The action in flight, until the batch is told to stop.
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !shared.is_cancelled() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                // An action takes time to finish once told to stop — longer than the loop's 200 ms
+                // wait, so a loop that stopped waiting for the batch leaves before its report.
+                std::thread::sleep(Duration::from_millis(400));
                 done += 1;
             }
             ApplyOutcome::Finished(BatchResult {
@@ -1228,13 +1234,15 @@ mod terminal_loss_tests {
                 ..Default::default()
             })
         }));
-        let finishes = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            for _ in 0..3 {
-                let _ = finish_tx.send(());
-            }
-        });
-        (started, finishes)
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while started.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the batch never started its first action"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        started
     }
 
     /// A move batch — work with no cancel flag of its own that has to land, as an action has to
@@ -1290,7 +1298,7 @@ mod terminal_loss_tests {
     fn a_lost_terminal_stops_the_batch_after_the_current_action() {
         let _quiet = quiet();
         let (mut app, rx) = crate::app::test_app();
-        let (started, finishes) = batch_of_three(&mut app);
+        let started = batch_of_three(&mut app);
 
         let (end, app) = run_to_the_end(app, rx, |_app| hung_up());
 
@@ -1304,7 +1312,6 @@ mod terminal_loss_tests {
             app.apply.is_none(),
             "the loop ended before the batch reported"
         );
-        finishes.join().unwrap();
     }
 
     /// Keys can still arrive when the terminal outlives its frame (a closed pipe on stdout), but
@@ -1400,7 +1407,7 @@ mod terminal_loss_tests {
     fn a_panicking_frame_stops_the_batch_after_the_current_action() {
         let _quiet = quiet();
         let (mut app, rx) = crate::app::test_app();
-        let (started, finishes) = batch_of_three(&mut app);
+        let started = batch_of_three(&mut app);
 
         let (end, app) = run_to_the_end(app, rx, |_app| panic!("a frame that panics"));
 
@@ -1414,7 +1421,6 @@ mod terminal_loss_tests {
             app.apply.is_none(),
             "the loop ended before the batch reported"
         );
-        finishes.join().unwrap();
     }
 
     /// A key whose handler panics while a batch runs is contained the same way as a frame.
@@ -1422,7 +1428,7 @@ mod terminal_loss_tests {
     fn a_panicking_key_handler_stops_the_batch_after_the_current_action() {
         let _quiet = quiet();
         let (mut app, rx) = crate::app::test_app();
-        let (started, finishes) = batch_of_three(&mut app);
+        let started = batch_of_three(&mut app);
         app.events
             .send(AppEvent::Key(KeyEvent::new(
                 KeyCode::Char('x'),
@@ -1450,7 +1456,6 @@ mod terminal_loss_tests {
             app.apply.is_none(),
             "the loop ended before the batch reported"
         );
-        finishes.join().unwrap();
     }
 
     /// Nothing in flight: a panicking frame ends the loop without waiting for anything.
