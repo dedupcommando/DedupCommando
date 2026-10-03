@@ -6800,6 +6800,7 @@ mod dir_watch_tests {
                     act: app.installed_act,
                     req,
                     plan: Box::new(plan),
+                    unrunnable: crate::model::plan::Unrunnable::default(),
                 },
             )));
             scenario
@@ -7873,6 +7874,7 @@ mod dir_watch_tests {
                     act: app.installed_act,
                     req,
                     plan: Box::new(plan),
+                    unrunnable: crate::model::plan::Unrunnable::default(),
                 })));
                 scenario
             }

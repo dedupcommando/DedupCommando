@@ -815,6 +815,16 @@ pub fn reclaim_phrase(estimate: ReclaimEstimate) -> String {
     }
 }
 
+/// What both confirmations say about the actions of a plan that cannot run where their files are:
+/// how many, and the first one's reason. The reason comes from the filesystem and the host's
+/// dataset list, so it is escaped here.
+pub fn cannot_run_phrase(count: usize, reason: &str) -> String {
+    format!(
+        "{count} cannot run here — {}",
+        crate::textsan::terminal(reason)
+    )
+}
+
 /// The same figure for a list row: one clause instead of two, and never one word shorter than
 /// that.
 ///
@@ -891,6 +901,36 @@ pub fn format_speed(bytes: u64, seconds: f64) -> String {
 #[cfg(test)]
 mod format_tests {
     use super::*;
+
+    /// Both confirmations say it in these words, the reason escaped; the manual quotes them where
+    /// it describes each window and where an operator looks up the refusal.
+    #[test]
+    fn the_cannot_run_line_is_one_sentence_the_manual_quotes() {
+        assert_eq!(
+            cannot_run_phrase(2, "read-only filesystem (tank/a)"),
+            "2 cannot run here — read-only filesystem (tank/a)"
+        );
+        assert_eq!(
+            cannot_run_phrase(1, "the file is\x1b immutable"),
+            format!(
+                "1 cannot run here — {}",
+                crate::textsan::terminal("the file is\x1b immutable")
+            )
+        );
+        let quoted = cannot_run_phrase(7, "R")
+            .replace('7', "L")
+            .replace('R', "<reason>");
+        for chapter in [
+            "05-commando.md",
+            "06-classic.md",
+            "08-actions.md",
+            "13-troubleshooting.md",
+        ] {
+            let text = crate::testfixtures::manual(chapter);
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(text.contains(&quoted), "{chapter} must quote: {quoted}");
+        }
+    }
 
     #[test]
     fn speed_is_mib_per_sec() {

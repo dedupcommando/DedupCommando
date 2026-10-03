@@ -18,6 +18,7 @@
 //! the structural preflight, the runtime ledger that tracks the batch's own transitions, and the
 //! realization that says what was achieved rather than what was attempted.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -563,6 +564,8 @@ pub struct PlanAction {
     keeper_object: usize,
     size: u64,
     expected_hash: String,
+    /// Index into the witness's groups — where every pathname of this action's group is listed.
+    group: usize,
 }
 
 impl PlanAction {
@@ -648,6 +651,15 @@ pub struct ActionPlan {
     /// group inputs the actions were folded from, so the plan and its witness cannot describe
     /// two different populations.
     witness: PlanWitness,
+    /// Which members of each group were marked when the plan was built — indices into the
+    /// witness's member lists: what a batch that changes the group spends. No other member can be
+    /// marked meanwhile: neither window takes a mark while its plan is being built (the classic one
+    /// refuses it, the commander's confirmation is invalidated by it), and the confirmation and the
+    /// batch take none.
+    group_marks: Vec<Vec<usize>>,
+    /// What stands in the way of each action where its files are, read when the plan was built
+    /// ([`ActionPlan::with_unrunnable`]); empty — nothing was read.
+    unrunnable: Unrunnable,
 }
 
 impl ActionPlan {
@@ -711,6 +723,19 @@ impl ActionPlan {
                 .collect(),
         };
 
+        let group_marks: Vec<Vec<usize>> = groups
+            .iter()
+            .map(|group| {
+                group
+                    .members
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, member)| member.mark().is_some())
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .collect();
+
         let mut objects: Vec<PlannedObject> = Vec::new();
         let mut actions: Vec<PlanAction> = Vec::new();
         let mut warnings: Vec<PlanWarning> = Vec::new();
@@ -718,7 +743,7 @@ impl ActionPlan {
         let mut crossing: Option<(ActionKind, PathBuf, PathBuf)> = None;
         let mut crossing_marks = 0;
 
-        for group in &groups {
+        for (group_index, group) in groups.iter().enumerate() {
             let members = &group.members;
             if members.is_empty() {
                 return Err(PlanRefusal::MissingKeeper {
@@ -809,6 +834,7 @@ impl ActionPlan {
                     keeper_object,
                     size,
                     expected_hash: group.hash.clone(),
+                    group: group_index,
                 });
             }
         }
@@ -856,6 +882,8 @@ impl ActionPlan {
             actions,
             summary,
             witness,
+            group_marks,
+            unrunnable: Unrunnable::default(),
         })
     }
 
@@ -938,37 +966,159 @@ impl ActionPlan {
         &self.objects[action.keeper_object]
     }
 
-    /// What a confirmation screen shows, derived from this plan and nothing else.
+    /// What a confirmation screen shows, derived from this plan and its reading: the counts, the
+    /// quoted targets and the figure are of the actions that can run, and the others are counted
+    /// and the first of them named.
     pub fn digest(&self) -> PlanDigest {
+        let runnable: Vec<&PlanAction> = self
+            .actions
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !self.is_set_aside(*index))
+            .map(|(_, action)| action)
+            .collect();
         let mut counts = Vec::new();
         for kind in [
             ActionKind::Delete,
             ActionKind::Hardlink,
             ActionKind::Reflink,
         ] {
-            let count = self
-                .actions
-                .iter()
-                .filter(|action| action.kind == kind)
-                .count();
+            let count = runnable.iter().filter(|action| action.kind == kind).count();
             if count > 0 {
                 counts.push((kind, count));
             }
         }
-        let samples: Vec<(ActionKind, PathBuf)> = self
-            .actions
+        let samples: Vec<(ActionKind, PathBuf)> = runnable
             .iter()
             .take(PlanDigest::SAMPLES)
             .map(|action| (action.kind, action.target.clone()))
             .collect();
+        let first_unrunnable = self
+            .unrunnable_head()
+            .map(|(_, target, reason)| (target.to_path_buf(), reason.to_string()));
+        let summary = self.runnable_summary().into_owned();
         PlanDigest {
             counts,
-            hidden: self.actions.len() - samples.len(),
+            hidden: runnable.len() - samples.len(),
             samples,
-            covered_objects: self.summary.covered_objects,
-            estimate: self.summary.estimate,
-            warnings: self.summary.warnings.clone(),
+            covered_objects: summary.covered_objects,
+            estimate: summary.estimate,
+            warnings: summary.warnings,
+            planned: self.actions.len(),
+            unrunnable: self.actions.len() - runnable.len(),
+            first_unrunnable,
         }
+    }
+
+    /// What the plan claims once the actions that cannot run are set aside. They are not counted,
+    /// and an allocation one of whose pathnames stays because its action cannot run releases
+    /// nothing — the batch would report it the same way. With nothing set aside it is the plan's
+    /// own summary, borrowed: a screen asks for it on every frame.
+    pub fn runnable_summary(&self) -> Cow<'_, PlanSummary> {
+        if self.unrunnable.count == 0 {
+            return Cow::Borrowed(&self.summary);
+        }
+        // Per object: one of its pathnames is still removed / one of them stays.
+        let mut removed = vec![false; self.objects.len()];
+        let mut stays = vec![false; self.objects.len()];
+        for (index, action) in self.actions.iter().enumerate() {
+            if self.is_set_aside(index) {
+                stays[action.target_object] = true;
+            } else {
+                removed[action.target_object] = true;
+            }
+        }
+        let figures = self.objects.iter().zip(&stays).map(|(object, stays)| {
+            if *stays {
+                ReclaimEstimate::exact(0)
+            } else {
+                object.estimate()
+            }
+        });
+        // A part of a total the plan already folded cannot leave the integer domain; an unknown is
+        // the honest answer if it ever did.
+        let estimate =
+            ReclaimEstimate::for_fresh_scan(figures).unwrap_or_else(|_| ReclaimEstimate::unknown());
+        Cow::Owned(PlanSummary {
+            actions: self.actions.len() - self.unrunnable.count,
+            covered_objects: removed.iter().filter(|removed| **removed).count(),
+            estimate,
+            warnings: self.summary.warnings.clone(),
+        })
+    }
+
+    /// How many actions cannot run where their files are, and the first of them with its reason;
+    /// `None` when every one can.
+    pub fn unrunnable_head(&self) -> Option<(usize, &Path, &str)> {
+        let index = self.unrunnable.first?;
+        let reason = self.unrunnable.reason(index)?;
+        Some((self.unrunnable.count, self.actions[index].target(), reason))
+    }
+
+    /// Why action `index` cannot run where its files are; `None` when it can.
+    pub fn unrunnable_reason(&self, index: usize) -> Option<&str> {
+        self.unrunnable.reason(index)
+    }
+
+    /// The plan with what stands in the way of each of its actions where its files are, read when
+    /// it was built — one reason or none per action, in plan order. Its confirmation shows it,
+    /// wherever the plan is seated again, and the batch keeps to it: an action it counts out stays
+    /// out even when its cause is gone by then, so no more runs than was confirmed. A reading that
+    /// is not one entry per action — another plan's — counts nothing out.
+    pub fn with_unrunnable(mut self, unrunnable: Unrunnable) -> Self {
+        self.unrunnable = if unrunnable.reasons.len() == self.actions.len() {
+            unrunnable
+        } else {
+            Unrunnable::default()
+        };
+        self
+    }
+
+    /// The reading this plan carries ([`ActionPlan::with_unrunnable`]).
+    pub fn unrunnable(&self) -> &Unrunnable {
+        &self.unrunnable
+    }
+
+    /// Whether the plan's confirmation counted action `index` out.
+    pub fn is_set_aside(&self, index: usize) -> bool {
+        self.unrunnable.reason(index).is_some()
+    }
+
+    /// What a batch leaves of the operator's marks. `ran[i]` — the batch carried out or attempted
+    /// action `i`; any other action was never reached or was refused before the snapshots, and
+    /// changed nothing. A group with an action that ran spends every mark it had when the plan
+    /// was built, its keeper's too: its files no longer match the scan, and a mark of it left
+    /// behind would bring the group into the next plan, which would refuse as a whole. A group
+    /// none of whose actions ran keeps every mark.
+    pub fn settle_marks(&self, ran: &[bool]) -> MarkSettlement {
+        let ran = |index: usize| ran.get(index).copied().unwrap_or(false);
+        let changed: BTreeSet<usize> = self
+            .actions
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| ran(*index))
+            .map(|(_, action)| action.group)
+            .collect();
+        let mut settlement = MarkSettlement::default();
+        for group in &changed {
+            let members = &self.witness.groups[*group].members;
+            settlement.spent.extend(
+                self.group_marks[*group]
+                    .iter()
+                    .map(|index| members[*index].clone()),
+            );
+        }
+        for (index, action) in self.actions.iter().enumerate() {
+            if ran(index) {
+                continue;
+            }
+            if changed.contains(&action.group) {
+                settlement.left_unmarked += 1;
+            } else {
+                settlement.left_marked += 1;
+            }
+        }
+        settlement
     }
 
     /// The one structural check over the whole plan, against the disk.
@@ -1171,6 +1321,10 @@ fn live_identity(path: &Path) -> PlanResult<LiveIdentity> {
 }
 
 /// Everything a confirmation needs, quoted from one plan.
+///
+/// The counts, the samples, `hidden`, `covered_objects` and the estimate are of the actions that
+/// can run; `planned` counts every action, and `unrunnable` the ones that cannot run where their
+/// files are, the first of them with its reason.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanDigest {
     pub counts: Vec<(ActionKind, usize)>,
@@ -1179,10 +1333,64 @@ pub struct PlanDigest {
     pub covered_objects: usize,
     pub estimate: ReclaimEstimate,
     pub warnings: Vec<PlanWarning>,
+    pub planned: usize,
+    pub unrunnable: usize,
+    pub first_unrunnable: Option<(PathBuf, String)>,
 }
 
 impl PlanDigest {
     pub const SAMPLES: usize = 5;
+}
+
+/// What stands in the way of each action of one plan where its files are, read when the plan was
+/// built: the reason, or nothing, in the plan's order. It informs the confirmation only — the
+/// batch reads the same again before its snapshots, and that reading decides.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unrunnable {
+    reasons: Vec<Option<String>>,
+    /// How many actions cannot run, and the first of them — counted once: a screen asks on every
+    /// frame.
+    count: usize,
+    first: Option<usize>,
+}
+
+impl Unrunnable {
+    pub fn new(reasons: Vec<Option<String>>) -> Self {
+        let count = reasons.iter().filter(|reason| reason.is_some()).count();
+        let first = reasons.iter().position(Option::is_some);
+        Self {
+            reasons,
+            count,
+            first,
+        }
+    }
+
+    /// One entry per action of the plan it was read for; empty when nothing was read.
+    pub fn reasons(&self) -> &[Option<String>] {
+        &self.reasons
+    }
+
+    /// Why action `index` cannot run; `None` when it can, or when nothing was read.
+    pub fn reason(&self, index: usize) -> Option<&str> {
+        self.reasons.get(index).and_then(|reason| reason.as_deref())
+    }
+
+    /// How many actions cannot run.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+}
+
+/// What a batch leaves of the operator's marks ([`ActionPlan::settle_marks`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MarkSettlement {
+    /// Every pathname marked when the plan was built, of every group the batch changed: their
+    /// marks go, the keeper's included.
+    pub spent: Vec<PathBuf>,
+    /// Actions that did not run and keep their marks, in groups the batch did not change.
+    pub left_marked: usize,
+    /// Actions that did not run and lose their marks with the rest of a group the batch changed.
+    pub left_unmarked: usize,
 }
 
 /// One allocation of the plan as the disk reports it right now.
@@ -2588,5 +2796,198 @@ mod tests {
             let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(text.contains(&quoted), "{chapter} must quote: {quoted}");
         }
+    }
+
+    /// Two groups of independent allocations, every twin marked Delete and `/x/spare` not marked at
+    /// all. In plan order the actions are `/x/twin_0`, `/x/twin_1` (one size each) and `/y/twin`
+    /// (two sizes).
+    fn three_deletes() -> ActionPlan {
+        ActionPlan::try_new(
+            1,
+            vec![
+                PlanGroupInput {
+                    id: gid(0),
+                    hash: "ab".repeat(32),
+                    members: vec![
+                        member("/x/keeper.bin", key(10, S), 1, true, None),
+                        member("/x/spare.bin", key(13, S), 1, false, None),
+                        member(
+                            "/x/twin_0.bin",
+                            key(11, S),
+                            1,
+                            false,
+                            Some(ActionKind::Delete),
+                        ),
+                        member(
+                            "/x/twin_1.bin",
+                            key(12, S),
+                            1,
+                            false,
+                            Some(ActionKind::Delete),
+                        ),
+                    ],
+                },
+                PlanGroupInput {
+                    id: gid(1),
+                    hash: "cd".repeat(32),
+                    members: vec![
+                        member("/y/keeper.bin", key(20, 2 * S), 1, true, None),
+                        member(
+                            "/y/twin.bin",
+                            key(21, 2 * S),
+                            1,
+                            false,
+                            Some(ActionKind::Delete),
+                        ),
+                    ],
+                },
+            ],
+        )
+        .expect("two plannable groups")
+    }
+
+    fn reasons(reasons: &[Option<&str>]) -> Unrunnable {
+        Unrunnable::new(
+            reasons
+                .iter()
+                .map(|reason| reason.map(String::from))
+                .collect(),
+        )
+    }
+
+    /// What cannot run leaves the count and the figure; the rest keeps its own.
+    #[test]
+    fn the_runnable_summary_sets_aside_what_cannot_run() {
+        let plan = three_deletes();
+        assert_eq!(plan.summary().actions(), 3);
+        assert_eq!(plan.summary().guaranteed_bytes(), 4 * S);
+
+        let plan = plan.with_unrunnable(reasons(&[None, Some("full"), None]));
+        let summary = plan.runnable_summary();
+        assert_eq!(summary.actions(), 2);
+        assert_eq!(summary.covered_objects(), 2);
+        assert_eq!(
+            summary.guaranteed_bytes(),
+            3 * S,
+            "twin_0 and the second group"
+        );
+        assert_eq!(summary.potential_bytes(), Some(3 * S));
+
+        let plan = three_deletes().with_unrunnable(reasons(&[None, None, None]));
+        assert_eq!(
+            &*plan.runnable_summary(),
+            plan.summary(),
+            "nothing set aside is the plan's own"
+        );
+    }
+
+    /// Two pathnames of one allocation, both marked: when one of them cannot run it stays, and
+    /// the allocation with it — the figure is zero, as the batch would report it.
+    #[test]
+    fn an_allocation_with_a_pathname_left_behind_releases_nothing() {
+        let alias = key(11, S);
+        let plan = ActionPlan::try_new(
+            1,
+            vec![group(vec![
+                member("/x/keeper.bin", key(10, S), 1, true, None),
+                member("/x/alias_0.bin", alias, 2, false, Some(ActionKind::Delete)),
+                member("/x/alias_1.bin", alias, 2, false, Some(ActionKind::Delete)),
+            ])],
+        )
+        .expect("a fully covered allocation is plannable");
+        assert_eq!(plan.summary().guaranteed_bytes(), S);
+
+        let plan = plan.with_unrunnable(reasons(&[Some("immutable"), None]));
+        let summary = plan.runnable_summary();
+        assert_eq!(summary.actions(), 1);
+        assert_eq!(
+            summary.covered_objects(),
+            1,
+            "one of its pathnames still goes"
+        );
+        assert_eq!(summary.guaranteed_bytes(), 0);
+        assert_eq!(summary.potential_bytes(), Some(0));
+    }
+
+    /// The confirmation's digest counts and quotes only what can run, and names the first action
+    /// that cannot with its reason.
+    #[test]
+    fn the_digest_counts_what_can_run_and_names_the_first_that_cannot() {
+        let plan =
+            three_deletes().with_unrunnable(reasons(&[Some("full"), None, Some("read-only")]));
+        let digest = plan.digest();
+        assert_eq!(digest.counts, vec![(ActionKind::Delete, 1)]);
+        assert_eq!(
+            digest.samples,
+            vec![(ActionKind::Delete, PathBuf::from("/x/twin_1.bin"))]
+        );
+        assert_eq!(digest.hidden, 0);
+        assert_eq!((digest.planned, digest.unrunnable), (3, 2));
+        assert_eq!(
+            digest.first_unrunnable,
+            Some((PathBuf::from("/x/twin_0.bin"), "full".to_string()))
+        );
+        assert_eq!(digest.covered_objects, 1);
+        assert_eq!(digest.estimate.guaranteed_bytes(), S);
+        assert_eq!(
+            plan.unrunnable_head(),
+            Some((2, Path::new("/x/twin_0.bin"), "full"))
+        );
+    }
+
+    /// A reading that does not have one entry per action — another plan's — sets nothing aside.
+    #[test]
+    fn a_reading_of_another_plan_sets_aside_nothing() {
+        let plan = three_deletes().with_unrunnable(reasons(&[Some("full")]));
+        assert_eq!(plan.unrunnable(), &Unrunnable::default());
+        assert_eq!(&*plan.runnable_summary(), plan.summary());
+        assert_eq!(plan.digest(), three_deletes().digest());
+        assert_eq!(plan.unrunnable_head(), None);
+        assert_eq!(plan.unrunnable_reason(0), None);
+        assert_eq!(plan.digest().unrunnable, 0);
+        assert_eq!(plan.digest().planned, 3);
+        assert!((0..3).all(|index| !plan.is_set_aside(index)));
+    }
+
+    /// The plan keeps its reading, action by action: what its confirmation counted out is what the
+    /// batch keeps out.
+    #[test]
+    fn the_plan_keeps_what_its_confirmation_counted_out() {
+        let reading = reasons(&[None, Some("full"), None]);
+        let plan = three_deletes().with_unrunnable(reading.clone());
+        assert_eq!(plan.unrunnable(), &reading);
+        assert_eq!(plan.unrunnable_reason(1), Some("full"));
+        assert_eq!(plan.unrunnable_reason(0), None);
+        let marks: Vec<bool> = (0..3).map(|index| plan.is_set_aside(index)).collect();
+        assert_eq!(marks, vec![false, true, false]);
+        assert!(!plan.is_set_aside(3), "past the end nothing is counted out");
+    }
+
+    /// A group with an action that ran spends every mark it has, the keeper's included — and
+    /// nothing else: its unmarked file has no mark to spend. A group none of whose actions ran keeps
+    /// its marks; what did not run is counted on its side.
+    #[test]
+    fn a_batch_spends_the_groups_it_changed_whole() {
+        let plan = three_deletes();
+        let group_x: Vec<PathBuf> = ["/x/keeper.bin", "/x/twin_0.bin", "/x/twin_1.bin"]
+            .map(PathBuf::from)
+            .to_vec();
+        let group_y: Vec<PathBuf> = ["/y/keeper.bin", "/y/twin.bin"].map(PathBuf::from).to_vec();
+
+        let first_ran = plan.settle_marks(&[true, false, false]);
+        assert_eq!(first_ran.spent, group_x);
+        assert_eq!((first_ran.left_marked, first_ran.left_unmarked), (1, 1));
+
+        let last_ran = plan.settle_marks(&[false, false, true]);
+        assert_eq!(last_ran.spent, group_y);
+        assert_eq!((last_ran.left_marked, last_ran.left_unmarked), (2, 0));
+
+        let none_ran = plan.settle_marks(&[]);
+        assert!(none_ran.spent.is_empty());
+        assert_eq!((none_ran.left_marked, none_ran.left_unmarked), (3, 0));
+
+        let all_ran = plan.settle_marks(&[true, true, true]);
+        assert_eq!(all_ran.spent, [group_x, group_y].concat());
+        assert_eq!((all_ran.left_marked, all_ran.left_unmarked), (0, 0));
     }
 }

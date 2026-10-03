@@ -19,7 +19,20 @@ use crate::tui::{centered, human_bytes};
 /// on this screen sums file sizes of its own, which is what let a review claim one allocation's
 /// worth of space once per alias.
 pub fn render(frame: &mut Frame, app: &mut App) {
-    let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(6)]).split(frame.area());
+    // The actions that cannot run where their files are: how many, and the first one.
+    let unrun = app
+        .review
+        .plan
+        .as_ref()
+        .and_then(|plan| plan.unrunnable_head())
+        .map(|(count, first, reason)| Unrun {
+            count,
+            first: first.to_path_buf(),
+            reason: reason.to_string(),
+        });
+    let footer_rows = if unrun.is_some() { 7 } else { 6 };
+    let rows =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(footer_rows)]).split(frame.area());
 
     // The key handler needs the window height for PageUp/PageDown; it is only known here.
     let visible = rows[0].height.saturating_sub(2);
@@ -42,15 +55,17 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // No selection (an empty plan) reads as `0 of 0` rather than panicking on `+ 1`.
     let position = local_sel.map_or(0, |local| start + local + 1);
 
+    let plan = app.review.plan.as_ref();
     let items: Vec<ListItem> = actions[start..end]
         .iter()
-        .map(|action| {
-            ListItem::new(format!(
-                "{:9}  {}   ({})",
-                action.kind().label(),
-                crate::textsan::path(action.target()),
-                human_bytes(action.size()),
-            ))
+        .enumerate()
+        .map(|(offset, action)| {
+            let kind = action.kind().label();
+            let target = crate::textsan::path(action.target());
+            let size = human_bytes(action.size());
+            let reason = plan.and_then(|plan| plan.unrunnable_reason(start + offset));
+            let reason = reason.map(crate::textsan::terminal);
+            ListItem::new(review_row(kind, &target, &size, reason.as_deref()))
         })
         .collect();
     let list = List::new(items)
@@ -63,14 +78,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     local.select(local_sel);
     frame.render_stateful_widget(list, rows[0], &mut local);
 
-    let summary = app.review.plan.as_ref().map(|plan| plan.summary());
+    // Worked out when the review was seated: what cannot run is set aside there, once.
+    let summary = plan.map(|plan| app.review.claim.as_ref().unwrap_or(plan.summary()));
     let counts = summary.map_or_else(
         || " Operations: 0 · allocations: 0 ".to_string(),
         |summary| {
+            let planned = unrun.as_ref().map(|unrun| summary.actions() + unrun.count);
             format!(
-                " Operations: {} · allocations: {} ",
-                summary.actions(),
-                summary.covered_objects()
+                " {} ",
+                review_counts(summary.actions(), planned, summary.covered_objects())
             )
         },
     );
@@ -92,12 +108,18 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
         _ => format!(" {} ", crate::tui::status_shown(&app.status)),
     };
-    let footer = vec![
-        Line::from(counts),
-        Line::from(claim),
-        Line::from(third),
-        Line::from(" ↑↓/PgUp/PgDn/Home/End scroll · [Y] execute · [Esc] back to browser ".dim()),
-    ];
+    let mut footer = vec![Line::from(counts), Line::from(claim)];
+    // Its own line, above the warnings: it is why the count and the figure are less than marked.
+    if let Some(unrun) = &unrun {
+        footer.push(Line::from(format!(
+            " {} ",
+            crate::tui::cannot_run_phrase(unrun.count, &unrun.reason)
+        )));
+    }
+    footer.push(Line::from(third));
+    footer.push(Line::from(
+        " ↑↓/PgUp/PgDn/Home/End scroll · [Y] execute · [Esc] back to browser ".dim(),
+    ));
     frame.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
         rows[1],
@@ -105,8 +127,45 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     if app.review.confirming {
         if let Some(summary) = summary {
-            render_confirm(frame, summary);
+            render_confirm(frame, summary, unrun.as_ref());
         }
+    }
+}
+
+/// The actions of the plan that cannot run where their files are: how many, and the first one
+/// with its reason.
+struct Unrun {
+    count: usize,
+    first: std::path::PathBuf,
+    reason: String,
+}
+
+/// One row of the review. An action that cannot run where its file is carries the mark where the
+/// eye starts and the reason after the size: on a narrow terminal the end of a long row is what
+/// gets cut, and the footer names the reason too. The manual quotes it.
+fn review_row(kind: &str, target: &str, size: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("{kind:9}✗ {target}   ({size})   {reason}"),
+        None => format!("{kind:9}  {target}   ({size})"),
+    }
+}
+
+/// The footer's count: the actions that run — of how many were planned, when some cannot — and
+/// the allocations they remove a pathname of. The manual quotes it.
+fn review_counts(actions: usize, planned: Option<usize>, covered: usize) -> String {
+    match planned {
+        Some(planned) => format!("Operations: {actions} of {planned} · allocations: {covered}"),
+        None => format!("Operations: {actions} · allocations: {covered}"),
+    }
+}
+
+/// The confirmation's question, in the same terms. The manual quotes it.
+fn confirm_head(actions: usize, planned: Option<usize>, covered: usize) -> String {
+    match planned {
+        Some(planned) => {
+            format!("Execute {actions} of {planned} action(s) over {covered} allocation(s)?")
+        }
+        None => format!("Execute {actions} action(s) over {covered} allocation(s)?"),
     }
 }
 
@@ -124,7 +183,7 @@ const CONFIRM_MAX_WIDTH: u16 = 72;
 /// what the operator is looking at when they decide. The box is sized to the terminal and the text
 /// wraps inside it: the previous fixed 56×8 box cut `up to 4.0 KiB after quarantine purge` off at
 /// `up to 4.0 K`, which reads as a smaller number rather than as a truncated one.
-fn render_confirm(frame: &mut Frame, summary: &PlanSummary) {
+fn render_confirm(frame: &mut Frame, summary: &PlanSummary, unrun: Option<&Unrun>) {
     let screen = frame.area();
     let width = screen
         .width
@@ -133,7 +192,7 @@ fn render_confirm(frame: &mut Frame, summary: &PlanSummary) {
     let inner = width.saturating_sub(4).max(8) as usize;
     // Two borders, the decision line, and at least the two lines that state what is about to run.
     let body_budget = screen.height.saturating_sub(3).max(2) as usize;
-    let body = confirm_body(summary, inner, body_budget);
+    let body = confirm_body(summary, unrun, inner, body_budget);
 
     let height = (body.len() + 3) as u16;
     let area = centered(screen, width, height.min(screen.height));
@@ -154,21 +213,37 @@ fn render_confirm(frame: &mut Frame, summary: &PlanSummary) {
 /// The modal's body, in priority order, wrapped to `inner` and cut to `budget` lines.
 ///
 /// What goes first is the reassurance about snapshots; then the warnings past the first, replaced
-/// by `… and N more`. The count line and the complete claim are never given up — they are the two
-/// things the answer depends on.
-fn confirm_body(summary: &PlanSummary, inner: usize, budget: usize) -> Vec<String> {
+/// by `… and N more`. The count line and the complete claim are given up last — they are what the
+/// answer depends on; the line about what cannot run comes right after them, and the pathname of
+/// the first of those goes before any of them.
+fn confirm_body(
+    summary: &PlanSummary,
+    unrun: Option<&Unrun>,
+    inner: usize,
+    budget: usize,
+) -> Vec<String> {
     let indent = |line: &str| format!("  {line}");
-    let head = format!(
-        "Execute {} action(s) over {} allocation(s)?",
-        summary.actions(),
-        summary.covered_objects()
-    );
+    let planned = unrun.map(|unrun| summary.actions() + unrun.count);
+    let head = confirm_head(summary.actions(), planned, summary.covered_objects());
     let mut essential: Vec<String> = wrap_words(&head, inner).iter().map(|l| indent(l)).collect();
     essential.extend(
         wrap_words(&crate::tui::reclaim_phrase(summary.estimate()), inner)
             .iter()
             .map(|l| indent(l)),
     );
+    if let Some(unrun) = unrun {
+        let line = crate::tui::cannot_run_phrase(unrun.count, &unrun.reason);
+        essential.extend(wrap_words(&line, inner).iter().map(|l| indent(l)));
+    }
+    // The first of what cannot run, last of the essentials: a short terminal cuts it first.
+    // Shortened from the left, so the name of the file stays.
+    if let Some(unrun) = unrun {
+        let first = crate::tui::commander::panel::ellipsize_left(
+            &crate::textsan::path(&unrun.first),
+            inner.saturating_sub("first: ".len()),
+        );
+        essential.push(indent(&format!("first: {first}")));
+    }
 
     let warnings = summary.warnings();
     let mut optional: Vec<String> = Vec::new();
@@ -389,6 +464,152 @@ mod tests {
                 "{width}x{height}: the way out is never shed:\n{screen}"
             );
         }
+    }
+
+    /// An action that cannot run where its file is: marked in the list with its reason, counted
+    /// apart in the footer, left out of the figure — and named in the confirmation, which asks
+    /// about the rest only.
+    #[test]
+    fn the_review_names_what_cannot_run_and_leaves_it_out() {
+        let _role = crate::state::store::role_guard();
+        let scenario = crate::testfixtures::PlanScenario::new("review_unrunnable");
+        let keeper = scenario.file("keeper.bin");
+        let here = scenario.file("here.bin");
+        let there = scenario.file("there.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), here.clone(), there.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        for twin in [&here, &there] {
+            scenario.mark(
+                &mut store,
+                scan_id,
+                twin,
+                false,
+                Some(crate::model::action::ActionKind::Delete),
+            );
+        }
+        drop(store);
+        let plan = crate::actions::tests::plan_of(&scenario, scan_id);
+        let mut reasons = vec![None; plan.actions().len()];
+        let blocked = plan
+            .actions()
+            .iter()
+            .position(|action| action.target() == there)
+            .unwrap();
+        reasons[blocked] = Some("read-only filesystem (tank/a)".to_string());
+
+        let (mut app, _rx) = review_app(0);
+        app.review = crate::app::ReviewState::seat(
+            plan.with_unrunnable(crate::model::plan::Unrunnable::new(reasons)),
+        );
+
+        let screen = screen_text(&mut app, 120, 20);
+        assert!(
+            screen.contains("Operations: 1 of 2 · allocations: 1"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("1 cannot run here — read-only filesystem (tank/a)"),
+            "{screen}"
+        );
+        let row = format!("DELETE   ✗ {}", there.display());
+        assert!(screen.contains(&row), "the row carries its mark:\n{screen}");
+        let wide = screen_text(&mut app, 220, 20);
+        assert!(
+            wide.contains("(4.0 KiB)   read-only filesystem (tank/a)"),
+            "and says why where there is room:\n{wide}"
+        );
+        assert!(
+            screen.contains("guaranteed after quarantine purge: 4.0 KiB"),
+            "one twin's worth, not two:\n{screen}"
+        );
+
+        app.review.confirming = true;
+        for (width, height) in [(80u16, 16u16), (120, 30)] {
+            let prose = visible_prose(&screen_text(&mut app, width, height));
+            assert!(
+                prose.contains("Execute 1 of 2 action(s) over 1 allocation(s)?"),
+                "{width}x{height}: {prose}"
+            );
+            assert!(
+                prose.contains("1 cannot run here read-only filesystem (tank/a)"),
+                "{width}x{height}: {prose}"
+            );
+            // The path is cut on the left, so the name of the file is what stays.
+            assert!(
+                prose.contains("first:") && prose.contains("/there.bin"),
+                "{width}x{height}: {prose}"
+            );
+            assert!(
+                prose.contains("guaranteed after quarantine purge: 4.0 KiB"),
+                "{width}x{height}: {prose}"
+            );
+        }
+        // A short terminal gives up the path before the figure — and, shorter still, the line
+        // about what cannot run before it too.
+        for height in [8u16, 5] {
+            let short = visible_prose(&screen_text(&mut app, 80, height));
+            assert!(
+                short.contains("guaranteed after quarantine purge: 4.0 KiB"),
+                "80x{height}: {short}"
+            );
+        }
+    }
+
+    /// The footer's count and the confirmation's question, with some actions set aside, as the
+    /// manual quotes them.
+    #[test]
+    fn the_manual_quotes_the_review_counts() {
+        let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let quote =
+            |text: String| words(&text.replace('7', "N").replace('8', "M").replace('9', "K"));
+        let head = quote(confirm_head(7, Some(8), 9));
+        let counts = quote(review_counts(7, Some(8), 9));
+        let counts = counts.split(" ·").next().unwrap().to_string();
+        assert_eq!(head, "Execute N of M action(s) over K allocation(s)?");
+        assert_eq!(counts, "Operations: N of M");
+        for (chapter, quotes) in [
+            ("06-classic.md", vec![&head, &counts]),
+            ("08-actions.md", vec![&head]),
+        ] {
+            let text = words(&crate::testfixtures::manual(chapter));
+            for quoted in quotes {
+                assert!(
+                    text.contains(quoted.as_str()),
+                    "{chapter} must quote: {quoted}"
+                );
+            }
+        }
+        assert_eq!(
+            confirm_head(3, None, 2),
+            "Execute 3 action(s) over 2 allocation(s)?"
+        );
+        assert_eq!(review_counts(3, None, 2), "Operations: 3 · allocations: 2");
+    }
+
+    /// A row that cannot run, as the manual shows one.
+    #[test]
+    fn the_manual_quotes_a_row_that_cannot_run() {
+        let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let row = review_row(
+            "DELETE",
+            "/tank/ro/a.bin",
+            "4.0 KiB",
+            Some("read-only filesystem (tank/ro)"),
+        );
+        assert_eq!(
+            row,
+            "DELETE   ✗ /tank/ro/a.bin   (4.0 KiB)   read-only filesystem (tank/ro)"
+        );
+        let chapter = words(&crate::testfixtures::manual("06-classic.md"));
+        assert!(
+            chapter.contains(&words(&row)),
+            "06-classic.md must quote: {row}"
+        );
+        assert_eq!(
+            review_row("DELETE", "/tank/a.bin", "4.0 KiB", None),
+            "DELETE     /tank/a.bin   (4.0 KiB)"
+        );
     }
 
     /// A terminal too short for everything still shows the numbers and the way out.

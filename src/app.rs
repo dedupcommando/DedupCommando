@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crossbeam_channel::Sender;
@@ -16,7 +16,7 @@ use crate::actions::{ApplyOutcome, ApplyRefusal};
 use crate::model::action::{ActionKind, BatchResult, RevalidationMode};
 use crate::model::dataset::Dataset;
 use crate::model::duplicate::{DirSigAlgo, DuplicateGroup, FileEntry};
-use crate::model::plan::{ActionPlan, GroupId, MarkIntent, PlanRefusal, RequestedMark};
+use crate::model::plan::{ActionPlan, GroupId, MarkIntent, PlanRefusal, RequestedMark, Unrunnable};
 use crate::model::preset::Preset;
 use crate::model::scan::{
     HashProfile, ResumeInfo, ScanConfig, ScanPhase, ScanProgress, ScanSummary,
@@ -60,6 +60,15 @@ const MARKS_STRANDED: &str = "browsing stopped before the marks were acknowledge
 /// are exactly where the operator left them and the plan can simply be run again.
 pub const BATCH_REFUSED: &str =
     "The batch was refused before any change — the marks are kept; check the snapshots it created";
+
+/// What the status line says when a first link mark takes the group's default keeper to a file
+/// on the target's dataset. The manual quotes it.
+fn keeper_moved(path: &Path) -> String {
+    format!(
+        "The keeper moved to {} — a link needs one on the same dataset",
+        crate::textsan::path(path)
+    )
+}
 
 /// What the wide surfaces say about a scan whose results were never published. Frozen wording:
 /// a candidate view is not a result, and the only way out is a rescan.
@@ -267,6 +276,9 @@ pub struct BrowserState {
     pub candidates: Option<CandidateView>,
     /// Files of the OPEN group ONLY (`id` = summary rank). `None` — group not open.
     pub open_group: Option<DuplicateGroup>,
+    /// The open group's keeper is the one shown by default — the first file by path — not one the
+    /// operator chose or the database holds. The first mark writes it down.
+    pub keeper_by_default: bool,
     /// Cache of the "file name → color" palette of the open group: computed
     /// ONCE when the group is loaded, NOT during render. On a /tank group of 2.2M
     /// files, recomputing the palette every frame caused ~4 s of freeze per cursor move.
@@ -350,6 +362,9 @@ pub struct BrowserState {
 pub struct ReviewState {
     pub plan: Option<ActionPlan>,
     pub confirming: bool,
+    /// The plan's summary with what cannot run set aside — worked out once when the review is
+    /// seated, not on every frame. `None` when nothing is set aside: the plan's own summary holds.
+    pub claim: Option<crate::model::plan::PlanSummary>,
     /// Cursor and scroll offset of the action list. The plan can hold every
     /// duplicate of a scan, so without this the rows past the first screen
     /// were unreachable — the operator confirmed a batch they could not read.
@@ -357,6 +372,25 @@ pub struct ReviewState {
     /// Height of the list window from the last frame — for PageUp/PageDown.
     /// `0` until the first frame; `page_step` falls back to 20.
     pub visible_rows: u16,
+}
+
+impl ReviewState {
+    /// The review of `plan`, cursor on its first action, with the figure worked out without what
+    /// the plan's reading says cannot run.
+    pub fn seat(plan: ActionPlan) -> Self {
+        let claim = plan
+            .unrunnable_head()
+            .map(|_| plan.runnable_summary().into_owned());
+        let mut list = ListState::default();
+        list.select(Some(0));
+        Self {
+            plan: Some(plan),
+            confirming: false,
+            claim,
+            list,
+            visible_rows: 0,
+        }
+    }
 }
 
 /// State of the startup disclaimer/consent gate.
@@ -597,8 +631,12 @@ pub(crate) struct BrowseRoutes {
 /// state, which is what the operator is looking at. Both are needed: one says what the database
 /// held, the other says what the screen must go back to.
 pub(crate) enum MarkOrigin {
-    /// The classic browser writes the whole open group back on every mark.
-    WizardGroup { before: Vec<FileEntry> },
+    /// The classic browser writes the whole open group back on every mark. A refusal puts back
+    /// the rows and whether their keeper was still the one shown by default.
+    WizardGroup {
+        before: Vec<FileEntry>,
+        keeper_by_default: bool,
+    },
     /// The commander marks one pathname at a time, on one panel.
     CommanderMark {
         panel: usize,
@@ -701,8 +739,9 @@ impl MarksGate {
 /// The settlement a finished batch owes the database.
 pub(crate) struct PendingReconcile {
     pub(crate) scan_id: i64,
-    pub(crate) attempted: Vec<PathBuf>,
-    pub(crate) cancelled: bool,
+    /// The pathnames marked when the plan was built, of every group the batch changed
+    /// (`ActionPlan::settle_marks`).
+    pub(crate) spent: Vec<PathBuf>,
     /// Which window's RAM marks the acknowledgement clears.
     pub(crate) commander: bool,
 }
@@ -1620,7 +1659,12 @@ impl App {
             BrowseEvent::AutoSelectDone { act, req, outcome } => {
                 self.on_auto_select_done(act, req, outcome)
             }
-            BrowseEvent::PlanReady { act, req, plan } => self.on_plan_ready(act, req, *plan),
+            BrowseEvent::PlanReady {
+                act,
+                req,
+                plan,
+                unrunnable,
+            } => self.on_plan_ready(act, req, *plan, unrunnable),
             BrowseEvent::PlanRefused { act, req, refusal } => {
                 self.on_plan_refused(act, req, refusal)
             }
@@ -1885,11 +1929,13 @@ impl App {
         let mut files = group.members;
         // Default keeper for display, if no file is marked as keeper. It is RAM-only until the
         // first real mark — plain viewing writes nothing.
-        if !files.iter().any(|file| file.is_keeper) {
+        let defaulted = !files.iter().any(|file| file.is_keeper);
+        if defaulted {
             if let Some(first) = files.first_mut() {
                 first.is_keeper = true;
             }
         }
+        self.browser.keeper_by_default = defaulted;
         let duplicate = DuplicateGroup {
             id: group.id.rank as usize,
             size_bytes: group.summary.size_bytes,
@@ -2599,10 +2645,14 @@ impl App {
     /// Puts the window back the way it was before an optimistic mark the database never took.
     fn restore_mark_origin(&mut self, origin: MarkOrigin) {
         match origin {
-            MarkOrigin::WizardGroup { before } => {
+            MarkOrigin::WizardGroup {
+                before,
+                keeper_by_default,
+            } => {
                 if let Some(open) = self.browser.open_group.as_mut() {
                     open.files = before;
                 }
+                self.browser.keeper_by_default = keeper_by_default;
             }
             MarkOrigin::CommanderMark {
                 panel,
@@ -2859,7 +2909,13 @@ impl App {
         }
     }
 
-    fn on_plan_ready(&mut self, act: Activation, req: RequestId, plan: ActionPlan) {
+    fn on_plan_ready(
+        &mut self,
+        act: Activation,
+        req: RequestId,
+        plan: ActionPlan,
+        unrunnable: Unrunnable,
+    ) {
         let window = match self.routes.plan {
             Some((expected, window)) if expected == req => {
                 self.routes.plan = None;
@@ -2872,13 +2928,18 @@ impl App {
         if !self.is_current(act) {
             return;
         }
+        // The plan carries its reading from here on, into every window it is seated in and into
+        // its batch.
+        let plan = plan.with_unrunnable(unrunnable);
         // A reflink the host or a pool cannot make is refused before the confirmation opens:
-        // once confirmed, the batch could only refuse it.
+        // once confirmed, the batch could only refuse it. So is a plan none of whose actions can
+        // run where its files are, in the words the batch would use after Y.
         let refusal = crate::actions::preflight::reflink_refusal(
             &plan,
             &self.datasets(),
             self.zfs.capabilities.reflink_safe,
-        );
+        )
+        .or_else(|| crate::actions::preflight::nothing_can_run(&plan, plan.unrunnable().reasons()));
         match (window, refusal) {
             // The review opens over the group view it was asked from, or not at all: a plan kept
             // without its review is guarded by nothing, so one that cannot be shown now is
@@ -2900,14 +2961,7 @@ impl App {
                 self.show_plan_refusal(window, crate::textsan::terminal(&refusal))
             }
             (PlanWindow::Wizard, None) => {
-                let mut list = ListState::default();
-                list.select(Some(0));
-                self.review = ReviewState {
-                    plan: Some(plan),
-                    confirming: false,
-                    list,
-                    visible_rows: 0,
-                };
+                self.review = ReviewState::seat(plan);
                 self.status.clear();
                 self.screen = Screen::ActionReview;
             }
@@ -2977,7 +3031,7 @@ impl App {
         match result {
             Ok(()) => {
                 if let Some(owed) = &owed {
-                    self.forget_settled_marks(&owed.attempted, owed.cancelled, owed.commander);
+                    self.forget_settled_marks(&owed.spent, owed.commander);
                 }
                 self.marks_unsettled = false;
                 // The batch's own report is not authority: the count and the open group are
@@ -2985,10 +3039,10 @@ impl App {
                 //
                 // Deliberately NOT `after_bulk_mark_write`. That one drops every RAM mark because
                 // it follows a write whose rows the UI never saw — an auto-select. This write is
-                // the opposite: the batch named exactly which pathnames it attempted, and
+                // the opposite: the batch named exactly which groups it changed, and
                 // `forget_settled_marks` has just applied that delta. Wiping the panels on top of
-                // it would throw away the marks of the work a cancelled batch never reached,
-                // which is the one thing that must survive it.
+                // it would throw away the marks of the groups the batch left alone — the work the
+                // next plan carries out.
                 //
                 // And not during a shutdown: the reload exists to refresh a screen, the exit is
                 // about to close the actor, and a reload that never comes back would end the
@@ -3138,14 +3192,8 @@ impl App {
             return None;
         }
         let act = self.installed_act;
-        let attempted = owed.attempted.clone();
-        let cancelled = owed.cancelled;
-        let sent = self.send_browse(|req| BrowseRequest::ReconcileAfterBatch {
-            act,
-            req,
-            attempted,
-            cancelled,
-        });
+        let spent = owed.spent.clone();
+        let sent = self.send_browse(|req| BrowseRequest::ReconcileAfterBatch { act, req, spent });
         self.routes.reconcile = sent;
         sent
     }
@@ -3286,24 +3334,20 @@ impl App {
         self.advance_shutdown();
     }
 
-    /// Drops the marks in RAM that the DB has just lost — the panels of the commander, or the
-    /// group open in the wizard's browser, which is written back wholesale by the next mark and
-    /// would otherwise resurrect what the batch already applied.
-    fn forget_settled_marks(&mut self, attempted: &[PathBuf], cancelled: bool, commander: bool) {
-        let spent = |path: &Path| !cancelled || attempted.iter().any(|target| target == path);
+    /// Drops the marks in RAM that the DB has just lost — the marked pathnames of every group the
+    /// batch changed — in the panels of the commander, or in the group open in the wizard's browser,
+    /// which is written back wholesale by the next mark and would otherwise resurrect them.
+    fn forget_settled_marks(&mut self, spent: &[PathBuf], commander: bool) {
+        let spent: HashSet<&Path> = spent.iter().map(PathBuf::as_path).collect();
         if commander {
             for panel in &mut self.commander.panels {
-                if cancelled {
-                    for target in attempted {
-                        panel.marks.remove(target);
-                    }
-                } else {
-                    panel.marks.clear();
-                }
+                panel
+                    .marks
+                    .retain(|path, _| !spent.contains(path.as_path()));
             }
         } else if let Some(open) = self.browser.open_group.as_mut() {
             for file in &mut open.files {
-                if spent(&file.path) {
+                if spent.contains(file.path.as_path()) {
                     file.is_keeper = false;
                     file.action = None;
                 }
@@ -3320,27 +3364,32 @@ impl App {
         let from_commander = self.commander.return_to_commander;
         match outcome {
             // The guarded boundary refused: no lease, no snapshot, no filesystem work at all.
-            // The exact plan comes back to the window that confirmed it, and the marks are
-            // untouched, so the operator can rescan or simply try again.
+            // The exact plan comes back to its window with its own reading, and the marks are
+            // untouched, so the operator can rescan or simply try again. A plan nothing of which
+            // can run does not come back — like one built that way, it would ask a question only a
+            // refusal answers; the status line says why.
             ApplyOutcome::Refused { refusal, plan } => {
                 self.apply_affected.clear();
                 self.marks_unsettled = false;
                 let message = Self::refusal_message(&refusal);
+                let back = !matches!(refusal, ApplyRefusal::NothingCanRun { .. });
                 if from_commander {
                     self.mode = AppMode::Commander;
                     self.commander.return_to_commander = false;
-                    crate::tui::commander::actions::seat_plan(self, *plan);
+                    if back {
+                        crate::tui::commander::actions::seat_plan(self, *plan);
+                    } else {
+                        crate::tui::commander::actions::clear_pending(self);
+                    }
                     self.commander.status = message;
                 } else {
-                    let mut list = ListState::default();
-                    list.select(Some(0));
-                    self.review = ReviewState {
-                        plan: Some(*plan),
-                        confirming: false,
-                        list,
-                        visible_rows: 0,
-                    };
-                    self.screen = Screen::ActionReview;
+                    if back {
+                        self.review = ReviewState::seat(*plan);
+                        self.screen = Screen::ActionReview;
+                    } else {
+                        self.review = ReviewState::default();
+                        self.screen = Screen::Browser;
+                    }
                     self.status = message;
                 }
             }
@@ -3360,15 +3409,12 @@ impl App {
                 }
                 let _ = self.refresh_marked_count();
             }
-            ApplyOutcome::Finished(batch) => {
-                // A cancelled batch is not a finished one: only what was actually attempted loses
-                // its mark, so the marking work for the rest of the plan survives.
-                let cancelled = batch.cancelled;
-                let attempted: Vec<PathBuf> = batch
-                    .outcomes
-                    .iter()
-                    .map(|outcome| outcome.target.clone())
-                    .collect();
+            ApplyOutcome::Finished(mut batch) => {
+                // Every group the batch changed loses its marks, the keeper's too; a group it did
+                // not change keeps them — what a stopped batch never reached, and what was refused
+                // before the snapshots, the next plan carries out. Taken, not copied: the Summary
+                // needs only the counts.
+                let spent = std::mem::take(&mut batch.settlement.spent);
                 // The marks also live in SQLite, and the plan is built straight from there —
                 // settling only the copy in RAM would bring the applied actions back on the next
                 // restart. The settlement goes through the one store owner and is acknowledged;
@@ -3384,8 +3430,7 @@ impl App {
                     Some(scan_id) => {
                         self.pending_reconcile = Some(PendingReconcile {
                             scan_id,
-                            attempted,
-                            cancelled,
+                            spent,
                             commander: from_commander,
                         });
                         self.marks_unsettled = true;
@@ -4629,10 +4674,13 @@ impl App {
             KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
             KeyCode::Esc => {
                 self.screen = Screen::ScanConfig;
-                // «Applied» would be a lie after a cancelled batch — the marks that were never
-                // reached are still there, waiting to be executed again.
+                // «Applied» would be a lie after a cancelled batch, and «start a new scan» after one
+                // that left marks the next plan can still carry out.
                 let result = self.summary_result.as_ref();
                 let cancelled = result.map(|result| result.cancelled).unwrap_or(false);
+                let left = result
+                    .map(|result| crate::tui::screens::summary::marks_left(&result.settlement))
+                    .unwrap_or_default();
                 let refused = result
                     .map(|result| result.aborted.is_some())
                     .unwrap_or(false);
@@ -4644,9 +4692,15 @@ impl App {
                 } else if refused {
                     BATCH_REFUSED.to_string()
                 } else if cancelled {
-                    "Application cancelled. The marks that were not reached are kept.".to_string()
+                    match left.first() {
+                        Some(first) => format!("Application cancelled. {first}"),
+                        None => "Application cancelled.".to_string(),
+                    }
                 } else {
-                    "Actions applied. Start a new scan for fresh data.".to_string()
+                    match left.first() {
+                        Some(first) => format!("Actions applied. {first}"),
+                        None => "Actions applied. Start a new scan for fresh data.".to_string(),
+                    }
                 };
             }
             _ => {}
@@ -4997,6 +5051,9 @@ impl App {
         if self.deny_if_read_only("marking files") {
             return;
         }
+        if self.plan_is_being_built() {
+            return;
+        }
         if action == Some(ActionKind::Reflink) && !self.zfs.capabilities.reflink_safe {
             self.status = format!(
                 "reflink unavailable — {}",
@@ -5017,18 +5074,70 @@ impl App {
             return;
         }
         let before = self.open_group_marks();
+        let by_default = self.browser.keeper_by_default;
+        let mut moved = None;
         if let Some(open) = self.browser.open_group.as_mut() {
-            // Before an action in the group a keeper is needed — so the plan from the DB sees the
-            // target→keeper pair. No keeper → assign a default one (any, except the target).
-            if action.is_some() && !open.files.iter().any(|file| file.is_keeper) {
-                if let Some(k) = (0..open.files.len()).find(|&i| i != file_index) {
-                    open.files[k].is_keeper = true;
+            if let Some(kind) = action {
+                let device = open.files[file_index].device;
+                // A file that can keep the group for this target: not the target, no action of its
+                // own, on the target's device — a link does not cross datasets.
+                let beside = |files: &[FileEntry]| {
+                    (0..files.len()).find(|&index| {
+                        index != file_index
+                            && files[index].action.is_none()
+                            && files[index].device == device
+                    })
+                };
+                match open.files.iter().position(|file| file.is_keeper) {
+                    // Before an action in the group a keeper is needed — so the plan from the DB
+                    // sees the target→keeper pair. No keeper → assign a default one: beside the
+                    // target if the group has one there, otherwise any except the target.
+                    None => {
+                        let default = beside(&open.files)
+                            .or_else(|| (0..open.files.len()).find(|&index| index != file_index));
+                        if let Some(index) = default {
+                            open.files[index].is_keeper = true;
+                        }
+                    }
+                    // The keeper shown by default was picked by path alone. A first link mark on
+                    // another device takes it beside the target, or the plan would refuse the link.
+                    Some(keeper)
+                        if self.browser.keeper_by_default
+                            && kind != ActionKind::Delete
+                            && open.files[keeper].device != device
+                            && open.files.iter().all(|file| file.action.is_none()) =>
+                    {
+                        if let Some(index) = beside(&open.files) {
+                            open.files[keeper].is_keeper = false;
+                            open.files[index].is_keeper = true;
+                            moved = Some(open.files[index].path.clone());
+                        }
+                    }
+                    Some(_) => {}
                 }
             }
             open.files[file_index].action = action;
         }
+        // From the first action on, the keeper is the one this write records.
+        if action.is_some() {
+            self.browser.keeper_by_default = false;
+        }
+        if let Some(path) = moved {
+            self.status = keeper_moved(&path);
+        }
         // Persist the whole group: keeper + marked; default rows are cleared.
-        self.settle_open_group(before);
+        self.settle_open_group(before, by_default);
+    }
+
+    /// The classic window's plan is being built. A mark written now would not be in it, and the
+    /// batch that follows would leave the mark behind in a group it changed — where it would refuse
+    /// every later plan. So it is refused, and the status line says why.
+    fn plan_is_being_built(&mut self) -> bool {
+        let building = matches!(self.routes.plan, Some((_, PlanWindow::Wizard)));
+        if building {
+            self.status = "The plan is being built — mark files once the review opens".to_string();
+        }
+        building
     }
 
     /// The open group's rows as they stand — the state to fall back to when a write is refused.
@@ -5045,10 +5154,14 @@ impl App {
         if self.deny_if_read_only("choosing a keeper") {
             return;
         }
+        if self.plan_is_being_built() {
+            return;
+        }
         let Some((_, file_index)) = self.current_group_file() else {
             return;
         };
         let before = self.open_group_marks();
+        let by_default = self.browser.keeper_by_default;
         if let Some(open) = self.browser.open_group.as_mut() {
             for (index, file) in open.files.iter_mut().enumerate() {
                 file.is_keeper = index == file_index;
@@ -5057,7 +5170,8 @@ impl App {
                 }
             }
         }
-        self.settle_open_group(before);
+        self.browser.keeper_by_default = false;
+        self.settle_open_group(before, by_default);
     }
 
     /// Auto-select: in each group keep the newest file, the rest — for deletion.
@@ -5068,6 +5182,9 @@ impl App {
     /// there is no window in which a cancellation can be erased.
     fn browser_auto(&mut self) {
         if self.deny_if_read_only("auto-select") {
+            return;
+        }
+        if self.plan_is_being_built() {
             return;
         }
         if self.current_scan_id.is_none() {
@@ -5108,7 +5225,7 @@ impl App {
     /// The rows on screen are optimistic until the acknowledgement arrives: the after-image the
     /// store read inside its own write transaction is what finally settles them, and a refusal
     /// puts `before` back. Nothing here decides that a write succeeded.
-    fn settle_open_group(&mut self, before: Vec<FileEntry>) {
+    fn settle_open_group(&mut self, before: Vec<FileEntry>, keeper_by_default: bool) {
         if self.current_scan_id.is_none() {
             return;
         }
@@ -5132,13 +5249,19 @@ impl App {
             if let Some(open) = self.browser.open_group.as_mut() {
                 open.files = before;
             }
+            self.browser.keeper_by_default = keeper_by_default;
             self.status = "The mark was not saved — browsing is not available".to_string();
             return;
         };
         match handle.send_set_marks(act, req, entries, durable) {
             Ok(()) => {
-                self.pending_marks
-                    .insert(req.0, MarkOrigin::WizardGroup { before });
+                self.pending_marks.insert(
+                    req.0,
+                    MarkOrigin::WizardGroup {
+                        before,
+                        keeper_by_default,
+                    },
+                );
             }
             Err(refused) => {
                 // The complete ticket (or the complete raw inputs) comes back, so the window is
@@ -5147,6 +5270,7 @@ impl App {
                 if let Some(open) = self.browser.open_group.as_mut() {
                     open.files = before;
                 }
+                self.browser.keeper_by_default = keeper_by_default;
                 let durable = refused.before().to_vec();
                 self.apply_mark_image(&durable);
                 self.status = format!("The mark was not saved: {:?}", refused.reason());
@@ -5167,6 +5291,9 @@ impl App {
             .iter()
             .filter_map(|file| {
                 let intent = match (file.is_keeper, file.action) {
+                    // The keeper shown by default is not a mark until one writes it down; the plan
+                    // takes whatever keeper the database holds.
+                    (true, _) if self.browser.keeper_by_default => return None,
                     (true, _) => MarkIntent::Keeper,
                     (false, Some(kind)) => MarkIntent::Act(kind),
                     (false, None) => return None,
@@ -5199,10 +5326,14 @@ impl App {
         }
         let requested = self.requested_marks();
         let act = self.installed_act;
+        let datasets = self.datasets();
+        let reflink_safe = self.zfs.capabilities.reflink_safe;
         if let Some(req) = self.send_browse(|req| BrowseRequest::BuildPlan {
             act,
             req,
             requested,
+            datasets,
+            reflink_safe,
         }) {
             self.routes.plan = Some((req, PlanWindow::Wizard));
             self.status = "Building the plan…".to_string();
@@ -5212,10 +5343,14 @@ impl App {
     /// Asks the authority for the commander's plan. `false` — it could not even be enqueued.
     pub(crate) fn request_commander_plan(&mut self, requested: Vec<RequestedMark>) -> bool {
         let act = self.installed_act;
+        let datasets = self.datasets();
+        let reflink_safe = self.zfs.capabilities.reflink_safe;
         match self.send_browse(|req| BrowseRequest::BuildPlan {
             act,
             req,
             requested,
+            datasets,
+            reflink_safe,
         }) {
             Some(req) => {
                 self.routes.plan = Some((req, PlanWindow::Commander));
@@ -6321,18 +6456,32 @@ mod cancel_tests {
         crate::state::store::marked_action_paths(db_path, scan_id)
     }
 
-    fn finished(outcomes: Vec<ActionOutcome>, planned: usize, cancelled: bool) -> AppEvent {
+    /// The fixture's one group: the keeper `/x/a` and the targets `/x/b` and `/x/c`.
+    const GROUP: [&str; 3] = ["/x/a", "/x/b", "/x/c"];
+
+    /// A batch that reached `outcomes` of `planned` actions and spent the marks of `spent` — what
+    /// `ActionPlan::settle_marks` decides from the groups it changed.
+    fn finished(
+        outcomes: Vec<ActionOutcome>,
+        planned: usize,
+        cancelled: bool,
+        spent: &[&str],
+    ) -> AppEvent {
         AppEvent::ApplyFinished(Box::new(ApplyOutcome::Finished(BatchResult {
             outcomes,
             planned,
             cancelled,
+            settlement: Box::new(crate::model::plan::MarkSettlement {
+                spent: spent.iter().map(|path| PathBuf::from(*path)).collect(),
+                ..Default::default()
+            }),
             ..Default::default()
         })))
     }
 
-    /// The marks are in SQLite too, and the wizard rebuilds its plan straight from there. A
-    /// cancelled batch must leave exactly the untouched remainder behind — not the whole plan
-    /// (the applied action would run again) and not an empty one (the work would be lost).
+    /// The marks are in SQLite too, and the wizard rebuilds its plan straight from there. A batch
+    /// stopped inside the group spent all of its marks, the unreached one too: left behind, it
+    /// would bring the group back into a plan that its changed files refuse as a whole.
     #[test]
     fn a_cancelled_batch_settles_the_persisted_marks_of_the_wizard() {
         let _role = crate::state::store::role_guard();
@@ -6342,7 +6491,7 @@ mod cancel_tests {
         finish_and_settle(
             &mut app,
             &rx,
-            finished(vec![applied(Path::new("/x/b"))], 2, true),
+            finished(vec![applied(Path::new("/x/b"))], 2, true, &GROUP),
         );
 
         assert!(
@@ -6350,10 +6499,9 @@ mod cancel_tests {
             "the acknowledgement arrived: {}",
             app.status
         );
-        assert_eq!(
-            plan_targets(&db_path, scan_id),
-            vec![PathBuf::from("/x/c")],
-            "the plan on disk holds only what the batch never reached"
+        assert!(
+            plan_targets(&db_path, scan_id).is_empty(),
+            "the plan on disk holds nothing of the group the batch changed"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -6375,23 +6523,22 @@ mod cancel_tests {
         finish_and_settle(
             &mut app,
             &rx,
-            finished(vec![applied(Path::new("/x/b"))], 2, true),
+            finished(vec![applied(Path::new("/x/b"))], 2, true, &GROUP),
         );
 
         assert!(!app.marks_unsettled, "the acknowledgement arrived");
-        assert_eq!(
-            plan_targets(&db_path, scan_id),
-            vec![PathBuf::from("/x/c")],
-            "the plan on disk holds only what the batch never reached"
+        assert!(
+            plan_targets(&db_path, scan_id).is_empty(),
+            "the plan on disk holds nothing of the group the batch changed"
         );
         let marks = &app.commander.panels[0].marks;
         assert!(!marks.contains_key(&PathBuf::from("/x/b")));
-        assert!(marks.contains_key(&PathBuf::from("/x/c")), "RAM agrees");
+        assert!(!marks.contains_key(&PathBuf::from("/x/c")), "RAM agrees");
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A batch that ran to the end spends the whole plan: nothing may be rebuilt from the marks
-    /// it left behind, or a restart would apply the same actions again.
+    /// A batch that ran to the end changed its group, so it spends all of its marks: nothing may
+    /// be rebuilt from marks it left behind, or a restart would apply the same actions again.
     #[test]
     fn a_finished_batch_leaves_no_persisted_plan_behind() {
         let _role = crate::state::store::role_guard();
@@ -6405,6 +6552,7 @@ mod cancel_tests {
                 vec![applied(Path::new("/x/b")), applied(Path::new("/x/c"))],
                 2,
                 false,
+                &GROUP,
             ),
         );
 
@@ -6530,7 +6678,7 @@ mod cancel_tests {
             .marks
             .insert(target.clone(), Mark::Delete);
 
-        app.handle_event(finished(vec![applied(&target)], 1, false));
+        app.handle_event(finished(vec![applied(&target)], 1, false, &GROUP));
 
         assert!(
             app.commander.panels[0].marks.contains_key(&target),
@@ -6558,7 +6706,7 @@ mod cancel_tests {
         app.mode = AppMode::Wizard;
         app.current_scan_id = Some(1);
 
-        app.handle_event(finished(vec![applied(Path::new("/x/b"))], 1, false));
+        app.handle_event(finished(vec![applied(Path::new("/x/b"))], 1, false, &GROUP));
         assert!(app.marks_unsettled, "the DB refused, so nothing is settled");
         assert!(matches!(app.screen, Screen::Summary));
 
@@ -6601,28 +6749,26 @@ mod cancel_tests {
         (dir, app, rx, scan_id)
     }
 
+    /// Esc before the batch reached the group: it changed nothing there, so every mark of it stays
+    /// — on the screen and on disk — and the next plan carries it out.
     #[test]
     fn a_cancelled_batch_keeps_the_marks_it_never_reached() {
         let _role = crate::state::store::role_guard();
         let (dir, mut app, rx, scan_id) = marked_commander("commander_cancel_ram");
         let db_path = app.db_path.clone();
-        let done = PathBuf::from("/x/b");
-        let never_reached = PathBuf::from("/x/c");
 
-        finish_and_settle(&mut app, &rx, finished(vec![applied(&done)], 2, true));
+        finish_and_settle(&mut app, &rx, finished(Vec::new(), 2, true, &[]));
 
         let marks = &app.commander.panels[0].marks;
-        assert!(
-            !marks.contains_key(&done),
-            "the action that ran must lose its mark"
-        );
-        assert!(
-            marks.contains_key(&never_reached),
-            "the action that was never attempted must keep its mark"
-        );
+        for path in GROUP {
+            assert!(
+                marks.contains_key(&PathBuf::from(path)),
+                "{path} was never reached and keeps its mark: {marks:?}"
+            );
+        }
         assert_eq!(
             plan_targets(&db_path, scan_id),
-            vec![never_reached],
+            vec![PathBuf::from("/x/b"), PathBuf::from("/x/c")],
             "and the durable half agrees with the screen"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -6639,7 +6785,7 @@ mod cancel_tests {
         finish_and_settle(
             &mut app,
             &rx,
-            finished(vec![applied(&first), applied(&second)], 2, false),
+            finished(vec![applied(&first), applied(&second)], 2, false, &GROUP),
         );
 
         assert!(
@@ -6671,6 +6817,44 @@ mod cancel_tests {
             "the operator must not read a stopped batch as a finished one: {}",
             app.status
         );
+    }
+
+    /// Leaving the Summary, the status line says what is still marked — after a stopped batch and
+    /// after one that ran to its end with actions refused before the snapshots alike.
+    #[test]
+    fn leaving_the_summary_says_what_is_still_marked() {
+        let (mut app, _rx) = test_app();
+        app.show_disclaimer = false;
+        let left = |cancelled: bool, left_marked: usize| BatchResult {
+            planned: 3,
+            cancelled,
+            settlement: Box::new(crate::model::plan::MarkSettlement {
+                left_marked,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for (result, expected) in [
+            (
+                left(true, 2),
+                "Application cancelled. 2 action(s) did not run and keep their marks — plan them \
+                 again",
+            ),
+            (
+                left(false, 1),
+                "Actions applied. 1 action(s) did not run and keep their marks — plan them again",
+            ),
+            (
+                left(false, 0),
+                "Actions applied. Start a new scan for fresh data.",
+            ),
+        ] {
+            app.mode = AppMode::Wizard;
+            app.screen = Screen::Summary;
+            app.summary_result = Some(result);
+            app.handle_event(AppEvent::Key(KeyEvent::from(KeyCode::Esc)));
+            assert_eq!(app.status, expected);
+        }
     }
 }
 
@@ -6892,6 +7076,701 @@ mod actor_route_tests {
             && app.routes.covering.is_empty()
             && app.routes.plan.is_none()
             && app.routes.reconcile.is_none()
+    }
+
+    /// A group over two filesystems opens with its default keeper on the other one. Marking a
+    /// hardlink takes the keeper to a copy on the target's own filesystem, so the plan can link.
+    #[test]
+    fn a_link_mark_takes_the_default_keeper_to_the_targets_dataset() {
+        let _role = crate::state::store::role_guard();
+        let shm = crate::actions::tests::ShmDir::new("default_keeper");
+        let scenario = PlanScenario::new("default_keeper");
+        let near = scenario.file("near.bin");
+        let target = scenario.file("target.bin");
+        let far = shm.path.join("far.bin");
+        std::fs::copy(&near, &far).unwrap();
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[far.clone(), near.clone(), target.clone()]);
+        drop(store);
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        app.show_disclaimer = false;
+        app.zfs.pools = vec![crate::model::dataset::Pool {
+            name: "tank".to_string(),
+            datasets: vec![
+                crate::actions::tests::dataset_over(&scenario.root, "tank/a"),
+                crate::actions::tests::dataset_over(&shm.path, "tank/b"),
+            ],
+        }];
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Wizard);
+        pump_until(&mut app, &rx, "the first group", |app| {
+            app.browser.open_group.is_some()
+        });
+        drain(&mut app, &rx);
+        let files = &app.browser.open_group.as_ref().unwrap().files;
+        assert_eq!(files[0].path, far, "the far copy sorts first");
+        assert!(files[0].is_keeper, "and is the default keeper");
+        let index = files.iter().position(|file| file.path == target).unwrap();
+
+        app.browser.file_state.select(Some(index));
+        app.browser_mark(Some(ActionKind::Hardlink));
+        pump_until(&mut app, &rx, "the mark acknowledgement", |app| {
+            app.pending_marks.is_empty()
+        });
+        drain(&mut app, &rx);
+        let keepers: Vec<PathBuf> = app
+            .browser
+            .open_group
+            .as_ref()
+            .unwrap()
+            .files
+            .iter()
+            .filter(|file| file.is_keeper)
+            .map(|file| file.path.clone())
+            .collect();
+        assert_eq!(keepers, vec![near.clone()], "{}", app.status);
+        assert_eq!(
+            app.status,
+            keeper_moved(&near),
+            "the operator is told where"
+        );
+
+        app.open_review();
+        pump_until(&mut app, &rx, "the plan", |app| app.routes.plan.is_none());
+        drain(&mut app, &rx);
+        assert_eq!(app.screen, Screen::ActionReview, "{}", app.status);
+    }
+
+    /// One group of identical files, `far` ones on `/dev/shm` and `near` ones on the scenario's
+    /// root, both filesystems datasets of the host, opened in the wizard. A `/dev/shm` path sorts
+    /// before a temporary directory's, so the first `far` file is the default keeper.
+    struct TwoFilesystems {
+        _shm: crate::actions::tests::ShmDir,
+        _scenario: PlanScenario,
+        app: App,
+        rx: Receiver<AppEvent>,
+        near: Vec<PathBuf>,
+        far: Vec<PathBuf>,
+    }
+
+    fn two_filesystems(tag: &str, near: &[&str], far: &[&str]) -> TwoFilesystems {
+        two_filesystems_with(tag, near, far, &[])
+    }
+
+    /// The same, the `near` files at `deleted` already marked Delete in the database, with no
+    /// keeper — what an earlier session can leave.
+    fn two_filesystems_with(
+        tag: &str,
+        near: &[&str],
+        far: &[&str],
+        deleted: &[usize],
+    ) -> TwoFilesystems {
+        let shm = crate::actions::tests::ShmDir::new(tag);
+        let scenario = PlanScenario::new(tag);
+        let near: Vec<PathBuf> = near.iter().map(|name| scenario.file(name)).collect();
+        let far: Vec<PathBuf> = far
+            .iter()
+            .map(|name| {
+                let path = shm.path.join(name);
+                std::fs::copy(&near[0], &path).unwrap();
+                path
+            })
+            .collect();
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[far.clone(), near.clone()].concat());
+        for index in deleted {
+            scenario.mark(
+                &mut store,
+                scan_id,
+                &near[*index],
+                false,
+                Some(ActionKind::Delete),
+            );
+        }
+        drop(store);
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        app.show_disclaimer = false;
+        app.zfs.pools = vec![crate::model::dataset::Pool {
+            name: "tank".to_string(),
+            datasets: vec![
+                crate::actions::tests::dataset_over(&scenario.root, "tank/a"),
+                crate::actions::tests::dataset_over(&shm.path, "tank/b"),
+            ],
+        }];
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Wizard);
+        pump_until(&mut app, &rx, "the first group", |app| {
+            app.browser.open_group.is_some()
+        });
+        drain(&mut app, &rx);
+        assert_eq!(
+            app.browser.open_group.as_ref().unwrap().files[0].path,
+            far[0]
+        );
+        TwoFilesystems {
+            _shm: shm,
+            _scenario: scenario,
+            app,
+            rx,
+            near,
+            far,
+        }
+    }
+
+    impl TwoFilesystems {
+        /// Marks `path` with `action` the way the Files tab does, and waits for the database.
+        fn mark(&mut self, path: &Path, action: ActionKind) {
+            let index = self
+                .app
+                .browser
+                .open_group
+                .as_ref()
+                .unwrap()
+                .files
+                .iter()
+                .position(|file| file.path == path)
+                .unwrap();
+            self.app.browser.file_state.select(Some(index));
+            self.app.browser_mark(Some(action));
+            pump_until(&mut self.app, &self.rx, "the mark acknowledgement", |app| {
+                app.pending_marks.is_empty()
+            });
+            drain(&mut self.app, &self.rx);
+        }
+
+        fn keepers(&self) -> Vec<PathBuf> {
+            self.app
+                .browser
+                .open_group
+                .as_ref()
+                .unwrap()
+                .files
+                .iter()
+                .filter(|file| file.is_keeper)
+                .map(|file| file.path.clone())
+                .collect()
+        }
+    }
+
+    /// Takes no real snapshot — the name it hands back is all a batch needs of one — and leaves
+    /// every other operation to the kernel.
+    struct NoSnapshots;
+
+    impl crate::actions::ApplyOps for NoSnapshots {
+        fn create_snapshot(&self, dataset: &str, suffix: &str) -> crate::error::Result<String> {
+            Ok(format!("{dataset}@dedcom-{suffix}"))
+        }
+    }
+
+    /// Every mark of `scan_id` in the database: the pathname, the keeper flag, the action.
+    fn persisted_marks(db_path: &Path, scan_id: i64) -> Vec<(String, i64, Option<String>)> {
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+        let conn = rusqlite::Connection::open_with_flags(db_path, flags).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT path, is_keeper, action FROM file_mark WHERE scan_id = ?1 ORDER BY path",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([scan_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    /// The marks the Files tab writes are spent by the batch that changed their group, the keeper
+    /// a link moved to included — the same as the marks an earlier session left behind. The whole
+    /// route: the mark, the plan, the batch over real files, the settlement in the database.
+    #[test]
+    fn a_batch_spends_the_marks_made_in_the_browser() {
+        let _role = crate::state::store::role_guard();
+        let mut fs = two_filesystems(
+            "browser_marks_spent",
+            &["near_a.bin", "near_b.bin"],
+            &["far.bin"],
+        );
+        let keeper = fs.near[0].clone();
+        let target = fs.near[1].clone();
+        fs.mark(&target, ActionKind::Hardlink);
+        assert_eq!(fs.keepers(), vec![keeper.clone()], "{}", fs.app.status);
+        let db_path = fs.app.db_path.clone();
+        let scan_id = fs.app.current_scan_id.unwrap();
+        let text = |path: &Path| path.to_string_lossy().into_owned();
+        assert_eq!(
+            persisted_marks(&db_path, scan_id),
+            vec![
+                (text(&keeper), 1, None),
+                (text(&target), 0, Some("hardlink".to_string())),
+            ],
+            "the link and the keeper it moved are both written down"
+        );
+
+        fs.app.open_review();
+        pump_until(&mut fs.app, &fs.rx, "the plan", |app| {
+            app.routes.plan.is_none()
+        });
+        drain(&mut fs.app, &fs.rx);
+        assert_eq!(fs.app.screen, Screen::ActionReview, "{}", fs.app.status);
+        let plan = fs.app.review.plan.take().unwrap();
+        let shared = crate::actions::ApplyShared::default();
+        let batch = match crate::actions::apply_guarded_with(
+            &NoSnapshots,
+            &db_path,
+            &plan,
+            &fs.app.datasets(),
+            false,
+            &shared,
+            fs.app.reval_mode,
+        ) {
+            crate::actions::GuardedApply::Ran(Ok(batch)) => batch,
+            crate::actions::GuardedApply::Ran(Err(err)) => panic!("the batch must run: {err}"),
+            crate::actions::GuardedApply::Refused(refusal) => {
+                panic!("the batch must not refuse: {refusal:?}")
+            }
+        };
+        assert_eq!(batch.succeeded(), 1, "{:?}", batch.outcomes);
+        fs.app.screen = Screen::Applying;
+        fs.app
+            .handle_event(AppEvent::ApplyFinished(Box::new(ApplyOutcome::Finished(
+                batch,
+            ))));
+        pump_until(
+            &mut fs.app,
+            &fs.rx,
+            "the reconcile acknowledgement",
+            |app| app.routes.reconcile.is_none(),
+        );
+        drain(&mut fs.app, &fs.rx);
+        assert!(!fs.app.marks_unsettled, "{}", fs.app.status);
+        assert_eq!(
+            persisted_marks(&db_path, scan_id),
+            Vec::new(),
+            "the group the batch changed keeps no mark: {}",
+            fs.app.status
+        );
+        pump_until(&mut fs.app, &fs.rx, "the marks re-read", |app| {
+            app.plan_gate_refusal().is_none()
+        });
+        drain(&mut fs.app, &fs.rx);
+        let open = fs.app.browser.open_group.as_ref().unwrap();
+        assert!(
+            open.files.iter().all(|file| file.action.is_none()),
+            "and the rows on screen forget them with it"
+        );
+        assert!(
+            fs.app.browser.keeper_by_default,
+            "the keeper shown is the default one again"
+        );
+    }
+
+    /// The group open in the Browser shows its first file as the keeper on screen only. `r` does
+    /// not ask the database to plan that keeper — it holds none — so the plan of the marks it holds
+    /// elsewhere is built, not refused as a mark that was never saved.
+    #[test]
+    fn the_review_plans_without_the_keeper_only_the_screen_shows() {
+        let _role = crate::state::store::role_guard();
+        let scenario = PlanScenario::new("review_default_keeper");
+        // The unmarked group is bigger, so it ranks first and is the one the Browser opens.
+        let big_a = scenario.root.join("big_a.bin");
+        let big_b = scenario.root.join("big_b.bin");
+        for path in [&big_a, &big_b] {
+            std::fs::write(path, vec![3u8; 16384]).unwrap();
+        }
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(
+            &mut store,
+            &[big_a.clone(), big_b.clone(), keeper.clone(), twin.clone()],
+        );
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(&mut store, scan_id, &twin, false, Some(ActionKind::Delete));
+        drop(store);
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        app.show_disclaimer = false;
+        app.zfs.pools = vec![crate::model::dataset::Pool {
+            name: "tank".to_string(),
+            datasets: vec![crate::actions::tests::dataset_over(
+                &scenario.root,
+                "tank/a",
+            )],
+        }];
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Wizard);
+        pump_until(&mut app, &rx, "the first group", |app| {
+            app.browser.open_group.is_some()
+        });
+        drain(&mut app, &rx);
+        let files = &app.browser.open_group.as_ref().unwrap().files;
+        assert_eq!(files[0].path, big_a, "the bigger, unmarked group opens");
+        assert!(files[0].is_keeper && app.browser.keeper_by_default);
+
+        app.open_review();
+        pump_until(&mut app, &rx, "the plan", |app| app.routes.plan.is_none());
+        drain(&mut app, &rx);
+        assert_eq!(app.screen, Screen::ActionReview, "{}", app.status);
+        let targets: Vec<&Path> = app
+            .review
+            .plan
+            .as_ref()
+            .unwrap()
+            .actions()
+            .iter()
+            .map(|action| action.target())
+            .collect();
+        assert_eq!(targets, vec![twin.as_path()]);
+    }
+
+    /// The classic review reads the plan the way the commander's confirmation does: an action on
+    /// a filesystem no dataset covers is counted apart, and a plan none of whose actions can run
+    /// opens no review at all.
+    #[test]
+    fn the_review_counts_apart_what_cannot_run() {
+        let _role = crate::state::store::role_guard();
+        let shm = crate::actions::tests::ShmDir::new("review_cannot_run");
+        let scenario = PlanScenario::new("review_cannot_run");
+        let keeper = scenario.file("keeper.bin");
+        let here = scenario.file("here.bin");
+        let there = shm.path.join("there.bin");
+        std::fs::copy(&keeper, &there).unwrap();
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[there.clone(), keeper.clone(), here.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        for copy in [&here, &there] {
+            scenario.mark(&mut store, scan_id, copy, false, Some(ActionKind::Delete));
+        }
+        drop(store);
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        app.show_disclaimer = false;
+        app.zfs.pools = vec![crate::model::dataset::Pool {
+            name: "tank".to_string(),
+            datasets: vec![crate::actions::tests::dataset_over(
+                &scenario.root,
+                "tank/a",
+            )],
+        }];
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Wizard);
+        pump_until(&mut app, &rx, "the first group", |app| {
+            app.browser.open_group.is_some()
+        });
+        drain(&mut app, &rx);
+
+        app.open_review();
+        pump_until(&mut app, &rx, "the plan", |app| app.routes.plan.is_none());
+        drain(&mut app, &rx);
+        assert_eq!(app.screen, Screen::ActionReview, "{}", app.status);
+        assert_eq!(app.review.plan.as_ref().unwrap().unrunnable().count(), 1);
+        assert_eq!(
+            app.review.claim.as_ref().map(|claim| claim.actions()),
+            Some(1)
+        );
+        let plan = app.review.plan.as_ref().unwrap();
+        let aside: Vec<&Path> = (0..plan.actions().len())
+            .filter(|index| plan.is_set_aside(*index))
+            .map(|index| plan.actions()[index].target())
+            .collect();
+        assert_eq!(
+            aside,
+            vec![there.as_path()],
+            "and the plan Y runs keeps it out"
+        );
+
+        // No dataset at all: nothing of the plan can run, so no review opens.
+        app.review = ReviewState::default();
+        app.screen = Screen::Browser;
+        app.zfs.pools.clear();
+        app.open_review();
+        pump_until(&mut app, &rx, "the plan", |app| app.routes.plan.is_none());
+        drain(&mut app, &rx);
+        assert_eq!(app.screen, Screen::Browser);
+        assert!(app.review.plan.is_none());
+        assert!(
+            app.status
+                .starts_with("nothing done — 2 actions cannot run"),
+            "{}",
+            app.status
+        );
+    }
+
+    /// A write that never reached the database puts the rows back as they were — and the keeper's
+    /// standing as the one shown by default with them, so the next link mark still moves it.
+    #[test]
+    fn a_refused_write_restores_the_default_keeper() {
+        let (mut app, _rx) = test_app();
+        app.current_scan_id = Some(1);
+        let row = |path: &str, device: u64, is_keeper: bool| FileEntry {
+            path: PathBuf::from(path),
+            device,
+            is_keeper,
+            ..Default::default()
+        };
+        app.browser.open_group = Some(DuplicateGroup {
+            id: 0,
+            size_bytes: 1,
+            hash: "ab".repeat(32),
+            files: vec![
+                row("/a/far.bin", 1, true),
+                row("/b/near.bin", 2, false),
+                row("/b/target.bin", 2, false),
+            ],
+        });
+        app.browser.keeper_by_default = true;
+        app.browser.group_state.select(Some(0));
+        app.browser.file_state.select(Some(2));
+
+        // No browsing actor here: the write is refused at once.
+        app.browser_mark(Some(ActionKind::Hardlink));
+        assert!(app.status.contains("not saved"), "{}", app.status);
+        let files = &app.browser.open_group.as_ref().unwrap().files;
+        assert!(
+            files[0].is_keeper && !files[1].is_keeper,
+            "the rows are back"
+        );
+        assert!(app.browser.keeper_by_default, "and so is the default");
+    }
+
+    /// While the classic window's plan is being built a mark is refused: the plan would not hold
+    /// it, and the batch would leave it behind in a group it changed.
+    #[test]
+    fn a_mark_waits_while_the_plan_is_being_built() {
+        let _role = crate::state::store::role_guard();
+        let (scenario, mut app, rx, _scan_id) = opened("mark_during_plan");
+        app.zfs.pools = vec![crate::model::dataset::Pool {
+            name: "tank".to_string(),
+            datasets: vec![crate::actions::tests::dataset_over(
+                &scenario.root,
+                "tank/a",
+            )],
+        }];
+        app.browser.file_state.select(Some(1));
+        app.browser_mark(Some(ActionKind::Delete));
+        pump_until(&mut app, &rx, "the mark acknowledgement", |app| {
+            app.pending_marks.is_empty()
+        });
+        drain(&mut app, &rx);
+
+        app.open_review();
+        assert!(app.routes.plan.is_some(), "the plan is on its way");
+        app.browser.file_state.select(Some(2));
+        app.browser_mark(Some(ActionKind::Delete));
+        assert!(app.status.contains("being built"), "{}", app.status);
+        assert!(app.pending_marks.is_empty(), "no mark was sent");
+        app.browser_set_keeper();
+        assert!(app.pending_marks.is_empty(), "nor a keeper");
+
+        pump_until(&mut app, &rx, "the plan", |app| app.routes.plan.is_none());
+        drain(&mut app, &rx);
+        assert_eq!(app.screen, Screen::ActionReview, "{}", app.status);
+        assert_eq!(app.review.plan.as_ref().unwrap().actions().len(), 1);
+    }
+
+    /// A write the database left unanswered gives the rows back — and whether their keeper was
+    /// still the one shown by default with them.
+    #[test]
+    fn an_unanswered_write_restores_the_default_keeper() {
+        let (mut app, _rx) = test_app();
+        let before = vec![FileEntry {
+            path: PathBuf::from("/a/far.bin"),
+            device: 1,
+            is_keeper: true,
+            ..Default::default()
+        }];
+        app.browser.open_group = Some(DuplicateGroup {
+            id: 0,
+            size_bytes: 1,
+            hash: "ab".repeat(32),
+            files: Vec::new(),
+        });
+        app.browser.keeper_by_default = false;
+        app.restore_mark_origin(MarkOrigin::WizardGroup {
+            before,
+            keeper_by_default: true,
+        });
+        let files = &app.browser.open_group.as_ref().unwrap().files;
+        assert_eq!(files.len(), 1);
+        assert!(files[0].is_keeper);
+        assert!(app.browser.keeper_by_default);
+    }
+
+    /// The status line of a moved default keeper, word for word in the classic chapter.
+    #[test]
+    fn the_manual_quotes_the_moved_keeper() {
+        let quoted = keeper_moved(Path::new("<path>"));
+        let text = crate::testfixtures::manual("06-classic.md");
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains(&quoted), "06-classic.md must quote: {quoted}");
+    }
+
+    /// A Delete crosses datasets: the default keeper stays where it is.
+    #[test]
+    fn a_delete_mark_leaves_the_default_keeper_in_place() {
+        let _role = crate::state::store::role_guard();
+        let mut group = two_filesystems(
+            "default_keeper_delete",
+            &["near.bin", "target.bin"],
+            &["far.bin"],
+        );
+        let target = group.near[1].clone();
+        group.mark(&target, ActionKind::Delete);
+        assert_eq!(group.keepers(), vec![group.far[0].clone()]);
+        assert!(
+            !group.app.status.contains("keeper moved"),
+            "{}",
+            group.app.status
+        );
+    }
+
+    /// No other file on the target's filesystem: the default keeper stays, and the plan refuses
+    /// the link with its own advice.
+    #[test]
+    fn with_nothing_beside_the_target_the_default_keeper_stays() {
+        let _role = crate::state::store::role_guard();
+        let mut group = two_filesystems(
+            "default_keeper_alone",
+            &["target.bin"],
+            &["far.bin", "far2.bin"],
+        );
+        let target = group.near[0].clone();
+        group.mark(&target, ActionKind::Hardlink);
+        assert_eq!(group.keepers(), vec![group.far[0].clone()]);
+        group.app.open_review();
+        pump_until(&mut group.app, &group.rx, "the plan", |app| {
+            app.routes.plan.is_none()
+        });
+        assert!(
+            group
+                .app
+                .status
+                .contains("pick a keeper on the same dataset"),
+            "{}",
+            group.app.status
+        );
+    }
+
+    /// Only the first mark of the group moves the default keeper: after it the keeper is the one
+    /// the database holds, and moving it would change what the earlier marks link to.
+    #[test]
+    fn only_the_first_mark_moves_the_default_keeper() {
+        let _role = crate::state::store::role_guard();
+        let mut group = two_filesystems(
+            "default_keeper_second",
+            &["near.bin", "other.bin", "target.bin"],
+            &["far.bin"],
+        );
+        let (other, target) = (group.near[1].clone(), group.near[2].clone());
+        group.mark(&other, ActionKind::Delete);
+        group.mark(&target, ActionKind::Hardlink);
+        assert_eq!(group.keepers(), vec![group.far[0].clone()]);
+    }
+
+    /// A group with no keeper at all — the batch settled the marks it showed — takes one beside
+    /// the target first, not merely the first file that is not the target.
+    #[test]
+    fn a_group_without_a_keeper_takes_one_beside_the_target() {
+        let _role = crate::state::store::role_guard();
+        let mut group = two_filesystems(
+            "default_keeper_none",
+            &["near.bin", "target.bin"],
+            &["far.bin"],
+        );
+        for file in &mut group.app.browser.open_group.as_mut().unwrap().files {
+            file.is_keeper = false;
+        }
+        group.app.browser.keeper_by_default = false;
+        let target = group.near[1].clone();
+        group.mark(&target, ActionKind::Hardlink);
+        assert_eq!(group.keepers(), vec![group.near[0].clone()]);
+    }
+
+    /// The keeper taken beside the target is never a file that is itself marked for an action.
+    #[test]
+    fn a_group_without_a_keeper_never_takes_a_marked_file() {
+        let _role = crate::state::store::role_guard();
+        let mut group = two_filesystems(
+            "default_keeper_marked",
+            &["marked.bin", "spare.bin", "target.bin"],
+            &["far.bin"],
+        );
+        for file in &mut group.app.browser.open_group.as_mut().unwrap().files {
+            file.is_keeper = false;
+            if file.path == group.near[0] {
+                file.action = Some(ActionKind::Delete);
+            }
+        }
+        group.app.browser.keeper_by_default = false;
+        let target = group.near[2].clone();
+        group.mark(&target, ActionKind::Hardlink);
+        assert_eq!(group.keepers(), vec![group.near[1].clone()]);
+    }
+
+    /// A keeper the operator chose with Enter stays where they put it, whatever is marked next.
+    #[test]
+    fn an_operator_chosen_keeper_is_never_moved() {
+        let _role = crate::state::store::role_guard();
+        let mut group = two_filesystems(
+            "default_keeper_chosen",
+            &["near.bin", "target.bin"],
+            &["far.bin"],
+        );
+        group.app.browser.file_state.select(Some(0));
+        group.app.browser_set_keeper();
+        pump_until(
+            &mut group.app,
+            &group.rx,
+            "the keeper acknowledgement",
+            |app| app.pending_marks.is_empty(),
+        );
+        drain(&mut group.app, &group.rx);
+        let target = group.near[1].clone();
+        group.mark(&target, ActionKind::Hardlink);
+        assert_eq!(group.keepers(), vec![group.far[0].clone()]);
+    }
+
+    /// The first mark writes the default keeper down; clearing that mark again does not make it a
+    /// default once more.
+    #[test]
+    fn a_written_default_keeper_stays_after_its_mark_is_cleared() {
+        let _role = crate::state::store::role_guard();
+        let mut group = two_filesystems(
+            "default_keeper_written",
+            &["near.bin", "other.bin", "target.bin"],
+            &["far.bin"],
+        );
+        let (other, target) = (group.near[1].clone(), group.near[2].clone());
+        group.mark(&other, ActionKind::Delete);
+        let index = group
+            .app
+            .browser
+            .open_group
+            .as_ref()
+            .unwrap()
+            .files
+            .iter()
+            .position(|file| file.path == other)
+            .unwrap();
+        group.app.browser.file_state.select(Some(index));
+        group.app.browser_mark(None);
+        pump_until(
+            &mut group.app,
+            &group.rx,
+            "the unmark acknowledgement",
+            |app| app.pending_marks.is_empty(),
+        );
+        drain(&mut group.app, &group.rx);
+        group.mark(&target, ActionKind::Hardlink);
+        assert_eq!(group.keepers(), vec![group.far[0].clone()]);
+    }
+
+    /// A group the database already holds actions for, but no keeper, keeps the keeper it shows:
+    /// moving it now could take it away from files those actions are on.
+    #[test]
+    fn a_group_with_actions_already_keeps_its_default_keeper() {
+        let _role = crate::state::store::role_guard();
+        let mut group = two_filesystems_with(
+            "default_keeper_premarked",
+            &["near.bin", "other.bin", "target.bin"],
+            &["far.bin"],
+            &[1],
+        );
+        let target = group.near[2].clone();
+        group.mark(&target, ActionKind::Hardlink);
+        assert_eq!(group.keepers(), vec![group.far[0].clone()]);
     }
 
     /// Matrix 6 — the scripted interaction, from the application's side: ONE activation is
@@ -7384,6 +8263,10 @@ mod actor_route_tests {
                 }],
                 planned: 2,
                 cancelled: true,
+                settlement: Box::new(crate::model::plan::MarkSettlement {
+                    spent: ["/x/a", "/x/b", "/x/c"].map(PathBuf::from).to_vec(),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         ))));
@@ -7419,9 +8302,8 @@ mod actor_route_tests {
             app.should_quit
         });
         assert!(matches!(app.shutdown, ShutdownStage::Done));
-        assert_eq!(
-            crate::state::store::marked_action_paths(&db_path, scan_id),
-            vec![PathBuf::from("/x/c")],
+        assert!(
+            crate::state::store::marked_action_paths(&db_path, scan_id).is_empty(),
             "the settlement was the real write, not a claim about one"
         );
         assert!(
@@ -7455,6 +8337,7 @@ mod action_review_scroll_tests {
         app.review = ReviewState {
             plan: test_plan(count),
             confirming: false,
+            claim: None,
             list,
             visible_rows: rows,
         };
@@ -9091,6 +9974,7 @@ mod preflight_refusal_tests {
             act: app.installed_act,
             req,
             plan: Box::new(plan),
+            unrunnable: Unrunnable::default(),
         })));
     }
 
@@ -9161,27 +10045,102 @@ mod preflight_refusal_tests {
         assert!(app.commander.pending_plan.is_some());
     }
 
-    /// A batch in which nothing can run comes back to its confirmation with its own line in the
-    /// status — no wrapper, no debug dump — so the operator can fix the cause and confirm again.
+    /// A batch in which nothing can run does not hand its plan back to a confirmation that could
+    /// only be refused again — like a plan built that way. Its own line goes to the status, no
+    /// wrapper and no debug dump; the operator fixes the cause and builds the plan again.
     #[test]
-    fn a_plan_where_nothing_can_run_comes_back_with_its_reason() {
-        let (mut app, _rx) = test_app();
-        let (_scenario, _twin, plan) = reflink_plan("nothing_back");
-        app.commander.return_to_commander = true;
+    fn a_batch_where_nothing_can_run_closes_its_confirmation() {
         let reason = "nothing done — 1 action cannot run: read-only filesystem (tank/test); no \
                       snapshot taken, marks kept; first: /tank/test/twin.bin";
-        app.on_apply_finished(ApplyOutcome::Refused {
+        let refused = |plan: ActionPlan| ApplyOutcome::Refused {
             refusal: ApplyRefusal::NothingCanRun {
                 reason: reason.to_string(),
             },
             plan: Box::new(plan),
-        });
+        };
+
+        let (mut app, _rx) = test_app();
+        let (_scenario, _twin, plan) = reflink_plan("nothing_back_commander");
+        app.commander.return_to_commander = true;
+        app.on_apply_finished(refused(plan));
         assert_eq!(app.commander.status, reason);
+        assert_eq!(app.commander.overlay, Overlay::None);
+        assert!(app.commander.pending_plan.is_none());
+        assert_eq!(app.mode, AppMode::Commander);
+
+        let (mut app, _rx) = test_app();
+        let (_scenario, _twin, plan) = reflink_plan("nothing_back_wizard");
+        app.mode = AppMode::Wizard;
+        app.screen = Screen::Applying;
+        app.on_apply_finished(refused(plan));
+        assert_eq!(app.status, reason);
+        assert_eq!(app.screen, Screen::Browser);
+        assert!(app.review.plan.is_none());
+    }
+
+    /// Any other refusal hands the plan back, and its window still says what cannot run: the
+    /// plan carries the reading it was confirmed with. So does a classic review that goes back to
+    /// the commander's window — a Browser opened from the commander does.
+    #[test]
+    fn a_refused_batch_hands_its_plan_back_with_what_cannot_run() {
+        let read = |plan: ActionPlan| {
+            let mut reasons = vec![None; plan.actions().len()];
+            reasons[0] = Some("read-only filesystem (tank/test)".to_string());
+            let reading = Unrunnable::new(reasons);
+            (plan.with_unrunnable(reading.clone()), reading)
+        };
+
+        let (mut app, _rx) = test_app();
+        app.zfs.capabilities.reflink_safe = true;
+        let (_scenario, _twin, plan) = reflink_plan("busy_back_commander");
+        let (plan, reading) = read(plan);
+        crate::tui::commander::actions::seat_plan(&mut app, plan);
+        let plan = app.commander.pending_plan.take().unwrap();
+        app.commander.return_to_commander = true;
+        app.on_apply_finished(ApplyOutcome::Refused {
+            refusal: ApplyRefusal::DatabaseBusy,
+            plan: Box::new(plan),
+        });
+        assert!(matches!(app.commander.overlay, Overlay::Confirm { .. }));
+        assert_eq!(app.commander.confirm_digest.unrunnable, 1);
+        let seated = app.commander.pending_plan.as_ref().unwrap();
+        assert_eq!(seated.unrunnable(), &reading);
+        assert!(seated.is_set_aside(0), "and Y still keeps it out");
+
+        let (mut app, _rx) = test_app();
+        let (_scenario, _twin, plan) = reflink_plan("busy_back_wizard");
+        let (plan, reading) = read(plan);
+        app.review = ReviewState::seat(plan);
+        let plan = app.review.plan.take().unwrap();
+        app.mode = AppMode::Wizard;
+        app.on_apply_finished(ApplyOutcome::Refused {
+            refusal: ApplyRefusal::DatabaseBusy,
+            plan: Box::new(plan),
+        });
+        assert_eq!(app.screen, Screen::ActionReview);
+        assert_eq!(app.review.plan.as_ref().unwrap().unrunnable(), &reading);
         assert!(
-            matches!(app.commander.overlay, Overlay::Confirm { .. }),
-            "the plan is seated again"
+            app.review.claim.is_some(),
+            "the figure without it, worked out again"
         );
-        assert!(app.commander.pending_plan.is_some());
+
+        // A classic review whose batch goes back to the commander's window.
+        let (mut app, _rx) = test_app();
+        app.zfs.capabilities.reflink_safe = true;
+        let (_scenario, _twin, plan) = reflink_plan("busy_back_crossed");
+        let (plan, reading) = read(plan);
+        app.review = ReviewState::seat(plan);
+        let plan = app.review.plan.take().unwrap();
+        app.commander.return_to_commander = true;
+        app.on_apply_finished(ApplyOutcome::Refused {
+            refusal: ApplyRefusal::DatabaseBusy,
+            plan: Box::new(plan),
+        });
+        assert_eq!(app.commander.confirm_digest.unrunnable, 1);
+        assert_eq!(
+            app.commander.pending_plan.as_ref().unwrap().unrunnable(),
+            &reading
+        );
     }
 
     /// On a host that cannot clone, the classic browser's reflink mark says what the host needs.

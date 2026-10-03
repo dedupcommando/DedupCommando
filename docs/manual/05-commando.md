@@ -412,6 +412,15 @@ A short terminal gives things up in order — first the quoted paths, then the
 spacing, then the snapshot note, then the size — so that the count, the
 composition, the `… and N more` and the `[Y]/[N]` hint are always on screen.
 
+When some actions of the plan cannot run where their files are — a read-only or
+full dataset, `chattr +i`, a second mount, a file on no dataset
+([§8.6](08-actions.md#before-the-snapshots--can-the-action-be-carried-out-at-all))
+— Summary counts the rest against the plan, `Actions to be executed: N of M over
+K allocation(s)`, names the first of the others with `L cannot run here —
+<reason>` and `first: <path>`, and leaves them out of the size; those two lines
+are never given up. When none can run, the confirmation does not open, and the
+status line says why.
+
 The **Commands** tab shows the plan's shell script and scrolls: the script of a
 large plan runs to thousands of lines, and the whole point of an audit view is
 that it can be read to the end. The overlay title carries the position as

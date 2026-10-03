@@ -234,13 +234,29 @@ where its files are — without reading their content and without changing anyth
   a file;
 - a Reflink can be made by the host and by the pool ([§8.3](#83-reflink--an-independent-inode-with-shared-blocks)).
 
-An action that fails a check is refused with the reason, without its snapshot and without
-its files being read, and the rest of the batch goes on. A dataset gets a snapshot only
-when at least one of its actions can run. When no action of the batch can run, nothing is
-changed and no snapshot is taken, the plan goes back to its confirmation with its marks,
-and the status line says why — the first action's reason, then its path:
+The same checks run when the plan is built, so its confirmation says what will not run
+before you confirm. Both windows count those actions apart — `Execute N of M action(s)
+over K allocation(s)?` in the classic review, `Actions to be executed: N of M over K
+allocation(s)` in commando — name the first of them with its reason and its path, as
+`L cannot run here — <reason>` and `first: <path>`, and leave them out of the figure; the
+classic review also marks each such row with `✗` and its reason. When no action of the
+plan can run, the confirmation does not open, and the status line says why in the words
+the batch would use — the first action's reason, then its path:
 `nothing done — N actions cannot run: …; no snapshot taken, marks kept; first: …`.
-Fix the cause and confirm again, or change the marks.
+Fix the cause or change the marks, and build the plan again (F11, or **r** in the classic
+Browser).
+
+The batch makes the checks once more before its snapshots, since what held when the plan
+was built may not hold at [Y]. What the confirmation counted out stays out even when its
+cause is gone by then — the batch refuses it as
+`set aside by the confirmation — build the plan again` — so no more runs than you
+confirmed. An action that fails a check is refused with the reason, without its snapshot
+and without its files being read, and the rest of the batch goes on; it keeps its mark
+while nothing else in its group was changed (see the end of
+[§8.6](#86-revalidation--the-final-check-before-each-action)). A dataset gets a snapshot
+only when at least one of its actions can run. When no action of the batch can run,
+nothing is changed and no snapshot is taken, the confirmation closes, the marks stay, and
+the status line gives the same `nothing done …` line.
 What the kernel does not tell is never a reason to refuse: such an action meets the
 kernel's own answer at its moment, after its snapshot.
 
@@ -289,9 +305,14 @@ dedcom --strict-verify  # Strict
 | `<role> <path>: <io_error>` | The file is gone / no permission / the disk dropped out |
 
 Each error affects a single action; it does not affect the rest of the batch. Its mark
-does not survive the batch: a batch that runs to its end clears every mark of the scan,
-keepers included, and only the actions a cancelled batch (Esc) never reached keep theirs.
-Review a "cancelled" item after a fresh scan and mark it again.
+does not survive the batch. Whether the batch runs to its end or is stopped with Esc, every
+group in which an action ran — done or failed — loses all its marks, keepers included:
+its files no longer match the scan, and one mark of it left behind would bring the group
+into the next plan, which would refuse as a whole. A group none of whose actions ran keeps
+its marks: one the batch never reached, and one whose actions were all refused before the
+snapshots — fix the cause and build the plan again. So does a group with no action at all —
+only a keeper, or marked files that already are the keeper's allocation: no batch changes
+it. Review a "cancelled" item after a fresh scan and mark it again.
 
 > TOCTOU note: operations act by PATH, not by an open file descriptor, so the
 > theoretical "check → act" window exists. Mitigations: the ZFS snapshot, the atomic

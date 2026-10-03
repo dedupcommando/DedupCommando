@@ -15,12 +15,17 @@ use std::path::{Path, PathBuf};
 
 use crate::model::action::ActionKind;
 use crate::model::dataset::Dataset;
-use crate::model::plan::{ActionPlan, PlanAction};
+use crate::model::plan::{ActionPlan, PlanAction, Unrunnable};
 
-use super::{dataset_by_device, quarantine, ApplyOps};
+use super::{dataset_by_device, quarantine, ApplyOps, RealOps};
 
 /// What a host needs before `dedcom` reflinks on it — the gate of `zfs::version::detect`.
 pub const CLONE_NEEDS: &str = "needs OpenZFS 2.2.1 or newer with zfs_bclone_enabled=1";
+
+/// The refusal of an action the plan's confirmation counted out, when nothing stands in its way any
+/// more: it does not run behind the operator's back, and its mark stays for the next plan while
+/// nothing else in its group ran.
+pub const SET_ASIDE: &str = "set aside by the confirmation — build the plan again";
 
 /// Which kind of pathname a probe asks about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +148,17 @@ impl<'a> Probes<'a> {
         self.nests.insert(mountpoint.to_path_buf(), nest.clone());
         nest
     }
+}
+
+/// What stands in the way of each action of `plan` as the kernel says it now: the pass the batch
+/// makes before its snapshots, made when the plan is built, so its confirmation can name what will
+/// not run. It reads every target — never on the interface thread.
+pub(crate) fn unrunnable(
+    plan: &ActionPlan,
+    datasets: &[Dataset],
+    reflink_safe: bool,
+) -> Unrunnable {
+    Unrunnable::new(obstacles(&RealOps, plan, datasets, reflink_safe))
 }
 
 /// The obstacle of every action of `plan`, in the plan's order — one pass, before any snapshot.
@@ -297,17 +313,27 @@ fn differ(one: Option<u64>, other: Option<u64>) -> bool {
 }
 
 /// The refusal of a batch in which no action can run: it takes no snapshot, changes nothing and
-/// keeps the marks. `None` while at least one action can run. The count and the first reason come
-/// before the pathname: the status line does not wrap.
-pub(super) fn nothing_can_run(plan: &ActionPlan, obstacles: &[Option<String>]) -> Option<String> {
-    if obstacles.iter().any(Option::is_none) {
+/// keeps the marks. `None` while at least one action can run, and for obstacles read for another
+/// plan. The count and the first reason come before the pathname: the status line does not wrap.
+/// Said by the batch, and before it by the plan's confirmation, which then does not open.
+pub(crate) fn nothing_can_run(plan: &ActionPlan, obstacles: &[Option<String>]) -> Option<String> {
+    if obstacles.len() != plan.actions().len() || obstacles.iter().any(Option::is_none) {
         return None;
     }
-    let (action, reason) = plan
-        .actions()
-        .iter()
-        .zip(obstacles)
-        .find_map(|(action, obstacle)| obstacle.as_ref().map(|reason| (action, reason)))?;
+    // A cause that appeared since the plan was built is what the operator has to hear about; the
+    // confirmation's own setting aside only when there is nothing else to name.
+    let first = |skip_set_aside: bool| {
+        plan.actions()
+            .iter()
+            .zip(obstacles)
+            .find_map(|(action, obstacle)| {
+                obstacle
+                    .as_deref()
+                    .filter(|reason| !(skip_set_aside && *reason == SET_ASIDE))
+                    .map(|reason| (action, reason))
+            })
+    };
+    let (action, reason) = first(true).or_else(|| first(false))?;
     Some(format!(
         "nothing done — {} cannot run: {reason}; no snapshot taken, marks kept; first: {}",
         counted(obstacles.len(), "action"),
@@ -493,6 +519,20 @@ mod tests {
             assert_eq!(
                 reflink_refusal(&plan, &cloning(&scenario, pool), safe),
                 None
+            );
+        }
+    }
+
+    /// The refusal of an action the confirmation counted out, word for word where the manual
+    /// describes the checks and where an operator looks the message up.
+    #[test]
+    fn the_manual_quotes_the_set_aside_refusal() {
+        for chapter in ["08-actions.md", "13-troubleshooting.md"] {
+            let text = crate::testfixtures::manual(chapter);
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                text.contains(SET_ASIDE),
+                "{chapter} must quote: {SET_ASIDE}"
             );
         }
     }

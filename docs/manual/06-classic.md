@@ -240,6 +240,14 @@ also carries the suffix `-> DELETE`, `-> HARDLINK`, or `-> REFLINK`.
 | **r**                  | Go to the action review (ActionReview)              |
 | **?**                  | Keyboard help                                       |
 
+Until you choose a keeper with **Enter**, a group that has none shows its first file
+as the keeper, and the first mark writes it down. A Hardlink or a Reflink cannot cross
+datasets, so when the group's first mark is one of them and that default is on another
+dataset than the file you mark, the keeper moves to the group's first file on the
+marked file's dataset, if there is one, and the status line says so:
+`The keeper moved to <path> — a link needs one on the same dataset`. A Delete leaves the
+default where it is, and so does any later mark.
+
 ### How the Browser differs from the commando views
 
 In commando, the same data is shown by the **GroupList + GroupFiles** pair
@@ -274,6 +282,15 @@ the Browser before it is ready, it is dropped, and **r** builds it again:
 Each row is `{KIND:9}  {path}   ({bytes})`. The row under the cursor carries the
 `▶ ` marker and is drawn in reverse video; long plans scroll — the list follows
 the cursor, and the title counts where in the plan it stands (`N of M`).
+
+A row whose action cannot run where its file is
+([§8.6](08-actions.md#before-the-snapshots--can-the-action-be-carried-out-at-all))
+carries `✗` and the reason, for example
+`DELETE   ✗ /tank/ro/a.bin   (4.0 KiB)   read-only filesystem (tank/ro)`. The footer then counts
+`Operations: N of M`, gets a line `L cannot run here — <reason>` for the first of them,
+and its figure leaves them out; the confirmation asks `Execute N of M action(s) over K
+allocation(s)?` and names the first one. When no action can run, the review does not
+open, and the status line says why.
 
 | Key         | Action                                                              |
 |-------------|---------------------------------------------------------------------|

@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::app::App;
 use crate::model::action::BatchResult;
-use crate::model::plan::{ObjectRealization, ZeroReason};
+use crate::model::plan::{MarkSettlement, ObjectRealization, ZeroReason};
 use crate::tui::human_bytes;
 
 /// How many exact quarantine pathnames the screen prints before summarising the rest.
@@ -50,6 +50,27 @@ fn zeros_by_reason(result: &BatchResult) -> Vec<(&'static str, usize)> {
         .collect()
 }
 
+/// What a batch left of the marks, one sentence per kind: the actions that did not run and keep
+/// their marks — the next plan carries them out — and those whose group the batch changed, which
+/// lost theirs with it. The Summary prints both; leaving it, the status line repeats the first.
+pub(crate) fn marks_left(settlement: &MarkSettlement) -> Vec<String> {
+    let mut lines = Vec::new();
+    if settlement.left_marked > 0 {
+        lines.push(format!(
+            "{} action(s) did not run and keep their marks — plan them again",
+            settlement.left_marked
+        ));
+    }
+    if settlement.left_unmarked > 0 {
+        lines.push(format!(
+            "{} action(s) did not run, in groups the batch changed — their marks are cleared; \
+             scan again for them",
+            settlement.left_unmarked
+        ));
+    }
+    lines
+}
+
 /// Summary screen: what was done, safety snapshots, the path to freeing disk space.
 pub fn render(frame: &mut Frame, app: &App) {
     let result = match &app.summary_result {
@@ -87,17 +108,26 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
 
     // A cancelled batch must not read as a finished one — the header above counts only what was
-    // reached, and the rest of the plan is still marked and waiting.
+    // reached.
     if result.cancelled {
         lines.push(Line::from(
             format!(
-                "  CANCELLED: {} of {} actions were reached — the marks of the rest are kept",
+                "  CANCELLED: {} of {} actions were reached",
                 result.outcomes.len(),
                 result.planned,
             )
             .bold()
             .yellow(),
         ));
+    }
+    // What is still marked, and what is not although it did not run — before the list of errors,
+    // which can run off the bottom of the screen. Not for a batch that refused itself as a whole:
+    // it ran nothing and settled nothing, and the line above says so. Nor while the settlement is
+    // not acknowledged: nothing is cleared yet, and the warning at the bottom says why.
+    if result.aborted.is_none() && !app.marks_unsettled {
+        for line in marks_left(&result.settlement) {
+            lines.push(Line::from(format!("  {line}")).yellow());
+        }
     }
 
     for outcome in &result.outcomes {
@@ -243,6 +273,68 @@ mod tests {
             snapshots: vec!["tank@dedcom-20260925-120000-0".to_string()],
             quarantine_dirs: vec![PathBuf::from("/tank/.dedcom-quarantine/20260925-120000-0")],
             ..Default::default()
+        }
+    }
+
+    /// What the batch left of the marks: a stopped batch counts what it reached, and the two
+    /// kinds of action that did not run are said apart — before the list of errors, which can run
+    /// off the screen. A batch that refused itself as a whole settled nothing and says only that.
+    #[test]
+    fn the_summary_says_which_marks_the_batch_left() {
+        let (mut app, _events) = crate::app::test_app();
+        let mut result = batch_with_quarantine(vec![ActionOutcome {
+            kind: ActionKind::Delete,
+            target: PathBuf::from("/tank/a.bin"),
+            quarantine: None,
+            result: Ok(()),
+        }]);
+        result.planned = 5;
+        result.cancelled = true;
+        result.settlement = Box::new(MarkSettlement {
+            spent: Vec::new(),
+            left_marked: 3,
+            left_unmarked: 1,
+        });
+        app.summary_result = Some(result.clone());
+        let shown = screen(&app, 140, 30);
+        for line in [
+            "CANCELLED: 1 of 5 actions were reached",
+            "3 action(s) did not run and keep their marks — plan them again",
+            "1 action(s) did not run, in groups the batch changed — their marks are cleared; \
+             scan again for them",
+        ] {
+            assert!(shown.contains(line), "{line}\n{shown}");
+        }
+
+        // Until the settlement is acknowledged nothing is cleared, and the screen does not say so.
+        app.marks_unsettled = true;
+        let shown = screen(&app, 140, 30);
+        assert!(!shown.contains("did not run"), "{shown}");
+        app.marks_unsettled = false;
+
+        result.aborted = Some("a covered pathname moved after the snapshots".to_string());
+        app.summary_result = Some(result);
+        let shown = screen(&app, 140, 30);
+        assert!(!shown.contains("did not run"), "{shown}");
+    }
+
+    /// The manual quotes both sentences where it says what Esc during an apply leaves.
+    #[test]
+    fn the_manual_quotes_what_the_batch_left_of_the_marks() {
+        let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let chapter = words(&crate::testfixtures::manual("03-safety.md"));
+        let lines = marks_left(&MarkSettlement {
+            spent: Vec::new(),
+            left_marked: 7,
+            left_unmarked: 7,
+        });
+        assert_eq!(lines.len(), 2);
+        for line in lines {
+            let quoted = words(&line.replace('7', "N"));
+            assert!(
+                chapter.contains(&quoted),
+                "03-safety.md must quote: {quoted}"
+            );
         }
     }
 

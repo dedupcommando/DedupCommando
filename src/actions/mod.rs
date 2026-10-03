@@ -432,7 +432,18 @@ fn run_batch(
     // 2. What stands in the way of each action, read before anything exists. An action with an
     //    obstacle is refused without a snapshot and without its files being read; a batch in which
     //    nothing can run refuses as a whole — no snapshot, no change, and the marks stay.
-    let obstacles = preflight::obstacles(ops, plan, datasets, reflink_safe);
+    //    What the confirmation counted out stays out even when its cause is gone by now: no
+    //    more runs than was confirmed.
+    let obstacles: Vec<Option<String>> = preflight::obstacles(ops, plan, datasets, reflink_safe)
+        .into_iter()
+        .enumerate()
+        .map(|(index, found)| {
+            found.or_else(|| {
+                plan.is_set_aside(index)
+                    .then(|| preflight::SET_ASIDE.to_string())
+            })
+        })
+        .collect();
     if let Some(refusal) = preflight::nothing_can_run(plan, &obstacles) {
         return Ok(Begun::NothingCanRun(refusal));
     }
@@ -522,6 +533,11 @@ fn run_batch(
 
     shared.set_phase(ApplyPhase::Done);
     let (realized, realized_summary) = plan.realize(&results)?;
+    // An action ran when it was reached and got past the check before the snapshots; one refused
+    // there, like one never reached, changed nothing, and its group keeps its marks.
+    let ran: Vec<bool> = (0..plan.actions().len())
+        .map(|index| index < outcomes.len() && batch.obstacles[index].is_none())
+        .collect();
     Ok(Begun::Ran(Box::new(BatchResult {
         outcomes,
         snapshots: snapshots_made,
@@ -529,10 +545,11 @@ fn run_batch(
         planned: plan.actions().len(),
         cancelled,
         aborted: None,
-        plan: plan.summary().clone(),
+        plan: plan.runnable_summary().into_owned(),
         realized,
         realized_summary,
         bytes_read: shared.bytes_done.load(Ordering::Relaxed),
+        settlement: Box::new(plan.settle_marks(&ran)),
     })))
 }
 
@@ -547,10 +564,11 @@ fn aborted_batch(plan: &ActionPlan, snapshots: Vec<String>, detail: String) -> R
         planned: plan.actions().len(),
         cancelled: false,
         aborted: Some(detail),
-        plan: plan.summary().clone(),
+        plan: plan.runnable_summary().into_owned(),
         realized,
         realized_summary,
         bytes_read: 0,
+        settlement: Box::new(plan.settle_marks(&[])),
     })
 }
 
@@ -2772,8 +2790,8 @@ pub(crate) mod tests {
         assert_eq!(batch.realized_summary.zero_objects(), 1);
     }
 
-    /// Esc mid-batch must not come back looking like a completed run: the caller decides from
-    /// `cancelled` whether the marks of the untouched rest of the plan may be thrown away.
+    /// Esc mid-batch must not come back looking like a completed run, and a batch stopped before
+    /// its first action changed no group: every mark stays.
     #[test]
     fn a_cancelled_batch_says_so_and_counts_the_whole_plan() {
         let scenario = PlanScenario::new("cancelled");
@@ -2814,6 +2832,368 @@ pub(crate) mod tests {
         assert_eq!(batch.planned, 2, "«applied 0 of 2» needs the whole plan");
         assert_eq!(batch.realized_summary.guaranteed_bytes(), 0);
         assert_eq!(batch.realized_summary.zero_objects(), 2);
+        assert!(batch.settlement.spent.is_empty(), "no group changed");
+        assert_eq!(
+            (batch.settlement.left_marked, batch.settlement.left_unmarked),
+            (2, 0)
+        );
+    }
+
+    /// Two groups of two files on the scenario's root, each a keeper and a twin marked Delete:
+    /// the first with the shared payload, the second with its own.
+    fn two_groups(tag: &str) -> (PlanScenario, i64, [PathBuf; 4]) {
+        let scenario = PlanScenario::new(tag);
+        let first_keeper = scenario.file("a_keeper.bin");
+        let first_twin = scenario.file("a_twin.bin");
+        let second_keeper = scenario.root.join("b_keeper.bin");
+        let second_twin = scenario.root.join("b_twin.bin");
+        for path in [&second_keeper, &second_twin] {
+            std::fs::write(path, vec![9u8; 8192]).unwrap();
+        }
+        let paths = [first_keeper, first_twin, second_keeper, second_twin];
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &paths);
+        for pair in paths.chunks(2) {
+            scenario.mark(&mut store, scan_id, &pair[0], true, None);
+            scenario.mark(
+                &mut store,
+                scan_id,
+                &pair[1],
+                false,
+                Some(ActionKind::Delete),
+            );
+        }
+        drop(store);
+        (scenario, scan_id, paths)
+    }
+
+    /// Esc after the first action, then F11: the group the batch never reached plans again on its
+    /// own, and the file the batch already moved is not in the new plan.
+    #[test]
+    fn after_esc_the_group_never_reached_plans_again() {
+        let (scenario, scan_id, _) = two_groups("esc_rest");
+        let plan = plan_of(&scenario, scan_id);
+        assert_eq!(plan.actions().len(), 2);
+        let shared = std::sync::Arc::new(ApplyShared::default());
+        let stop = std::sync::Arc::clone(&shared);
+        // Esc while the first action runs: the flag is read before the second one.
+        let ops = FakeOps::new().on_before_action(move |index| {
+            if index == 0 {
+                stop.cancel.store(true, Ordering::Relaxed);
+            }
+        });
+        let batch = apply_batch_with(
+            &ops,
+            &plan,
+            &[dataset_over(&scenario.root, "tank/test")],
+            true,
+            &shared,
+            RevalidationMode::Hybrid,
+        )
+        .unwrap();
+        assert!(batch.cancelled);
+        assert_eq!(batch.succeeded(), 1, "{:?}", batch.outcomes);
+        let reached = batch.outcomes[0].target.clone();
+        let settlement = &batch.settlement;
+        assert_eq!(
+            settlement.spent.len(),
+            2,
+            "the reached group, keeper and twin"
+        );
+        assert!(settlement.spent.contains(&reached));
+        assert_eq!((settlement.left_marked, settlement.left_unmarked), (1, 0));
+        scenario
+            .store()
+            .reconcile_marks_after_batch(scan_id, &settlement.spent)
+            .unwrap();
+
+        let again = scenario
+            .store()
+            .build_action_plan(scan_id, &[])
+            .unwrap_or_else(|refusal| panic!("F11 after Esc is refused: {refusal}"));
+        let targets: Vec<&Path> = again.actions().iter().map(PlanAction::target).collect();
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        assert_ne!(targets[0], reached.as_path(), "the reached file is done");
+    }
+
+    /// A group whose action was refused before the snapshots — a read-only dataset — keeps its
+    /// marks through a batch that ran to its end, and plans again once the cause is gone.
+    #[test]
+    fn a_group_refused_before_the_snapshots_keeps_its_marks() {
+        let shm = ShmDir::new("refused_kept");
+        let scenario = PlanScenario::new("refused_kept");
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let frozen_keeper = shm.path.join("keeper.bin");
+        let frozen_twin = shm.path.join("twin.bin");
+        for path in [&frozen_keeper, &frozen_twin] {
+            std::fs::write(path, vec![9u8; 8192]).unwrap();
+        }
+        let paths = [keeper, twin, frozen_keeper, frozen_twin.clone()];
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &paths);
+        for pair in paths.chunks(2) {
+            scenario.mark(&mut store, scan_id, &pair[0], true, None);
+            scenario.mark(
+                &mut store,
+                scan_id,
+                &pair[1],
+                false,
+                Some(ActionKind::Delete),
+            );
+        }
+        drop(store);
+        let plan = plan_of(&scenario, scan_id);
+        let frozen = shm.path.clone();
+        let ops = FakeOps::new().probing(move |path| {
+            path.starts_with(&frozen).then(|| preflight::Probe {
+                read_only: true,
+                ..preflight::Probe::of(path, preflight::Role::Directory)
+            })
+        });
+        let datasets = [
+            dataset_over(&scenario.root, "tank/a"),
+            dataset_over(&shm.path, "tank/b"),
+        ];
+        let batch = run(&ops, &plan, &datasets).unwrap();
+        assert!(!batch.cancelled);
+        assert_eq!(batch.succeeded(), 1, "{:?}", batch.outcomes);
+        let settlement = &batch.settlement;
+        assert_eq!((settlement.left_marked, settlement.left_unmarked), (1, 0));
+        assert!(
+            !settlement.spent.contains(&frozen_twin),
+            "{:?}",
+            settlement.spent
+        );
+        scenario
+            .store()
+            .reconcile_marks_after_batch(scan_id, &settlement.spent)
+            .unwrap();
+
+        let again = scenario
+            .store()
+            .build_action_plan(scan_id, &[])
+            .unwrap_or_else(|refusal| panic!("the refused group lost its marks: {refusal}"));
+        let targets: Vec<&Path> = again.actions().iter().map(PlanAction::target).collect();
+        assert_eq!(targets, vec![frozen_twin.as_path()]);
+    }
+
+    /// What the confirmation counted out does not run even when nothing stands in its way any
+    /// more: it is refused as set aside, its file stays, and its group keeps its marks.
+    #[test]
+    fn what_the_confirmation_set_aside_does_not_run() {
+        let (scenario, scan_id, paths) = two_groups("set_aside");
+        let plan = plan_of(&scenario, scan_id);
+        let aside = plan
+            .actions()
+            .iter()
+            .position(|action| action.target() == paths[3])
+            .unwrap();
+        let mut reasons = vec![None; plan.actions().len()];
+        reasons[aside] = Some("no space left on tank/test (full pool or quota)".to_string());
+        let plan = plan.with_unrunnable(crate::model::plan::Unrunnable::new(reasons));
+        let ops = FakeOps::new();
+        let batch = run(&ops, &plan, &[dataset_over(&scenario.root, "tank/test")]).unwrap();
+
+        let refused = batch
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.target == paths[3])
+            .expect("the set-aside action is reported");
+        assert_eq!(refused.result, Err(preflight::SET_ASIDE.to_string()));
+        assert!(paths[3].exists(), "its file stays");
+        assert_eq!(
+            batch.plan.actions(),
+            1,
+            "the Summary's «planned» is what was confirmed"
+        );
+        assert_eq!(batch.succeeded(), 1, "{:?}", batch.outcomes);
+        assert_eq!(
+            (batch.settlement.left_marked, batch.settlement.left_unmarked),
+            (1, 0)
+        );
+        assert!(!batch.settlement.spent.contains(&paths[3]));
+    }
+
+    /// Two groups on two datasets: the bigger one on the scenario's root, planned first, the other
+    /// on `/dev/shm`. Every keeper and twin is marked.
+    fn groups_on_two_datasets(tag: &str) -> (ShmDir, PlanScenario, i64, [PathBuf; 4]) {
+        let shm = ShmDir::new(tag);
+        let scenario = PlanScenario::new(tag);
+        let keeper = scenario.root.join("keeper.bin");
+        let twin = scenario.root.join("twin.bin");
+        for path in [&keeper, &twin] {
+            std::fs::write(path, vec![5u8; 16384]).unwrap();
+        }
+        let far_keeper = shm.path.join("keeper.bin");
+        let far_twin = shm.path.join("twin.bin");
+        for path in [&far_keeper, &far_twin] {
+            std::fs::write(path, vec![6u8; 4096]).unwrap();
+        }
+        let paths = [keeper, twin, far_keeper, far_twin];
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &paths);
+        for pair in paths.chunks(2) {
+            scenario.mark(&mut store, scan_id, &pair[0], true, None);
+            scenario.mark(
+                &mut store,
+                scan_id,
+                &pair[1],
+                false,
+                Some(ActionKind::Delete),
+            );
+        }
+        drop(store);
+        (shm, scenario, scan_id, paths)
+    }
+
+    /// The plan with one action counted out by its confirmation.
+    fn set_aside(plan: ActionPlan, target: &Path) -> ActionPlan {
+        let mut reasons = vec![None; plan.actions().len()];
+        let index = plan
+            .actions()
+            .iter()
+            .position(|action| action.target() == target)
+            .unwrap();
+        reasons[index] = Some("no space left on tank/a (full pool or quota)".to_string());
+        plan.with_unrunnable(crate::model::plan::Unrunnable::new(reasons))
+    }
+
+    /// A dataset where everything was counted out gets no snapshot; the one where an action runs
+    /// does.
+    #[test]
+    fn a_dataset_with_only_set_aside_actions_gets_no_snapshot() {
+        let (shm, scenario, scan_id, paths) = groups_on_two_datasets("aside_no_snapshot");
+        let plan = set_aside(plan_of(&scenario, scan_id), &paths[3]);
+        let ops = FakeOps::new();
+        let datasets = [
+            dataset_over(&scenario.root, "tank/a"),
+            dataset_over(&shm.path, "tank/b"),
+        ];
+        let batch = run(&ops, &plan, &datasets).unwrap();
+        let made = ops.made();
+        assert_eq!(made.len(), 1, "{made:?}");
+        assert!(made[0].starts_with("tank/a@"), "{made:?}");
+        assert!(paths[3].exists());
+        assert_eq!(batch.succeeded(), 1, "{:?}", batch.outcomes);
+    }
+
+    /// What the confirmation counted out, beside an action with a new obstacle: nothing runs, no
+    /// snapshot is taken, and the refusal names the new cause, not the setting aside.
+    #[test]
+    fn a_new_obstacle_beside_a_set_aside_action_is_what_the_refusal_names() {
+        let (shm, scenario, scan_id, paths) = groups_on_two_datasets("aside_and_new");
+        let plan = set_aside(plan_of(&scenario, scan_id), &paths[1]);
+        assert_eq!(
+            plan.actions()[0].target(),
+            paths[1].as_path(),
+            "the set-aside action comes first in the plan"
+        );
+        let frozen = shm.path.clone();
+        let ops = FakeOps::new().probing(move |path| {
+            path.starts_with(&frozen).then(|| preflight::Probe {
+                read_only: true,
+                ..preflight::Probe::of(path, preflight::Role::Directory)
+            })
+        });
+        let datasets = [
+            dataset_over(&scenario.root, "tank/a"),
+            dataset_over(&shm.path, "tank/b"),
+        ];
+        let refusal = run(&ops, &plan, &datasets).unwrap_err().to_string();
+        assert!(
+            refusal
+                .starts_with("nothing done — 2 actions cannot run: read-only filesystem (tank/b);"),
+            "{refusal}"
+        );
+        assert!(ops.made().is_empty(), "no snapshot");
+        assert!(paths[1].exists() && paths[3].exists());
+    }
+
+    /// A link that failed after its snapshot still changed its group — making the link moved the
+    /// keeper's ctime — so the group's marks go: left behind, they would refuse the next plan as a
+    /// whole.
+    #[test]
+    fn a_failed_link_spends_its_group() {
+        let scenario = PlanScenario::new("failed_link_spent");
+        let keeper = scenario.file("keeper.bin");
+        let twin = scenario.file("twin.bin");
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), twin.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        scenario.mark(
+            &mut store,
+            scan_id,
+            &twin,
+            false,
+            Some(ActionKind::Hardlink),
+        );
+        drop(store);
+        let plan = plan_of(&scenario, scan_id);
+        let ops = FakeOps::new().failing_renames(&[Some(libc::EIO)]);
+        let batch = run(&ops, &plan, &[dataset_over(&scenario.root, "tank/test")]).unwrap();
+        assert_eq!(batch.failed(), 1, "{:?}", batch.outcomes);
+
+        let mut spent = batch.settlement.spent.clone();
+        spent.sort();
+        assert_eq!(spent, vec![keeper, twin]);
+        assert_eq!(
+            (batch.settlement.left_marked, batch.settlement.left_unmarked),
+            (0, 0)
+        );
+        scenario
+            .store()
+            .reconcile_marks_after_batch(scan_id, &batch.settlement.spent)
+            .unwrap();
+        assert_eq!(
+            scenario.store().build_action_plan(scan_id, &[]).err(),
+            Some(crate::model::plan::PlanRefusal::NoMarks),
+            "nothing of the changed group is planned again"
+        );
+    }
+
+    /// One group, two twins: one on a read-only filesystem, refused before the snapshots, the
+    /// other deleted. The group changed, so all of its marks go — the refused twin's too, since
+    /// a plan with it would meet the deleted one and refuse as a whole — and the batch says so.
+    #[test]
+    fn a_refused_action_in_a_changed_group_goes_with_its_group() {
+        let shm = ShmDir::new("refused_mixed");
+        let scenario = PlanScenario::new("refused_mixed");
+        let keeper = scenario.file("keeper.bin");
+        let here = scenario.file("here.bin");
+        let there = shm.path.join("there.bin");
+        std::fs::copy(&keeper, &there).unwrap();
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), here.clone(), there.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        for twin in [&here, &there] {
+            scenario.mark(&mut store, scan_id, twin, false, Some(ActionKind::Delete));
+        }
+        drop(store);
+        let plan = plan_of(&scenario, scan_id);
+        let frozen = shm.path.clone();
+        let ops = FakeOps::new().probing(move |path| {
+            path.starts_with(&frozen).then(|| preflight::Probe {
+                read_only: true,
+                ..preflight::Probe::of(path, preflight::Role::Directory)
+            })
+        });
+        let datasets = [
+            dataset_over(&scenario.root, "tank/a"),
+            dataset_over(&shm.path, "tank/b"),
+        ];
+        let batch = run(&ops, &plan, &datasets).unwrap();
+        assert_eq!(batch.succeeded(), 1, "{:?}", batch.outcomes);
+
+        let mut spent = batch.settlement.spent.clone();
+        spent.sort();
+        let mut group = vec![keeper, here, there];
+        group.sort();
+        assert_eq!(spent, group, "the whole group, keeper included");
+        assert_eq!(
+            (batch.settlement.left_marked, batch.settlement.left_unmarked),
+            (0, 1)
+        );
     }
 
     #[test]

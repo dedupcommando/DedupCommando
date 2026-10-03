@@ -42,7 +42,8 @@ pub fn prepare_execution(app: &mut App) {
     }
 }
 
-/// Seats a plan the authority just built: its script, its digest and its overlay, together.
+/// Seats a plan the authority just built: its script, its digest and its overlay, together. The
+/// digest sets aside what the plan's own reading says cannot run where its files are.
 pub(crate) fn seat_plan(app: &mut App, plan: ActionPlan) {
     // Shell-script preview — datasets are needed for quarantine and snapshot paths, as in the
     // batch itself.
@@ -182,6 +183,7 @@ mod tests {
         drop(store);
 
         let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        root_dataset(&mut app, &scenario.root);
         open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
         assert_eq!(
             app.commander.dedup_scan_id,
@@ -316,6 +318,7 @@ mod tests {
         drop(store);
 
         let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        root_dataset(&mut app, &scenario.root);
         open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
         drain(&mut app, &rx);
         app.commander.panels[0].marks.insert(keeper, Mark::Keeper);
@@ -557,6 +560,7 @@ mod tests {
         let _role = role_guard();
         let (scenario, scan_id, keeper, copy) = marked_before_a_restart("restart_shows");
         let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        root_dataset(&mut app, &scenario.root);
         open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
         list_in_panel(&mut app, &rx, 0, &scenario.root);
 
@@ -584,6 +588,7 @@ mod tests {
         let _role = role_guard();
         let (scenario, scan_id, _keeper, copy) = marked_before_a_restart("restart_unlisted");
         let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        root_dataset(&mut app, &scenario.root);
         open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
         drain(&mut app, &rx);
         assert!(
@@ -648,6 +653,7 @@ mod tests {
             second
         };
         let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        root_dataset(&mut app, &scenario.root);
         open_and_settle(&mut app, &rx, first, OpenIntent::Commander);
         list_in_panel(&mut app, &rx, 0, &scenario.root);
         assert_eq!(
@@ -923,19 +929,36 @@ mod tests {
     }
 
     /// After a batch stopped with Esc, the panel showing the folder shows what the database kept:
-    /// the keeper, and the marks of the actions never reached — the work F11 can still do.
+    /// every mark of the group the batch never reached — the work F11 still does — and none of the
+    /// group it changed.
     #[test]
     fn a_stopped_batch_leaves_the_unreached_marks_on_the_panel() {
         let _role = role_guard();
         let scenario = PlanScenario::new("stopped_batch");
         let keeper = scenario.file("keeper.bin");
         let done = scenario.file("done.bin");
-        let left = scenario.file("left.bin");
+        let other_keeper = scenario.root.join("other_keeper.bin");
+        let left = scenario.root.join("left.bin");
+        for path in [&other_keeper, &left] {
+            std::fs::write(path, vec![9u8; 8192]).unwrap();
+        }
+        let paths = [
+            keeper.clone(),
+            done.clone(),
+            other_keeper.clone(),
+            left.clone(),
+        ];
         let mut store = scenario.store();
-        let scan_id = scenario.seed(&mut store, &[keeper.clone(), done.clone(), left.clone()]);
-        scenario.mark(&mut store, scan_id, &keeper, true, None);
-        for copy in [&done, &left] {
-            scenario.mark(&mut store, scan_id, copy, false, Some(ActionKind::Delete));
+        let scan_id = scenario.seed(&mut store, &paths);
+        for pair in paths.chunks(2) {
+            scenario.mark(&mut store, scan_id, &pair[0], true, None);
+            scenario.mark(
+                &mut store,
+                scan_id,
+                &pair[1],
+                false,
+                Some(ActionKind::Delete),
+            );
         }
         drop(store);
         let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
@@ -943,7 +966,8 @@ mod tests {
         list_in_panel(&mut app, &rx, 0, &scenario.root);
         app.commander.return_to_commander = true;
 
-        // The batch deleted the first copy, then Esc.
+        // The batch deleted the first group's copy, then Esc: that group is spent, the other one
+        // was never reached.
         let reached = crate::model::action::ActionOutcome {
             kind: ActionKind::Delete,
             target: done.clone(),
@@ -955,6 +979,11 @@ mod tests {
                 outcomes: vec![reached],
                 planned: 2,
                 cancelled: true,
+                settlement: Box::new(crate::model::plan::MarkSettlement {
+                    spent: vec![keeper.clone(), done.clone()],
+                    left_marked: 1,
+                    left_unmarked: 0,
+                }),
                 ..Default::default()
             }),
         )));
@@ -970,9 +999,124 @@ mod tests {
         );
 
         let marks = &app.commander.panels[0].marks;
-        assert_eq!(marks.get(&keeper), Some(&Mark::Keeper), "{marks:?}");
+        assert_eq!(marks.get(&keeper), None, "{marks:?}");
         assert_eq!(marks.get(&done), None, "{marks:?}");
+        assert_eq!(marks.get(&other_keeper), Some(&Mark::Keeper), "{marks:?}");
         assert_eq!(marks.get(&left), Some(&Mark::Delete), "{marks:?}");
+    }
+
+    /// The Summary tab as an 80×40 terminal shows it, borders out and whitespace collapsed, so a
+    /// sentence the box wrapped still reads as one.
+    fn summary_text(app: &mut App) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (width, height) = (80u16, 40u16);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                super::super::overlay::render_confirm(
+                    frame,
+                    ConfirmTab::Summary,
+                    &app.commander.confirm_script,
+                    &app.commander.confirm_digest,
+                    &mut app.commander.confirm_scroll,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect::<Vec<_>>()
+            .join("");
+        text.replace(['│', '─', '┌', '┐', '└', '┘'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The scenario's root as one dataset of pool `tank` — what a ZFS host reports at startup.
+    fn root_dataset(app: &mut App, root: &Path) {
+        app.zfs.pools = vec![crate::model::dataset::Pool {
+            name: "tank".to_string(),
+            datasets: vec![crate::actions::tests::dataset_over(root, "tank/a")],
+        }];
+    }
+
+    /// One of two copies is on a filesystem no dataset covers, so the batch would refuse it
+    /// before its snapshot: the confirmation says so before Y, and does not count it.
+    #[test]
+    fn the_confirmation_names_what_cannot_run_and_leaves_it_out() {
+        let _role = role_guard();
+        let shm = crate::actions::tests::ShmDir::new("cannot_run");
+        let scenario = PlanScenario::new("cannot_run");
+        let keeper = scenario.file("keeper.bin");
+        let here = scenario.file("here.bin");
+        let there = shm.path.join("there.bin");
+        std::fs::copy(&keeper, &there).unwrap();
+        let mut store = scenario.store();
+        let scan_id = scenario.seed(&mut store, &[keeper.clone(), here.clone(), there.clone()]);
+        scenario.mark(&mut store, scan_id, &keeper, true, None);
+        for copy in [&here, &there] {
+            scenario.mark(&mut store, scan_id, copy, false, Some(ActionKind::Delete));
+        }
+        drop(store);
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        root_dataset(&mut app, &scenario.root);
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        drain(&mut app, &rx);
+
+        prepare_and_settle(&mut app, &rx);
+        assert!(
+            matches!(app.commander.overlay, Overlay::Confirm { .. }),
+            "{}",
+            app.commander.status
+        );
+        let text = summary_text(&mut app);
+        assert!(text.contains("Actions to be executed: 1 of 2"), "{text}");
+        let plan = app.commander.pending_plan.as_ref().unwrap();
+        let aside: Vec<&Path> = (0..plan.actions().len())
+            .filter(|index| plan.is_set_aside(*index))
+            .map(|index| plan.actions()[index].target())
+            .collect();
+        assert_eq!(
+            aside,
+            vec![there.as_path()],
+            "and the plan Y runs keeps it out"
+        );
+        assert!(text.contains("1 cannot run here"), "{text}");
+        assert!(
+            text.contains("target file's dataset could not be determined"),
+            "{text}"
+        );
+    }
+
+    /// When nothing of the plan can run where its files are, no confirmation opens: the status
+    /// line says what the batch would have said after Y.
+    #[test]
+    fn a_plan_where_nothing_can_run_opens_no_confirmation() {
+        let _role = role_guard();
+        let (scenario, scan_id, _keeper, copy) = marked_before_a_restart("cannot_run_all");
+        // No dataset covers the scenario: the host reported none.
+        let (mut app, rx) = test_app_with_db(scenario.db_path.clone());
+        open_and_settle(&mut app, &rx, scan_id, OpenIntent::Commander);
+        drain(&mut app, &rx);
+
+        prepare_and_settle(&mut app, &rx);
+        assert_eq!(
+            app.commander.overlay,
+            Overlay::None,
+            "{}",
+            app.commander.status
+        );
+        assert!(app.commander.pending_plan.is_none());
+        assert_eq!(
+            app.commander.status,
+            format!(
+                "nothing done — 1 action cannot run: target file's dataset could not be \
+                 determined; no snapshot taken, marks kept; first: {}",
+                copy.display()
+            )
+        );
     }
 
     /// Reopening the same scan shows what the database holds now — the classic interface's

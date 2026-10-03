@@ -180,13 +180,17 @@ opens the pool read-only.
 
 ### "nothing done — N actions cannot run: …; no snapshot taken, marks kept; first: …"
 
-**Cause:** every action of the batch was refused by the checks made before the snapshots
-([§8.6](08-actions.md#before-the-snapshots--can-the-action-be-carried-out-at-all)); the reason
-printed is the first action's. Nothing was snapshotted, read or changed; the plan went
-back to its confirmation, and the marks stay. When only some actions cannot run, the
-others run as usual and the Summary lists each refused one with its reason.
+**Cause:** no action of the plan can run where its files are
+([§8.6](08-actions.md#before-the-snapshots--can-the-action-be-carried-out-at-all)). The
+checks are made when the plan is built — the confirmation then does not open — and again
+by the batch before its snapshots — the confirmation then closes. The reason printed is the
+first action's. Nothing was snapshotted, read or changed, and the marks
+stay. When only some actions cannot run, the confirmation says so with
+`L cannot run here — <reason>` and leaves them out of the figure; the others run as usual,
+the Summary lists each refused one with its reason, and a refused one keeps its mark while
+nothing else in its group was changed.
 
-**Fix,** by the reason — then confirm again:
+**Fix,** by the reason — then build the plan again (F11, or **r** in the classic Browser):
 
 - `read-only filesystem (<dataset>)` — `zfs get readonly <dataset>`; turn it off
   (`zfs set readonly=off <dataset>`) or unmark the files there.
@@ -211,6 +215,10 @@ others run as usual and the Summary lists each refused one with its reason.
 - `target file's dataset could not be determined` — the file is not on a ZFS dataset the
   host reported when `dedcom` started: a non-ZFS filesystem, or a dataset mounted later
   (restart `dedcom`).
+- `set aside by the confirmation — build the plan again` — the confirmation counted this
+  action out, since it could not run when the plan was built, and the batch keeps to what
+  was confirmed even when the cause is gone since. Its mark stays while nothing else in its
+  group ran: build the plan again.
 
 ### Apply cancelled half the actions (revalidation failed)
 

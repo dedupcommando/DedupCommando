@@ -248,9 +248,10 @@ fn summary_lines(digest: &PlanDigest, max_rows: usize) -> Vec<String> {
 /// The Summary body at one particular level of shedding.
 fn compose(digest: &PlanDigest, shed: Shed) -> Vec<String> {
     let actions: usize = digest.counts.iter().map(|(_, count)| count).sum();
+    let planned = (digest.unrunnable > 0).then_some(digest.planned);
     let mut lines = vec![format!(
-        "  Actions to be executed: {actions} over {} allocation(s)",
-        digest.covered_objects,
+        "  {}",
+        actions_line(actions, planned, digest.covered_objects)
     )];
     if !digest.counts.is_empty() {
         let by_kind: Vec<String> = digest
@@ -259,6 +260,17 @@ fn compose(digest: &PlanDigest, shed: Shed) -> Vec<String> {
             .map(|(kind, count)| format!("{} {count}", kind.label().to_lowercase()))
             .collect();
         lines.push(format!("  By type: {}", by_kind.join(" · ")));
+    }
+    // Never shed, like a warning: it is why the count and the figure are less than was marked.
+    if let Some((first, reason)) = &digest.first_unrunnable {
+        let line = crate::tui::cannot_run_phrase(digest.unrunnable, reason);
+        for line in crate::tui::screens::browser::wrap_words(&line, SUMMARY_WIDTH as usize - 2) {
+            lines.push(format!("  {line}"));
+        }
+        lines.push(format!(
+            "  first: {}",
+            ellipsize_left(&crate::textsan::path(first), SUMMARY_PATH),
+        ));
     }
     if shed.size {
         lines.push(format!("  {}", crate::tui::reclaim_phrase(digest.estimate)));
@@ -299,6 +311,17 @@ fn compose(digest: &PlanDigest, shed: Shed) -> Vec<String> {
         lines.push("  A ZFS snapshot for rollback is created before changes.".to_string());
     }
     lines
+}
+
+/// The Summary's count: the actions that run — of how many were planned, when some cannot — and
+/// the allocations they remove a pathname of. The manual quotes it.
+fn actions_line(actions: usize, planned: Option<usize>, covered: usize) -> String {
+    match planned {
+        Some(planned) => {
+            format!("Actions to be executed: {actions} of {planned} over {covered} allocation(s)")
+        }
+        None => format!("Actions to be executed: {actions} over {covered} allocation(s)"),
+    }
 }
 
 /// Tab-label span of the confirmation overlay; the active one is inverted.
@@ -774,6 +797,57 @@ mod confirm_summary_tests {
             "the deletion the operator did not mean must be named:\n{text}"
         );
         assert!(!text.contains("more"), "a 3-action plan is quoted whole");
+    }
+
+    /// The actions that cannot run are counted against the plan and named, and — like a warning —
+    /// never shed: they are why the count and the figure are less than was marked.
+    #[test]
+    fn what_cannot_run_is_named_and_never_shed() {
+        let mut digest = long_plan(12);
+        digest.planned = 14;
+        digest.unrunnable = 2;
+        digest.first_unrunnable = Some((
+            PathBuf::from("/tank/ro/f.bin"),
+            "read-only filesystem (tank/ro)".to_string(),
+        ));
+        let text = joined(&digest, 30);
+        assert!(
+            text.contains("Actions to be executed: 12 of 14 over 12 allocation(s)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("2 cannot run here — read-only filesystem (tank/ro)"),
+            "{text}"
+        );
+        assert!(text.contains("first: /tank/ro/f.bin"), "{text}");
+
+        let tight = summary_lines(&digest, 6).join("\n");
+        assert!(tight.contains("2 cannot run here"), "{tight}");
+        assert!(tight.contains("first: /tank/ro/f.bin"), "{tight}");
+    }
+
+    /// The Summary's count with some actions set aside, as the manual quotes it.
+    #[test]
+    fn the_manual_quotes_the_count_of_what_runs() {
+        let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let quoted = words(
+            &actions_line(7, Some(8), 9)
+                .replace('7', "N")
+                .replace('8', "M")
+                .replace('9', "K"),
+        );
+        assert_eq!(
+            quoted,
+            "Actions to be executed: N of M over K allocation(s)"
+        );
+        for chapter in ["05-commando.md", "08-actions.md"] {
+            let text = words(&crate::testfixtures::manual(chapter));
+            assert!(text.contains(&quoted), "{chapter} must quote: {quoted}");
+        }
+        assert_eq!(
+            actions_line(3, None, 2),
+            "Actions to be executed: 3 over 2 allocation(s)"
+        );
     }
 
     /// A plan longer than the quota says so, instead of quietly showing five of five hundred.

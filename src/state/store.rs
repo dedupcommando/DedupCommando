@@ -2958,26 +2958,19 @@ impl ScanStore {
     }
 
     /// Settles the persisted marks with what a batch of actions actually did — the durable half
-    /// of what each UI does with its own copy. `attempted` are the targets the batch reached.
-    /// A cancelled batch clears only those, so everything it never got to stays marked and a
-    /// re-run applies exactly the remainder; a batch that ran to the end spends the whole plan,
-    /// keepers included. One transaction: the plan is settled as a whole or not at all.
-    pub fn reconcile_marks_after_batch(
-        &mut self,
-        scan_id: i64,
-        attempted: &[PathBuf],
-        cancelled: bool,
-    ) -> Result<()> {
+    /// of what each UI does with its own copy. `spent` is every pathname marked when the plan was
+    /// built, of every group the batch changed (`ActionPlan::settle_marks`): their marks go,
+    /// keepers included. Every other mark
+    /// stays, whether the batch ran to its end or was stopped: an action it never reached, or one
+    /// refused before its snapshots, is in a group whose files still match the scan, and the next
+    /// plan carries it out. One transaction: the batch is settled as a whole or not at all.
+    pub fn reconcile_marks_after_batch(&mut self, scan_id: i64, spent: &[PathBuf]) -> Result<()> {
         let tx = self.conn.transaction()?;
-        if cancelled {
-            let mut clear = tx.prepare("DELETE FROM file_mark WHERE scan_id = ?1 AND path = ?2")?;
-            for target in attempted {
-                clear.execute(params![scan_id, &*target.to_string_lossy()])?;
-            }
-            drop(clear);
-        } else {
-            tx.execute("DELETE FROM file_mark WHERE scan_id = ?1", params![scan_id])?;
+        let mut clear = tx.prepare("DELETE FROM file_mark WHERE scan_id = ?1 AND path = ?2")?;
+        for path in spent {
+            clear.execute(params![scan_id, &*path.to_string_lossy()])?;
         }
+        drop(clear);
         tx.commit()?;
         Ok(())
     }
@@ -13589,18 +13582,23 @@ mod tests {
         rows.map(|row| row.unwrap()).collect()
     }
 
+    /// The settlement deletes exactly the marks it is given and nothing else: which pathnames a
+    /// batch spent is the plan's decision (`ActionPlan::settle_marks`), not the store's.
     #[test]
-    fn reconciling_a_cancelled_batch_leaves_the_rest_of_the_plan_marked() {
-        let (dir, mut store, id) = store_on_disk_with_marked_group("marks_cancelled");
-        // The batch reached /x/b and was stopped before /x/c.
-        store
-            .reconcile_marks_after_batch(id, &[PathBuf::from("/x/b")], true)
-            .unwrap();
-
+    fn reconciling_leaves_every_mark_it_was_not_given() {
+        let (dir, mut store, id) = store_on_disk_with_marked_group("marks_given");
+        store.reconcile_marks_after_batch(id, &[]).unwrap();
         assert_eq!(
             marked_paths(&store, id),
-            vec!["/x/a".to_string(), "/x/c".to_string()],
-            "the attempted target is gone; the keeper the rest of the plan needs stays"
+            vec!["/x/a".to_string(), "/x/b".to_string(), "/x/c".to_string()],
+            "a batch that changed no group spends no mark"
+        );
+        store
+            .reconcile_marks_after_batch(id, &[PathBuf::from("/x/b")])
+            .unwrap();
+        assert_eq!(
+            marked_paths(&store, id),
+            vec!["/x/a".to_string(), "/x/c".to_string()]
         );
 
         drop(store);
@@ -13608,15 +13606,14 @@ mod tests {
     }
 
     #[test]
-    fn reconciling_a_finished_batch_leaves_no_plan_to_rebuild() {
-        let (dir, mut store, id) = store_on_disk_with_marked_group("marks_finished");
-        store
-            .reconcile_marks_after_batch(id, &[PathBuf::from("/x/b"), PathBuf::from("/x/c")], false)
-            .unwrap();
+    fn reconciling_a_changed_group_leaves_none_of_its_marks() {
+        let (dir, mut store, id) = store_on_disk_with_marked_group("marks_changed");
+        let group = ["/x/a", "/x/b", "/x/c"].map(PathBuf::from);
+        store.reconcile_marks_after_batch(id, &group).unwrap();
 
         assert!(
             marked_paths(&store, id).is_empty(),
-            "a spent plan leaves nothing marked, keepers included"
+            "a group the batch changed leaves nothing marked, the keeper included"
         );
 
         drop(store);

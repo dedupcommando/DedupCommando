@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::path::PathBuf;
 
-use crate::model::plan::{ObjectRealization, PlanObjectKey, PlanSummary, RealizedSummary};
+use crate::model::plan::{
+    MarkSettlement, ObjectRealization, PlanObjectKey, PlanSummary, RealizedSummary,
+};
 
 /// Type of action on a duplicate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,19 +67,24 @@ pub struct BatchResult {
     /// «applied N of M» — `outcomes` only ever holds the ones that were reached.
     pub planned: usize,
     /// The operator stopped the batch (Esc, or a shutdown signal) before it ran out of actions.
-    /// A partial result is not a finished one, and the untouched marks must survive it.
+    /// A partial result is not a finished one.
     pub cancelled: bool,
     /// The batch refused itself as a whole after the safety snapshots existed — the second
     /// whole-plan preflight found the plan no longer described the disk. No action ran; the
     /// snapshots above are still there and still have to be reported.
     pub aborted: Option<String>,
-    /// What the plan promised, carried from the `ActionPlan` the batch was given.
+    /// What the confirmation promised: the figure of the `ActionPlan` the batch was given, without
+    /// the actions it counted out.
     pub plan: PlanSummary,
     /// What each covered allocation is actually worth now.
     pub realized: Vec<(PlanObjectKey, ObjectRealization)>,
     pub realized_summary: RealizedSummary,
     /// Bytes re-read during revalidation. A progress metric for the bar, never a reclaim figure.
     pub bytes_read: u64,
+    /// Which marks the batch spent and how many of the actions that did not run keep theirs —
+    /// decided by the groups it changed (`ActionPlan::settle_marks`). Boxed: the result travels
+    /// inside enums whose other variants are small.
+    pub settlement: Box<MarkSettlement>,
 }
 
 impl BatchResult {

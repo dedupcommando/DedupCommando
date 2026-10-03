@@ -32,8 +32,9 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::error::AppError;
+use crate::model::dataset::Dataset;
 use crate::model::duplicate::{AttributedDirGroup, DirSigAlgo, FileEntry};
-use crate::model::plan::{ActionPlan, GroupId, MarkIntent, PlanRefusal, RequestedMark};
+use crate::model::plan::{ActionPlan, GroupId, MarkIntent, PlanRefusal, RequestedMark, Unrunnable};
 use crate::model::scan::{ScanStatus, ScanSummary};
 use crate::state::store::{
     AttributedDirGroupSummaries, CandidateView, DirGroupAnswer, FileInfoAnswer, LiveDirSignature,
@@ -777,12 +778,17 @@ pub enum BrowseRequest {
         act: Activation,
         req: RequestId,
         requested: Vec<RequestedMark>,
+        /// The host's datasets and whether it can clone — what the batch will be given — so the
+        /// answer can say which actions cannot run where their files are.
+        datasets: Vec<Dataset>,
+        reflink_safe: bool,
     },
     ReconcileAfterBatch {
         act: Activation,
         req: RequestId,
-        attempted: Vec<PathBuf>,
-        cancelled: bool,
+        /// The pathnames marked when the plan was built, of every group the batch changed
+        /// (`ActionPlan::settle_marks`).
+        spent: Vec<PathBuf>,
     },
     LatestScan {
         act: Activation,
@@ -864,6 +870,8 @@ pub enum BrowseEvent {
         act: Activation,
         req: RequestId,
         plan: Box<ActionPlan>,
+        /// What stands in the way of each of its actions where its files are, read with it.
+        unrunnable: Unrunnable,
     },
     PlanRefused {
         act: Activation,
@@ -1939,12 +1947,10 @@ mod guarded {
         pub(crate) fn reconcile_marks_after_batch(
             &mut self,
             scan_id: i64,
-            attempted: &[PathBuf],
-            cancelled: bool,
+            spent: &[PathBuf],
         ) -> Result<()> {
             self.inner.ensure_current_path()?;
-            self.inner
-                .reconcile_marks_after_batch(scan_id, attempted, cancelled)
+            self.inner.reconcile_marks_after_batch(scan_id, spent)
         }
 
         pub(crate) fn upsert_hash(
@@ -2182,6 +2188,7 @@ mod arms {
         StoreMiss, SweepFailure,
     };
     use crate::error::AppError;
+    use crate::model::dataset::Dataset;
     use crate::model::duplicate::FileEntry;
     use crate::model::plan::{ActionPlan, GroupId, PlanRefusal, RequestedMark};
     use crate::state::store::{MarkWriteError, MembershipMiss, MembershipMode};
@@ -2233,13 +2240,12 @@ mod arms {
                 act,
                 req,
                 requested,
-            } => build_plan(state, emitter, act, req, requested),
-            BrowseRequest::ReconcileAfterBatch {
-                act,
-                req,
-                attempted,
-                cancelled,
-            } => reconcile(state, emitter, act, req, attempted, cancelled),
+                datasets,
+                reflink_safe,
+            } => build_plan(state, emitter, act, req, requested, &datasets, reflink_safe),
+            BrowseRequest::ReconcileAfterBatch { act, req, spent } => {
+                reconcile(state, emitter, act, req, spent)
+            }
             BrowseRequest::LatestScan { act, req } => latest_scan(state, emitter, act, req),
             BrowseRequest::CoveringScan { act, req, cwd } => {
                 covering_scan(state, emitter, act, req, cwd)
@@ -3225,6 +3231,8 @@ mod arms {
         act: Activation,
         req: RequestId,
         requested: Vec<RequestedMark>,
+        datasets: &[Dataset],
+        reflink_safe: bool,
     ) {
         // A gate refusal travels typed through the funnel — a lazily-opened connection that
         // died of a path mismatch must poison here exactly as it does for every other arm —
@@ -3246,11 +3254,22 @@ mod arms {
             Slot::Open(ref door) => door.build_action_plan(scan_id, &requested),
             Slot::Absent | Slot::Poisoned { .. } => Ok(Err(miss_to_plan(StoreMiss::NotOpen))),
         };
+        // What stands in the way of each action is read here, right after the plan: its own check
+        // has just read every file, the interface never waits for it, and the confirmation can say
+        // what will not run before anything is confirmed.
+        let step = step.map(|built| {
+            built.map(|plan| {
+                let unrunnable =
+                    crate::actions::preflight::unrunnable(&plan, datasets, reflink_safe);
+                (plan, unrunnable)
+            })
+        });
         emitter.finish(state, step, |result| match result {
-            Ok(Ok(plan)) => BrowseEvent::PlanReady {
+            Ok(Ok((plan, unrunnable))) => BrowseEvent::PlanReady {
                 act,
                 req,
                 plan: Box::new(plan),
+                unrunnable,
             },
             Ok(Err(refusal)) => BrowseEvent::PlanRefused { act, req, refusal },
             Err(err) => BrowseEvent::PlanRefused {
@@ -3268,14 +3287,13 @@ mod arms {
         emitter: &Emitter,
         act: Activation,
         req: RequestId,
-        attempted: Vec<PathBuf>,
-        cancelled: bool,
+        spent: Vec<PathBuf>,
     ) {
         let step = match state.scan_gate(act, true) {
             Err(miss) => Err(miss),
             Ok(scan_id) => match state.slot {
                 Slot::Open(ref mut door) => door
-                    .reconcile_marks_after_batch(scan_id, &attempted, cancelled)
+                    .reconcile_marks_after_batch(scan_id, &spent)
                     .map_err(app_to_miss),
                 Slot::Absent | Slot::Poisoned { .. } => Err(StoreMiss::NotOpen),
             },
@@ -3790,6 +3808,8 @@ mod tests {
                     RequestedMark::keeper(a1.clone()),
                     RequestedMark::acting(a2.clone(), ActionKind::Delete),
                 ],
+                datasets: Vec::new(),
+                reflink_safe: false,
             },
         );
         let req = rig.req();
@@ -3811,8 +3831,7 @@ mod tests {
             BrowseRequest::ReconcileAfterBatch {
                 act,
                 req,
-                attempted: Vec::new(),
-                cancelled: false,
+                spent: Vec::new(),
             },
         );
         let req = rig.req();
@@ -5011,13 +5030,12 @@ mod tests {
         }));
         let _ = rig.recv();
         assert_eq!(rig.marked(1), 1);
-        // A finished batch spends the whole plan.
+        // A batch spends the marks of the group it changed, the keeper's too.
         let req = rig.req();
         assert!(rig.handle.send_raw(BrowseRequest::ReconcileAfterBatch {
             act: Activation(1),
             req,
-            attempted: vec![a2.clone()],
-            cancelled: false,
+            spent: vec![a1.clone(), a2.clone()],
         }));
         match rig.recv() {
             BrowseEvent::ReconcileAck { result: Ok(()), .. } => {}
@@ -5198,6 +5216,8 @@ mod tests {
                 act,
                 req,
                 requested: vec![RequestedMark::keeper(a1.clone())],
+                datasets: Vec::new(),
+                reflink_safe: false,
             },
         );
         let req = rig.req();
@@ -5208,8 +5228,7 @@ mod tests {
             BrowseRequest::ReconcileAfterBatch {
                 act,
                 req,
-                attempted: Vec::new(),
-                cancelled: false,
+                spent: Vec::new(),
             },
         );
         let req = rig.req();
@@ -6357,8 +6376,7 @@ mod tests {
         )
         .unwrap();
         at = expect(&door, at, 1, "dir_aggregates");
-        door.reconcile_marks_after_batch(scan_id, &[], false)
-            .unwrap();
+        door.reconcile_marks_after_batch(scan_id, &[]).unwrap();
         at = expect(&door, at, 1, "reconcile_marks_after_batch");
         door.upsert_hash(1, 2, 3, 4, &[6u8; 32]).unwrap();
         at = expect(&door, at, 1, "upsert_hash");

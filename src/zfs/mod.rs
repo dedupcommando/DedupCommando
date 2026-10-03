@@ -20,8 +20,9 @@ pub struct ZfsEnvironment {
 }
 
 impl ZfsEnvironment {
-    /// Detects datasets and ZFS capabilities. Does not fail: problems
-    /// are collected into `warnings`, so that delete/hardlink work even without ZFS.
+    /// Detects datasets and ZFS capabilities. Does not fail: problems are collected into
+    /// `warnings` and the program goes on. An action still needs a dataset: one whose target is on
+    /// none is refused before the snapshots (`actions::preflight::place`) — nothing could insure it.
     pub fn detect() -> Self {
         let mut warnings = Vec::new();
 

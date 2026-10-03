@@ -363,8 +363,9 @@ What happens:
 3. **Done** — the summary.
 
 **Esc** — cancel on an action boundary. What has been done by that point is in
-quarantine and reversible. Details in
-[§03 Safety](03-safety.md#pull-the-cable-during-apply-between-actions).
+quarantine and reversible, and the groups the batch never reached keep their marks:
+**F11** executes them. Details in
+[§03 Safety](03-safety.md#press-esc-during-apply).
 
 ## Step 11. Summary
 
