@@ -5,6 +5,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::cli::Cli;
 
@@ -539,6 +541,208 @@ pub struct PathIdentity {
 pub fn probe_existing_db_file(db_path: &Path) -> io::Result<PathIdentity> {
     let st = stat_db_path(db_path).map_err(|err| db_file_error(DbStep::Verify, db_path, err))?;
     require_regular_db_file(DbStep::Verify, db_path, &st)?;
+    Ok(PathIdentity {
+        device: st.st_dev as u64,
+        inode: st.st_ino as u64,
+    })
+}
+
+/// What follows the name of a database in the names of its three files: nothing for the database
+/// itself, then its journal, then the index of the journal.
+pub const DATABASE_FILE_SUFFIXES: [&str; 3] = ["", "-wal", "-shm"];
+
+/// The files SQLite holds for this process, one entry for each connection it has open.
+///
+/// A read-write lock, and what it orders is the close of a descriptor against the opening of a
+/// connection: [`unless_open_database_file`] asks and closes with the lock held to read, and a
+/// connection is entered here — with the lock held to write — before SQLite opens its file. So a
+/// descriptor that is closed through that function is never closed over a file that has just
+/// become a connection's.
+///
+/// The price is that the close itself happens with the list held. A close that blocks — on a
+/// filesystem that waits for something when a file is closed — holds up every connection that
+/// opens or closes meanwhile, and behind those every other question asked here.
+static OPEN_DATABASES: RwLock<Vec<HeldFiles>> = RwLock::new(Vec::new());
+
+/// Tells one entry of [`OPEN_DATABASES`] from another: two connections on one database are two.
+static NEXT_OPEN_DATABASE: AtomicU64 = AtomicU64::new(0);
+
+/// The three files of one connection.
+struct HeldFiles {
+    connection: u64,
+    /// Where each of the three is looked for, absolute: a relative path has to go on naming the
+    /// same place whatever the working directory is when it is next looked at.
+    names: [PathBuf; 3],
+    /// The files SQLite is known to hold, each noted from its name at the moment the connection
+    /// had it: the database when the store was about to open it, the journal and its index once
+    /// the connection had read ([`OpenDatabase::note_files`]). Noted and not looked up again,
+    /// because SQLite keeps the file it opened and not the name: a file that is renamed while it
+    /// is open stays the file to stay away from. A name whose file is not noted answers for
+    /// whatever it holds at the moment of the question.
+    ///
+    /// Forgotten again just before the connection closes ([`OpenDatabase::closing`]). Up to
+    /// then the number of a file cannot pass to another file, because the connection has the
+    /// file open; from the close on it can, and a number kept past its file would in time
+    /// refuse somebody else's. (The journal and its index are open only for a database in WAL
+    /// mode — the one mode a store leaves a database in.)
+    noted: [Option<PathIdentity>; 3],
+}
+
+impl HeldFiles {
+    /// Notes, of the first `count` names, those that hold something and are not noted yet.
+    fn note(&mut self, count: usize) {
+        for (name, noted) in self.names.iter().zip(self.noted.iter_mut()).take(count) {
+            if noted.is_none() {
+                *noted = identity_at(name).ok();
+            }
+        }
+    }
+
+    /// The three files as of now: what was noted, and for the rest what the name holds.
+    fn files(&self) -> impl Iterator<Item = PathIdentity> + '_ {
+        self.names
+            .iter()
+            .zip(self.noted.iter())
+            .filter_map(|(name, noted)| noted.or_else(|| identity_at(name).ok()))
+    }
+}
+
+// A panic elsewhere while the list was held leaves it as true as it was, so a poisoned lock is
+// taken all the same.
+fn open_databases() -> RwLockReadGuard<'static, Vec<HeldFiles>> {
+    OPEN_DATABASES
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+fn open_databases_mut() -> RwLockWriteGuard<'static, Vec<HeldFiles>> {
+    OPEN_DATABASES
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A database this process has open through SQLite — for as long as this value lives.
+///
+/// The other half of what [`stat_db_path`] is about. Nothing here opens the database file to look
+/// at it any more; but this program also reads files for their content — a scan, a hash asked for
+/// in a panel, the check before an action — and a read ends in a close. So does a read of the
+/// journal index (`-shm`), on which SQLite keeps locks of the same kind: with those gone, the
+/// next process to open the database takes the index for nobody's and cuts it short under this
+/// one. Whatever reads files for their content therefore asks [`is_open_database_file`] before it
+/// opens one, and [`unless_open_database_file`] before it closes one.
+///
+/// Whoever opens a connection takes one of these before SQLite opens the file, tells it when the
+/// connection has read ([`Self::note_files`]) and when it is about to close ([`Self::closing`]),
+/// and drops it once the connection is closed. While it lives, the three names — or the files
+/// noted from them — are refused to every read.
+#[derive(Debug)]
+pub struct OpenDatabase(u64);
+
+impl OpenDatabase {
+    /// Taken before SQLite opens the file at `db_path`, which is noted here if it is there: it
+    /// is the file the connection is about to hold.
+    pub fn at(db_path: &Path) -> Self {
+        let path = std::path::absolute(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+        let connection = NEXT_OPEN_DATABASE.fetch_add(1, Ordering::Relaxed);
+        let mut held = HeldFiles {
+            connection,
+            names: DATABASE_FILE_SUFFIXES.map(|suffix| {
+                let mut name = path.as_os_str().to_owned();
+                name.push(suffix);
+                PathBuf::from(name)
+            }),
+            noted: [None; 3],
+        };
+        held.note(1);
+        open_databases_mut().push(held);
+        Self(connection)
+    }
+
+    /// Notes those of the three files that are there now and not noted yet: as a rule the journal
+    /// and its index, which the connection holds once it has read — the database was noted at
+    /// [`Self::at`] and stays as it was. An opener asks as its last step, so if the journal's or
+    /// the index's name changed hands after the first read, the newcomer is what is noted.
+    pub fn note_files(&self) {
+        self.with(|held| held.note(3));
+    }
+
+    /// Forgets what was noted, so that the three names answer for themselves again. To be asked
+    /// for as the last thing before the connection closes — see `HeldFiles::noted`.
+    pub fn closing(&self) {
+        self.with(|held| held.noted = [None; 3]);
+    }
+
+    fn with(&self, change: impl FnOnce(&mut HeldFiles)) {
+        if let Some(held) = open_databases_mut()
+            .iter_mut()
+            .find(|held| held.connection == self.0)
+        {
+            change(held);
+        }
+    }
+}
+
+impl Drop for OpenDatabase {
+    fn drop(&mut self) {
+        let mut open = open_databases_mut();
+        let forgotten = open
+            .iter()
+            .filter(|held| held.connection == self.0)
+            .all(|held| held.noted == [None; 3]);
+        open.retain(|held| held.connection != self.0);
+        drop(open);
+        // Whoever lets go of this without having said `closing` has kept numbers past the close
+        // of their connection — the mistake `HeldFiles::noted` describes. Said aloud in a debug
+        // build, after the entry is gone; not during a panic, where a second one would end the
+        // process.
+        debug_assert!(
+            forgotten || std::thread::panicking(),
+            "an OpenDatabase was dropped with files still noted: `closing` was not called"
+        );
+    }
+}
+
+/// The files of every database this process has open: the database, its journal (`-wal`) and
+/// the index of that (`-shm`), each by `(st_dev, st_ino)`.
+///
+/// By identity, because a name proves nothing here: a hard link elsewhere in a scanned tree is
+/// the same file, and so is a file that was moved. A name whose file is not noted is looked at —
+/// by `lstat`, without a descriptor ([`stat_db_path`]) — and one that holds nothing is simply
+/// not in the answer. Empty while no database is open.
+pub fn open_database_files() -> Vec<PathIdentity> {
+    open_databases().iter().flat_map(HeldFiles::files).collect()
+}
+
+/// Whether `file` is one of [`open_database_files`] — the question for a single file that is
+/// about to be read.
+pub fn is_open_database_file(file: PathIdentity) -> bool {
+    holds(&open_databases(), file)
+}
+
+/// Does `act` unless `file` is one of [`open_database_files`], and says whether it did — the
+/// question and the act as one step, for an act that must not happen to such a file: the close
+/// of a descriptor. No connection can be entered in the list between the answer and the act
+/// (see [`OPEN_DATABASES`]).
+///
+/// `act` runs with the list held: it must not open or drop a store, nor ask about a file.
+pub fn unless_open_database_file(file: PathIdentity, act: impl FnOnce()) -> bool {
+    let open = open_databases();
+    if holds(&open, file) {
+        return false;
+    }
+    act();
+    true
+}
+
+fn holds(open: &[HeldFiles], file: PathIdentity) -> bool {
+    open.iter()
+        .any(|held| held.files().any(|theirs| theirs == file))
+}
+
+/// What the name `path` holds, by `(st_dev, st_ino)` and whatever kind of thing it is — looked at
+/// the way [`stat_db_path`] looks, without a descriptor.
+pub fn identity_at(path: &Path) -> io::Result<PathIdentity> {
+    let st = stat_db_path(path)?;
     Ok(PathIdentity {
         device: st.st_dev as u64,
         inode: st.st_ino as u64,
@@ -1931,6 +2135,245 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// The name of the file of `db` that carries `suffix`.
+    fn beside(db: &Path, suffix: &str) -> PathBuf {
+        let mut name = db.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    }
+
+    /// A database is known by its three files from the moment it is held to the moment the last
+    /// holder lets go — two connections on one database are two holders — and not a moment longer.
+    /// Other tests hold databases of their own meanwhile, so only these three files are asked about.
+    #[test]
+    fn an_open_database_is_known_by_its_three_files_while_it_is_held() {
+        let base = temp_path("open_db");
+        let db = base.join("dedcom.db");
+        let conn = wal_connection(&db);
+        let files = DATABASE_FILE_SUFFIXES.map(|suffix| identity_at(&beside(&db, suffix)).unwrap());
+        let known = || {
+            let all = open_database_files();
+            let listed = files.iter().filter(|file| all.contains(file)).count();
+            let asked = files
+                .iter()
+                .filter(|file| is_open_database_file(**file))
+                .count();
+            (listed, asked)
+        };
+        assert_eq!(known(), (0, 0), "nobody holds it yet");
+
+        let first = OpenDatabase::at(&db);
+        assert_eq!(
+            known(),
+            (3, 3),
+            "the database, its journal and the index of that"
+        );
+        let second = OpenDatabase::at(&db);
+        first.closing();
+        drop(first);
+        assert_eq!(known(), (3, 3), "one holder is left");
+        second.closing();
+        assert_eq!(
+            known(),
+            (3, 3),
+            "and answers by the three names while it closes"
+        );
+        drop(second);
+        assert_eq!(known(), (0, 0), "the last holder is gone");
+        drop(conn);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// What is held is the file, not the name: the database is noted when it is about to be
+    /// opened, and from then on it is known wherever it is moved to, and whatever takes its old
+    /// name is not taken for it. A name whose file was not there to note answers for what it
+    /// holds at the moment — nothing more.
+    #[test]
+    fn an_open_database_is_known_by_the_file_it_held_not_by_the_name() {
+        let base = temp_path("open_db_moved");
+        let db = base.join("dedcom.db");
+        prepare_db_file(&db).unwrap();
+        let file = identity_at(&db).unwrap();
+        let held = OpenDatabase::at(&db);
+        let moved = base.join("moved.db");
+        std::fs::rename(&db, &moved).unwrap();
+        prepare_db_file(&db).unwrap();
+        // Told that its connection has read, a holder notes what it had not noted yet and
+        // leaves what it had: the database's name has another file by now.
+        held.note_files();
+        assert!(
+            is_open_database_file(file) && identity_at(&moved).unwrap() == file,
+            "the file that was held, under its new name"
+        );
+        assert!(
+            !is_open_database_file(identity_at(&db).unwrap()),
+            "another file under the old name"
+        );
+        assert!(
+            !is_open_database_file(PathIdentity {
+                device: file.device.wrapping_add(1),
+                inode: file.inode,
+            }),
+            "the same number on another device is another file"
+        );
+        held.closing();
+        drop(held);
+        assert!(!is_open_database_file(file), "nobody holds it any more");
+
+        let late = base.join("late.db");
+        let held = OpenDatabase::at(&late);
+        prepare_db_file(&late).unwrap();
+        let file = identity_at(&late).unwrap();
+        assert!(
+            is_open_database_file(file),
+            "the file came after the holder"
+        );
+        std::fs::rename(&late, base.join("late-moved.db")).unwrap();
+        assert!(
+            !is_open_database_file(file),
+            "it was never noted, and its name holds nothing now"
+        );
+        drop(held);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// What a holder is told once its connection has read notes the journal and its index as
+    /// they are at that moment, so that they are known wherever they are moved to afterwards;
+    /// what it is told as the connection is about to close makes the names answer for themselves
+    /// again. And the names are kept absolute, so that they go on meaning the same place wherever
+    /// the process stands.
+    #[test]
+    fn an_open_database_notes_its_files_when_told_and_forgets_them_at_the_close() {
+        let base = temp_path("open_db_noted");
+        let db = base.join("dedcom.db");
+        let held = OpenDatabase::at(&db);
+        let index = beside(&db, "-shm");
+        std::fs::write(&index, b"index").unwrap();
+        held.note_files();
+        let moved = base.join("moved-shm");
+        std::fs::rename(&index, &moved).unwrap();
+        let file = identity_at(&moved).unwrap();
+        assert!(
+            is_open_database_file(file),
+            "noted when told, before it was moved"
+        );
+        held.closing();
+        assert!(
+            !is_open_database_file(file),
+            "forgotten: the name it was noted from holds nothing"
+        );
+        std::fs::rename(&moved, &index).unwrap();
+        assert!(
+            is_open_database_file(file),
+            "and the name answers for what it holds until the holder is gone"
+        );
+        drop(held);
+        assert!(!is_open_database_file(file));
+
+        let relative = OpenDatabase::at(Path::new("some/relative/dedcom.db"));
+        let names = open_databases()
+            .iter()
+            .find(|held| held.connection == relative.0)
+            .map(|held| held.names.clone())
+            .expect("the holder is listed");
+        assert!(names.iter().all(|name| name.is_absolute()), "{names:?}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The question and the act as one step: what must not happen to a file of an open database
+    /// is done to a file nobody holds, and is not done to one that is held.
+    #[test]
+    fn what_must_not_happen_to_an_open_database_is_not_done_to_it() {
+        let base = temp_path("open_db_unless");
+        let db = base.join("dedcom.db");
+        prepare_db_file(&db).unwrap();
+        let file = identity_at(&db).unwrap();
+        let done = std::cell::Cell::new(0);
+        let act = || done.set(done.get() + 1);
+        assert!(unless_open_database_file(file, act), "nobody holds it");
+        assert_eq!(done.get(), 1, "so it was done");
+
+        let held = OpenDatabase::at(&db);
+        assert!(!unless_open_database_file(file, act), "it is held");
+        assert_eq!(done.get(), 1, "so it was not done");
+        held.closing();
+        drop(held);
+        assert!(unless_open_database_file(file, act) && done.get() == 2);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// One step means that the list stays held while the act is done: a connection that asks to
+    /// be entered meanwhile waits until the act is over. Otherwise a database could be opened
+    /// between the answer «nobody holds this file» and the close of a descriptor of it.
+    ///
+    /// The act here lasts 50 ms, and for that long every store this process opens or closes
+    /// waits with the opener below: once a run, and nothing in the suite is timed that tightly.
+    #[test]
+    fn no_database_is_listed_while_the_act_is_under_way() {
+        use std::sync::mpsc;
+        let base = temp_path("open_db_one_step");
+        let db = base.join("dedcom.db");
+        prepare_db_file(&db).unwrap();
+        let file = identity_at(&db).unwrap();
+        let (acting, begun) = mpsc::channel();
+        let (asking, about_to_ask) = mpsc::channel();
+        let (listed, seen) = mpsc::channel();
+        let opener = std::thread::spawn({
+            let db = db.clone();
+            move || {
+                // The other thread has answered and is acting.
+                begun.recv().unwrap();
+                asking.send(()).unwrap();
+                // Has to wait here until the act is over.
+                let held = OpenDatabase::at(&db);
+                listed.send(()).unwrap();
+                held.closing();
+            }
+        });
+        let done = unless_open_database_file(file, || {
+            acting.send(()).unwrap();
+            about_to_ask.recv().unwrap();
+            // The opener is running and one call away from being listed. A slow machine could
+            // only let a wrong order through here, never fail a right one.
+            assert!(
+                seen.recv_timeout(std::time::Duration::from_millis(50))
+                    .is_err(),
+                "a database was listed while the act was under way"
+            );
+        });
+        assert!(
+            done,
+            "the control: nobody held the file, so the act was done"
+        );
+        opener.join().unwrap();
+        seen.recv()
+            .expect("the control: the opener was listed once the act was over");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Letting go of a database whose files are still noted — a close that was not announced —
+    /// is the mistake that lets a number outlive its file. A debug build says so.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "`closing` was not called")]
+    fn letting_go_of_an_open_database_without_closing_is_caught() {
+        // Removes the directory once the holder is gone, the panic notwithstanding. Removed any
+        // earlier, the file would be deleted while its number is still noted — and the number
+        // could pass to a file another test makes in that instant.
+        struct Removed(PathBuf);
+        impl Drop for Removed {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).ok();
+            }
+        }
+        let base = temp_path("open_db_unclosed");
+        let _removed = Removed(base.clone());
+        let db = base.join("dedcom.db");
+        prepare_db_file(&db).unwrap();
+        let held = OpenDatabase::at(&db);
+        drop(held);
+    }
+
     /// The rule itself, for everything here that looks at the DB file or prepares it: none of it
     /// opens the file. A watch on the directory reports each open and each close of a file in it,
     /// whoever makes them — the one case no lock can show included, a file only just created.
@@ -1982,11 +2425,20 @@ mod tests {
         probe_existing_db_file(&db).unwrap();
         verify_existing_db_file(&db).unwrap();
         enforce_db_perms_0600(&db).unwrap();
+        // And the list of open databases, from the first word to the last: it only ever looks.
+        let held = OpenDatabase::at(&db);
+        held.note_files();
+        let file = identity_at(&db).unwrap();
+        assert!(is_open_database_file(file) && open_database_files().contains(&file));
+        assert!(!unless_open_database_file(file, || ()));
+        held.closing();
+        assert!(is_open_database_file(file), "by its name, while it closes");
+        drop(held);
         assert_eq!(
             seen(),
             0,
-            "the DB file was opened while it was created, prepared again, identified, verified \
-             or given its permissions"
+            "the DB file was opened while it was created, prepared again, identified, verified, \
+             given its permissions or listed as open"
         );
 
         // The control: the watch does report an open and a close of that very file.

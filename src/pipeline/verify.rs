@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 
@@ -100,7 +99,7 @@ fn files_equal(a: &Path, b: &Path) -> io::Result<bool> {
 }
 
 /// Reads into the buffer until it is full or EOF; returns the number of bytes read.
-fn read_chunk(file: &mut File, buf: &mut [u8]) -> io::Result<usize> {
+fn read_chunk(file: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
         let read = file.read(&mut buf[filled..])?;

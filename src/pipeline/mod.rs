@@ -21,7 +21,7 @@ use walk::{OmissionSnapshot, SnapshotUnavailable, WalkOutcome};
 pub mod governor;
 pub mod hash;
 pub mod roots;
-mod safe_open;
+pub(crate) mod safe_open;
 pub mod verify;
 pub mod walk;
 
@@ -1180,6 +1180,107 @@ mod hash_failures_tests {
             "status Complete without warnings"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A scan whose root holds its own state directory leaves the database it is writing to
+    /// alone: the three files are not part of what it finds, none of them is read, and SQLite
+    /// still holds its locks on them afterwards.
+    ///
+    /// Each of the three has a file of its own size beside it, because only a file with a twin in
+    /// size is read at all — and the journal index is 32768 bytes in every small database, so on
+    /// a real tree such a twin is close to certain. Reading one of them and closing it again used
+    /// to drop every lock this process held on that file: POSIX takes them all with the close of
+    /// ANY descriptor.
+    #[test]
+    fn a_scan_over_its_own_state_directory_leaves_its_database_alone() {
+        use crate::testfixtures::{outside, Errand};
+        let dir = unique_temp_dir("own_state");
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let db = state.join("dedcom.db");
+        let mut store = ScanStore::open_writable(&db).unwrap();
+        for name in ["dedcom.db", "dedcom.db-wal", "dedcom.db-shm"] {
+            let size = std::fs::metadata(state.join(name)).unwrap().len();
+            std::fs::write(
+                dir.join(format!("as-large-as-{name}")),
+                vec![7u8; size as usize],
+            )
+            .unwrap();
+        }
+        let me = format!("held by {}", std::process::id());
+        let locks = || {
+            (
+                outside(Errand::SharedLockHolder, &db),
+                outside(Errand::IndexLockHolder, &db),
+            )
+        };
+        assert_eq!(
+            locks(),
+            (me.clone(), me.clone()),
+            "the control: SQLite holds its lock on the database and on the journal index"
+        );
+
+        let mut cfg = ScanConfig::new(vec![dir.clone()]);
+        cfg.min_size = 0;
+        let cancel = AtomicBool::new(false);
+        let outcome = run_scan(&mut store, &cfg, None, false, &cancel, |_| {}).unwrap();
+
+        assert_eq!(
+            locks(),
+            (me.clone(), me),
+            "after a scan that walked its own state directory"
+        );
+        let results = match outcome {
+            ScanOutcome::Completed(results) => results,
+            ScanOutcome::Cancelled => panic!("expected Completed, not Cancelled"),
+        };
+        assert_eq!(
+            results.summary.hash_failures, 0,
+            "nothing of the database reached the hashing, so nothing failed there"
+        );
+        assert_eq!(
+            store.scan_status(results.scan_id).unwrap(),
+            ScanStatus::Complete,
+            "and the scan has nothing to warn about"
+        );
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The one exception to «a folder is called a twin only if the scan saw all of it», pinned
+    /// as it is (`model::omission::OmissionReason` says why): a file of the open database is left
+    /// out without a record, so a folder that holds one — here through a hard link — is offered
+    /// as a twin of a folder that differs from it by that file alone.
+    #[test]
+    fn a_folder_that_holds_a_file_of_the_open_database_is_still_called_a_twin() {
+        let dir = unique_temp_dir("own_twin");
+        let db = dir.join("state").join("dedcom.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let mut store = ScanStore::open_writable(&db).unwrap();
+        let tree = dir.join("tree");
+        for folder in ["a", "b"] {
+            std::fs::create_dir_all(tree.join(folder)).unwrap();
+            std::fs::write(tree.join(folder).join("film.bin"), vec![7u8; 8192]).unwrap();
+        }
+        std::fs::hard_link(&db, tree.join("a").join("db-link")).unwrap();
+
+        let mut cfg = ScanConfig::new(vec![tree.clone()]);
+        cfg.min_size = 0;
+        let cancel = AtomicBool::new(false);
+        let id = match run_scan(&mut store, &cfg, None, false, &cancel, |_| {}).unwrap() {
+            ScanOutcome::Completed(results) => results.scan_id,
+            ScanOutcome::Cancelled => panic!("expected Completed, not Cancelled"),
+        };
+        let groups = store.attributed_dir_groups(id).unwrap();
+        assert_eq!(groups.len(), 1, "the two folders are one group");
+        assert_eq!(groups[0].group.paths, [tree.join("a"), tree.join("b")]);
+        assert_eq!(
+            groups[0].trust,
+            crate::model::duplicate::DirTrust::Trusted,
+            "and nothing says that the first holds one file more"
+        );
+        drop(store);
         std::fs::remove_dir_all(&dir).ok();
     }
 

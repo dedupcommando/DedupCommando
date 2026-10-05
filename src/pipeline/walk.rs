@@ -243,6 +243,9 @@ struct Sink<'a> {
     /// A directory yielded without its identity, until the walk's next item shows whether the
     /// walk went into it — see `absorb`. At most one: an entry either settles it or stops the walk.
     unverified: Option<Unverified>,
+    /// The files of the database this process has open, as they were when the walk began: the
+    /// one permanent exclusion that is known by what a file is rather than by a name.
+    own_database: &'a [crate::paths::PathIdentity],
 }
 
 /// A directory whose `(device, inode)` could not be read, and why.
@@ -696,6 +699,20 @@ fn absorb(
         }
     };
 
+    // The database this process has open — the file, its journal, the index of that — whatever
+    // name it was reached by. A permanent exclusion like `.zfs` and the quarantine directory,
+    // and left out the way they are: before any of the branches below, without an omission
+    // recorded. Reading the database or the index as a file would cost SQLite its locks on it
+    // (`paths::OpenDatabase`), and all three are what the scan itself is writing to: nobody's
+    // duplicates. The price is stated where the ledger's rule is (`model::omission`): a
+    // folder that holds one of them is not thereby kept from being called a twin.
+    if sink.own_database.contains(&crate::paths::PathIdentity {
+        device: meta.dev(),
+        inode: meta.ino(),
+    }) {
+        return Ok(());
+    }
+
     let size = meta.size();
     if size < config.min_size {
         sink.record_child(entry.path(), OmissionReason::MinSize);
@@ -760,7 +777,8 @@ fn absorb(
 /// `DirAliasGuard` are shared across every root, because a tree reachable twice THROUGH TWO ROOTS
 /// is exactly what that guard exists to catch.
 ///
-/// The `.zfs` and quarantine directories are excluded. Aborts on `cancel`.
+/// The `.zfs` and quarantine directories are excluded, and so are the files of the database this
+/// process has open. Aborts on `cancel`.
 /// `on_progress` periodically receives (entries scanned, files found).
 ///
 /// **Non-UTF8 guard:** a path that cannot be represented as
@@ -798,6 +816,10 @@ pub fn walk_collecting(
     let mut dirs = super::roots::DirAliasGuard::default();
     let mut log = WalkErrorLog::default();
     let mut cancelled = false;
+    // Read once: the scan holds its database open from before the walk until after it, and for
+    // that long SQLite keeps the same three files. A file that slips past this all the same is
+    // still refused where it would be read (`safe_open`).
+    let own_database = crate::paths::open_database_files();
 
     let snapshot = match root_keys(&config.roots) {
         // No authority to be had. The scan still walks exactly as it always did — this is a verdict
@@ -817,6 +839,7 @@ pub fn walk_collecting(
                 account: Account::Observed(&mut tally),
                 log: &mut log,
                 unverified: None,
+                own_database: &own_database,
             };
             // Test-only: the same iterator-error seam the ledgered branch has, so the observed
             // tally's walk-error counting is provable without a filesystem that misbehaves.
@@ -858,6 +881,7 @@ pub fn walk_collecting(
                     }),
                     log: &mut log,
                     unverified: None,
+                    own_database: &own_database,
                 };
                 // Test-only: an iterator error this root's filesystem has no way to produce —
                 // pathless, or nested inside `Partial`. Fires once, and only for this root.
@@ -1320,6 +1344,71 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// The database this process has open is not part of what a walk finds, whatever the root:
+    /// its three files are left out by what they are, not by what they are called, so a hard link
+    /// to one of them elsewhere in the tree is left out with it. Like `.zfs` and the quarantine
+    /// directory they are left out without a word in the ledger — and only for as long as the
+    /// database is open: after that it is a file like any other.
+    #[test]
+    fn the_walk_leaves_out_the_database_this_process_has_open() {
+        let root = temp_dir("own_db");
+        let state = root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let db = state.join("dedcom.db");
+        let store = crate::state::store::ScanStore::open_writable(&db).unwrap();
+        fs::write(root.join("kept.bin"), b"an ordinary file").unwrap();
+        fs::write(
+            state.join("beside.bin"),
+            b"an ordinary file beside the database",
+        )
+        .unwrap();
+        fs::hard_link(&db, root.join("alias.bin")).unwrap();
+
+        let outcome = collect(&base_config(&root));
+        assert_eq!(
+            walked_names(finished(&outcome), &root),
+            ["kept.bin", "state/beside.bin"],
+            "the database, its journal, the index of that and the link are left out"
+        );
+        assert_eq!(
+            cells(&outcome, &root),
+            vec![],
+            "and no omission is recorded for them"
+        );
+
+        drop(store);
+        let outcome = collect(&base_config(&root));
+        assert_eq!(
+            walked_names(finished(&outcome), &root),
+            [
+                "alias.bin",
+                "kept.bin",
+                "state/beside.bin",
+                "state/dedcom.db"
+            ],
+            "the control: once nothing has it open, the database is walked like any file"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The manual lists what a scan always skips, and the three files are on that list by name.
+    #[test]
+    fn the_manual_lists_the_open_database_among_the_permanent_exclusions() {
+        let chapter = crate::testfixtures::manual("07-scanning.md");
+        let section = chapter
+            .split_once("### Permanent exclusions")
+            .and_then(|(_, rest)| rest.split_once("\n## "))
+            .map(|(section, _)| section)
+            .expect("07-scanning.md has a «Permanent exclusions» section");
+        for suffix in crate::paths::DATABASE_FILE_SUFFIXES {
+            let name = format!("`dedcom.db{suffix}`");
+            assert!(
+                section.contains(&name),
+                "07-scanning.md, «Permanent exclusions», must name {name}"
+            );
+        }
     }
 
     /// A directory holding one child, plus a file beside it. `sub` is the directory whose metadata

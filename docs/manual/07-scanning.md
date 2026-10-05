@@ -94,9 +94,35 @@ Always skipped:
   read-only).
 - `**/.dedcom-quarantine/**` — our own quarantine (we don't deduplicate
   ourselves).
+- The database of the `dedcom` that is scanning — `dedcom.db`, `dedcom.db-wal` and
+  `dedcom.db-shm` in its state directory. The scan is writing to these three files,
+  and it knows them by what they are, not by name: a hard link to one of them
+  anywhere under a root is skipped with it, and a file that only carries one of these
+  names — a copy in a backup, the database of another `dedcom` — is scanned like any
+  other. So is everything else in the state directory.
 
-These two are skipped silently: nothing under them is counted among the omissions
-below.
+All of these are skipped silently: none of them is counted among the omissions
+below. For the three database files that has one consequence: a folder is not
+treated as incomplete on their account, so a folder that holds one of them can be
+offered as a twin of a folder without it. In practice that takes a hard link to one
+of them in some other folder; the state directory itself is kept out by its other
+files — the log, the lock, the settings.
+
+`dedcom` does not read these three files anywhere else either, for as long as it has
+the database open. **F4** on one of them says so, and so do `--verify` and the check
+before an action where a scan made by an older version lists one — unless that check
+has already stopped at a changed size:
+
+```text
+a file of dedcom's open database, or a hard link to one — it is not read as a file
+```
+
+A move is another matter: before it moves a file, it reads it only when the destination
+holds a file of the same size, to tell whether the two are duplicates. So a move of one
+of the three into a folder that holds a file of its size is not carried out, and these
+words are in `dedcom.log`. Any other move or rename of one of them goes through like
+that of any file — and must not be made while `dedcom` runs
+([§12](12-maintenance.md#state-directory)).
 
 There is no way to add exclusions of your own: a root takes in everything below it,
 including every dataset mounted there, so choose roots that do not reach what must stay
@@ -138,7 +164,8 @@ How a scan reports them:
 - Anything in the table except the size and extension filters, and any failed hash,
   finishes the scan as `complete_with_warnings` — `ready ⚠` in the list of scans.
 - A directory with anything left out under it, a file below the size limit
-  included, is not offered among the twin folders. This holds for roots given as
+  included, is not offered among the twin folders; the permanent exclusions above do
+  not count as left out. This holds for roots given as
   absolute paths; with a relative `--scan` root such directories are listed as
   unverified, and the notice ends with
   `(details not persisted: no completeness authority)`.

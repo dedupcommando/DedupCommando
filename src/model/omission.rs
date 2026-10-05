@@ -8,6 +8,9 @@
 //! reader gets back — including the honest «nobody recorded that» for a scan produced before the
 //! ledger existed.
 //!
+//! One more drop came later and leaves no trace on purpose: the files of the database the scanning
+//! process itself has open. What that costs the rule above is said at [`OmissionReason`].
+//!
 //! Nothing here decides what to DO with a verdict. Suppressing a signature, wording a warning and
 //! refusing a destructive plan belong to the later integration; this module stays policy-neutral
 //! so those decisions are made in one place rather than three.
@@ -120,7 +123,19 @@ pub enum EventKind {
 /// One per branch of the walk that drops something. There is deliberately no variant for an
 /// intentional exclusion (`.zfs`, the quarantine directory, an operator exclusion glob): those are
 /// applied before an entry is ever yielded, so they cannot reach any of these branches, and giving
-/// them a variant would let a deliberate narrowing masquerade as user-data incompleteness.
+/// them a variant would let a deliberate narrowing masquerade as user-data incompleteness. The
+/// files of the database this process has open are an intentional exclusion as well, and for
+/// that reason have no variant either — but they are known by what they are, which no glob can
+/// say, so they are yielded, and the walk drops them once it has read what they are: ahead of
+/// the size, extension and name branches, after the three that can fail before that.
+///
+/// That drop is the one exception to the rule this module opens with, and it is a known one.
+/// Unlike `.zfs` and the quarantine these are regular files inside an ordinary folder — the
+/// state directory, or a folder into which somebody hard-linked one of them — and that folder
+/// is not marked incomplete: it can be called an exact twin of a folder without the file.
+/// Recording the drop under a reason of its own would make the rule whole, at the price of a
+/// value an older build refuses to read; until that is done two tests pin the exception as it
+/// is — the walk's, that nothing is recorded, and the pipeline's, what that costs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OmissionReason {
     /// Smaller than the configured minimum size.

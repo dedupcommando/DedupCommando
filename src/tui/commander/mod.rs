@@ -2889,7 +2889,15 @@ fn same_size_files(dir: &Path, size: u64) -> std::io::Result<Vec<PathBuf>> {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err),
         };
-        if meta.is_file() && meta.size() == size {
+        // A file of the database this process has open is nobody's duplicate, and finding out
+        // would take a read of it, which it does not get (`pipeline::safe_open`).
+        let candidate = meta.is_file()
+            && meta.size() == size
+            && !crate::paths::is_open_database_file(crate::paths::PathIdentity {
+                device: meta.dev(),
+                inode: meta.ino(),
+            });
+        if candidate {
             out.push(entry.path());
         }
     }
@@ -4505,6 +4513,34 @@ mod triage_tests {
         assert!(same_size_files(&dir, 999)
             .expect("the directory reads")
             .is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file of the database this process has open is not listed, whatever its size: it is
+    /// nobody's duplicate, and it could not be read to find out — a file moved into the state
+    /// directory would otherwise be refused for the sake of a comparison that cannot be made.
+    /// Once nothing has the database open, its file is a file like any other.
+    #[test]
+    fn same_size_files_leaves_out_the_open_database() {
+        let dir = temp_dir("own_db");
+        let db = dir.join("dedcom.db");
+        let store = crate::state::store::ScanStore::open_writable(&db).unwrap();
+        let index = dir.join("dedcom.db-shm");
+        let size = fs::metadata(&index).unwrap().len();
+        fs::write(dir.join("as-large.bin"), vec![7u8; size as usize]).unwrap();
+        assert_eq!(
+            same_size_files(&dir, size).expect("the directory reads"),
+            vec![dir.join("as-large.bin")],
+            "the journal index has that size too, and is not a candidate"
+        );
+
+        drop(store);
+        let size = fs::metadata(&db).unwrap().len();
+        assert_eq!(
+            same_size_files(&dir, size).expect("the directory reads"),
+            vec![db.clone()],
+            "the control: the closed database is listed by its size"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -26,7 +26,10 @@ pub fn reflink(
         mountpoint,
         quarantine_dir,
         |keeper, temp| {
-            reflink_copy::reflink(keeper, temp)
+            // The library opens the keeper itself and closes it again, so the look that every
+            // other read takes inside `open_regular_nofollow` is taken here.
+            crate::pipeline::safe_open::refuse_open_database(keeper)
+                .and_then(|()| reflink_copy::reflink(keeper, temp))
                 .map_err(|err| AppError::msg(format!("reflink failed: {err}")))
         },
     )
@@ -128,6 +131,47 @@ mod tests {
             value.truncate(size as usize);
             Some(value)
         }
+    }
+
+    /// A clone has its keeper opened by a library, past the one place that knows which files are
+    /// the database this process has open. So the look is taken here: such a keeper is refused
+    /// before the library opens it — and closes it again, which would cost SQLite its lock —
+    /// and the file that was to be replaced stays as it is.
+    #[test]
+    fn a_keeper_that_is_the_open_database_is_refused_before_it_is_opened() {
+        use crate::testfixtures::{outside, Errand};
+        let mountpoint = temp_dir("own_db");
+        let quarantine = mountpoint.join(".dedcom-quarantine");
+        let state = mountpoint.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let db = state.join("dedcom.db");
+        let store = crate::state::store::ScanStore::open_writable(&db).unwrap();
+        let target = mountpoint.join("target.bin");
+        std::fs::write(&target, b"duplicate content").unwrap();
+        let me = format!("held by {}", std::process::id());
+        let holder = || outside(Errand::SharedLockHolder, &db);
+        assert_eq!(holder(), me, "the control: SQLite holds its lock");
+
+        let published = reflink(
+            &super::super::RealOps,
+            &target,
+            &db,
+            &mountpoint,
+            &quarantine,
+        );
+        assert_eq!(holder(), me, "after the clone was asked for");
+        match published {
+            Publication::NotMoved { detail } => {
+                assert!(
+                    detail.contains(crate::pipeline::safe_open::OPEN_DATABASE_REFUSAL),
+                    "{detail}"
+                )
+            }
+            other => panic!("the original must not have been moved: {other:?}"),
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"duplicate content");
+        drop(store);
+        std::fs::remove_dir_all(&mountpoint).ok();
     }
 
     /// The published clone must look like the file it replaced, not like the process that built

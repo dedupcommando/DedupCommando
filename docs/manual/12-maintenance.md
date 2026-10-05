@@ -25,7 +25,9 @@ dedcom --state-dir /var/lib/dedcom
 ```
 
 Useful when `~` sits on a thin root (a Linux/ZFS root filesystem may be only 16–32 GiB),
-while the database can grow to hundreds of MB — move it somewhere roomier.
+while the database can grow to hundreds of MB — move it somewhere roomier. It may lie under
+a root you scan: a scan leaves the database it is writing to out
+([§7](07-scanning.md#permanent-exclusions)).
 
 The last `dedcom` that writes removes `dedcom.db-wal` and `dedcom.db-shm` when it closes,
 unless something still has the database open. A run that only reads — `--stats`,
@@ -34,7 +36,12 @@ cannot remove them. Left that way they are harmless, and the
 next `dedcom` that opens the database to write removes them. Do not delete them by hand: while
 `dedcom` runs they are in use, and after a `dedcom` that did not exit cleanly `dedcom.db-wal`
 holds changes that are not in `dedcom.db` yet — the next `dedcom` that opens the database
-folds them in.
+folds them in. Do not move or rename the three files while `dedcom` runs either — as a rule
+the commander's own move does not stop you ([§7](07-scanning.md#permanent-exclusions)). With
+`dedcom.db` away from its name, the next `dedcom` to open the database for writing starts an
+empty database there and deletes `dedcom.db-wal`: the changes that were not in `dedcom.db`
+yet are lost, scans and marks among them. The running `dedcom` is such an opener itself, and
+not only for a scan or a move: the list of scans and the trash open the database the same way.
 
 To look into `dedcom.db` while `dedcom` is running, open it read-only —
 `sqlite3 -readonly dedcom.db`. A client that is able to write competes with `dedcom` for the

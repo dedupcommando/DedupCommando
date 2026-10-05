@@ -207,7 +207,7 @@ pub struct LiveDirSignature {
 
 /// Checkpoint store: a SQLite DB with the scan state and the file manifest.
 pub struct ScanStore {
-    conn: Connection,
+    conn: HeldConnection,
     /// The configured database path and the identity that path carried, observed immediately
     /// around the open. Not a claim about SQLite's own descriptor — see `settled_identity`.
     /// `None` for an in-memory store, which has no path to be replaced. Re-checked before every
@@ -974,6 +974,140 @@ impl Drop for OpenRace {
     }
 }
 
+/// A connection, and with it what tells the rest of the process which files SQLite holds for it
+/// ([`crate::paths::OpenDatabase`]), so that nothing reads those files as files.
+///
+/// One owner for the order that matters, on every way out — a store that is dropped, an opener
+/// that fails halfway. The database is listed before SQLite opens it. What was noted of its files
+/// is forgotten before the connection closes, because from the close on they can be deleted and
+/// their numbers given to other files. And the entry goes last, when the connection has closed:
+/// up to then every read of the three names is still refused.
+struct HeldConnection {
+    conn: std::mem::ManuallyDrop<Connection>,
+    /// `None` for an in-memory database, which has no file.
+    open_database: Option<crate::paths::OpenDatabase>,
+}
+
+impl HeldConnection {
+    /// Lists the database at `db_path` as open, then has `open` open it.
+    fn open<E>(
+        db_path: &Path,
+        open: impl FnOnce() -> std::result::Result<Connection, E>,
+    ) -> std::result::Result<Self, E> {
+        let open_database = crate::paths::OpenDatabase::at(db_path);
+        match open() {
+            Ok(conn) => Ok(Self {
+                conn: std::mem::ManuallyDrop::new(conn),
+                open_database: Some(open_database),
+            }),
+            Err(err) => {
+                // Nothing was opened, so nothing is held.
+                open_database.closing();
+                Err(err)
+            }
+        }
+    }
+
+    /// A connection to a database that has no file — the in-memory one the unit tests use.
+    #[cfg(test)]
+    fn without_a_file(conn: Connection) -> Self {
+        Self {
+            conn: std::mem::ManuallyDrop::new(conn),
+            open_database: None,
+        }
+    }
+
+    /// To be called once the connection has read: the journal and its index are there to be
+    /// noted from then on ([`crate::paths::OpenDatabase::note_files`]).
+    fn note_files(&self) {
+        if let Some(open_database) = &self.open_database {
+            open_database.note_files();
+        }
+    }
+}
+
+impl std::ops::Deref for HeldConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl std::ops::DerefMut for HeldConnection {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+}
+
+impl Drop for HeldConnection {
+    fn drop(&mut self) {
+        if let Some(open_database) = &self.open_database {
+            open_database.closing();
+        }
+        #[cfg(test)]
+        closing_stage(ClosingStage::AboutToClose);
+        // SAFETY: the one place the connection is dropped, and nothing uses the field after it.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.conn) };
+        #[cfg(test)]
+        closing_stage(ClosingStage::Closed);
+        // `open_database` is dropped when this returns: the entry goes last.
+    }
+}
+
+/// Where the drop of a [`HeldConnection`] has got to when the test seam below is called.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClosingStage {
+    /// The rest of the process has been told; the connection is still open.
+    AboutToClose,
+    /// The connection is closed; its entry in the list of open databases is still there.
+    Closed,
+}
+
+// Test-only seam in the drop of a connection's holder, called at each of its two stages for the
+// first holder this thread drops while it is armed. What the process knows of a database's files
+// at those instants cannot be seen from outside the drop.
+#[cfg(test)]
+type ClosingAction = Box<dyn FnMut(ClosingStage)>;
+
+#[cfg(test)]
+thread_local! {
+    static CLOSING_HOOK: std::cell::RefCell<Option<ClosingAction>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms the closing hook for this thread and disarms it on drop.
+#[cfg(test)]
+pub(crate) struct Closing;
+
+#[cfg(test)]
+impl Closing {
+    pub(crate) fn armed(action: impl FnMut(ClosingStage) + 'static) -> Self {
+        CLOSING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(action)));
+        Closing
+    }
+}
+
+#[cfg(test)]
+impl Drop for Closing {
+    fn drop(&mut self) {
+        CLOSING_HOOK.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn closing_stage(stage: ClosingStage) {
+    // Taken out for the call, so that the action may itself open and drop a store.
+    let Some(mut action) = CLOSING_HOOK.with(|slot| slot.borrow_mut().take()) else {
+        return;
+    };
+    action(stage);
+    if stage == ClosingStage::AboutToClose {
+        CLOSING_HOOK.with(|slot| *slot.borrow_mut() = Some(action));
+    }
+}
+
 // Test-only one-shot fault in the full-validator path, so a transient store failure can be
 // produced deterministically — the real thing is a disk or SQLite hiccup, which no test can
 // schedule. Proves the retry contract: such a failure is never cached.
@@ -1091,8 +1225,10 @@ fn propagate_committed_objects(
 }
 
 impl ScanStore {
+    /// A store on a database that has no file — the in-memory one the unit tests use.
+    #[cfg(test)]
     fn new(conn: Connection) -> Self {
-        Self::with_identity(conn, None)
+        Self::with_identity(HeldConnection::without_a_file(conn), None)
     }
 
     /// The errno SQLite recorded with the last I/O or open failure on this connection; `0` if it
@@ -1107,7 +1243,7 @@ impl ScanStore {
     }
 
     fn with_identity(
-        conn: Connection,
+        conn: HeldConnection,
         db_identity: Option<(PathBuf, crate::paths::PathIdentity)>,
     ) -> Self {
         Self {
@@ -1272,12 +1408,13 @@ impl ScanStore {
         // context rather than downgraded to «unknown».
         let before = crate::paths::probe_existing_db_file(db_path)?;
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let conn = Connection::open_with_flags(db_path, flags).map_err(|err| {
-            AppError::msg(format!(
-                "cannot open dedcom.db read-only ({}): {err}",
-                crate::textsan::terminal(&db_path.display().to_string())
-            ))
-        })?;
+        let conn = HeldConnection::open(db_path, || Connection::open_with_flags(db_path, flags))
+            .map_err(|err| {
+                AppError::msg(format!(
+                    "cannot open dedcom.db read-only ({}): {err}",
+                    crate::textsan::terminal(&db_path.display().to_string())
+                ))
+            })?;
         // The closing half of the bracket, FIRST — before any pragma, schema read or anything
         // else that could act on a file that is no longer the one we probed.
         let identity = settled_identity(db_path, before)?;
@@ -1289,6 +1426,8 @@ impl ScanStore {
         // Migrating needs a writer, so an out-of-date DB is reported here rather than as a
         // «no such column» from some query later on.
         schema::ensure_migrated(&conn)?;
+        // The connection has read by now: the journal and its index are there to be noted.
+        conn.note_files();
         Ok(Self::with_identity(conn, identity))
     }
 
@@ -1310,7 +1449,7 @@ impl ScanStore {
         // file, so this probe must succeed — the absence-before-create case is already handled
         // there, and a failure here is a real refusal rather than «unknown».
         let before = crate::paths::probe_existing_db_file(db_path)?;
-        let conn = Connection::open(db_path)?;
+        let conn = HeldConnection::open(db_path, || Connection::open(db_path))?;
         // The closing half, FIRST. Everything below writes to or about the file — WAL setup,
         // migration, `enforce_db_perms_0600` — so a path swapped between `prepare_db_file` and
         // here must be refused before any of it can touch the replacement.
@@ -1341,6 +1480,9 @@ impl ScanStore {
         // 0600 on the DB file and WAL/SHM (created by enabling WAL above): the contents — the paths of all
         // pool files — are for the owner only (errors are propagated, not best-effort).
         crate::paths::enforce_db_perms_0600(db_path)?;
+        // The connection has read and written by now: the journal and its index are there to be
+        // noted.
+        conn.note_files();
         Ok(Self::with_identity(conn, identity))
     }
 
@@ -6000,14 +6142,15 @@ impl ScanStore {
             });
         }
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let conn = match Connection::open_with_flags(db_path, flags) {
-            Ok(conn) => conn,
-            Err(err) => {
-                return Err(LeaseRefusal::Open {
-                    detail: err.to_string(),
-                })
-            }
-        };
+        let conn =
+            match HeldConnection::open(db_path, || Connection::open_with_flags(db_path, flags)) {
+                Ok(conn) => conn,
+                Err(err) => {
+                    return Err(LeaseRefusal::Open {
+                        detail: err.to_string(),
+                    })
+                }
+            };
         // The R4A-C1 invariant, per connection, proved by read-back (2 statements).
         if let Err(err) = schema::enforce_foreign_keys(&conn) {
             return Err(LeaseRefusal::Open {
@@ -6026,7 +6169,9 @@ impl ScanStore {
                 detail: err.to_string(),
             });
         }
-        let store = Self::new(conn);
+        // The connection has read by now: the journal and its index are there to be noted.
+        conn.note_files();
+        let store = Self::with_identity(conn, None);
         #[cfg(test)]
         store.membership_statements.set(4);
         Ok(store)
@@ -21257,6 +21402,37 @@ mod membership_staging_tests {
             other => panic!("a removed database must refuse: {other:?}"),
         }
         assert_eq!(store.identity_probes(), 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A database SQLite could not open is not left listed as open, and nothing of it is kept:
+    /// its file had been noted for a connection that never came to be.
+    #[test]
+    fn a_database_that_could_not_be_opened_is_not_left_listed() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = temp_dir("db_not_opened");
+        let db = dir.join("dedcom.db");
+        std::fs::write(&db, b"").unwrap();
+        let meta = std::fs::symlink_metadata(&db).unwrap();
+        let file = crate::paths::PathIdentity {
+            device: meta.dev(),
+            inode: meta.ino(),
+        };
+
+        let listed = std::cell::Cell::new(false);
+        let refused: std::result::Result<HeldConnection, &str> = HeldConnection::open(&db, || {
+            listed.set(crate::paths::is_open_database_file(file));
+            Err("refused")
+        });
+        assert!(refused.is_err());
+        assert!(
+            listed.get(),
+            "the control: it was listed before the open was tried"
+        );
+        assert!(
+            !crate::paths::is_open_database_file(file),
+            "and is not once the open has failed"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
