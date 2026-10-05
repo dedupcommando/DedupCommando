@@ -1303,7 +1303,8 @@ impl ScanStore {
             crate::paths::verify_db_dir(parent)?;
         }
         // Refuse if the DB file is a symlink (opening by the link would write the target outside
-        // the state-dir), and create with 0600. O_NOFOLLOW on the final component.
+        // the state-dir), and create with 0600. A file that is already there is looked at and
+        // never opened: closing a descriptor of it would drop SQLite's locks on it.
         crate::paths::prepare_db_file(db_path)?;
         // The opening half of the bracket. `prepare_db_file` has just created or verified the
         // file, so this probe must succeed — the absence-before-create case is already handled
@@ -13406,7 +13407,8 @@ mod tests {
 
     #[test]
     fn open_rejects_symlinked_db() {
-        // Opening via a symlink would write the target outside the state-dir — refused (O_NOFOLLOW).
+        // Opening via a symlink would write the target outside the state-dir — refused before
+        // SQLite is asked.
         let _role = role_guard();
         let dir = temp_state_dir("symlink");
         let real = dir.join("real-target.db");
@@ -21256,6 +21258,126 @@ mod membership_staging_tests {
         }
         assert_eq!(store.identity_probes(), 3);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The store keeps SQLite's locks — on the database file and on the journal index — through
+    /// everything it does itself.
+    ///
+    /// Red on the parent: every identity check opened the database file and closed it again, and
+    /// closing any descriptor of a file drops all the locks the process holds on it. SQLite never
+    /// learns of that, so the first check after the open left the store without its lock on the
+    /// file until its last connection closed.
+    #[test]
+    fn the_store_keeps_sqlites_lock_on_the_database() {
+        use crate::testfixtures::{outside, Errand};
+        let _role = role_guard();
+        let dir = temp_dir("db_lock_kept");
+        let (db, store) = file_store(&dir);
+        let me = format!("held by {}", std::process::id());
+        let mine = (me.clone(), me);
+        let holders = || {
+            (
+                outside(Errand::SharedLockHolder, &db),
+                outside(Errand::IndexLockHolder, &db),
+            )
+        };
+        assert_eq!(holders(), mine, "the control: an open store holds both");
+
+        store.ensure_current_path().unwrap();
+        assert_eq!(holders(), mine, "after the identity check");
+
+        drop(ScanStore::open_writable(&db).unwrap());
+        assert_eq!(holders(), mine, "after a second writer of this process");
+
+        drop(ScanStore::open_for_apply_lease(&db).unwrap());
+        assert_eq!(holders(), mine, "after the apply lease");
+
+        drop(ScanStore::open_read_only(&db).unwrap());
+        assert_eq!(holders(), mine, "after a read-only connection");
+
+        drop(store);
+        assert_eq!(
+            holders(),
+            ("free".to_string(), "absent".to_string()),
+            "the locks go with the last connection, and the index with them"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Another process opens the database to write and closes it while a store of this one is in
+    /// the middle of a session: the journal the store is using must still be there afterwards.
+    fn a_visit_leaves_the_journal_in_use(visit: crate::testfixtures::Errand) {
+        let _role = role_guard();
+        let dir = temp_dir("db_lock_journal");
+        let (db, store) = file_store(&dir);
+        // What every session does within its first second.
+        store.ensure_current_path().unwrap();
+
+        assert_eq!(crate::testfixtures::outside(visit, &db), "closed");
+        for sidecar in ["dedcom.db-wal", "dedcom.db-shm"] {
+            assert!(
+                dir.join(sidecar).exists(),
+                "{visit:?} took {sidecar} from under a live store"
+            );
+        }
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// And what losing it cost: a write made after the visitor left went into the deleted journal,
+    /// where no other process could see it and from where nothing but a clean exit of this one
+    /// could still bring it back.
+    fn a_write_after_a_visit_reaches_the_next_reader(visit: crate::testfixtures::Errand) {
+        use crate::testfixtures::{outside, Errand};
+        let _role = role_guard();
+        let dir = temp_dir("db_lock_write");
+        let (db, mut store) = file_store(&dir);
+        store.ensure_current_path().unwrap();
+        assert_eq!(outside(Errand::CountScans, &db), "0", "the control");
+
+        assert_eq!(outside(visit, &db), "closed");
+        store
+            .begin_scan(&ScanConfig::new(vec![dir.clone()]))
+            .unwrap();
+        assert_eq!(
+            outside(Errand::CountScans, &db),
+            "1",
+            "a scan recorded after {visit:?} reached nobody"
+        );
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `sqlite3` shell, a script, a viewer — any program that opens the database to write and
+    /// then closes it must not take the journal from under a running dedcom.
+    ///
+    /// Red on the parent: with the lock gone, the visitor's close found nobody else there, folded
+    /// the journal into the database and deleted `-wal` and `-shm` while the store was using them.
+    #[test]
+    fn another_program_closing_the_database_leaves_the_journal_in_use() {
+        a_visit_leaves_the_journal_in_use(crate::testfixtures::Errand::VisitAsAnotherProgram);
+    }
+
+    #[test]
+    fn a_write_after_another_program_left_reaches_the_next_reader() {
+        a_write_after_a_visit_reaches_the_next_reader(
+            crate::testfixtures::Errand::VisitAsAnotherProgram,
+        );
+    }
+
+    /// The same visitor can be dedcom itself: a second one let in past the instance lock (`F` in
+    /// the overlay, `--force`, the `allow` policy). It need not even finish its work — starting
+    /// up opens a store and closes it again.
+    #[test]
+    fn a_second_dedcom_closing_the_database_leaves_the_journal_in_use() {
+        a_visit_leaves_the_journal_in_use(crate::testfixtures::Errand::VisitAsASecondDedcom);
+    }
+
+    #[test]
+    fn a_write_after_a_second_dedcom_left_reaches_the_next_reader() {
+        a_write_after_a_visit_reaches_the_next_reader(
+            crate::testfixtures::Errand::VisitAsASecondDedcom,
+        );
     }
 
     /// One membership request spends exactly ONE probe, and every new reader spends none: the

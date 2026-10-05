@@ -794,11 +794,333 @@ pub fn strip_v6(conn: &rusqlite::Connection) {
     );
 }
 
+/// Selects the child half of [`outside`] and names its errand; [`OUTSIDE_DB`] carries the file.
+const OUTSIDE_ERRAND: &str = "DEDCOM_TEST_OUTSIDE_ERRAND";
+const OUTSIDE_DB: &str = "DEDCOM_TEST_OUTSIDE_DB";
+/// The test [`outside`] re-runs this binary for, the marker that precedes its answer on stdout,
+/// and the status it leaves with. Not zero on purpose: were an errand ever to leak into the
+/// environment of a whole run, that run would end at this test — and must not look green.
+const OUTSIDE_TEST: &str =
+    "testfixtures::tests::an_outside_process_sees_sqlites_lock_on_a_database";
+const OUTSIDE_ANSWER: &str = "OUTSIDE-ANSWER:";
+const OUTSIDE_DONE: i32 = 86;
+
+/// SQLite's shared lock on a database file is a read lock over these bytes: `SHARED_FIRST` and
+/// `SHARED_SIZE` of its `os.h`, two bytes past the pending byte at 1 GiB.
+const SQLITE_SHARED_FIRST: libc::off_t = 0x4000_0002;
+const SQLITE_SHARED_SIZE: libc::off_t = 510;
+/// And every process that has the journal index (`-shm`) open keeps a read lock on this byte of
+/// it — `UNIX_SHM_DMS` of SQLite's `os_unix.c`. The next one to open the database and find the
+/// byte free takes the index for nobody's and starts it afresh.
+const SQLITE_INDEX_IN_USE: libc::off_t = 128;
+
+/// What a process other than this one finds at a database file, or does to it.
+///
+/// SQLite's locking has two halves that the process holding the lock cannot see for itself:
+/// `fcntl(F_GETLK)` never reports the caller's own locks, and SQLite keeps its own count of the
+/// connections of one process — only another process is turned away by the lock in the kernel.
+/// The other errands need a process of their own for what belongs to a whole process: its umask,
+/// and whether it is root.
+#[derive(Debug, Clone, Copy)]
+pub enum Errand {
+    /// Who holds SQLite's shared lock on the file: `held by <pid>`, or `free`.
+    SharedLockHolder,
+    /// Who holds the in-use lock on the journal index beside the file: `held by <pid>`, `free`,
+    /// or `absent` when there is no index.
+    IndexLockHolder,
+    /// Opens the database to write with plain SQLite, reads from it and closes it, as a `sqlite3`
+    /// shell or any other program would. Answers `closed`.
+    VisitAsAnotherProgram,
+    /// Opens the database the way a dedcom that writes does, and closes it. Answers `closed`.
+    VisitAsASecondDedcom,
+    /// The number of scans a fresh read-only connection finds.
+    CountScans,
+    /// As the owner of the file but not as root — root becomes `nobody` first —: prepares a new
+    /// file under a umask that would take the owner's write bit away, prepares one it has made
+    /// read-only, identifies one it may not read and one in a directory it may not search.
+    /// Answers `new: <outcome>; read-only: <outcome> (mode <octal>); unreadable: <outcome>;
+    /// hidden: <outcome>`, or `skipped: <why>` where it can neither give up root nor write beside
+    /// the file.
+    OwnerWithoutPrivilege,
+}
+
+impl Errand {
+    const ALL: [Errand; 6] = [
+        Errand::SharedLockHolder,
+        Errand::IndexLockHolder,
+        Errand::VisitAsAnotherProgram,
+        Errand::VisitAsASecondDedcom,
+        Errand::CountScans,
+        Errand::OwnerWithoutPrivilege,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Errand::SharedLockHolder => "shared-lock-holder",
+            Errand::IndexLockHolder => "index-lock-holder",
+            Errand::VisitAsAnotherProgram => "visit-as-another-program",
+            Errand::VisitAsASecondDedcom => "visit-as-a-second-dedcom",
+            Errand::CountScans => "count-scans",
+            Errand::OwnerWithoutPrivilege => "owner-without-privilege",
+        }
+    }
+
+    fn run(self, db: &Path) -> String {
+        match self {
+            Errand::SharedLockHolder => lock_holder(db, SQLITE_SHARED_FIRST, SQLITE_SHARED_SIZE),
+            Errand::IndexLockHolder => {
+                let mut index = db.as_os_str().to_owned();
+                index.push("-shm");
+                lock_holder(Path::new(&index), SQLITE_INDEX_IN_USE, 1)
+            }
+            Errand::OwnerWithoutPrivilege => owner_without_privilege(db),
+            Errand::VisitAsAnotherProgram => {
+                let conn = rusqlite::Connection::open(db).expect("another program opens it");
+                let _: i64 = conn
+                    .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+                    .expect("another program reads it");
+                conn.close()
+                    .map_err(|(_, err)| err)
+                    .expect("another program closes it");
+                "closed".to_string()
+            }
+            Errand::VisitAsASecondDedcom => {
+                let store = crate::state::store::ScanStore::open_writable(db)
+                    .expect("a second dedcom opens it");
+                drop(store);
+                "closed".to_string()
+            }
+            Errand::CountScans => {
+                let conn = rusqlite::Connection::open_with_flags(
+                    db,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .expect("a reader opens it");
+                let scans: i64 = conn
+                    .query_row("SELECT count(*) FROM scan", [], |row| row.get(0))
+                    .expect("a reader counts the scans");
+                scans.to_string()
+            }
+        }
+    }
+}
+
+/// Asks the kernel who holds a lock that would stop a writer from taking `len` bytes of `file`
+/// from `start` on. Opening and closing the file here costs the asked-about process nothing:
+/// locks are dropped by a close in the process that holds them, and this is another one.
+fn lock_holder(file: &Path, start: libc::off_t, len: libc::off_t) -> String {
+    use std::os::unix::io::AsRawFd;
+    let file = match std::fs::File::open(file) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return "absent".to_string(),
+        Err(err) => panic!("open the file to ask about its lock: {err}"),
+    };
+    // SAFETY: an all-zero `flock` is a valid value, and F_GETLK only fills it in.
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as libc::c_short;
+    lock.l_whence = libc::SEEK_SET as libc::c_short;
+    lock.l_start = start;
+    lock.l_len = len;
+    // SAFETY: `file` stays open for the call and `lock` is a valid in-out pointer.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) };
+    assert_eq!(rc, 0, "F_GETLK: {}", std::io::Error::last_os_error());
+    if lock.l_type == libc::F_UNLCK as libc::c_short {
+        "free".to_string()
+    } else {
+        format!("held by {}", lock.l_pid)
+    }
+}
+
+/// The body of [`Errand::OwnerWithoutPrivilege`]: every file is this process's own, made after it
+/// has stopped being root, so nothing but their mode stands between it and them.
+fn owner_without_privilege(db: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: plain libc calls on this process, which exists for this errand alone.
+    let still_root = unsafe {
+        libc::geteuid() == 0
+            && (libc::setgroups(0, std::ptr::null()) != 0
+                || libc::setgid(65534) != 0
+                || libc::setuid(65534) != 0)
+    };
+    if still_root {
+        return format!(
+            "skipped: cannot give up root: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // Whether this process may write here at all is asked of something that is not under test:
+    // a refusal by the code under test must never pass for a reason to skip.
+    let beside = db.with_extension("writable");
+    if let Err(err) = std::fs::write(&beside, b"").and_then(|()| std::fs::remove_file(&beside)) {
+        return format!("skipped: cannot write beside the file: {err}");
+    }
+    let said = |outcome: std::io::Result<String>| outcome.unwrap_or_else(|err| err.to_string());
+    let identified = |path: &Path| {
+        said(crate::paths::probe_existing_db_file(path).map(|_| "identified".to_string()))
+    };
+
+    // SAFETY: `umask` only swaps this process's file mode creation mask.
+    let usual = unsafe { libc::umask(0o277) };
+    let new = said(crate::paths::prepare_db_file(db).map(|()| format!("mode {:o}", mode_bits(db))));
+    // SAFETY: as above.
+    unsafe { libc::umask(usual) };
+
+    let mine = |mode: u32| {
+        std::fs::remove_file(db).ok();
+        std::fs::write(db, b"kept").expect("the owner writes its file");
+        std::fs::set_permissions(db, std::fs::Permissions::from_mode(mode))
+            .expect("the owner sets its mode");
+    };
+    mine(0o400);
+    let read_only = said(crate::paths::prepare_db_file(db).map(|()| "prepared".to_string()));
+    let mode = mode_bits(db);
+    mine(0o000);
+    let unreadable = identified(db);
+    std::fs::remove_file(db).expect("the owner removes its file");
+
+    // And a file in a directory its owner has closed even to itself: the lookup is what fails.
+    let closed = db.with_extension("closed");
+    let shut = |mode: u32| {
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(mode))
+            .expect("the owner sets the mode of its directory");
+    };
+    std::fs::create_dir(&closed).expect("the owner makes a directory");
+    std::fs::write(closed.join("dedcom.db"), b"kept").expect("the owner writes inside it");
+    shut(0o000);
+    let hidden = identified(&closed.join("dedcom.db"));
+    shut(0o700);
+    std::fs::remove_dir_all(&closed).expect("the owner removes its directory");
+
+    format!(
+        "new: {new}; read-only: {read_only} (mode {mode:o}); unreadable: {unreadable}; \
+         hidden: {hidden}"
+    )
+}
+
+/// Runs `errand` on `db` in another process — a re-exec of this test binary, filtered to the test
+/// that is its child half — and returns the answer.
+pub fn outside(errand: Errand, db: &Path) -> String {
+    use std::time::{Duration, Instant};
+    // Numbered as well: two calls within one tick of the clock must not share a directory.
+    static SPOOLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let spool = ScratchDir::new(&format!(
+        "outside_spool_{}",
+        SPOOLS.fetch_add(1, Ordering::Relaxed)
+    ));
+    let (out, err) = (spool.path().join("stdout"), spool.path().join("stderr"));
+    let spooled = |path: &Path| {
+        String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default()).into_owned()
+    };
+    let mut child = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        // `--exact`, so no other test whose name holds this one runs in the child.
+        .args([OUTSIDE_TEST, "--exact", "--nocapture", "--test-threads=1"])
+        .env(OUTSIDE_ERRAND, errand.name())
+        .env(OUTSIDE_DB, db)
+        .stdin(std::process::Stdio::null())
+        // Files rather than pipes: the child is waited for against a deadline below, and a pipe
+        // nobody drains meanwhile could stall it.
+        .stdout(std::fs::File::create(&out).expect("spool stdout"))
+        .stderr(std::fs::File::create(&err).expect("spool stderr"))
+        .spawn()
+        .expect("start the outside process");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .expect("the outside process can be waited for")
+        {
+            break status;
+        }
+        if Instant::now() > deadline {
+            child.kill().ok();
+            child.wait().ok();
+            panic!(
+                "{errand:?} ran for two minutes:\n{}\n{}",
+                spooled(&out),
+                spooled(&err)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let (stdout, stderr) = (spooled(&out), spooled(&err));
+    // A filter that matched nothing would exit 0 having run nothing, and every caller would fail
+    // on a consequence of that rather than on this.
+    assert!(
+        stdout.contains("running 1 test"),
+        "the outside process ran no test — does {OUTSIDE_TEST} still name it?\n{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(OUTSIDE_DONE),
+        "{errand:?} stopped before its answer:\n{stdout}\n{stderr}"
+    );
+    // Not at the start of a line: libtest prints the test's own name first, on the same line.
+    stdout
+        .lines()
+        .find_map(|line| {
+            line.split_once(OUTSIDE_ANSWER)
+                .map(|(_, answer)| answer.to_string())
+        })
+        .unwrap_or_else(|| {
+            panic!("the outside process gave no answer to {errand:?}:\n{stdout}\n{stderr}")
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pipeline::hash::hash_file_verified;
     use std::sync::atomic::AtomicU64;
+
+    /// The instrument itself, on plain SQLite with none of dedcom's code in the way: another
+    /// process sees the locks a WAL connection of this one keeps on its database and on the
+    /// journal index, a visitor that finds them held leaves the journal where it is, and the
+    /// locks go when the connection does.
+    ///
+    /// With an errand in the environment this is the child half of [`outside`] instead.
+    #[test]
+    fn an_outside_process_sees_sqlites_lock_on_a_database() {
+        if let Ok(name) = std::env::var(OUTSIDE_ERRAND) {
+            let errand = Errand::ALL
+                .into_iter()
+                .find(|errand| errand.name() == name)
+                .expect("a known errand");
+            let db = PathBuf::from(std::env::var_os(OUTSIDE_DB).expect("the errand's database"));
+            println!("{OUTSIDE_ANSWER}{}", errand.run(&db));
+            std::process::exit(OUTSIDE_DONE);
+        }
+
+        let scratch = ScratchDir::new("outside");
+        let db = scratch.path().join("plain.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE scan(id INTEGER PRIMARY KEY);
+             INSERT INTO scan DEFAULT VALUES;",
+        )
+        .unwrap();
+        let me = format!("held by {}", std::process::id());
+        let holder = || outside(Errand::SharedLockHolder, &db);
+        assert_eq!(holder(), me);
+        assert_eq!(outside(Errand::IndexLockHolder, &db), me);
+        assert_eq!(outside(Errand::CountScans, &db), "1");
+
+        assert_eq!(outside(Errand::VisitAsAnotherProgram, &db), "closed");
+        assert!(
+            scratch.path().join("plain.db-wal").exists(),
+            "a visitor that finds the lock held leaves the journal"
+        );
+        assert_eq!(holder(), me);
+
+        // The rule every test built on this instrument is about: the process opens the file
+        // itself, closes that one descriptor, and its lock is gone while its connection lives on.
+        drop(std::fs::File::open(&db).unwrap());
+        assert_eq!(holder(), "free", "a lock lost under an open connection");
+
+        drop(conn);
+        assert_eq!(holder(), "free");
+        assert_eq!(outside(Errand::IndexLockHolder, &db), "absent");
+    }
 
     /// The fixture's own promises, asserted after `build` already checked them — this is the test
     /// that fails when a filesystem (or a future edit) stops giving us a real hardlink forest.

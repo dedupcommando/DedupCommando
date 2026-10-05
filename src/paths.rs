@@ -396,33 +396,96 @@ fn nothing_to_report(shown: &Path) -> io::Error {
     )
 }
 
-/// Prepares the DB file: refuses if it is a symlink (opening via the link would write the
-/// target OUTSIDE the protected state-dir), and creates the file at 0600 if absent.
-/// `O_NOFOLLOW` on the final component; the ancestors were walked by [`verify_db_dir`] just
-/// before, in `ScanStore::open_writable`, and are not writable by anyone else, so there is no
-/// path race. `fchmod` 0600 is applied to an already-existing file too.
+/// What the name `db_path` holds — `lstat`, so a symbolic link answers for itself — read WITHOUT
+/// a descriptor.
+///
+/// No descriptor on purpose. SQLite holds its locks on the database as `fcntl` locks, and POSIX
+/// drops every `fcntl` lock a process holds on a file when the process closes ANY descriptor of
+/// that file. A look through `open`, `fstat` and `close`, however brief, left this process
+/// without its lock for as long as it kept a connection open: the next program to close the
+/// database took it for unused, folded the journal in and deleted it while this process was still
+/// writing to it.
+fn stat_db_path(db_path: &Path) -> io::Result<libc::stat> {
+    let c = cstring(db_path)?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid C string and `st` a valid out-pointer for the duration of the call.
+    if unsafe { libc::lstat(c.as_ptr(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
+/// Refuses what `st` describes unless it is a regular file, with the wording `open(O_NOFOLLOW)`
+/// would have produced: `ELOOP` for a link, `EISDIR` for a directory that was to be opened.
+fn require_regular_db_file(step: DbStep, db_path: &Path, st: &libc::stat) -> io::Result<()> {
+    let errno = match (st.st_mode & libc::S_IFMT, step) {
+        (libc::S_IFREG, _) => return Ok(()),
+        (libc::S_IFLNK, _) => libc::ELOOP,
+        (libc::S_IFDIR, DbStep::Open) => libc::EISDIR,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the DB path is not a regular file: {}",
+                    crate::textsan::terminal(&db_path.display().to_string())
+                ),
+            ))
+        }
+    };
+    Err(db_file_error(
+        step,
+        db_path,
+        io::Error::from_raw_os_error(errno),
+    ))
+}
+
+/// Prepares the DB file: creates it at 0600 if absent, and refuses a symlink in its place
+/// (opening via the link would write the target OUTSIDE the protected state-dir) or anything else
+/// that is not a regular file.
+///
+/// Nothing here holds a descriptor on the file, not even to create it ([`stat_db_path`] says
+/// why): `mknod` makes the empty file, and its mode — like that of a file that was already there —
+/// is set by path. So every step goes by path, and what keeps the path still between the steps is
+/// not this function but the directory check: the ancestors were walked by [`verify_db_dir`] just
+/// before, in `ScanStore::open_writable`, and are not writable by anyone else.
+///
+/// For a file that was already there the access check comes first. It asks the permission
+/// question the old `open(O_RDWR)` asked — may this process read and write the file — before
+/// SQLite could settle for a read-only connection, and before the mode is touched: a database its
+/// owner made read-only is refused, not made writable again. That makes it more than a duplicate
+/// of [`enforce_db_perms_0600`], which runs after the open.
 pub fn prepare_db_file(db_path: &Path) -> io::Result<()> {
     let c = cstring(db_path)?;
-    let fd = unsafe {
-        libc::open(
-            c.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        )
-    };
-    if fd < 0 {
-        return Err(db_open_error(
-            DbOpen::Create,
+    // SAFETY: `c` is a valid C string for the duration of the call.
+    let created = unsafe { libc::mknod(c.as_ptr(), libc::S_IFREG | 0o600, 0) } == 0;
+    if !created {
+        let err = io::Error::last_os_error();
+        // A taken name is not a failure yet — and a link takes it too: `mknod` follows none.
+        if err.raw_os_error() != Some(libc::EEXIST) {
+            return Err(db_file_error(DbStep::Create, db_path, err));
+        }
+    }
+    let st = stat_db_path(db_path).map_err(|err| db_file_error(DbStep::Verify, db_path, err))?;
+    require_regular_db_file(DbStep::Open, db_path, &st)?;
+    // SAFETY: `c` is a valid C string for the duration of the call.
+    if !created
+        && unsafe {
+            libc::faccessat(
+                libc::AT_FDCWD,
+                c.as_ptr(),
+                libc::R_OK | libc::W_OK,
+                libc::AT_EACCESS,
+            )
+        } != 0
+    {
+        return Err(db_file_error(
+            DbStep::Open,
             db_path,
             io::Error::last_os_error(),
         ));
     }
-    // SAFETY: fd >= 0 and just obtained from open — we own it (closed on Drop).
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    if unsafe { libc::fchmod(owned.as_raw_fd(), 0o600) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|err| db_file_error(DbStep::SetMode, db_path, err))
 }
 
 /// Sets 0600 on the DB file and its WAL/SHM companions: the contents (the paths of all files
@@ -444,25 +507,17 @@ pub fn enforce_db_perms_0600(db_path: &Path) -> io::Result<()> {
 }
 
 /// Verifies that `db_path` is an existing regular file whose final component is not a symlink,
-/// without creating it, changing its mode, or blocking on a FIFO/device: `O_RDONLY | O_NONBLOCK
-/// | O_NOFOLLOW | O_CLOEXEC` — no `O_CREAT`, no `fchmod` — then `fstat` on the already-open fd
-/// and a refusal of everything but a regular file. The fd closes by RAII.
+/// without creating it, changing its mode, or blocking on a FIFO/device: one `lstat` and a
+/// refusal of everything but a regular file. The file is never opened ([`stat_db_path`] says why).
 ///
-/// The three safety flags are written out here rather than borrowed from
-/// `pipeline::safe_open::open_regular_nofollow` on purpose: `paths` is a leaf module that
-/// `state::store` depends on, and reaching into `pipeline` would invert that layering for seven
-/// lines whose error would then say «skipping» inside a database diagnostic. The duplication is
-/// deliberate.
-///
-/// Staged by R4B-1; `ScanStore::open_for_apply_lease` is its only caller until R4B-2 wires the
-/// worker route.
+/// `ScanStore::open_for_apply_lease` asks this before SQLite opens the file.
 pub fn verify_existing_db_file(db_path: &Path) -> io::Result<()> {
     probe_existing_db_file(db_path).map(|_| ())
 }
 
 /// The regular-file identity — `(st_dev, st_ino)` — that the configured path names at the
-/// moment of one probe, read through the same no-follow descriptor the verifier above uses and
-/// returned instead of discarded.
+/// moment of one probe: the same no-follow look the verifier above takes, returned instead of
+/// discarded.
 ///
 /// One probe is a single observation. Its value is in comparing several: a pair taken before and
 /// after an open, or a later pair against the retained one, shows whether the path still names
@@ -482,71 +537,64 @@ pub struct PathIdentity {
 }
 
 pub fn probe_existing_db_file(db_path: &Path) -> io::Result<PathIdentity> {
-    let c = cstring(db_path)?;
-    let fd = unsafe {
-        libc::open(
-            c.as_ptr(),
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(db_open_error(
-            DbOpen::Verify,
-            db_path,
-            io::Error::last_os_error(),
-        ));
-    }
-    // SAFETY: fd >= 0 and just obtained from open — we own it (closed on Drop).
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(owned.as_raw_fd(), &mut st) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "the DB path is not a regular file: {}",
-                crate::textsan::terminal(&db_path.display().to_string())
-            ),
-        ));
-    }
+    let st = stat_db_path(db_path).map_err(|err| db_file_error(DbStep::Verify, db_path, err))?;
+    require_regular_db_file(DbStep::Verify, db_path, &st)?;
     Ok(PathIdentity {
         device: st.st_dev as u64,
         inode: st.st_ino as u64,
     })
 }
 
-/// Which open of the DB file failed: the one that creates it if absent, or the one that only
-/// checks it. A missing name means a missing directory to the first and a missing file to the
-/// second.
+/// What was being done with the DB file when it failed: creating it, making sure it can be opened
+/// to read and write, only looking at it, or setting its permissions. A missing name means a
+/// missing directory to the first and a missing file to the third.
 #[derive(Debug, Clone, Copy)]
-enum DbOpen {
+enum DbStep {
     Create,
+    Open,
     Verify,
+    SetMode,
 }
 
-/// The `open` of the DB file that failed with `err` (taken at the call site, before anything else
+/// The step on the DB file that failed with `err` (taken at the call site, before anything else
 /// can touch errno), with what the name holds. «symlink?» used to be the guess for every errno,
 /// and it sent the operator looking for a link when the name held a directory, or nothing at all.
-fn db_open_error(open: DbOpen, db_path: &Path, err: io::Error) -> io::Error {
-    let (doing, what) = match (open, err.raw_os_error()) {
-        (DbOpen::Create, Some(libc::ENOENT)) => ("cannot create", "its directory does not exist"),
-        (DbOpen::Verify, Some(libc::ENOENT)) => ("cannot verify", "it does not exist"),
-        (open, errno) => (
-            match open {
-                DbOpen::Create => "cannot open",
-                DbOpen::Verify => "cannot verify",
+fn db_file_error(step: DbStep, db_path: &Path, err: io::Error) -> io::Error {
+    let (doing, what) = match (step, err.raw_os_error()) {
+        (DbStep::Create, Some(libc::ENOENT)) => ("cannot create", "its directory does not exist"),
+        (DbStep::Verify, Some(libc::ENOENT)) => ("cannot verify", "it does not exist"),
+        (step, errno) => (
+            match step {
+                DbStep::Create => "cannot create",
+                DbStep::Open => "cannot open",
+                DbStep::Verify => "cannot verify",
+                DbStep::SetMode => "cannot set the permissions of",
             },
             match errno {
                 Some(libc::ELOOP) => "it is a symbolic link, and dedcom does not open one here",
                 Some(libc::EISDIR) => "it is a directory, not a database file",
-                Some(libc::EACCES | libc::EPERM) => {
-                    "permission denied (an immutable file or directory?)"
-                }
+                Some(libc::EACCES | libc::EPERM) => match step {
+                    DbStep::Create | DbStep::Open => {
+                        "permission denied (an immutable file or directory?)"
+                    }
+                    // A look needs nothing of the file itself, only the way to it.
+                    DbStep::Verify => {
+                        "permission denied (a directory on the way that cannot be searched?)"
+                    }
+                    DbStep::SetMode => {
+                        "permission denied (not this user's file, or an immutable or \
+                         append-only one?)"
+                    }
+                },
                 Some(libc::EROFS) => "the filesystem is read-only",
-                Some(libc::ENOSPC | libc::EDQUOT) => "there is no space or quota left to create it",
-                _ => "the open failed",
+                Some(libc::ENOSPC | libc::EDQUOT) if matches!(step, DbStep::Create) => {
+                    "there is no space or quota left to create it"
+                }
+                // No step makes an `open` call on the file, so no failure is called a failed one.
+                _ => match step {
+                    DbStep::Verify => "the lookup failed",
+                    DbStep::Create | DbStep::Open | DbStep::SetMode => "the system call failed",
+                },
             },
         ),
     };
@@ -917,7 +965,7 @@ pub fn presets_file(cli: &Cli) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testfixtures::{mode_bits, names_in};
+    use crate::testfixtures::{mode_bits, names_in, outside, Errand};
 
     fn temp_path(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -1724,7 +1772,7 @@ mod tests {
         assert_eq!(xdg_state_base_from(env), None);
     }
 
-    // --- verify_existing_db_file: the staged apply-lease path verifier (R4B-1) ---
+    // --- verify_existing_db_file: what the apply lease asks before SQLite opens the file ---
 
     #[test]
     fn verify_db_accepts_a_regular_file() {
@@ -1753,7 +1801,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &db).unwrap();
         assert!(
             verify_existing_db_file(&db).is_err(),
-            "O_NOFOLLOW must refuse the link"
+            "a link must be refused"
         );
         assert_eq!(std::fs::read(&target).unwrap(), b"victim");
         std::fs::remove_dir_all(&base).ok();
@@ -1762,7 +1810,7 @@ mod tests {
     #[test]
     fn verify_db_refuses_a_directory() {
         let base = temp_path("vf_dir");
-        // open(O_RDONLY) on a directory succeeds on Linux — the S_ISREG check is what rejects it.
+        // The name is there, and what it holds is not a regular file.
         assert!(verify_existing_db_file(&base).is_err());
         std::fs::remove_dir_all(&base).ok();
     }
@@ -1786,10 +1834,24 @@ mod tests {
         );
         assert!(!err.contains("symlink"), "{err}");
 
-        // Creating it, a missing name is a missing directory: the file is what open(O_CREAT) makes.
+        // Verifying opens nothing, so its fallback wording must not say «the open failed».
+        std::fs::write(base.join("plain"), b"").unwrap();
+        let under_a_file = base.join("plain").join("dedcom.db");
+        let err = probe_existing_db_file(&under_a_file)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot verify") && err.contains("the lookup failed"),
+            "{err}"
+        );
+
+        // Creating it, a missing name is a missing directory: the file is what the call makes.
         let orphan = base.join("no-such-dir").join("dedcom.db");
         let err = prepare_db_file(&orphan).unwrap_err().to_string();
-        assert!(err.contains("its directory does not exist"), "{err}");
+        assert!(
+            err.contains("cannot create") && err.contains("its directory does not exist"),
+            "{err}"
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -1801,8 +1863,8 @@ mod tests {
         // SAFETY: a valid C string for a child of an existing directory; mode 0600.
         let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
         assert_eq!(rc, 0, "mkfifo did not create the FIFO");
-        // No writer and no helper thread: O_NONBLOCK returns the fd immediately and the
-        // S_ISREG check rejects it — the call comes back instead of hanging.
+        // No writer and no helper thread: the FIFO is looked at, never opened, so there is
+        // nothing for the call to hang on.
         assert!(verify_existing_db_file(&fifo).is_err());
         std::fs::remove_dir_all(&base).ok();
     }
@@ -1813,6 +1875,263 @@ mod tests {
         let sock = base.join("dedcom.db");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         assert!(verify_existing_db_file(&sock).is_err());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // --- SQLite's lock on the DB file: nothing here may open the file to look at it ---
+
+    /// A connection SQLite keeps in WAL mode — it holds its shared lock on the database file for
+    /// as long as it stays open.
+    fn wal_connection(db: &Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL;\nCREATE TABLE t(x);")
+            .unwrap();
+        conn
+    }
+
+    /// Looking at the database file must not cost SQLite its lock on it.
+    ///
+    /// POSIX drops every lock a process holds on a file when the process closes ANY descriptor of
+    /// that file. The probe used to open the file to look at it, so the first look left the
+    /// process without its lock for as long as it kept a connection open — and the next program to
+    /// close the database took it for unused and deleted the journal that was still in use.
+    #[test]
+    fn the_identity_probe_leaves_sqlites_lock_on_the_db_file() {
+        let base = temp_path("lock_probe");
+        let db = base.join("dedcom.db");
+        let conn = wal_connection(&db);
+        let me = format!("held by {}", std::process::id());
+        let holder = || outside(Errand::SharedLockHolder, &db);
+        assert_eq!(holder(), me, "the control: SQLite holds its lock");
+
+        probe_existing_db_file(&db).unwrap();
+        assert_eq!(holder(), me, "after the identity probe");
+        verify_existing_db_file(&db).unwrap();
+        assert_eq!(holder(), me, "after the verifier");
+        drop(conn);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The same for the step that precedes every `open_writable`: a second connection of one
+    /// process prepares a file the first already holds locked.
+    #[test]
+    fn preparing_a_db_file_that_exists_leaves_sqlites_lock_on_it() {
+        let base = temp_path("lock_prepare");
+        let db = base.join("dedcom.db");
+        let conn = wal_connection(&db);
+        let me = format!("held by {}", std::process::id());
+        let holder = || outside(Errand::SharedLockHolder, &db);
+        assert_eq!(holder(), me, "the control: SQLite holds its lock");
+
+        prepare_db_file(&db).unwrap();
+        assert_eq!(holder(), me, "after preparing a file that exists");
+        enforce_db_perms_0600(&db).unwrap();
+        assert_eq!(holder(), me, "after setting the permissions");
+        drop(conn);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The rule itself, for everything here that looks at the DB file or prepares it: none of it
+    /// opens the file. A watch on the directory reports each open and each close of a file in it,
+    /// whoever makes them — the one case no lock can show included, a file only just created.
+    #[test]
+    fn nothing_here_opens_the_db_file() {
+        let base = temp_path("no_open");
+        let db = base.join("dedcom.db");
+        let dir = CString::new(base.as_os_str().as_bytes()).unwrap();
+        // SAFETY: plain libc calls; the descriptor is owned at once and closed on drop.
+        let watch = unsafe {
+            let fd = libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC);
+            assert!(fd >= 0, "inotify: {}", io::Error::last_os_error());
+            OwnedFd::from_raw_fd(fd)
+        };
+        let events = libc::IN_OPEN | libc::IN_CLOSE_WRITE | libc::IN_CLOSE_NOWRITE;
+        // SAFETY: `dir` is a valid C string and `watch` an inotify descriptor.
+        let watched = unsafe { libc::inotify_add_watch(watch.as_raw_fd(), dir.as_ptr(), events) };
+        assert!(watched >= 0, "inotify: {}", io::Error::last_os_error());
+        // The opens and closes of the DB file queued so far. What happens to anything else in the
+        // directory, or to the directory itself, is somebody else's business.
+        let seen = || {
+            let header = std::mem::size_of::<libc::inotify_event>();
+            let mut buffer = [0u8; 4096];
+            let mut count = 0;
+            loop {
+                // SAFETY: `buffer` is valid for its length; the descriptor does not block.
+                let got = unsafe {
+                    libc::read(watch.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len())
+                };
+                if got <= 0 {
+                    return count;
+                }
+                let mut at = 0;
+                while at + header <= got as usize {
+                    // SAFETY: the kernel wrote a whole event at `at`; it is read unaligned.
+                    let event: libc::inotify_event =
+                        unsafe { std::ptr::read_unaligned(buffer.as_ptr().add(at).cast()) };
+                    let name = &buffer[at + header..at + header + event.len as usize];
+                    if name.split(|byte| *byte == 0).next() == Some(b"dedcom.db".as_slice()) {
+                        count += 1;
+                    }
+                    at += header + event.len as usize;
+                }
+            }
+        };
+
+        prepare_db_file(&db).unwrap();
+        prepare_db_file(&db).unwrap();
+        probe_existing_db_file(&db).unwrap();
+        verify_existing_db_file(&db).unwrap();
+        enforce_db_perms_0600(&db).unwrap();
+        assert_eq!(
+            seen(),
+            0,
+            "the DB file was opened while it was created, prepared again, identified, verified \
+             or given its permissions"
+        );
+
+        // The control: the watch does report an open and a close of that very file.
+        drop(std::fs::File::open(&db).unwrap());
+        assert_eq!(seen(), 2, "the control: one open and one close of the file");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// What depends on who asks, asked by an owner who is not root — root passes every access
+    /// check, and a umask is a whole process's, so the question goes to another process:
+    ///
+    /// - a new DB file is its owner's to read and write whatever the umask: the mode asked for at
+    ///   its creation is cut by the umask, the one set by path afterwards is not;
+    /// - a database its owner made read-only is refused as it stands, the way the old
+    ///   `open(O_RDWR)` refused it, and is not made writable again;
+    /// - a file its owner cannot read is identified all the same: nothing is opened to look at it;
+    /// - a file in a directory its owner cannot search is not, and the refusal says where to look.
+    #[test]
+    fn an_owner_who_is_not_root_is_answered_as_the_old_open_answered() {
+        let base = temp_path("prep_owner");
+        // SAFETY: a plain libc call.
+        let root = unsafe { libc::geteuid() } == 0;
+        if root {
+            // Root becomes `nobody` for the errand: the directory is handed to it, not opened to
+            // everybody. Where even that cannot be done, the errand finds the directory closed
+            // and says so.
+            let _ = std::os::unix::fs::chown(&base, Some(65534), Some(65534));
+        }
+        let answer = outside(Errand::OwnerWithoutPrivilege, &base.join("dedcom.db"));
+        if answer.starts_with("skipped:") {
+            // A run that is not root always has an answer; only a root that cannot stop being
+            // root, or cannot reach the directory as `nobody`, may have none.
+            assert!(root, "only root may have to skip: {answer}");
+            eprintln!("an_owner_who_is_not_root_is_answered_as_the_old_open_answered {answer}");
+        } else {
+            assert!(
+                answer.starts_with("new: mode 600; read-only: cannot open the DB file"),
+                "{answer}"
+            );
+            assert!(
+                answer.contains("permission denied (an immutable file or directory?)"),
+                "{answer}"
+            );
+            assert!(
+                answer.contains("(mode 400); unreadable: identified; hidden: cannot verify the DB"),
+                "{answer}"
+            );
+            assert!(
+                answer.contains("(a directory on the way that cannot be searched?)"),
+                "{answer}"
+            );
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The probe answers with the identity of what the name itself holds.
+    #[test]
+    fn the_identity_probe_names_the_file_at_the_path() {
+        use std::os::unix::fs::MetadataExt;
+        let base = temp_path("probe_id");
+        let db = base.join("dedcom.db");
+        std::fs::write(&db, b"sqlite?").unwrap();
+        let meta = std::fs::symlink_metadata(&db).unwrap();
+        let seen = probe_existing_db_file(&db).unwrap();
+        assert_eq!((seen.device, seen.inode), (meta.dev(), meta.ino()));
+
+        // A link to that very file is not the file: the probe says so instead of following it.
+        let link = base.join("link.db");
+        std::os::unix::fs::symlink(&db, &link).unwrap();
+        let err = probe_existing_db_file(&link).unwrap_err().to_string();
+        assert!(
+            err.contains("cannot verify")
+                && err.contains("it is a symbolic link, and dedcom does not open one here"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn preparing_the_db_file_creates_a_missing_one_and_keeps_one_that_exists() {
+        use std::os::unix::fs::MetadataExt;
+        let base = temp_path("prep_file");
+        let db = base.join("dedcom.db");
+        prepare_db_file(&db).unwrap();
+        assert_eq!(mode_bits(&db), 0o600);
+        assert_eq!(std::fs::read(&db).unwrap(), b"");
+
+        std::fs::write(&db, b"kept").unwrap();
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let inode = std::fs::symlink_metadata(&db).unwrap().ino();
+        prepare_db_file(&db).unwrap();
+        assert_eq!(std::fs::read(&db).unwrap(), b"kept");
+        assert_eq!(mode_bits(&db), 0o600, "an existing file is made owner-only");
+        assert_eq!(std::fs::symlink_metadata(&db).unwrap().ino(), inode);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A link at the DB path is refused as one, and nothing reaches what it points at — not a
+    /// byte, not a permission bit, and no file where a dangling link points.
+    #[test]
+    fn preparing_the_db_file_refuses_a_symlink_and_leaves_its_target_alone() {
+        let base = temp_path("prep_link");
+        let target = base.join("outside.bin");
+        std::fs::write(&target, b"victim").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let db = base.join("dedcom.db");
+        std::os::unix::fs::symlink(&target, &db).unwrap();
+        let err = prepare_db_file(&db).unwrap_err().to_string();
+        assert!(
+            err.contains("it is a symbolic link, and dedcom does not open one here"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"victim");
+        assert_eq!(mode_bits(&target), 0o644);
+
+        let nowhere = base.join("nowhere.bin");
+        let dangling = base.join("dangling.db");
+        std::os::unix::fs::symlink(&nowhere, &dangling).unwrap();
+        let err = prepare_db_file(&dangling).unwrap_err().to_string();
+        assert!(
+            err.contains("it is a symbolic link, and dedcom does not open one here"),
+            "{err}"
+        );
+        assert!(std::fs::symlink_metadata(&nowhere).is_err());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// What is neither a file nor a link is refused where it stands, untouched: a FIFO used to have
+    /// its permissions rewritten first and was refused a step later.
+    #[test]
+    fn preparing_the_db_file_refuses_what_is_not_a_file_without_touching_it() {
+        let base = temp_path("prep_fifo");
+        let fifo = base.join("dedcom.db");
+        let c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid C string for a child of an existing directory.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o640) }, 0);
+        std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let err = prepare_db_file(&fifo).unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+        assert_eq!(mode_bits(&fifo), 0o640);
+
+        let sock = base.join("sock.db");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let err = prepare_db_file(&sock).unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
         std::fs::remove_dir_all(&base).ok();
     }
 }

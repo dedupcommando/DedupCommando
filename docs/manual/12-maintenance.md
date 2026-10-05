@@ -27,13 +27,19 @@ dedcom --state-dir /var/lib/dedcom
 Useful when `~` sits on a thin root (a Linux/ZFS root filesystem may be only 16–32 GiB),
 while the database can grow to hundreds of MB — move it somewhere roomier.
 
-The last `dedcom` that writes removes `dedcom.db-wal` and `dedcom.db-shm` when it closes. A
-run that only reads — `--stats`, `--export-csv`, an observer (`--read-only`) — may leave them
-behind: a read-only connection cannot remove them. Left that way they are harmless, and the
+The last `dedcom` that writes removes `dedcom.db-wal` and `dedcom.db-shm` when it closes,
+unless something still has the database open. A run that only reads — `--stats`,
+`--export-csv`, an observer (`--read-only`) — may leave them behind: a read-only connection
+cannot remove them. Left that way they are harmless, and the
 next `dedcom` that opens the database to write removes them. Do not delete them by hand: while
 `dedcom` runs they are in use, and after a `dedcom` that did not exit cleanly `dedcom.db-wal`
 holds changes that are not in `dedcom.db` yet — the next `dedcom` that opens the database
 folds them in.
+
+To look into `dedcom.db` while `dedcom` is running, open it read-only —
+`sqlite3 -readonly dedcom.db`. A client that is able to write competes with `dedcom` for the
+database's write lock: `dedcom` waits up to five seconds for it, and a batch of actions does
+not wait at all.
 
 ## `dedcom.db` — structure and size
 
@@ -66,8 +72,9 @@ The exact figures come from `dedcom --stats`:
 ```
 
 If `dedcom.db` grows much faster than the number of active sessions, the WAL is not
-being checkpointed. Restarting `dedcom` (closing the DB) triggers a checkpoint; as a last
-resort `--compact-db` compacts the database forcibly.
+being checkpointed. Restarting `dedcom` (closing the DB) triggers a checkpoint when nothing
+else — another `dedcom`, an observer included, or a `sqlite3` shell — has the database open;
+as a last resort `--compact-db` compacts the database forcibly.
 
 ## VACUUM — compacting the database
 
