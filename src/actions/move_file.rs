@@ -50,8 +50,18 @@ pub fn move_to(src: &Path, dest: &Path) -> Result<PathBuf> {
             Err(err) if n > 0 && is_name_too_long(&err) => {
                 return Err(suffix_too_long(dest, &format!(".{n}"), &err))
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(rename_failure(err)),
         }
+    }
+}
+
+/// A rename that failed, or the look before one that refused, as the error of a move. What the
+/// system said stays the I/O error it is; a refusal of this program's own carries no error
+/// number and goes in its own words alone, the same wherever it is met.
+pub(crate) fn rename_failure(err: std::io::Error) -> AppError {
+    match err.raw_os_error() {
+        Some(_) => err.into(),
+        None => AppError::msg(err.to_string()),
     }
 }
 
@@ -106,9 +116,46 @@ pub(crate) fn suffixed(base: &Path, n: u32) -> PathBuf {
     }
 }
 
+/// What a move is told when it is asked to move a file of the database this process has open.
+/// One line; the manual quotes it (chapters 12 and 13).
+pub(crate) const OPEN_DATABASE_MOVE_REFUSAL: &str =
+    "a file of dedcom's open database, or a hard link to one — it is not moved";
+
+/// And when it is asked to move a directory that database lies in.
+pub(crate) const OPEN_DATABASE_FOLDER_MOVE_REFUSAL: &str =
+    "a folder that holds dedcom's open database — it is not moved";
+
+fn open_database_move_refusal(part: crate::paths::OpenDatabasePart) -> std::io::Error {
+    let words = match part {
+        crate::paths::OpenDatabasePart::File => OPEN_DATABASE_MOVE_REFUSAL,
+        crate::paths::OpenDatabasePart::Directory => OPEN_DATABASE_FOLDER_MOVE_REFUSAL,
+    };
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, words)
+}
+
+/// Refuses `src` if it is a file of a database this process has open, or a directory such a
+/// database lies in — what [`rename_noreplace`] asks for itself, for the caller that has
+/// something to settle about `src` before it gets there. A name that cannot be looked at is an
+/// error as well: nothing is moved unseen.
+pub(crate) fn refuse_open_database_move(src: &Path) -> std::io::Result<()> {
+    match crate::paths::part_of_open_database(src)? {
+        Some(part) => Err(open_database_move_refusal(part)),
+        None => Ok(()),
+    }
+}
+
 /// Atomic `rename` without overwrite (Linux `renameat2` + `RENAME_NOREPLACE`):
 /// if `dest` exists — `EEXIST`, the target is not overwritten. The check and the move are
 /// a single kernel operation, the TOCTOU race is eliminated.
+///
+/// Every rename of something an operator pointed at comes down to this one — a move, its undo,
+/// the quarantine — so this is where a database this process has open is kept at its name:
+/// neither one of its three files nor a directory it lies in is renamed. SQLite would go on
+/// working through its descriptors; but the next connection is opened by name, finds the name
+/// free and starts an empty database there, and what the journal held is lost
+/// ([`crate::paths::OpenDatabase`]). The look at the source, the question and the rename are one
+/// step as far as the list of open databases goes: no connection can be entered in it, announce
+/// its close or leave it between them.
 pub(crate) fn rename_noreplace(src: &Path, dest: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -118,20 +165,44 @@ pub(crate) fn rename_noreplace(src: &Path, dest: &Path) -> std::io::Result<()> {
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let dest_c = CString::new(dest.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            src_c.as_ptr(),
-            libc::AT_FDCWD,
-            dest_c.as_ptr(),
-            RENAME_NOREPLACE,
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
+    let mut outcome = Ok(());
+    let refused = crate::paths::unless_part_of_open_database(src, || {
+        #[cfg(test)]
+        take_before_the_rename();
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                src_c.as_ptr(),
+                libc::AT_FDCWD,
+                dest_c.as_ptr(),
+                RENAME_NOREPLACE,
+            )
+        };
+        // Taken here, before anything else can touch errno.
+        if rc != 0 {
+            outcome = Err(std::io::Error::last_os_error());
+        }
+    })?;
+    match refused {
+        Some(part) => Err(open_database_move_refusal(part)),
+        None => outcome,
+    }
+}
+
+// Test-only one-shot seam inside the rename's own step: what is put here runs right before the
+// system call, from wherever the rename is made. Thread-local, so it cannot fire in a parallel
+// test; absent from every non-test build.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_THE_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn take_before_the_rename() {
+    if let Some(seam) = BEFORE_THE_RENAME.with(|slot| slot.borrow_mut().take()) {
+        seam();
     }
 }
 
@@ -598,6 +669,162 @@ mod tests {
         fs::create_dir_all(&dst).unwrap();
         assert!(move_to(&link, &dst.join("link.txt")).is_err());
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// The one rename every move, undo and quarantine comes down to does not take a file of a
+    /// database this process has open from its name — the database, its journal or the index of
+    /// that — and takes any of them once nothing has the database open.
+    ///
+    /// Red on the parent: all three were renamed.
+    #[test]
+    fn a_file_of_the_open_database_is_not_renamed() {
+        let _role = crate::state::store::role_guard();
+        let root = temp_dir("rename_own_db");
+        let db = root.join("dedcom.db");
+        let store = crate::state::store::ScanStore::open_writable(&db).unwrap();
+        let refused = Err(OPEN_DATABASE_MOVE_REFUSAL.to_string());
+        for suffix in crate::paths::DATABASE_FILE_SUFFIXES {
+            let file = root.join(format!("dedcom.db{suffix}"));
+            let away = root.join(format!("away{suffix}"));
+            let outcome = rename_noreplace(&file, &away).map_err(|err| err.to_string());
+            assert_eq!(outcome, refused, "dedcom.db{suffix}");
+            assert!(
+                file.is_file() && !away.exists(),
+                "dedcom.db{suffix} stays at its name"
+            );
+        }
+        // A hard link is the same file under another name; a symbolic link is a file of its own.
+        let link = root.join("link");
+        fs::hard_link(&db, &link).unwrap();
+        let outcome =
+            rename_noreplace(&link, &root.join("away-link")).map_err(|err| err.to_string());
+        assert_eq!(outcome, refused, "a hard link to the database");
+        let symlink = root.join("symlink");
+        std::os::unix::fs::symlink(&db, &symlink).unwrap();
+        rename_noreplace(&symlink, &root.join("away-symlink")).expect("a symbolic link to it");
+        // A move that comes down to this rename says the same, and in those words alone.
+        let dst = root.join("dst");
+        fs::create_dir(&dst).unwrap();
+        let said = move_into_dir(&db, &dst).map_err(|err| err.to_string());
+        assert_eq!(said, Err(OPEN_DATABASE_MOVE_REFUSAL.to_string()), "a move");
+
+        drop(store);
+        rename_noreplace(&db, &root.join("away")).expect("nobody holds it any more");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A refusal of this program's own is told in its own words alone, wherever it is met; what
+    /// the system said keeps the mark of an I/O error.
+    #[test]
+    fn a_refusal_goes_in_its_own_words_and_a_system_error_as_one() {
+        let refusal =
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, OPEN_DATABASE_MOVE_REFUSAL);
+        assert_eq!(
+            rename_failure(refusal).to_string(),
+            OPEN_DATABASE_MOVE_REFUSAL
+        );
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
+        let said = rename_failure(denied).to_string();
+        assert!(said.starts_with("I/O: "), "{said}");
+    }
+
+    /// The question and the rename are one step: the list of open databases stays held while
+    /// the system call is made, for a file and for a directory alike. Were it let go of in
+    /// between, a connection could be opened after the answer «nobody has this open» and before
+    /// the rename.
+    #[test]
+    fn the_list_of_open_databases_is_held_while_the_rename_is_made() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let _alone = crate::paths::alone_with_the_list();
+        let root = temp_dir("rename_one_step");
+        let file = root.join("file");
+        write_file(&file, b"content");
+        let dir = root.join("dir");
+        fs::create_dir(&dir).unwrap();
+        for src in [file, dir] {
+            let held = Rc::new(Cell::new(None));
+            BEFORE_THE_RENAME.with(|slot| {
+                let held = Rc::clone(&held);
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    held.set(Some(crate::paths::open_databases_are_held()))
+                }));
+            });
+            let moved = src.with_extension("moved");
+            rename_noreplace(&src, &moved).expect("nobody holds it");
+            assert_eq!(held.get(), Some(true), "{}", src.display());
+            assert!(moved.exists(), "the control: it was renamed");
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The look a caller takes before it settles anything else tells a file of the open database
+    /// and every directory the database lies in, each in its own words — and nothing else, and
+    /// nothing once the database is closed. What cannot be looked at is not passed either.
+    #[test]
+    fn the_look_before_a_move_tells_the_open_database_and_every_folder_above_it() {
+        let _role = crate::state::store::role_guard();
+        let root = temp_dir("look_own_db");
+        let state = root.join("home").join("state");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(root.join("home").join("beside")).unwrap();
+        let db = state.join("dedcom.db");
+        let store = crate::state::store::ScanStore::open_writable(&db).unwrap();
+        write_file(&state.join("config.json"), b"{}");
+        let said = |path: &Path| refuse_open_database_move(path).map_err(|err| err.to_string());
+
+        assert_eq!(said(&db), Err(OPEN_DATABASE_MOVE_REFUSAL.to_string()));
+        for above in [state.clone(), root.join("home"), root.clone()] {
+            assert_eq!(
+                said(&above),
+                Err(OPEN_DATABASE_FOLDER_MOVE_REFUSAL.to_string()),
+                "{}",
+                above.display()
+            );
+        }
+        assert_eq!(said(&state.join("config.json")), Ok(()), "a file beside it");
+        assert_eq!(
+            said(&root.join("home").join("beside")),
+            Ok(()),
+            "a directory beside its own"
+        );
+        let absent = refuse_open_database_move(&root.join("absent")).expect_err("nothing there");
+        assert_eq!(absent.kind(), std::io::ErrorKind::NotFound, "{absent}");
+
+        drop(store);
+        assert_eq!(
+            (said(&db), said(&state)),
+            (Ok(()), Ok(())),
+            "nobody holds it"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Both refusals are what `dedcom.log` shows an operator, so the manual carries them word
+    /// for word: where the state directory is described, and where an operator looks a message
+    /// up.
+    #[test]
+    fn the_manual_quotes_both_refusals_of_a_move() {
+        for name in ["12-maintenance.md", "13-troubleshooting.md"] {
+            let chapter = crate::testfixtures::manual(name);
+            for words in [
+                OPEN_DATABASE_MOVE_REFUSAL,
+                OPEN_DATABASE_FOLDER_MOVE_REFUSAL,
+            ] {
+                assert!(chapter.contains(words), "{name} must quote: {words}");
+            }
+        }
+    }
+
+    /// Where the manual says what a move of the state directory would cost the running
+    /// program, it gives the status line of a lost database in the interface's own words.
+    #[test]
+    fn the_manual_quotes_the_status_line_of_a_lost_database() {
+        let quoted = format!("`{}`", crate::app::REOPEN_REQUIRED);
+        assert!(
+            crate::testfixtures::manual("12-maintenance.md").contains(&quoted),
+            "12-maintenance.md must quote: {quoted}"
+        );
     }
 
     #[test]

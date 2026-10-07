@@ -263,6 +263,25 @@ rsync -aHAX --sparse <src> <dest> && rm -f <src>
 **Fix:** keep the move within a single dataset, or run the suggested `rsync`
 command by hand (it preserves hardlinks, ACLs, xattrs, and sparseness).
 
+### "… dedcom's open database … it is not moved" (a move of dedcom's own database)
+
+**Cause:** the item is one of the three files of the database this `dedcom` has open
+(`dedcom.db`, `dedcom.db-wal`, `dedcom.db-shm`), a hard link to one of them, or a folder
+they lie in, at whatever depth. Moved from under the running program, the database would
+be lost to it: a moved `dedcom.db` is replaced by a new, empty one at the next opening; a
+moved folder leaves none to open ([§12](12-maintenance.md#state-directory)). The status
+line counts the item — `moved 0, errors 1 (reasons in dedcom.log)` — and the line in
+`dedcom.log` is one of:
+
+```text
+move failed: <path> — a file of dedcom's open database, or a hard link to one — it is not moved
+move failed: <path> — a folder that holds dedcom's open database — it is not moved
+```
+
+**Fix:** leave them where they are. To relocate the state directory — or to move a folder
+above it — quit `dedcom`, move the folder, and from then on start `dedcom` with
+`--state-dir` naming the state directory's new place.
+
 ### "dedcom: N of M actions not carried out — each is named above" (a saved script)
 
 **Cause:** a script saved with `S` in the `F11` overlay went on past the actions it could

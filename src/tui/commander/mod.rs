@@ -2740,6 +2740,28 @@ mod move_worker_tests {
         assert!(outcome.error.is_none());
     }
 
+    /// What the status line says of a batch with an item it did not move: the count, and where
+    /// the reason is. The manual quotes it, in the entry an operator reaches from this line.
+    #[test]
+    fn the_status_of_a_batch_with_an_error_is_the_one_the_manual_quotes() {
+        let (mut app, _events) = crate::app::test_app();
+        app.commander.move_pending = 1;
+        let outcome = move_batch::MoveBatchOutcome {
+            label: "panel 2".to_string(),
+            failed: 1,
+            ..Default::default()
+        };
+        apply_move_outcome(&mut app, outcome);
+
+        let counted = "moved 0, errors 1 (reasons in dedcom.log)";
+        assert_eq!(app.commander.status, format!("→ panel 2: {counted}"));
+        let quoted = format!("`{counted}`");
+        assert!(
+            crate::testfixtures::manual("13-troubleshooting.md").contains(&quoted),
+            "13-troubleshooting.md must quote: {quoted}"
+        );
+    }
+
     fn recv_move_done(
         events: &crossbeam_channel::Receiver<AppEvent>,
     ) -> move_batch::MoveBatchOutcome {
@@ -4408,6 +4430,40 @@ mod triage_tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Undo is a move like any other: it does not take a file of the open database from its
+    /// name, nor a folder the database lies in.
+    ///
+    /// Red on the parent: `restore_one` renamed both.
+    #[test]
+    fn undo_does_not_move_the_open_database_or_its_folder() {
+        let _role = crate::state::store::role_guard();
+        let root = temp_dir("undo_own_db");
+        let state = root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let db = state.join("dedcom.db");
+        let store = crate::state::store::ScanStore::open_writable(&db).unwrap();
+
+        let file_back = root.join("elsewhere").join("dedcom.db");
+        let file = restore_one(&db, &file_back).map_err(|err| err.to_string());
+        let folder_back = root.join("before").join("state");
+        let folder = restore_one(&state, &folder_back).map_err(|err| err.to_string());
+
+        assert_eq!(
+            file,
+            Err(crate::actions::move_file::OPEN_DATABASE_MOVE_REFUSAL.to_string()),
+            "the file is refused, and for this reason"
+        );
+        assert!(db.is_file() && !file_back.exists(), "and stays");
+        assert_eq!(
+            folder,
+            Err(crate::actions::move_file::OPEN_DATABASE_FOLDER_MOVE_REFUSAL.to_string()),
+            "the folder is refused, and for this reason"
+        );
+        assert!(state.is_dir() && !folder_back.exists(), "and stays");
+        drop(store);
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -29,19 +29,47 @@ while the database can grow to hundreds of MB — move it somewhere roomier. It 
 a root you scan: a scan leaves the database it is writing to out
 ([§7](07-scanning.md#permanent-exclusions)).
 
-The last `dedcom` that writes removes `dedcom.db-wal` and `dedcom.db-shm` when it closes,
-unless something still has the database open. A run that only reads — `--stats`,
-`--export-csv`, an observer (`--read-only`) — may leave them behind: a read-only connection
-cannot remove them. Left that way they are harmless, and the
-next `dedcom` that opens the database to write removes them. Do not delete them by hand: while
-`dedcom` runs they are in use, and after a `dedcom` that did not exit cleanly `dedcom.db-wal`
-holds changes that are not in `dedcom.db` yet — the next `dedcom` that opens the database
-folds them in. Do not move or rename the three files while `dedcom` runs either — as a rule
-the commander's own move does not stop you ([§7](07-scanning.md#permanent-exclusions)). With
+A headless scan (`--scan`) removes `dedcom.db-wal` and `dedcom.db-shm` when it ends, unless
+something still has the database open. The interface, left with `q` or F10, as a rule does
+not: both files stay, and `dedcom.db-wal` holds the changes of the session that are not in
+`dedcom.db` yet. Ended by a signal — `SIGTERM`, `SIGINT`, or `SIGHUP` from a dropped SSH
+session — it closes the database first and removes them as a scan does, unless a second
+`SIGTERM` or `SIGINT` cuts that exit short
+([§3](03-safety.md#lose-the-ssh-connection-during-apply)).
+A run that only reads — `--stats`, `--export-csv`, an observer (`--read-only`) — may leave
+the two files behind as well: a read-only connection cannot remove them. Nothing is lost by
+their staying: the next `dedcom` that opens the database reads the journal along with it.
+Do not delete them by hand, at any time: while `dedcom` runs they are in use, and once it
+has quit `dedcom.db-wal` may hold changes that are in no other file. From then on keep the
+three together: move or copy them only as a set — or the whole folder — never `dedcom.db`
+alone.
+
+Do not move or rename the three files while `dedcom` runs, nor the folder they lie in. With
 `dedcom.db` away from its name, the next `dedcom` to open the database for writing starts an
 empty database there and deletes `dedcom.db-wal`: the changes that were not in `dedcom.db`
 yet are lost, scans and marks among them. The running `dedcom` is such an opener itself, and
 not only for a scan or a move: the list of scans and the trash open the database the same way.
+With the folder away from its path, the running `dedcom` has lost its database: the panels
+stop showing the scan and its marks, the status line begins
+`the checkpoint database was replaced — reopen required`, and a scan, the list of scans and
+the trash no longer find it. If the folder was renamed within its filesystem, the move in
+progress is recorded in it, and the log is written there from then on; moved to another
+filesystem, the folder is a copy and gets neither. The next `dedcom` that writes and is not
+told the new place with `--state-dir` starts an empty state directory where the old one was.
+
+`dedcom` does not make such a move itself. A move in the commander or on the Triage Board
+leaves the three files of the database it has open where they are, and the folder they lie
+in, and every folder above that one. The item is counted among the errors in the status
+line, and `dedcom.log` gives the reason, in one of these two wordings:
+
+```text
+a file of dedcom's open database, or a hard link to one — it is not moved
+a folder that holds dedcom's open database — it is not moved
+```
+
+To relocate the state directory, quit `dedcom`, move the folder, and from then on start
+`dedcom` with `--state-dir` naming the new place. Another program — `mv`, a file manager —
+is not stopped by any of this.
 
 To look into `dedcom.db` while `dedcom` is running, open it read-only —
 `sqlite3 -readonly dedcom.db`. A client that is able to write competes with `dedcom` for the
@@ -79,9 +107,10 @@ The exact figures come from `dedcom --stats`:
 ```
 
 If `dedcom.db` grows much faster than the number of active sessions, the WAL is not
-being checkpointed. Restarting `dedcom` (closing the DB) triggers a checkpoint when nothing
-else — another `dedcom`, an observer included, or a `sqlite3` shell — has the database open;
-as a last resort `--compact-db` compacts the database forcibly.
+being checkpointed. Restarting `dedcom` triggers a checkpoint (its start folds the journal
+the last run left) when nothing else — another `dedcom`, an observer included, or a
+`sqlite3` shell — has the database open; as a last resort `--compact-db` compacts the
+database forcibly.
 
 ## VACUUM — compacting the database
 
@@ -330,8 +359,9 @@ case "$rc" in
 esac
 command -v sqlite3 >/dev/null || {
   echo "sqlite3 CLI is missing (Debian/Proxmox: apt install sqlite3)." >&2
-  echo "Without it: start the OLD dedcom build once and exit cleanly (it folds the WAL and" >&2
-  echo "removes -wal/-shm), verify that only dedcom.db remains, then: cp -p dedcom.db <new name>" >&2
+  echo "Without it: if neither dedcom.db-wal nor dedcom.db-shm is in $S, cp -p dedcom.db <new name>" >&2
+  echo "copies the whole database — a way back only if the new build has not started yet. If either file" >&2
+  echo "is there, install sqlite3; do not delete it." >&2
   exit 1
 }
 
@@ -347,7 +377,7 @@ case "$V" in ''|*[!0-9]*) echo "cannot read the schema version of dedcom.db" >&2
 BAK="dedcom.db.v$V-$(date +%Y%m%d-%H%M%S).bak"
 if [ -e "$BAK" ] || [ -L "$BAK" ]; then echo "$BAK already exists" >&2; exit 1; fi
 
-# Reading the version has already folded a leftover -wal into dedcom.db, as starting dedcom would;
+# Reading the version has already folded a leftover -wal into dedcom.db;
 # .backup reads through any WAL still in use.
 ls -l dedcom.db*
 sqlite3 dedcom.db ".backup '$BAK'"
@@ -407,7 +437,7 @@ ASIDE="aside-$(date +%Y%m%d-%H%M%S)"
 mkdir -m 700 "$ASIDE"
 
 # 3. The main file must move; the sidecars move only if present.
-#    "Absent sidecar" is normal after a clean exit; "cannot move" is an error (set -e stops).
+#    An absent sidecar is normal; "cannot move" is an error (set -e stops).
 mv dedcom.db "$ASIDE/"
 for f in dedcom.db-wal dedcom.db-shm; do
   if [ -e "$f" ] || [ -L "$f" ]; then mv "$f" "$ASIDE/"; fi

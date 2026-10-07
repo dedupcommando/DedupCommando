@@ -553,15 +553,19 @@ pub const DATABASE_FILE_SUFFIXES: [&str; 3] = ["", "-wal", "-shm"];
 
 /// The files SQLite holds for this process, one entry for each connection it has open.
 ///
-/// A read-write lock, and what it orders is the close of a descriptor against the opening of a
-/// connection: [`unless_open_database_file`] asks and closes with the lock held to read, and a
-/// connection is entered here — with the lock held to write — before SQLite opens its file. So a
-/// descriptor that is closed through that function is never closed over a file that has just
-/// become a connection's.
+/// A read-write lock, and what it orders is an act against the opening of a connection — the
+/// close of a descriptor, or a rename: [`unless_open_database_file`] and
+/// [`unless_part_of_open_database`] ask and act with the lock held to read, and a connection is
+/// entered here — with the lock held to write — before SQLite opens its file. So a descriptor
+/// that is closed through the first is never closed over a file that has just become a
+/// connection's, and nothing is renamed through the second while a connection on it is being
+/// entered.
 ///
-/// The price is that the close itself happens with the list held. A close that blocks — on a
-/// filesystem that waits for something when a file is closed — holds up every connection that
-/// opens or closes meanwhile, and behind those every other question asked here.
+/// The price is that the act itself happens with the list held, and so does the look before a
+/// rename. Either one that waits — a close on a filesystem that waits for something when a file
+/// is closed, a rename or a look on a pool that has suspended its writes or on a network mount
+/// that does not answer — holds up every connection that opens or closes meanwhile, on whatever
+/// thread, and behind those every other question asked here.
 static OPEN_DATABASES: RwLock<Vec<HeldFiles>> = RwLock::new(Vec::new());
 
 /// Tells one entry of [`OPEN_DATABASES`] from another: two connections on one database are two.
@@ -621,6 +625,27 @@ fn open_databases_mut() -> RwLockWriteGuard<'static, Vec<HeldFiles>> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Test-only: whether the list is held right now — by anybody, this thread included; it cannot
+/// tell whose hold it is. What an act handed to [`unless_open_database_file`] or
+/// [`unless_part_of_open_database`] can ask from inside. A test that asks takes
+/// [`alone_with_the_list`] first.
+#[cfg(test)]
+pub(crate) fn open_databases_are_held() -> bool {
+    matches!(
+        OPEN_DATABASES.try_write(),
+        Err(std::sync::TryLockError::WouldBlock)
+    )
+}
+
+/// Test-only: taken, one at a time, by the tests that hold the list for long and by those that
+/// ask [`open_databases_are_held`]. With it taken, «held» can be another thread's only for the
+/// instant in which some other test asks the list, or enters or leaves it.
+#[cfg(test)]
+pub(crate) fn alone_with_the_list() -> std::sync::MutexGuard<'static, ()> {
+    static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ALONE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// A database this process has open through SQLite — for as long as this value lives.
 ///
 /// The other half of what [`stat_db_path`] is about. Nothing here opens the database file to look
@@ -631,10 +656,20 @@ fn open_databases_mut() -> RwLockWriteGuard<'static, Vec<HeldFiles>> {
 /// one. Whatever reads files for their content therefore asks [`is_open_database_file`] before it
 /// opens one, and [`unless_open_database_file`] before it closes one.
 ///
+/// A rename is the other thing that must not happen to them. It closes nothing and costs no
+/// lock; but the next connection is opened by name. With the database gone from its name, it
+/// finds the name free and starts an empty database there, and what the journal held is lost;
+/// with the journal gone from its name, the next program to read the database fails; with the
+/// index of the journal gone, the next program to write no longer sees where this one's records
+/// end. So the one rename this program makes of what an operator points at
+/// (`actions::move_file::rename_noreplace`) asks the same list first — about a file, and about
+/// a directory the database lies in ([`unless_part_of_open_database`]).
+///
 /// Whoever opens a connection takes one of these before SQLite opens the file, tells it when the
 /// connection has read ([`Self::note_files`]) and when it is about to close ([`Self::closing`]),
 /// and drops it once the connection is closed. While it lives, the three names — or the files
-/// noted from them — are refused to every read.
+/// noted from them — are refused to every read; a rename of anything an operator points at is
+/// refused the noted files and any non-directory at one of the three names.
 #[derive(Debug)]
 pub struct OpenDatabase(u64);
 
@@ -737,6 +772,153 @@ pub fn unless_open_database_file(file: PathIdentity, act: impl FnOnce()) -> bool
 fn holds(open: &[HeldFiles], file: PathIdentity) -> bool {
     open.iter()
         .any(|held| held.files().any(|theirs| theirs == file))
+}
+
+/// Which part of an open database a name holds — asked of a name that is about to be renamed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenDatabasePart {
+    /// One of the three files, a hard link to one, or a non-directory at one of the three names.
+    File,
+    /// A directory the database lies in, at whatever depth: the three files would keep their
+    /// names inside it and SQLite its descriptors, but whatever opens the database after that
+    /// does so by the path it was given, and finds nothing there.
+    Directory,
+}
+
+/// What the name `path` holds of the databases this process has open, if anything — the
+/// question for a name that is about to be renamed, asked without renaming. A name that cannot
+/// be looked at is an error.
+pub fn part_of_open_database(path: &Path) -> io::Result<Option<OpenDatabasePart>> {
+    let open = open_databases();
+    let looked = look_at(path)?;
+    Ok(part_held(&open, path, &looked))
+}
+
+/// Does `act` unless the name `path` holds part of an open database, and says which part
+/// stopped it — the look, the question and the act as one step, for the act that must not
+/// happen to either part: a rename. No connection can be entered in the list between the answer
+/// and the act (see [`OPEN_DATABASES`]), and none can leave it between the look and the answer:
+/// the journal and its index are other files once the last connection has closed and the next
+/// has opened, so a look taken any earlier could ask about a file that is gone while the name
+/// already holds its successor. What the list does not order — SQLite making and removing those
+/// two files while a connection that is listed opens or closes — is met by asking about the
+/// name as well (`names`).
+///
+/// `act` runs with the list held: it must not open or drop a store, nor ask about a file.
+pub fn unless_part_of_open_database(
+    path: &Path,
+    act: impl FnOnce(),
+) -> io::Result<Option<OpenDatabasePart>> {
+    let open = open_databases();
+    let looked = look_at(path)?;
+    let part = part_held(&open, path, &looked);
+    if part.is_none() {
+        act();
+    }
+    Ok(part)
+}
+
+/// What a name holds, as a rename of it has to know: which thing, and whether it is a directory.
+struct Looked {
+    thing: PathIdentity,
+    is_dir: bool,
+}
+
+/// The look a rename's question starts from — `lstat`, as everything here looks: a symbolic link
+/// answers for itself. Taken with the list held; see [`unless_part_of_open_database`].
+fn look_at(path: &Path) -> io::Result<Looked> {
+    let st = stat_db_path(path)?;
+    #[cfg(test)]
+    take_after_the_look();
+    Ok(Looked {
+        thing: PathIdentity {
+            device: st.st_dev as u64,
+            inode: st.st_ino as u64,
+        },
+        is_dir: st.st_mode & libc::S_IFMT == libc::S_IFDIR,
+    })
+}
+
+// Test-only one-shot seam right after that look: the instant by which the list has to be held
+// already. Thread-local, so it cannot fire in a parallel test; absent from every non-test build.
+#[cfg(test)]
+thread_local! {
+    static AFTER_THE_LOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn take_after_the_look() {
+    if let Some(seen) = AFTER_THE_LOOK.with(|slot| slot.borrow_mut().take()) {
+        seen();
+    }
+}
+
+/// The question itself: a directory is asked about as a directory, anything else as a file —
+/// by what the look found, and by the name it was found under.
+fn part_held(open: &[HeldFiles], path: &Path, looked: &Looked) -> Option<OpenDatabasePart> {
+    if looked.is_dir {
+        lies_above(open, looked.thing).then_some(OpenDatabasePart::Directory)
+    } else {
+        (holds(open, looked.thing) || names(open, path)).then_some(OpenDatabasePart::File)
+    }
+}
+
+/// Whether `path` is one of the three names of a database in the list: that name in that
+/// directory, by whatever way the directory is reached.
+///
+/// Asked beside [`holds`], because the list cannot keep a look and a name together by itself. A
+/// connection has its journal and the index noted from the end of its opening (`note_files`) to
+/// the announcement of its close; before and after, those two names answer for whatever they
+/// hold at the moment — and SQLite removes the files when the last connection closes and makes
+/// them anew for the next one, without asking here. A look taken just before that is of a file
+/// that is gone, while the name already holds its successor. So a name of a listed database is
+/// refused as a name, whatever file was found under it.
+///
+/// The name is compared as its bytes. A listing gives a name as the filesystem stores it, and
+/// that is the spelling a panel hands on; any other spelling that a dataset without case
+/// sensitivity, or with a normalization form, would accept is left to [`holds`].
+fn names(open: &[HeldFiles], path: &Path) -> bool {
+    let (Some(name), Some(dir)) = (path.file_name(), path.parent()) else {
+        return false;
+    };
+    // A directory is looked at through its `.`, so that a link at the end of the way to it is
+    // followed, as the rename itself will follow it.
+    let directory = |dir: &Path| identity_at(&dir.join(".")).ok();
+    // This one once, and only if some database has a file of this name.
+    let mut ours = None;
+    open.iter().any(|held| {
+        held.names.iter().any(|theirs| {
+            theirs.file_name() == Some(name)
+                && theirs.parent().is_some_and(|their_dir| {
+                    let ours = *ours.get_or_insert_with(|| directory(dir));
+                    ours.is_some() && ours == directory(their_dir)
+                })
+        })
+    })
+}
+
+/// Whether a database in the list lies in the directory `dir`, at whatever depth.
+///
+/// Asked of the directories on the way to each database's name, each looked at now and by
+/// `lstat`. Nothing holds a directory open, so there is no number of one worth keeping (see
+/// `HeldFiles::noted`). And the way to a state directory a mode that writes was started in has
+/// neither a link nor a `..` in it ([`establish_state_dir`]), so every name on it is a directory
+/// the database does lie in; only such a mode renames anything.
+fn lies_above(open: &[HeldFiles], dir: PathIdentity) -> bool {
+    let mut walked: Vec<&Path> = Vec::new();
+    open.iter().any(|held| {
+        // Connections on one database, opened by one spelling of its name: one walk serves all.
+        let database = held.names[0].as_path();
+        if walked.contains(&database) {
+            return false;
+        }
+        walked.push(database);
+        database
+            .ancestors()
+            .skip(1)
+            .any(|above| identity_at(above).is_ok_and(|theirs| theirs == dir))
+    })
 }
 
 /// What the name `path` holds, by `(st_dev, st_ino)` and whatever kind of thing it is — looked at
@@ -2302,19 +2484,282 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// A database is known by the directories it lies in as well, for as long as it is held: the
+    /// one that holds its three files and every one above that — and no directory beside them,
+    /// and no file. They are asked by name each time: what is refused is what stands on the way
+    /// to the name the database is opened by.
+    #[test]
+    fn an_open_database_is_known_by_the_directories_it_lies_in() {
+        let base = temp_path("open_db_above");
+        let home = base.join("home");
+        let state = home.join("state");
+        let beside = home.join("beside");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&beside).unwrap();
+        let db = state.join("dedcom.db");
+        prepare_db_file(&db).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&state, &link).unwrap();
+        let part = |path: &Path| part_of_open_database(path).expect("the name can be looked at");
+        let above = [state.as_path(), home.as_path(), base.as_path()];
+        let known = || {
+            above
+                .iter()
+                .filter(|dir| part(dir) == Some(OpenDatabasePart::Directory))
+                .count()
+        };
+        assert_eq!(
+            (known(), part(&db)),
+            (0, None),
+            "nobody holds it yet: neither its directories nor its file are part of anything"
+        );
+
+        let first = OpenDatabase::at(&db);
+        let second = OpenDatabase::at(&db);
+        // And another database held at the same time, somewhere else: each one is asked about.
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let other = OpenDatabase::at(&elsewhere.join("dedcom.db"));
+        assert_eq!(known(), 3, "its own directory and the two above that");
+        assert_eq!(
+            part(&db),
+            Some(OpenDatabasePart::File),
+            "the database itself is asked about as a file"
+        );
+        let own = identity_at(&state).unwrap();
+        assert!(
+            !lies_above(
+                &open_databases(),
+                PathIdentity {
+                    device: own.device.wrapping_add(1),
+                    inode: own.inode,
+                }
+            ),
+            "the same number on another device is another directory"
+        );
+        assert_eq!(
+            part(&elsewhere),
+            Some(OpenDatabasePart::Directory),
+            "the directory of the other database"
+        );
+        other.closing();
+        drop(other);
+        assert_eq!(part(&elsewhere), None, "which nobody holds any more");
+        assert_eq!(part(&beside), None, "a directory beside its own");
+        assert_eq!(
+            part(&link),
+            None,
+            "a symbolic link to its directory answers for itself, and is neither"
+        );
+        let absent = part_of_open_database(&base.join("absent")).expect_err("nothing there");
+        assert_eq!(absent.kind(), io::ErrorKind::NotFound, "{absent}");
+        first.closing();
+        drop(first);
+        assert_eq!(known(), 3, "one holder is left");
+
+        let moved = home.join("moved");
+        std::fs::rename(&state, &moved).unwrap();
+        assert_eq!(
+            (part(&moved), part(&home)),
+            (None, Some(OpenDatabasePart::Directory)),
+            "moved by somebody else, it is no longer on the way to the name; what is above still is"
+        );
+        std::fs::rename(&moved, &state).unwrap();
+
+        second.closing();
+        drop(second);
+        assert_eq!(known(), 0, "the last holder is gone");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The look, the question and the act as one step, for a rename: what must not happen to a
+    /// file of an open database, or to a directory it lies in, is done to those nobody holds and
+    /// not to these — and not to a name that cannot be looked at.
+    #[test]
+    fn what_must_not_happen_to_part_of_an_open_database_is_not_done_to_it() {
+        let base = temp_path("open_part_unless");
+        let db = base.join("dedcom.db");
+        prepare_db_file(&db).unwrap();
+        let done = std::cell::Cell::new(0);
+        let act = || done.set(done.get() + 1);
+        let unless =
+            |path: &Path| unless_part_of_open_database(path, act).map_err(|err| err.kind());
+        assert_eq!(
+            (unless(&db), unless(&base)),
+            (Ok(None), Ok(None)),
+            "nobody holds it"
+        );
+        assert_eq!(
+            done.get(),
+            2,
+            "so it was done, to the file and to its directory"
+        );
+
+        let held = OpenDatabase::at(&db);
+        assert_eq!(
+            (unless(&db), unless(&base)),
+            (
+                Ok(Some(OpenDatabasePart::File)),
+                Ok(Some(OpenDatabasePart::Directory))
+            ),
+            "it is held"
+        );
+        assert_eq!(done.get(), 2, "so it was done to neither");
+        held.closing();
+        drop(held);
+        assert_eq!(
+            (unless(&db), done.get()),
+            (Ok(None), 3),
+            "nobody holds it any more"
+        );
+        assert_eq!(
+            (unless(&base.join("absent")), done.get()),
+            (Err(io::ErrorKind::NotFound), 3),
+            "nothing is done to what cannot be looked at"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The look is taken with the list held, not before it. The journal and its index are other
+    /// files once every connection has closed and one has opened again; a look taken any earlier
+    /// could be of a file that is gone by the time the question is asked, while the name already
+    /// holds the next connection's.
+    #[test]
+    fn the_look_at_what_is_to_be_renamed_is_taken_with_the_list_held() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let _alone = alone_with_the_list();
+        let base = temp_path("open_part_look");
+        let seen = Rc::new(Cell::new(None));
+        for with_an_act in [false, true] {
+            AFTER_THE_LOOK.with(|slot| {
+                let seen = Rc::clone(&seen);
+                *slot.borrow_mut() =
+                    Some(Box::new(move || seen.set(Some(open_databases_are_held()))));
+            });
+            let part = if with_an_act {
+                unless_part_of_open_database(&base, || {})
+            } else {
+                part_of_open_database(&base)
+            };
+            assert_eq!(part.expect("it can be looked at"), None, "nobody's");
+            assert_eq!(
+                seen.take(),
+                Some(true),
+                "the list at the moment of the look (with an act: {with_an_act})"
+            );
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A name of an open database is refused as a name, whatever file the look found under it.
+    /// The journal is noted only at the end of the opening; until then — and again from the
+    /// announcement of the close — its name answers for whatever it holds, and SQLite replaces
+    /// that file without asking here. Shown at the seam: between the look and the question the
+    /// journal gives way to a successor (moved aside, so that the two cannot share a number).
+    /// Asked by the name itself, and by a way that goes through a link to its directory.
+    #[test]
+    fn a_name_of_an_open_database_is_refused_whatever_file_the_look_found_under_it() {
+        let base = temp_path("open_part_name");
+        let state = base.join("state");
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let db = state.join("dedcom.db");
+        prepare_db_file(&db).unwrap();
+        let journal = state.join("dedcom.db-wal");
+        std::fs::write(&journal, b"the journal the look finds").unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&state, &link).unwrap();
+        // The connection has not read yet: its journal is not noted.
+        let held = OpenDatabase::at(&db);
+
+        for (round, asked) in [journal.clone(), link.join("dedcom.db-wal")]
+            .iter()
+            .enumerate()
+        {
+            let aside = base.join(format!("aside-{round}"));
+            AFTER_THE_LOOK.with(|slot| {
+                let journal = journal.clone();
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    std::fs::rename(&journal, &aside).unwrap();
+                    std::fs::write(&journal, b"its successor").unwrap();
+                }));
+            });
+            let done = std::cell::Cell::new(false);
+            let part = unless_part_of_open_database(asked, || done.set(true));
+            assert_eq!(
+                (part.map_err(|err| err.kind()), done.get()),
+                (Ok(Some(OpenDatabasePart::File)), false),
+                "{}",
+                asked.display()
+            );
+            assert!(
+                AFTER_THE_LOOK.with(|slot| slot.borrow().is_none()),
+                "the control: the journal did change hands after the look"
+            );
+        }
+
+        // The name alone makes nothing part of the database, and neither does the directory.
+        let part = |path: &Path| part_of_open_database(path).expect("the name can be looked at");
+        let namesake = elsewhere.join("dedcom.db-wal");
+        std::fs::write(&namesake, b"a file of that name").unwrap();
+        let neighbour = state.join("notes.txt");
+        std::fs::write(&neighbour, b"a file beside the database").unwrap();
+        assert_eq!(
+            (part(&namesake), part(&neighbour)),
+            (None, None),
+            "the same name in another directory, another name in the same directory"
+        );
+
+        held.closing();
+        drop(held);
+        assert_eq!(part(&journal), None, "nobody holds the database any more");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     /// One step means that the list stays held while the act is done: a connection that asks to
     /// be entered meanwhile waits until the act is over. Otherwise a database could be opened
     /// between the answer «nobody holds this file» and the close of a descriptor of it.
     ///
     /// The act here lasts 50 ms, and for that long every store this process opens or closes
-    /// waits with the opener below: once a run, and nothing in the suite is timed that tightly.
+    /// waits with the opener below: three times a run — once for the close, twice for the
+    /// rename — and nothing in the suite is timed that tightly.
     #[test]
     fn no_database_is_listed_while_the_act_is_under_way() {
+        the_list_is_held_through_the_act("open_db_one_step", |db, act| {
+            unless_open_database_file(identity_at(db).unwrap(), act)
+        });
+    }
+
+    /// And the same of a rename, of the file and of the directory it lies in: no database is
+    /// opened there between the answer «this is part of no open database» and the rename.
+    #[test]
+    fn no_database_is_listed_while_part_of_it_is_being_renamed() {
+        the_list_is_held_through_the_act("open_file_one_step", |db, act| {
+            unless_part_of_open_database(db, act)
+                .expect("the file can be looked at")
+                .is_none()
+        });
+        the_list_is_held_through_the_act("open_dir_one_step", |db, act| {
+            let dir = db.parent().expect("the directory of the database");
+            unless_part_of_open_database(dir, act)
+                .expect("the directory can be looked at")
+                .is_none()
+        });
+    }
+
+    /// `unless` asks about the database `db` — which nobody holds — or about its directory, and
+    /// does the act it is handed.
+    fn the_list_is_held_through_the_act(
+        tag: &str,
+        unless: impl FnOnce(&Path, &mut dyn FnMut()) -> bool,
+    ) {
         use std::sync::mpsc;
-        let base = temp_path("open_db_one_step");
+        let _alone = alone_with_the_list();
+        let base = temp_path(tag);
         let db = base.join("dedcom.db");
         prepare_db_file(&db).unwrap();
-        let file = identity_at(&db).unwrap();
         let (acting, begun) = mpsc::channel();
         let (asking, about_to_ask) = mpsc::channel();
         let (listed, seen) = mpsc::channel();
@@ -2330,7 +2775,7 @@ mod tests {
                 held.closing();
             }
         });
-        let done = unless_open_database_file(file, || {
+        let done = unless(&db, &mut || {
             acting.send(()).unwrap();
             about_to_ask.recv().unwrap();
             // The opener is running and one call away from being listed. A slow machine could
@@ -2341,10 +2786,7 @@ mod tests {
                 "a database was listed while the act was under way"
             );
         });
-        assert!(
-            done,
-            "the control: nobody held the file, so the act was done"
-        );
+        assert!(done, "the control: nobody held it, so the act was done");
         opener.join().unwrap();
         seen.recv()
             .expect("the control: the opener was listed once the act was over");
@@ -2431,6 +2873,19 @@ mod tests {
         let file = identity_at(&db).unwrap();
         assert!(is_open_database_file(file) && open_database_files().contains(&file));
         assert!(!unless_open_database_file(file, || ()));
+        assert_eq!(
+            (
+                part_of_open_database(&db).unwrap(),
+                unless_part_of_open_database(&db, || ()).unwrap(),
+                part_of_open_database(&base).unwrap(),
+            ),
+            (
+                Some(OpenDatabasePart::File),
+                Some(OpenDatabasePart::File),
+                Some(OpenDatabasePart::Directory)
+            ),
+            "asked about as something to rename, and its directory"
+        );
         held.closing();
         assert!(is_open_database_file(file), "by its name, while it closes");
         drop(held);
@@ -2438,7 +2893,7 @@ mod tests {
             seen(),
             0,
             "the DB file was opened while it was created, prepared again, identified, verified, \
-             given its permissions or listed as open"
+             given its permissions, listed as open or asked about as something to rename"
         );
 
         // The control: the watch does report an open and a close of that very file.

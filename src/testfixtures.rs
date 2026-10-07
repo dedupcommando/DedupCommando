@@ -835,6 +835,9 @@ pub enum Errand {
     VisitAsASecondDedcom,
     /// The number of scans a fresh read-only connection finds.
     CountScans,
+    /// Opens the database the way a dedcom that writes does, records a scan in it and closes it.
+    /// Answers `recorded`.
+    RecordAScan,
     /// As the owner of the file but not as root — root becomes `nobody` first —: prepares a new
     /// file under a umask that would take the owner's write bit away, prepares one it has made
     /// read-only, identifies one it may not read and one in a directory it may not search.
@@ -845,12 +848,13 @@ pub enum Errand {
 }
 
 impl Errand {
-    const ALL: [Errand; 6] = [
+    const ALL: [Errand; 7] = [
         Errand::SharedLockHolder,
         Errand::IndexLockHolder,
         Errand::VisitAsAnotherProgram,
         Errand::VisitAsASecondDedcom,
         Errand::CountScans,
+        Errand::RecordAScan,
         Errand::OwnerWithoutPrivilege,
     ];
 
@@ -861,6 +865,7 @@ impl Errand {
             Errand::VisitAsAnotherProgram => "visit-as-another-program",
             Errand::VisitAsASecondDedcom => "visit-as-a-second-dedcom",
             Errand::CountScans => "count-scans",
+            Errand::RecordAScan => "record-a-scan",
             Errand::OwnerWithoutPrivilege => "owner-without-privilege",
         }
     }
@@ -900,6 +905,16 @@ impl Errand {
                     .query_row("SELECT count(*) FROM scan", [], |row| row.get(0))
                     .expect("a reader counts the scans");
                 scans.to_string()
+            }
+            Errand::RecordAScan => {
+                let mut store = crate::state::store::ScanStore::open_writable(db)
+                    .expect("a second dedcom opens it");
+                let beside = db.parent().expect("a database lies in a directory");
+                store
+                    .begin_scan(&ScanConfig::new(vec![beside.to_path_buf()]))
+                    .expect("a second dedcom records a scan");
+                drop(store);
+                "recorded".to_string()
             }
         }
     }

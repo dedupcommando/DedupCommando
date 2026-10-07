@@ -46,7 +46,39 @@ pub fn delete_to_quarantine(
                     &err,
                 ))
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(crate::actions::move_file::rename_failure(err)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The quarantine is a rename too, and a file of the open database does not go there.
+    ///
+    /// Red on the parent: it went. (A batch of actions never got this far with such a file —
+    /// the check before an action reads the target, and that read is refused; this is the door
+    /// itself.)
+    #[test]
+    fn a_file_of_the_open_database_does_not_go_to_quarantine() {
+        let _role = crate::state::store::role_guard();
+        let scratch = crate::testfixtures::ScratchDir::new("quarantine_own_db");
+        let mountpoint = scratch.path();
+        let db = mountpoint.join("state").join("dedcom.db");
+        fs::create_dir_all(db.parent().expect("the state directory")).unwrap();
+        let store = crate::state::store::ScanStore::open_writable(&db).unwrap();
+
+        let quarantine = mountpoint.join(".dedcom-quarantine");
+        let outcome =
+            delete_to_quarantine(&db, mountpoint, &quarantine).map_err(|err| err.to_string());
+
+        assert_eq!(
+            outcome,
+            Err(crate::actions::move_file::OPEN_DATABASE_MOVE_REFUSAL.to_string()),
+            "refused, and for this reason"
+        );
+        assert!(db.is_file(), "the database stays at its name");
+        drop(store);
     }
 }

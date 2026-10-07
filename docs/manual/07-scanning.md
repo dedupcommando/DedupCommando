@@ -117,11 +117,8 @@ has already stopped at a changed size:
 a file of dedcom's open database, or a hard link to one — it is not read as a file
 ```
 
-A move is another matter: before it moves a file, it reads it only when the destination
-holds a file of the same size, to tell whether the two are duplicates. So a move of one
-of the three into a folder that holds a file of its size is not carried out, and these
-words are in `dedcom.log`. Any other move or rename of one of them goes through like
-that of any file — and must not be made while `dedcom` runs
+Nor does it move them: for as long as it has the database open, `dedcom` moves none of
+the three, and no folder they lie in. That refusal has words of its own
 ([§12](12-maintenance.md#state-directory)).
 
 There is no way to add exclusions of your own: a root takes in everything below it,

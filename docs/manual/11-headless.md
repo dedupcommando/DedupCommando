@@ -249,8 +249,8 @@ $ dedcom --stats
 
 Read-only — it does not block other sessions and can be run alongside a running
 TUI. It may leave `dedcom.db-wal` and `dedcom.db-shm` in the state directory; they
-are harmless, and the next `dedcom` that opens the database to write removes them
-([§12](12-maintenance.md)).
+are harmless there, and are not to be deleted by hand
+([§12](12-maintenance.md#state-directory)).
 
 ## 11.3. `--compact-db` — trash cleanup and VACUUM
 

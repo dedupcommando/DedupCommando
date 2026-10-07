@@ -10,8 +10,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::actions::move_file::{
-    cross_device_error, is_cross_device, is_name_too_long, rename_noreplace, suffix_too_long,
-    suffixed,
+    cross_device_error, is_cross_device, is_name_too_long, rename_failure, rename_noreplace,
+    suffix_too_long, suffixed,
 };
 use crate::error::{AppError, Result};
 
@@ -58,7 +58,7 @@ pub fn move_dir_to(src: &Path, dest: &Path) -> Result<PathBuf> {
             Err(err) if n > 0 && is_name_too_long(&err) => {
                 return Err(suffix_too_long(dest, &format!(".{n}"), &err))
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(rename_failure(err)),
         }
     }
 }
@@ -151,6 +151,47 @@ mod tests {
         let src = root.join("src");
         fs::create_dir_all(&src).unwrap();
         assert!(move_dir_to(&src, &src.join("inner")).is_err());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory is not moved while a database this process has open lies in it, at whatever
+    /// depth; a directory beside the database is, and so is the same directory once nothing has
+    /// the database open.
+    ///
+    /// Red on the parent: the directory was renamed with the open database inside.
+    #[test]
+    fn a_directory_that_holds_the_open_database_is_not_moved() {
+        let _role = crate::state::store::role_guard();
+        let root = temp_dir("own_db_inside");
+        let home = root.join("home");
+        let state = home.join("state");
+        let beside = home.join("beside");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&beside).unwrap();
+        let db = state.join("dedcom.db");
+        let store = crate::state::store::ScanStore::open_writable(&db).unwrap();
+
+        for held in [&state, &home] {
+            let away = root.join("away");
+            let said = move_dir_to(held, &away)
+                .expect_err("the database lies in it")
+                .to_string();
+            assert_eq!(
+                said,
+                crate::actions::move_file::OPEN_DATABASE_FOLDER_MOVE_REFUSAL,
+                "{}",
+                held.display()
+            );
+            assert!(
+                db.is_file() && !away.exists(),
+                "{} stays where it is",
+                held.display()
+            );
+        }
+        move_dir_to(&beside, &root.join("moved-beside")).expect("no database lies in it");
+
+        drop(store);
+        move_dir_to(&state, &root.join("moved-state")).expect("nobody holds the database");
         fs::remove_dir_all(&root).ok();
     }
 

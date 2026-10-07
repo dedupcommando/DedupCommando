@@ -74,11 +74,28 @@ fn move_item(
         out.failed += 1;
         return;
     }
+    // A file of the database this process has open, or a directory that database lies in, is
+    // not moved. The rename would refuse it by itself; it is refused here first, before anything
+    // else is asked about it. Whether a file duplicates something at the destination takes a
+    // read of it, and that read is refused in words of its own, which say nothing of a move. And
+    // a directory that is merged is taken apart child by child: the three files would be refused
+    // one by one, and everything else in the state directory would be gone from it.
+    if let Some(refusal) = refused_at_once(src) {
+        fail(out, src, &refusal);
+        return;
+    }
     if meta.is_dir() {
         move_dir_item(store, scan_id, src, dest_dir, out);
     } else {
         move_file_item(store, scan_id, src, meta.len(), dest_dir, out);
     }
+}
+
+/// What stops `src` before anything else is asked about it, as the batch reports it.
+fn refused_at_once(src: &Path) -> Option<crate::error::AppError> {
+    crate::actions::move_file::refuse_open_database_move(src)
+        .err()
+        .map(crate::actions::move_file::rename_failure)
 }
 
 /// Directory: if `dest_dir` already has a directory with the same name — MERGE the
@@ -137,16 +154,18 @@ fn dup_marker_too_long(src: &Path, err: crate::error::AppError) -> crate::error:
 /// Records a move failure: the reason goes to `dedcom.log` (previously `Err(_) =>
 /// failed += 1` silently lost it, including the `rsync` hint for a cross-dataset move).
 fn fail(out: &mut MoveBatchOutcome, src: &Path, err: &crate::error::AppError) {
+    tracing::warn!("{}", failure_line(src, err));
+    out.failed += 1;
+}
+
+/// The line a move that failed leaves in `dedcom.log`.
+fn failure_line(src: &Path, err: &crate::error::AppError) -> String {
     // Both src and {err} (cross_device_error embeds raw src/dest)
     // may carry control bytes — we sanitize the whole string before logging.
-    tracing::warn!(
-        "{}",
-        crate::textsan::terminal(&format!(
-            "move failed: {} — {err}",
-            crate::textsan::path(src)
-        ))
-    );
-    out.failed += 1;
+    crate::textsan::terminal(&format!(
+        "move failed: {} — {err}",
+        crate::textsan::path(src)
+    ))
 }
 
 /// Merges the contents of `src` into the existing directory `target_dir`: each item
@@ -1079,6 +1098,374 @@ mod tests {
         assert!(!src_x.exists());
         assert_eq!(out.failed, 0);
 
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A session with one scan on record: its state directory under a fresh root, the database
+    /// in it with a store open — the connection a running dedcom keeps — and a directory beside
+    /// the state directory to move things to. Returns the root (to remove), the database, the
+    /// destination and the store.
+    fn a_session_with_one_scan(tag: &str) -> (PathBuf, PathBuf, PathBuf, ScanStore) {
+        a_session_with_one_scan_in(tag, "state")
+    }
+
+    /// The same, with the state directory at `state` under the root, however deep that is.
+    fn a_session_with_one_scan_in(
+        tag: &str,
+        state: &str,
+    ) -> (PathBuf, PathBuf, PathBuf, ScanStore) {
+        let root = temp_dir(tag);
+        let state = root.join(state);
+        let dest = root.join("dest");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        let db = state.join("dedcom.db");
+        let mut store = ScanStore::open_writable(&db).expect("the session opens its database");
+        store
+            .begin_scan(&crate::model::scan::ScanConfig::new(vec![root.clone()]))
+            .expect("and records a scan");
+        (root, db, dest, store)
+    }
+
+    /// The name of the file of `db` that carries `suffix`.
+    fn beside(db: &Path, suffix: &str) -> PathBuf {
+        let mut name = db.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    }
+
+    /// The database a running dedcom has open is not moved from under it.
+    ///
+    /// Red on the parent: the file went to the destination like any other. The next thing to
+    /// open the database by its name to write — any later batch does, as here — found the name
+    /// free, made an empty database there, and SQLite deleted the journal beside it: the scan the
+    /// session had on record was in neither file.
+    #[test]
+    fn the_open_database_is_not_moved_and_its_scans_stay() {
+        use crate::testfixtures::{outside, Errand};
+        let _role = crate::state::store::role_guard();
+        let (root, db, dest, store) = a_session_with_one_scan("own_db_move");
+
+        let out = run_batch(&db, std::slice::from_ref(&db), &dest, None);
+        drop(ScanStore::open(&db).expect("the next batch opens the database"));
+
+        let scans = outside(Errand::CountScans, &db);
+        assert_eq!(
+            (
+                out.moved.len(),
+                out.failed,
+                dest.join("dedcom.db").exists(),
+                scans.as_str()
+            ),
+            (0, 1, false, "1"),
+            "moved, failed, at the destination, scans a reader finds afterwards"
+        );
+        drop(store);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Nor is its journal.
+    ///
+    /// Red on the parent: with `dedcom.db-wal` gone from its name, a reader in another process
+    /// was sent by the journal's index to frames in a file that was not there.
+    #[test]
+    fn the_open_journal_is_not_moved_and_a_reader_still_reads() {
+        use crate::testfixtures::{outside, Errand};
+        let _role = crate::state::store::role_guard();
+        let (root, db, dest, store) = a_session_with_one_scan("own_wal_move");
+        let journal = beside(&db, "-wal");
+
+        let out = run_batch(&db, std::slice::from_ref(&journal), &dest, None);
+
+        let scans = outside(Errand::CountScans, &db);
+        assert_eq!(
+            (
+                out.moved.len(),
+                out.failed,
+                dest.join("dedcom.db-wal").exists(),
+                scans.as_str()
+            ),
+            (0, 1, false, "1"),
+            "moved, failed, at the destination, scans a reader finds afterwards"
+        );
+        drop(store);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Nor the index of the journal.
+    ///
+    /// Red on the parent: with `dedcom.db-shm` gone from its name, the next program to write made
+    /// an index of its own, and neither writer saw where the other's frames ended. A scan a
+    /// second dedcom recorded was overwritten by the session's next one — committed, and gone.
+    #[test]
+    fn the_open_journal_index_is_not_moved_and_no_scan_is_lost() {
+        use crate::testfixtures::{outside, Errand};
+        let _role = crate::state::store::role_guard();
+        let (root, db, dest, mut store) = a_session_with_one_scan("own_shm_move");
+        let index = beside(&db, "-shm");
+
+        let out = run_batch(&db, std::slice::from_ref(&index), &dest, None);
+        assert_eq!(outside(Errand::RecordAScan, &db), "recorded");
+        store
+            .begin_scan(&crate::model::scan::ScanConfig::new(vec![root.clone()]))
+            .expect("the session records another scan");
+
+        let scans = outside(Errand::CountScans, &db);
+        assert_eq!(
+            (
+                out.moved.len(),
+                out.failed,
+                dest.join("dedcom.db-shm").exists(),
+                scans.as_str()
+            ),
+            (0, 1, false, "3"),
+            "moved, failed, at the destination, scans a reader finds afterwards: the session's \
+             two and the second dedcom's one"
+        );
+        drop(store);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The refusal comes before anything else is asked about the file: the destination is not
+    /// even listed for a file of its size. Otherwise a destination that happens to hold one sends
+    /// the move off to hash the database, and what the log then carries is the refusal of a read.
+    #[test]
+    fn a_file_of_the_open_database_is_refused_before_the_destination_is_read() {
+        use crate::testfixtures::{WalkFault, WalkFaults};
+        let _role = crate::state::store::role_guard();
+        let (root, db, dest, store) = a_session_with_one_scan("own_db_first");
+        let index = beside(&db, "-shm");
+        let listing = (dest.clone(), WalkFault::Iterator);
+        let faults = WalkFaults::arm(std::slice::from_ref(&listing));
+
+        let out = run_batch(&db, std::slice::from_ref(&index), &dest, None);
+
+        assert_eq!(
+            (out.moved.len(), out.failed, index.is_file()),
+            (0, 1, true),
+            "moved, failed, still there"
+        );
+        assert_eq!(
+            faults.pending(),
+            vec![listing],
+            "the destination was listed before the refusal"
+        );
+        drop(faults);
+        drop(store);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A hard link to the database is the database under another name, wherever it lies: the
+    /// refusal is of the file, and says so.
+    #[test]
+    fn a_hard_link_to_the_open_database_is_not_moved_either() {
+        let _role = crate::state::store::role_guard();
+        let (root, db, dest, store) = a_session_with_one_scan("own_db_link");
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let link = elsewhere.join("a-copy-that-is-not-one.db");
+        fs::hard_link(&db, &link).unwrap();
+
+        let out = run_batch(&db, std::slice::from_ref(&link), &dest, None);
+
+        assert_eq!(
+            (out.moved.len(), out.failed, link.is_file()),
+            (0, 1, true),
+            "moved, failed, still there"
+        );
+        assert_eq!(
+            crate::actions::move_file::refuse_open_database_move(&link)
+                .map_err(|err| err.to_string()),
+            Err(crate::actions::move_file::OPEN_DATABASE_MOVE_REFUSAL.to_string()),
+            "and it is as a file of the database that it is refused"
+        );
+        drop(store);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// What `dedcom.log` is given for a refused item: the path, then the refusal in its own
+    /// words with nothing in front of them — the line the manual shows an operator.
+    #[test]
+    fn the_log_line_of_a_refused_move_is_the_one_the_manual_shows() {
+        use crate::actions::move_file::{
+            OPEN_DATABASE_FOLDER_MOVE_REFUSAL, OPEN_DATABASE_MOVE_REFUSAL,
+        };
+        let _role = crate::state::store::role_guard();
+        let (root, db, _dest, store) = a_session_with_one_scan("own_db_line");
+        let state = db.parent().expect("the state directory").to_path_buf();
+        // What the batch itself says of the item, and the line it would write of it.
+        let line = |src: &Path| {
+            let refusal = refused_at_once(src).expect("part of the open database");
+            failure_line(src, &refusal)
+        };
+
+        assert_eq!(
+            line(&db),
+            format!(
+                "move failed: {} — {OPEN_DATABASE_MOVE_REFUSAL}",
+                db.display()
+            )
+        );
+        assert_eq!(
+            line(&state),
+            format!(
+                "move failed: {} — {OPEN_DATABASE_FOLDER_MOVE_REFUSAL}",
+                state.display()
+            )
+        );
+        let chapter = crate::testfixtures::manual("13-troubleshooting.md");
+        for words in [
+            OPEN_DATABASE_MOVE_REFUSAL,
+            OPEN_DATABASE_FOLDER_MOVE_REFUSAL,
+        ] {
+            let shown = format!("move failed: <path> — {words}");
+            assert!(
+                chapter.contains(&shown),
+                "13-troubleshooting.md must show: {shown}"
+            );
+        }
+        drop(store);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A folder is not moved with the open database in it. The three files would keep their names
+    /// inside it; what goes wrong is every later opening by the path the program knows.
+    ///
+    /// Red on the parent: the state directory went to the destination whole, and the session
+    /// could not open its database again — the path to it was gone.
+    #[test]
+    fn a_folder_that_holds_the_open_database_is_not_moved() {
+        let _role = crate::state::store::role_guard();
+        let (root, db, dest, store) = a_session_with_one_scan("own_dir_move");
+        let state = db.parent().expect("the state directory").to_path_buf();
+
+        let out = run_batch(&db, std::slice::from_ref(&state), &dest, None);
+
+        assert_eq!(
+            (
+                out.moved.len(),
+                out.failed,
+                state.is_dir(),
+                dest.join("state").exists(),
+                ScanStore::open(&db).is_ok()
+            ),
+            (0, 1, true, false, true),
+            "moved, failed, still there, at the destination, the database opens by its path"
+        );
+        drop(store);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Nor is a folder further up: whatever lies on the way to the database stays where it is.
+    #[test]
+    fn nor_is_a_folder_further_up_from_the_open_database() {
+        let _role = crate::state::store::role_guard();
+        let (root, db, dest, store) =
+            a_session_with_one_scan_in("own_dir_above", "home/user/state");
+        let home = root.join("home");
+
+        let out = run_batch(&db, std::slice::from_ref(&home), &dest, None);
+
+        assert_eq!(
+            (
+                out.moved.len(),
+                out.failed,
+                db.is_file(),
+                dest.join("home").exists()
+            ),
+            (0, 1, true, false),
+            "moved, failed, the database at its name, the folder at the destination"
+        );
+        drop(store);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A merge does not go into such a folder either. Taken apart file by file, the state
+    /// directory would lose everything but the three files, which are refused one by one.
+    ///
+    /// Red on the parent: all four went, the database among them.
+    #[test]
+    fn a_merge_stays_out_of_the_folder_of_the_open_database() {
+        let _role = crate::state::store::role_guard();
+        let (root, db, dest, store) = a_session_with_one_scan("own_dir_merge");
+        let state = db.parent().expect("the state directory").to_path_buf();
+        write(&state.join("config.json"), b"{}");
+        fs::create_dir_all(dest.join("state")).unwrap();
+
+        let out = run_batch(&db, std::slice::from_ref(&state), &dest, None);
+
+        assert_eq!(
+            (
+                out.moved.len(),
+                out.failed,
+                crate::testfixtures::names_in(&dest.join("state")).len(),
+                state.join("config.json").is_file(),
+                db.is_file()
+            ),
+            (0, 1, 0, true, true),
+            "moved, failed, entries poured into the destination, the settings and the database \
+             where they were"
+        );
+        drop(store);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// What is refused is a database that is OPEN. The session's connection alone is enough —
+    /// this batch keeps its own journal elsewhere — and once nothing has the database open, its
+    /// folder is a folder like any other.
+    #[test]
+    fn the_folder_moves_once_nothing_has_its_database_open() {
+        let _role = crate::state::store::role_guard();
+        let (root, db, dest, store) = a_session_with_one_scan("own_dir_closed");
+        let state = db.parent().expect("the state directory").to_path_buf();
+        let journal = root.join("batch.db");
+
+        let out = run_batch(&journal, std::slice::from_ref(&state), &dest, None);
+        assert_eq!(
+            (out.moved.len(), out.failed, state.is_dir()),
+            (0, 1, true),
+            "held by the session alone: moved, failed, still there"
+        );
+
+        drop(store);
+        let out = run_batch(&journal, std::slice::from_ref(&state), &dest, None);
+        assert_eq!(
+            (
+                out.moved.len(),
+                out.failed,
+                dest.join("state").join("dedcom.db").is_file()
+            ),
+            (1, 0, true),
+            "nobody holds it: moved, failed, the database at the destination"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// And so is its file.
+    #[test]
+    fn the_database_file_moves_once_nothing_has_it_open() {
+        let _role = crate::state::store::role_guard();
+        let (root, db, dest, store) = a_session_with_one_scan("own_db_closed");
+        let journal = root.join("batch.db");
+
+        let out = run_batch(&journal, std::slice::from_ref(&db), &dest, None);
+        assert_eq!(
+            (out.moved.len(), out.failed, db.is_file()),
+            (0, 1, true),
+            "held by the session alone: moved, failed, still there"
+        );
+
+        drop(store);
+        let out = run_batch(&journal, std::slice::from_ref(&db), &dest, None);
+        assert_eq!(
+            (
+                out.moved.len(),
+                out.failed,
+                dest.join("dedcom.db").is_file()
+            ),
+            (1, 0, true),
+            "nobody holds it: moved, failed, the database at the destination"
+        );
         fs::remove_dir_all(&root).ok();
     }
 }
