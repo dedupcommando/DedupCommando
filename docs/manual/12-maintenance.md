@@ -57,6 +57,13 @@ progress is recorded in it, and the log is written there from then on; moved to 
 filesystem, the folder is a copy and gets neither. The next `dedcom` that writes and is not
 told the new place with `--state-dir` starts an empty state directory where the old one was.
 
+When the panels find the database gone — at the next thing they ask of it — the log gets
+one line, `browsing store poisoned: the database path changed`; after a move of the folder
+to another filesystem there is no log left to read it in. To get the panels back, return the
+file or the folder to its name and open a scan from the list of scans. With `dedcom.db`
+away, do that before anything else: the list of scans, opened in the meantime, may start the
+empty database described above.
+
 `dedcom` does not make such a move itself. A move in the commander or on the Triage Board
 leaves the three files of the database it has open where they are, and the folder they lie
 in, and every folder above that one. The item is counted among the errors in the status

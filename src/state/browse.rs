@@ -1492,6 +1492,9 @@ pub struct RetiredActor {
 // Actor state and the pre-dispatch gate
 // ---------------------------------------------------------------------------------------------
 
+/// Logged when the database is found replaced under the view; §12 of the manual quotes it.
+const POISONED_LOG: &str = "browsing store poisoned: the database path changed";
+
 /// The connection slot. A third state beside «no connection yet» and «connection held» is
 /// what lets two frozen rules coexist: connection-scoped requests may bootstrap lazily from
 /// `Absent`, while after a path mismatch every non-`Open` request must refuse until a fresh
@@ -1532,12 +1535,25 @@ impl ActorState {
 
     /// The one poisoning transition: both the connection and the active scan are dropped
     /// BEFORE the refusal that reports it leaves the actor. Only `Open` recovers.
+    ///
+    /// Logged when the slot becomes poisoned, not while it is: every request refused afterwards
+    /// comes back through the funnel with the same typed mismatch and lands here again, and a
+    /// line for each of them would say nothing the first has not.
     fn poison(&mut self, detail: &str) {
-        tracing::warn!(%detail, "browsing store poisoned: the database path changed");
+        if !matches!(self.slot, Slot::Poisoned { .. }) {
+            self.log_poisoned(detail);
+        }
         self.slot = Slot::Poisoned {
             detail: detail.to_string(),
         };
         self.active = None;
+    }
+
+    /// The line in the log, and with it the seam a test counts the line by: one function, so
+    /// the count cannot part from what is written.
+    fn log_poisoned(&self, detail: &str) {
+        tracing::warn!(%detail, "{POISONED_LOG}");
+        self.hooks.fire_poisoned(detail);
     }
 
     /// The connection, opening lazily by the actor's own immutable role. This is the
@@ -1644,9 +1660,9 @@ pub(crate) enum ChunkPhase {
 }
 
 /// Deterministic observation seams for the tests: a rendezvous before every dispatch, one
-/// before each `Open` candidate step, and one at auto-select chunk boundaries. They observe
-/// and may act from OUTSIDE (cancel a token, swap a file, panic) — nothing here gives the
-/// actor a behaviour production lacks.
+/// before each `Open` candidate step, one at auto-select chunk boundaries, and one where the
+/// poisoning is written to the log. They observe and may act from OUTSIDE (cancel a token,
+/// swap a file, panic) — nothing here gives the actor a behaviour production lacks.
 #[derive(Clone, Default)]
 #[allow(clippy::type_complexity)] // test-only seam cells; a named alias would outlive its one use
 pub(crate) struct TestHooks {
@@ -1656,6 +1672,8 @@ pub(crate) struct TestHooks {
     open_step: Arc<Mutex<Option<Box<dyn FnMut(&'static str) + Send>>>>,
     #[cfg(test)]
     chunk: Arc<Mutex<Option<Box<dyn FnMut(ChunkPhase) + Send>>>>,
+    #[cfg(test)]
+    poisoned: Arc<Mutex<Option<Box<dyn FnMut(&str) + Send>>>>,
 }
 
 impl TestHooks {
@@ -1696,6 +1714,19 @@ impl TestHooks {
             hook(phase);
         }
     }
+
+    fn fire_poisoned(&self, detail: &str) {
+        let _ = &detail;
+        #[cfg(test)]
+        if let Some(hook) = self
+            .poisoned
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+        {
+            hook(detail);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1717,6 +1748,13 @@ impl TestHooks {
     pub(crate) fn on_chunk(&self, hook: impl FnMut(ChunkPhase) + Send + 'static) {
         *self
             .chunk
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
+    }
+
+    pub(crate) fn on_poisoned(&self, hook: impl FnMut(&str) + Send + 'static) {
+        *self
+            .poisoned
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
     }
@@ -4690,6 +4728,142 @@ mod tests {
             assert_eq!(store.marked_count(rig.scan_id).unwrap(), 0);
         }
         rig.shutdown();
+    }
+
+    // ---- 4a. what the poisoning leaves in the log ---------------------------------------------
+
+    /// Counts the times the actor writes its poisoning to the log, at the seam beside the line.
+    fn poisonings_logged(rig: &Rig) -> Arc<AtomicU64> {
+        let logged = Arc::new(AtomicU64::new(0));
+        let counter = logged.clone();
+        rig.hooks.on_poisoned(move |_detail| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        logged
+    }
+
+    /// One request that a replaced path must refuse; `at` picks which of three kinds.
+    fn refused_after_the_replacement(rig: &mut Rig, act: u64, at: usize) {
+        let req = rig.req();
+        let act = Activation(act);
+        let request = match at % 3 {
+            0 => BrowseRequest::MarkedCount { act, req },
+            1 => BrowseRequest::LatestScan { act, req },
+            _ => BrowseRequest::CoveringScan {
+                act,
+                req,
+                cwd: rig.dir.clone(),
+            },
+        };
+        assert!(rig.handle.send_raw(request));
+        match rig.recv() {
+            BrowseEvent::MarkedCount {
+                result: Err(StoreMiss::PathChanged { .. }),
+                ..
+            }
+            | BrowseEvent::LatestScan {
+                result: Err(StoreMiss::PathChanged { .. }),
+                ..
+            }
+            | BrowseEvent::CoveringScan {
+                result: Err(StoreMiss::PathChanged { .. }),
+                ..
+            } => {}
+            other => panic!("a replaced path must refuse request {at}: {other:?}"),
+        }
+    }
+
+    /// The log gets the line when the replacement is noticed, and not again for the requests
+    /// refused after it. Each of those comes back through the funnel with the same typed
+    /// mismatch; the line written for every one of them grew the log as fast as they came.
+    #[test]
+    fn a_poisoning_is_logged_once_however_many_requests_it_refuses() {
+        let mut rig = Rig::new("poison_logged_once", BrowseRole::Operator);
+        let logged = poisonings_logged(&rig);
+        rig.open(1);
+        assert_eq!(logged.load(Ordering::SeqCst), 0, "a healthy open logs none");
+        let _aside = swap_away(&rig.db);
+        refused_after_the_replacement(&mut rig, 1, 0);
+        assert_eq!(
+            logged.load(Ordering::SeqCst),
+            1,
+            "the replacement is logged when it is noticed"
+        );
+        for at in 1..=50 {
+            refused_after_the_replacement(&mut rig, 1, at);
+        }
+        assert_eq!(
+            logged.load(Ordering::SeqCst),
+            1,
+            "fifty refusals later the log holds that one line"
+        );
+        rig.shutdown();
+    }
+
+    /// A reopen that fails over the path still replaced is one more line — it used to be two,
+    /// one written in `open` and one in the funnel behind it. And a checkpoint replaced again
+    /// after a reopen that worked is a new poisoning: it is logged again.
+    #[test]
+    fn a_failed_reopen_is_logged_once_and_a_new_poisoning_is_logged_again() {
+        let mut rig = Rig::new("poison_logged_again", BrowseRole::Operator);
+        let logged = poisonings_logged(&rig);
+        rig.open(1);
+        let aside = swap_away(&rig.db);
+        refused_after_the_replacement(&mut rig, 1, 0);
+        assert_eq!(logged.load(Ordering::SeqCst), 1);
+
+        let req = rig.req();
+        assert!(rig.handle.send_raw(BrowseRequest::Open {
+            act: Activation(2),
+            req,
+            scan_id: rig.scan_id,
+        }));
+        match rig.recv() {
+            BrowseEvent::OpenFinished {
+                result: Err(BrowseOpenFailure::PathChanged { .. }),
+                ..
+            } => {}
+            other => panic!("a reopen over the replaced path is class B: {other:?}"),
+        }
+        assert_eq!(
+            logged.load(Ordering::SeqCst),
+            2,
+            "the failed reopen is one more line, not two"
+        );
+        refused_after_the_replacement(&mut rig, 1, 1);
+        assert_eq!(
+            logged.load(Ordering::SeqCst),
+            2,
+            "and the refusals stay silent"
+        );
+
+        swap_back(&rig.db, &aside);
+        rig.open(3);
+        assert_eq!(
+            logged.load(Ordering::SeqCst),
+            2,
+            "a reopen that works logs none"
+        );
+        let _aside = swap_away(&rig.db);
+        refused_after_the_replacement(&mut rig, 3, 0);
+        assert_eq!(
+            logged.load(Ordering::SeqCst),
+            3,
+            "a second replacement is a new poisoning"
+        );
+        refused_after_the_replacement(&mut rig, 3, 2);
+        assert_eq!(logged.load(Ordering::SeqCst), 3);
+        rig.shutdown();
+    }
+
+    /// §12 quotes the line a replaced database leaves in the log, so the operator can find it.
+    #[test]
+    fn the_manual_quotes_the_line_a_replaced_database_leaves_in_the_log() {
+        let quoted = format!("`{POISONED_LOG}`");
+        assert!(
+            crate::testfixtures::manual("12-maintenance.md").contains(&quoted),
+            "12-maintenance.md must quote: {quoted}"
+        );
     }
 
     // ---- 5. stale activation -----------------------------------------------------------------

@@ -1363,6 +1363,8 @@ impl App {
         self.commander.dedup = DedupCache::default();
         self.commander.watch_cache = Vec::new();
         self.commander.watch_dir_cache = Vec::new();
+        // The store answers again: a cwd it refused to speak of may be asked about anew.
+        self.commander.coverage_refused = None;
         // The marks the panels hold belong to the scan this open replaces, or to an earlier open
         // of this one. The refresh every panel asks for below brings back what the database holds
         // for the files it lists.
@@ -3102,6 +3104,12 @@ impl App {
                     // Nothing is cached: a failed probe must not become a remembered «no scan
                     // covers this directory».
                     self.commander.status = format!("scan coverage unavailable: {miss:?}");
+                }
+                // Remembered as a refusal instead, so the frame does not ask it again at once —
+                // and only for the cwd the panel is still on: a late refusal about one it has
+                // left says nothing of where it is now.
+                if self.commander.active_panel().cwd == cwd {
+                    self.commander.coverage_refused = Some(cwd);
                 }
             }
         }

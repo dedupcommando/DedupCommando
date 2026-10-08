@@ -840,9 +840,14 @@ pub struct CommanderState {
     /// Cache of `latest_scan_covering(cwd)` for each cwd —
     /// `maybe_auto_switch_scan` does not poke the DB every frame, only when
     /// it sees a new cwd. A value of `None` — "no covering scan" (also cached,
-    /// so misses aren't repeated). Cleared on `spawn_dedup_load` (a new scan
-    /// → old coverages may have changed).
+    /// so misses aren't repeated). Cleared when the browsing view is uninstalled, a scan
+    /// finishes or the overlay is reloaded (old coverages may have changed).
     pub scan_coverage_cache: HashMap<PathBuf, Option<i64>>,
+    /// The cwd of the active panel, once the store has refused to say which scan covers it. A
+    /// refusal is not an answer and is not cached as one, but the frame does not ask again
+    /// while the panel stays there: only once the panel has shown another cwd, the overlay is
+    /// reloaded or a scan is opened.
+    pub coverage_refused: Option<PathBuf>,
     /// Cache of the resolved groups of "watching" panels (GroupFiles/DuplicatesOfCursor) by
     /// panel index — the DB is read only on a source change, not every frame.
     pub watch_cache: Vec<WatchEntry>,
@@ -948,6 +953,7 @@ impl CommanderState {
             dir_groups_error: None,
             groups_loaded_for: None,
             scan_coverage_cache: HashMap::new(),
+            coverage_refused: None,
             watch_cache: Vec::new(),
             watch_dir_cache: Vec::new(),
             dir_size_cache: HashMap::new(),

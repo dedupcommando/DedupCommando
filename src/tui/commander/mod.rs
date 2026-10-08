@@ -335,9 +335,18 @@ pub(crate) fn humanize_ago(created_at: &str) -> String {
 /// result in `scan_coverage_cache` so as not to hit the DB every frame.
 fn maybe_auto_switch_scan(app: &mut App) {
     let cwd = app.commander.active_panel().cwd.clone();
+    // A refusal is remembered for the cwd the panel is on and no longer: coming back asks again.
+    if app.commander.coverage_refused.as_ref() != Some(&cwd) {
+        app.commander.coverage_refused = None;
+    }
     // Cache hit — we already know the covering id (or None).
     if let Some(&cached) = app.commander.scan_coverage_cache.get(&cwd) {
         apply_auto_switch(app, &cwd, cached);
+        return;
+    }
+    // Asked, and refused, and nothing has changed since: the same question would only get
+    // the same refusal, so it waits for another cwd, a reloaded overlay or an opened scan.
+    if app.commander.coverage_refused.is_some() {
         return;
     }
     // Cache miss — ask the actor ONCE. The reply fills the cache and applies the switch; until
@@ -1475,6 +1484,7 @@ fn scan_active_panel(app: &mut App) {
 /// to pick again via `latest_scan_covering(active panel's cwd)`.
 fn reload_dedup(app: &mut App) {
     app.commander.scan_coverage_cache.clear();
+    app.commander.coverage_refused = None;
     maybe_auto_switch_scan(app);
     app.commander.status = "Refreshing the dedup overlay…".to_string();
 }
@@ -6697,6 +6707,288 @@ mod dir_watch_tests {
             narrow.contains("file group unavailable:"),
             "the subject survives the floor whole — `unavailable` is never truncated: {narrow}"
         );
+    }
+
+    /// «Which scan covers this folder» — what a frame asks about the active panel's folder —
+    /// against a store that refuses to answer. Real frames, the real actor, a real database.
+    mod coverage_probe {
+        use super::*;
+
+        type Events = crossbeam_channel::Receiver<crate::tui::event::AppEvent>;
+
+        fn frame(app: &mut App) {
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|frame| render(frame, app)).unwrap();
+        }
+
+        /// Carries back every answer the frames have asked for.
+        fn settle(app: &mut App, events: &Events) {
+            crate::app::pump_until(app, events, "the frame's answers", |app| {
+                app.routes.covering.is_empty()
+                    && app.routes.groups.is_empty()
+                    && app.routes.infos.is_empty()
+                    && app.routes.dirs_at.is_empty()
+                    && app.routes.dir_opens.is_empty()
+            });
+        }
+
+        /// Draws `frames` frames, settling after each, and counts those that asked the question.
+        fn frames_that_asked(app: &mut App, events: &Events, frames: usize) -> usize {
+            let mut asked = 0;
+            for _ in 0..frames {
+                frame(app);
+                if !app.routes.covering.is_empty() {
+                    asked += 1;
+                }
+                settle(app, events);
+            }
+            asked
+        }
+
+        /// The active panel shows `dir`.
+        fn show(app: &mut App, dir: &str) {
+            app.commander.panels[0].cwd = PathBuf::from(dir);
+        }
+
+        /// The database is moved away under an open scan. The frame after the first refusal used
+        /// to ask again, and the one after that, as fast as frames are drawn — the loop that
+        /// wrote a line to the log for each. Asked once, the folder is left alone while the
+        /// panel stays on it.
+        #[test]
+        fn a_database_gone_from_its_name_is_asked_about_once_not_on_every_frame() {
+            let _role = crate::state::store::role_guard();
+            let (db, scan_id) = seeded_db("probe_gone");
+            let (mut app, events) = app_watching(&db, scan_id, "/tank/t1");
+            assert_eq!(
+                frames_that_asked(&mut app, &events, 3),
+                1,
+                "a healthy folder is asked about once"
+            );
+            assert_eq!(
+                app.commander.scan_coverage_cache.get(Path::new("/tank")),
+                Some(&Some(scan_id))
+            );
+
+            std::fs::rename(&db, db.with_extension("aside")).unwrap();
+            show(&mut app, "/tank/t1");
+            assert_eq!(
+                frames_that_asked(&mut app, &events, 1),
+                1,
+                "the folder the panel went to is asked about"
+            );
+            assert!(
+                app.current_scan_id.is_none()
+                    && app
+                        .commander
+                        .status
+                        .starts_with(crate::app::REOPEN_REQUIRED),
+                "and the answer is that the database is gone: {}",
+                app.commander.status
+            );
+
+            assert_eq!(
+                frames_that_asked(&mut app, &events, 20),
+                0,
+                "not asked again while the panel stays there"
+            );
+            assert!(
+                app.commander.scan_coverage_cache.is_empty(),
+                "a refusal is not remembered as «no scan covers it»"
+            );
+        }
+
+        /// The same for a refusal that is not a replaced path: a database this build cannot
+        /// open. No line in the log there, but the same question on every frame.
+        #[test]
+        fn a_database_that_cannot_be_opened_is_asked_about_once_too() {
+            let _role = crate::state::store::role_guard();
+            let (db, _scan_id) = unopenable_db("probe_unopenable");
+            let (mut app, events) = panels_only(&db, "/tank/t1");
+            assert_eq!(frames_that_asked(&mut app, &events, 1), 1);
+            assert!(
+                app.commander
+                    .status
+                    .starts_with("scan coverage unavailable"),
+                "the refusal is on the status line: {}",
+                app.commander.status
+            );
+            assert_eq!(
+                frames_that_asked(&mut app, &events, 20),
+                0,
+                "not asked again while the panel stays there"
+            );
+            assert!(
+                app.commander.scan_coverage_cache.is_empty(),
+                "a refusal is not remembered as «no scan covers it»"
+            );
+        }
+
+        /// Asked again when something changes — the panel shows another folder, comes back,
+        /// another panel becomes the active one, or the operator reloads the overlay: one
+        /// question each time, never one per frame.
+        #[test]
+        fn a_refused_folder_is_asked_about_again_when_something_changes() {
+            let _role = crate::state::store::role_guard();
+            let (db, scan_id) = seeded_db("probe_again");
+            let (mut app, events) = app_watching(&db, scan_id, "/tank/t1");
+            std::fs::rename(&db, db.with_extension("aside")).unwrap();
+            assert_eq!(
+                frames_that_asked(&mut app, &events, 5),
+                1,
+                "asked, refused, left alone"
+            );
+            assert!(app.current_scan_id.is_none(), "the database is gone");
+
+            show(&mut app, "/tank/t2");
+            assert_eq!(
+                frames_that_asked(&mut app, &events, 5),
+                1,
+                "another folder: one question"
+            );
+            show(&mut app, "/tank");
+            assert_eq!(
+                frames_that_asked(&mut app, &events, 5),
+                1,
+                "back to the first: one question"
+            );
+
+            // Tab: the other panel, on a folder of its own, becomes the active one — and back.
+            app.commander.panels[1].cwd = PathBuf::from("/tank/t3");
+            app.commander.active = 1;
+            assert_eq!(
+                frames_that_asked(&mut app, &events, 5),
+                1,
+                "the other panel's folder: one question"
+            );
+            app.commander.active = 0;
+            assert_eq!(
+                frames_that_asked(&mut app, &events, 5),
+                1,
+                "the first panel again: one question"
+            );
+
+            reload_dedup(&mut app);
+            assert!(
+                !app.routes.covering.is_empty(),
+                "a reload of the overlay asks at once"
+            );
+            settle(&mut app, &events);
+            assert_eq!(
+                frames_that_asked(&mut app, &events, 5),
+                0,
+                "and the frames after it do not"
+            );
+        }
+
+        /// Two questions on their way at once: the panel asked about one folder, went to
+        /// another and came back before either answer. The late refusal about the folder it
+        /// left is not taken for a refusal about the one it stands on.
+        #[test]
+        fn a_late_refusal_about_a_folder_the_panel_has_left_is_not_remembered() {
+            let _role = crate::state::store::role_guard();
+            let (db, scan_id) = seeded_db("probe_late");
+            let (mut app, events) = app_watching(&db, scan_id, "/tank/t1");
+            std::fs::rename(&db, db.with_extension("aside")).unwrap();
+
+            frame(&mut app);
+            show(&mut app, "/tank/t2");
+            frame(&mut app);
+            show(&mut app, "/tank");
+            assert_eq!(
+                app.routes.covering.len(),
+                2,
+                "both questions are on their way"
+            );
+            settle(&mut app, &events);
+            assert_eq!(
+                app.commander.coverage_refused.as_deref(),
+                Some(Path::new("/tank")),
+                "the refusal kept is the one about the folder the panel is on"
+            );
+            assert_eq!(
+                frames_that_asked(&mut app, &events, 5),
+                0,
+                "so the frames after both answers ask nothing more"
+            );
+        }
+
+        /// The refusal is remembered for the folder the panel is on and no longer: a visit to a
+        /// folder whose answer is known, and back, asks again.
+        #[test]
+        fn leaving_for_a_known_folder_and_coming_back_asks_again() {
+            let _role = crate::state::store::role_guard();
+            let (db, scan_id) = seeded_db("probe_back");
+            let (mut app, events) = app_watching(&db, scan_id, "/tank/t1");
+            assert_eq!(frames_that_asked(&mut app, &events, 2), 1, "/tank is known");
+            // The statement that answers the question fails from here on; the database is not
+            // replaced, so nothing is uninstalled and what is known stays known.
+            break_column(&db, "scan", "config_json");
+            show(&mut app, "/tank/t2");
+            assert_eq!(
+                frames_that_asked(&mut app, &events, 5),
+                1,
+                "asked, refused, left alone"
+            );
+            assert!(
+                app.commander
+                    .status
+                    .starts_with("scan coverage unavailable"),
+                "{}",
+                app.commander.status
+            );
+            assert_eq!(app.current_scan_id, Some(scan_id), "the scan stays open");
+
+            show(&mut app, "/tank");
+            assert_eq!(
+                frames_that_asked(&mut app, &events, 5),
+                0,
+                "a known folder is answered from memory"
+            );
+            show(&mut app, "/tank/t2");
+            assert_eq!(
+                frames_that_asked(&mut app, &events, 5),
+                1,
+                "back at the refused one: asked again"
+            );
+        }
+
+        /// The database is back and a scan is opened: the refusal is forgotten, the frame asks,
+        /// and the answer is kept — the commander is not left without one.
+        #[test]
+        fn an_opened_scan_forgets_the_refusal() {
+            let _role = crate::state::store::role_guard();
+            let (db, scan_id) = seeded_db("probe_recovers");
+            let (mut app, events) = app_watching(&db, scan_id, "/tank/t1");
+            let aside = db.with_extension("aside");
+            std::fs::rename(&db, &aside).unwrap();
+            assert_eq!(frames_that_asked(&mut app, &events, 3), 1);
+            assert!(app.current_scan_id.is_none(), "the database is gone");
+
+            std::fs::rename(&aside, &db).unwrap();
+            crate::app::open_and_settle(
+                &mut app,
+                &events,
+                scan_id,
+                crate::app::OpenIntent::Commander,
+            );
+            assert_eq!(
+                app.commander.dedup_scan_id,
+                Some(scan_id),
+                "the scan opens again: {}",
+                app.commander.status
+            );
+            crate::app::drain(&mut app, &events);
+            assert_eq!(
+                frames_that_asked(&mut app, &events, 3),
+                1,
+                "the folder is asked about again"
+            );
+            assert_eq!(
+                app.commander.scan_coverage_cache.get(Path::new("/tank")),
+                Some(&Some(scan_id)),
+                "and the answer is kept"
+            );
+        }
     }
 
     /// The screens the manual shows in chapters 04 and 05, drawn by the real commander over a
