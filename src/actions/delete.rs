@@ -81,4 +81,32 @@ mod tests {
         assert!(db.is_file(), "the database stays at its name");
         drop(store);
     }
+
+    /// Nor does the lock file this process holds the lock on.
+    ///
+    /// Red on the parent: it went, and the name it left was free for a second operator.
+    #[test]
+    fn the_lock_file_does_not_go_to_quarantine() {
+        let scratch = crate::testfixtures::ScratchDir::new("quarantine_own_lock");
+        let mountpoint = scratch.path();
+        let state = mountpoint.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let held = match crate::lock::try_acquire(&state).unwrap() {
+            crate::lock::Acquire::Operator(lock) => lock,
+            crate::lock::Acquire::Busy(_) => panic!("a fresh directory's lock is free"),
+        };
+        let lock = crate::lock::lock_path(&state);
+
+        let quarantine = mountpoint.join(".dedcom-quarantine");
+        let outcome =
+            delete_to_quarantine(&lock, mountpoint, &quarantine).map_err(|err| err.to_string());
+
+        assert_eq!(
+            outcome,
+            Err(crate::actions::move_file::LOCK_FILE_MOVE_REFUSAL.to_string()),
+            "refused, and for this reason"
+        );
+        assert!(lock.is_file(), "the lock file stays at its name");
+        drop(held);
+    }
 }

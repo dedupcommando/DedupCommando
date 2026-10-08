@@ -86,6 +86,11 @@ The file is moved **in the background** (a separate thread). The status line
 shows the number of moves queued. You can keep sorting the next files without
 waiting for the current one to finish.
 
+Once the file has moved, the cursor is on the next one. A file that was not moved —
+the status line counts it among the errors, and `dedcom.log` gives the reason — is
+still under the cursor: the same key again asks about the same file. The same holds
+for **m** + digit in the commander.
+
 ### 3. Batch move (Insert batch)
 
 If you need to send several files to one receiver:

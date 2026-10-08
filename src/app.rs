@@ -491,6 +491,11 @@ pub struct App {
     /// The held single-instance lock: while it's alive (until App is dropped),
     /// we are the operator. `None` — observer, or operator "by force".
     pub instance_lock: Option<crate::lock::InstanceLock>,
+    /// The name of the lock file in this window's state directory, kept from being renamed
+    /// for as long as the window lives — whoever holds the lock. An operator "by force" holds
+    /// none, and the lock file there is the other instance's.
+    #[allow(dead_code)] // held for its `Drop`: the name leaves the list with the window
+    pub lock_name: Option<crate::lock::LockName>,
     /// `Some` → show the startup role-selection overlay when an operator is live
     /// (`ask` policy): `[R]` read-only / `[F]` as operator / `Esc` exit.
     pub concurrency_prompt: Option<crate::lock::Holder>,
@@ -831,6 +836,8 @@ impl App {
             )
         };
 
+        let lock_name = db_path.parent().map(crate::lock::LockName::in_dir);
+
         let app = Self {
             screen,
             should_quit: false,
@@ -886,6 +893,7 @@ impl App {
             read_only: lock_startup.read_only,
             read_only_asked: lock_startup.read_only_asked,
             instance_lock: lock_startup.lock,
+            lock_name,
             concurrency_prompt: lock_startup.prompt,
             frame_guard_reported: false,
             tick: 0,

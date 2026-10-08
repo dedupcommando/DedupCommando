@@ -67,6 +67,25 @@ a file of dedcom's open database, or a hard link to one — it is not moved
 a folder that holds dedcom's open database — it is not moved
 ```
 
+Nor does it move `dedcom.lock`. The lock that makes one `dedcom` the operator is held on
+that file, and the next `dedcom` looks for the file by its name: moved, the file would stay
+locked and leave the name free, and the next `dedcom` would lock a new file there and run as
+a second operator, with no question asked ([§3](03-safety.md#5-single-instance-lock)). So
+while a `dedcom` window is open on a state directory, a move leaves the lock file there
+where it is, and the folder it lies in, and every folder above that one — whether the
+database is open at that moment or not, and whether the window holds the lock itself or was
+let in beside the instance that does. The reason in `dedcom.log` is one of:
+
+```text
+dedcom's own lock file, or a hard link to it — it is not moved
+a folder that holds dedcom's own lock file — it is not moved
+```
+
+Of a folder that holds both, the wording names the database while it is open. Everything
+else in the state directory — the settings, the two logs — is a file like any other: point
+at it, and it is moved. So is everything in the state directory of another `dedcom`, started
+with its own `--state-dir`, its lock file included: a `dedcom` knows only its own.
+
 To relocate the state directory, quit `dedcom`, move the folder, and from then on start
 `dedcom` with `--state-dir` naming the new place. Another program — `mv`, a file manager —
 is not stopped by any of this.

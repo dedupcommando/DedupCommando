@@ -25,8 +25,8 @@ use crate::app::App;
 
 use super::state::{BoardState, EntryKind, LoadTarget, Mark, Panel, PanelLoadRequest};
 use super::{
-    collect_source_batch, ensure_panel_loader, layout, next_survivor, panel, reload_target,
-    restore_one, spawn_move, DOUBLE_CLICK,
+    collect_source_batch, ensure_panel_loader, layout, panel, reload_target, restore_one,
+    spawn_move, DOUBLE_CLICK,
 };
 
 /// Splits the Board area vertically: panels, status line, legend.
@@ -477,7 +477,7 @@ fn reload_all(app: &mut App) {
 /// Re-reads a Board panel's directory in the background, preserving cursor position.
 /// Delegates to the shared `reload_target`.
 fn load(app: &mut App, target: LoadTarget) {
-    reload_target(app, target, None);
+    reload_target(app, target);
 }
 
 // --- Move ------------------------------------------------------------------
@@ -507,7 +507,8 @@ fn mark_focused_cursor(app: &mut App) {
 
 /// Digit 1–4: moves the entry under the focused panel's cursor (or the marked
 /// batch) into receiver `receiver` in the BACKGROUND (UI is not blocked). Files — dedup-aware,
-/// directories — whole. The source cursor auto-advances to the next surviving item.
+/// directories — whole. The cursor of the focused panel goes to the next surviving item once
+/// the one under it has left, and stays on an item that was not moved.
 fn send_to_receiver(app: &mut App, receiver: usize) {
     let focus = current_focus(app);
     if focus == receiver + 1 {
@@ -538,9 +539,9 @@ fn send_to_receiver(app: &mut App, receiver: usize) {
             panel.marks.remove(src);
         }
     }
-    // Auto-advance the source panel's cursor to the next surviving item.
-    let keep = focused_panel_ref(app, focus).and_then(|panel| next_survivor(panel, &sources));
-    let reload = vec![(from, keep), (LoadTarget::BoardReceiver(receiver), None)];
+    // Where the focused panel's cursor goes is settled when the panel is re-read, from what its
+    // directory then holds.
+    let reload = vec![from, LoadTarget::BoardReceiver(receiver)];
     spawn_move(
         app,
         sources,
@@ -775,5 +776,222 @@ mod mouse_tests {
         let (mut app, _events) = board_app();
         click(&mut app, slot_row(1));
         assert_eq!(current_focus(&app), 1);
+    }
+}
+
+#[cfg(test)]
+mod cursor_after_move_tests {
+    use super::*;
+    use crate::tui::commander::state::BoardState;
+    use crate::tui::event::AppEvent;
+    use std::path::PathBuf;
+
+    /// A board over real directories under a fresh root. The panel with the focus — the source
+    /// when `focus` is 0, else receiver `focus` — is on a state directory with a store open on
+    /// its database, the connection a running dedcom keeps, and two ordinary files beside the
+    /// database; every other panel is on an empty directory of its own. All read. Returns the
+    /// root (to remove) and the store with the window.
+    fn a_board_with_a_state_directory_in_focus(
+        tag: &str,
+        focus: usize,
+    ) -> (
+        PathBuf,
+        crate::state::store::ScanStore,
+        App,
+        crossbeam_channel::Receiver<AppEvent>,
+    ) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root =
+            std::env::temp_dir().join(format!("dedcom_board_{tag}_{}_{nanos}", std::process::id()));
+        let dirs = ["source", "to-1", "to-2", "to-3", "to-4"].map(|name| root.join(name));
+        for dir in &dirs {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let state = dirs[focus].clone();
+        let db = state.join("dedcom.db");
+        let mut store = crate::state::store::ScanStore::open_writable(&db)
+            .expect("the session opens its database");
+        store
+            .begin_scan(&crate::model::scan::ScanConfig::new(vec![root.clone()]))
+            .expect("and records a scan");
+        std::fs::write(state.join("a-first.bin"), b"first").unwrap();
+        std::fs::write(state.join("z-last.bin"), b"last").unwrap();
+
+        let (mut app, events) = crate::app::test_app_with_db(db);
+        let [source, receivers @ ..] = dirs;
+        let mut board = BoardState::new(source, receivers);
+        board.focus = focus;
+        app.commander.board = Some(board);
+        app.commander.board_active = true;
+        reload_target(&mut app, LoadTarget::BoardSource);
+        for receiver in 0..4 {
+            reload_target(&mut app, LoadTarget::BoardReceiver(receiver));
+        }
+        settle(&mut app, &events);
+        (root, store, app, events)
+    }
+
+    /// Carries the batch's answer and the re-reads it asks for back into the board.
+    fn settle(app: &mut App, events: &crossbeam_channel::Receiver<AppEvent>) {
+        crate::app::pump_until(
+            app,
+            events,
+            "the move and the re-read of the board",
+            |app| {
+                let board = app.commander.board.as_ref().expect("the board");
+                app.commander.move_pending == 0
+                    && !board.source.loading
+                    && board.receivers.iter().all(|receiver| !receiver.loading)
+            },
+        );
+    }
+
+    /// Puts the cursor of the focused panel on `name`, sends what is under it to the receiver
+    /// of the digit `to`, and says where that cursor is once the answer is in.
+    fn send(
+        app: &mut App,
+        events: &crossbeam_channel::Receiver<AppEvent>,
+        name: &str,
+        to: char,
+    ) -> String {
+        let focus = current_focus(app);
+        let panel = focused_panel_mut(app, focus).expect("the focused panel");
+        let index = panel
+            .entries
+            .iter()
+            .position(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("{name} is not in the focused panel"));
+        panel.select(index);
+        on_key(app, KeyEvent::new(KeyCode::Char(to), KeyModifiers::NONE));
+        settle(app, events);
+        focused_panel_ref(app, focus)
+            .and_then(|panel| panel.selected())
+            .map(|entry| entry.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// On the Board as in the commander: a file that was not moved is still under the cursor,
+    /// and one that was leaves the cursor on the next.
+    ///
+    /// Red on the parent: after the refusal the cursor stood on `dedcom.db-shm`.
+    #[test]
+    fn the_source_cursor_stays_on_a_file_that_was_not_sent() {
+        let _role = crate::state::store::role_guard();
+        let (root, store, mut app, events) = a_board_with_a_state_directory_in_focus("source", 0);
+
+        let after_a_refusal = send(&mut app, &events, "dedcom.db", '1');
+        let status_of_the_refusal = app.commander.status.clone();
+        let after_a_move = send(&mut app, &events, "a-first.bin", '1');
+
+        assert_eq!(
+            (
+                status_of_the_refusal.as_str(),
+                after_a_refusal.as_str(),
+                app.commander.status.as_str(),
+                after_a_move.as_str()
+            ),
+            (
+                "→ receiver 1: moved 0, errors 1 (reasons in dedcom.log)",
+                "dedcom.db",
+                "→ receiver 1: moved 1",
+                "dedcom.db"
+            ),
+            "refused: the status line and the cursor; moved: the status line and the cursor"
+        );
+        drop(store);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The same when the focus is on a receiver and its files are sent on to another one: that
+    /// receiver's cursor stays on a file that was not sent, and steps on from one that was.
+    #[test]
+    fn so_does_the_cursor_of_a_receiver_things_are_sent_on_from() {
+        let _role = crate::state::store::role_guard();
+        let (root, store, mut app, events) = a_board_with_a_state_directory_in_focus("receiver", 1);
+
+        let after_a_refusal = send(&mut app, &events, "dedcom.db", '2');
+        let status_of_the_refusal = app.commander.status.clone();
+        let after_a_move = send(&mut app, &events, "a-first.bin", '2');
+
+        assert_eq!(
+            (
+                status_of_the_refusal.as_str(),
+                after_a_refusal.as_str(),
+                app.commander.status.as_str(),
+                after_a_move.as_str()
+            ),
+            (
+                "→ receiver 2: moved 0, errors 1 (reasons in dedcom.log)",
+                "dedcom.db",
+                "→ receiver 2: moved 1",
+                "dedcom.db"
+            ),
+            "refused: the status line and the cursor; moved: the status line and the cursor"
+        );
+        drop(store);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// And a folder sent to a receiver that has a folder of its name is merged into it. What a
+    /// merge moves are the folder's children, so no panel shows a directory the move touched:
+    /// the focused panel is re-read only because the request names it. Its cursor goes by what
+    /// the merge left of the folder under it — on to the next entry from a folder the merge
+    /// emptied and removed, and nowhere from one a link inside it keeps standing.
+    #[test]
+    fn and_the_source_cursor_goes_by_what_a_merge_left_of_the_folder_under_it() {
+        let _role = crate::state::store::role_guard();
+        let (root, store, mut app, events) = a_board_with_a_state_directory_in_focus("merge", 0);
+        let (source, receiver) = (root.join("source"), root.join("to-1"));
+        for dir in [&source, &receiver] {
+            for name in ["emptied", "standing"] {
+                std::fs::create_dir_all(dir.join(name)).unwrap();
+            }
+        }
+        std::fs::write(source.join("emptied").join("child.bin"), b"child").unwrap();
+        std::fs::write(source.join("standing").join("child.bin"), b"another child").unwrap();
+        // A symbolic link is not moved, and keeps the folder it is in standing after the merge.
+        std::os::unix::fs::symlink(
+            source.join("a-first.bin"),
+            source.join("standing").join("a.link"),
+        )
+        .unwrap();
+        reload_target(&mut app, LoadTarget::BoardSource);
+        reload_target(&mut app, LoadTarget::BoardReceiver(0));
+        settle(&mut app, &events);
+
+        let after_the_emptied = send(&mut app, &events, "emptied", '1');
+        let status_of_the_emptied = app.commander.status.clone();
+        let after_the_standing = send(&mut app, &events, "standing", '1');
+
+        assert_eq!(
+            (
+                status_of_the_emptied.as_str(),
+                after_the_emptied.as_str(),
+                app.commander.status.as_str(),
+                after_the_standing.as_str()
+            ),
+            (
+                "→ receiver 1: moved 1",
+                "standing",
+                "→ receiver 1: moved 1, errors 1 (reasons in dedcom.log)",
+                "standing"
+            ),
+            "the folder the merge removed: the status line and the cursor; the folder it left \
+             standing: the status line and the cursor"
+        );
+        assert_eq!(
+            (
+                source.join("emptied").exists(),
+                receiver.join("emptied").join("child.bin").is_file(),
+                source.join("standing").join("a.link").is_symlink()
+            ),
+            (false, true, true),
+            "on disk: the emptied folder, its child in the receiver, the link that stayed"
+        );
+        drop(store);
+        std::fs::remove_dir_all(&root).ok();
     }
 }

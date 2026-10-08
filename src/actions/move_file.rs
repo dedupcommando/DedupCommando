@@ -11,13 +11,17 @@ use std::path::{Path, PathBuf};
 use crate::actions::script_preview::sh_quote;
 use crate::error::{AppError, Result};
 
+/// What a move is told about a symbolic link: it is left where it is. One line; the manual
+/// quotes it (chapter 13).
+pub(crate) const SYMLINK_MOVE_REFUSAL: &str = "source is a symbolic link, skipping";
+
 /// Moves file `src` ONTO path `dest`, uniquifying on a name collision
 /// (`dest`, then `dest.1`, `dest.2`, …) ATOMICALLY, without overwriting a neighbor.
 /// Returns the final path.
 pub fn move_to(src: &Path, dest: &Path) -> Result<PathBuf> {
     let meta = fs::symlink_metadata(src)?;
     if meta.file_type().is_symlink() {
-        return Err(AppError::msg("source is a symbolic link, skipping"));
+        return Err(AppError::msg(SYMLINK_MOVE_REFUSAL));
     }
     if !meta.is_file() {
         return Err(AppError::msg("only a file can be moved (v1)"));
@@ -144,6 +148,35 @@ pub(crate) fn refuse_open_database_move(src: &Path) -> std::io::Result<()> {
     }
 }
 
+/// What a move is told when it is asked to move the lock file of a running dedcom — the file
+/// this process holds its lock on, or whatever lies at that file's name in the state directory.
+/// One line; the manual quotes it (chapters 12 and 13).
+pub(crate) const LOCK_FILE_MOVE_REFUSAL: &str =
+    "dedcom's own lock file, or a hard link to it — it is not moved";
+
+/// And when it is asked to move a directory that lock file lies in.
+pub(crate) const LOCK_FOLDER_MOVE_REFUSAL: &str =
+    "a folder that holds dedcom's own lock file — it is not moved";
+
+fn lock_move_refusal(part: crate::lock::LockPart) -> std::io::Error {
+    let words = match part {
+        crate::lock::LockPart::File => LOCK_FILE_MOVE_REFUSAL,
+        crate::lock::LockPart::Directory => LOCK_FOLDER_MOVE_REFUSAL,
+    };
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, words)
+}
+
+/// Refuses `src` if it is the lock file of this process's state directory, or a directory that
+/// file lies in — the second thing [`rename_noreplace`] asks for itself, for the same caller as
+/// [`refuse_open_database_move`] and asked after it: of a directory that holds both, the
+/// database is what is named.
+pub(crate) fn refuse_lock_move(src: &Path) -> std::io::Result<()> {
+    match crate::lock::part_of_lock(src)? {
+        Some(part) => Err(lock_move_refusal(part)),
+        None => Ok(()),
+    }
+}
+
 /// Atomic `rename` without overwrite (Linux `renameat2` + `RENAME_NOREPLACE`):
 /// if `dest` exists — `EEXIST`, the target is not overwritten. The check and the move are
 /// a single kernel operation, the TOCTOU race is eliminated.
@@ -156,6 +189,12 @@ pub(crate) fn refuse_open_database_move(src: &Path) -> std::io::Result<()> {
 /// ([`crate::paths::OpenDatabase`]). The look at the source, the question and the rename are one
 /// step as far as the list of open databases goes: no connection can be entered in it, announce
 /// its close or leave it between them.
+///
+/// And where the lock file is kept at its name, for as long as this process works in its state
+/// directory: the lock stays on a file that is renamed, and the name it leaves is free for the
+/// next dedcom to take a lock of its own at (`lock::LOCK_FILES`). The same one step, inside the
+/// first: the list of open databases is asked and held first, the list of lock files second,
+/// always in that order.
 pub(crate) fn rename_noreplace(src: &Path, dest: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -166,26 +205,32 @@ pub(crate) fn rename_noreplace(src: &Path, dest: &Path) -> std::io::Result<()> {
     let dest_c = CString::new(dest.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let mut outcome = Ok(());
+    let mut lock = Ok(None);
     let refused = crate::paths::unless_part_of_open_database(src, || {
-        #[cfg(test)]
-        take_before_the_rename();
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                libc::AT_FDCWD,
-                src_c.as_ptr(),
-                libc::AT_FDCWD,
-                dest_c.as_ptr(),
-                RENAME_NOREPLACE,
-            )
-        };
-        // Taken here, before anything else can touch errno.
-        if rc != 0 {
-            outcome = Err(std::io::Error::last_os_error());
-        }
+        lock = crate::lock::unless_part_of_lock(src, || {
+            #[cfg(test)]
+            take_before_the_rename();
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    libc::AT_FDCWD,
+                    src_c.as_ptr(),
+                    libc::AT_FDCWD,
+                    dest_c.as_ptr(),
+                    RENAME_NOREPLACE,
+                )
+            };
+            // Taken here, before anything else can touch errno.
+            if rc != 0 {
+                outcome = Err(std::io::Error::last_os_error());
+            }
+        });
     })?;
-    match refused {
-        Some(part) => Err(open_database_move_refusal(part)),
+    if let Some(part) = refused {
+        return Err(open_database_move_refusal(part));
+    }
+    match lock? {
+        Some(part) => Err(lock_move_refusal(part)),
         None => outcome,
     }
 }
@@ -711,6 +756,185 @@ mod tests {
         drop(store);
         rename_noreplace(&db, &root.join("away")).expect("nobody holds it any more");
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// Nor does that rename take the lock file from its name while this process holds the lock.
+    /// The lock is on the file, and the next dedcom looks for the file by its name: renamed, it
+    /// stays locked and leaves the name free.
+    ///
+    /// Red on the parent: it was renamed, and the next attempt on the lock made a second
+    /// operator beside the first.
+    #[test]
+    fn the_lock_file_is_not_renamed_while_the_lock_is_held() {
+        let root = temp_dir("rename_own_lock");
+        let state = root.join("state");
+        fs::create_dir(&state).unwrap();
+        let held = match crate::lock::try_acquire(&state).unwrap() {
+            crate::lock::Acquire::Operator(lock) => lock,
+            crate::lock::Acquire::Busy(_) => panic!("a fresh directory's lock is free"),
+        };
+        let lock = crate::lock::lock_path(&state);
+        let away = root.join("away.lock");
+        let refused = Err(LOCK_FILE_MOVE_REFUSAL.to_string());
+
+        let outcome = rename_noreplace(&lock, &away).map_err(|err| err.to_string());
+
+        assert_eq!(outcome, refused, "refused, and in these words");
+        assert!(
+            lock.is_file() && !away.exists(),
+            "the lock file stays at its name"
+        );
+        assert!(
+            matches!(
+                crate::lock::try_acquire(&state).unwrap(),
+                crate::lock::Acquire::Busy(_)
+            ),
+            "and the next dedcom is still turned away"
+        );
+        // A move that comes down to this rename says the same, and in those words alone.
+        let dst = root.join("dst");
+        fs::create_dir(&dst).unwrap();
+        let said = move_into_dir(&lock, &dst).map_err(|err| err.to_string());
+        assert_eq!(said, Err(LOCK_FILE_MOVE_REFUSAL.to_string()), "a move");
+        // A hard link is the same file under another name; a symbolic link is a file of its own.
+        let link = root.join("link");
+        fs::hard_link(&lock, &link).unwrap();
+        let outcome =
+            rename_noreplace(&link, &root.join("away-link")).map_err(|err| err.to_string());
+        assert_eq!(outcome, refused, "a hard link to the lock file");
+        fs::remove_file(&link).unwrap();
+        let symlink = root.join("symlink");
+        std::os::unix::fs::symlink(&lock, &symlink).unwrap();
+        rename_noreplace(&symlink, &root.join("away-symlink")).expect("a symbolic link to it");
+
+        drop(held);
+        rename_noreplace(&lock, &away).expect("nobody holds the lock any more");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The same one step for the lock file: the list of lock files stays held while the system
+    /// call is made. Were it let go of in between, a lock could be taken after the answer «this
+    /// is nobody's lock file» and before the rename.
+    #[test]
+    fn the_list_of_lock_files_is_held_while_the_rename_is_made() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let _alone = crate::paths::alone_with_the_list();
+        let root = temp_dir("rename_one_step_lock");
+        // More than once: «held» can be another test's for an instant, and must not pass for ours.
+        for round in 0..8 {
+            let file = root.join(format!("file-{round}"));
+            write_file(&file, b"content");
+            let dir = root.join(format!("dir-{round}"));
+            fs::create_dir(&dir).unwrap();
+            for src in [file, dir] {
+                let held = Rc::new(Cell::new(None));
+                BEFORE_THE_RENAME.with(|slot| {
+                    let held = Rc::clone(&held);
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        held.set(Some(crate::lock::lock_files_are_held()))
+                    }));
+                });
+                let moved = src.with_extension("moved");
+                rename_noreplace(&src, &moved).expect("nobody's lock file");
+                assert_eq!(held.get(), Some(true), "{}", src.display());
+                assert!(moved.exists(), "the control: it was renamed");
+            }
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The look a caller takes before it settles anything else tells the lock file and every
+    /// directory it lies in, each in its own words — and nothing else, and nothing once the
+    /// lock is let go of. What cannot be looked at is not passed either.
+    #[test]
+    fn the_look_before_a_move_tells_the_lock_file_and_every_folder_above_it() {
+        let root = temp_dir("look_own_lock");
+        let state = root.join("home").join("state");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(root.join("home").join("beside")).unwrap();
+        let held = match crate::lock::try_acquire(&state).unwrap() {
+            crate::lock::Acquire::Operator(lock) => lock,
+            crate::lock::Acquire::Busy(_) => panic!("a fresh directory's lock is free"),
+        };
+        let lock = crate::lock::lock_path(&state);
+        write_file(&state.join("config.json"), b"{}");
+        let said = |path: &Path| refuse_lock_move(path).map_err(|err| err.to_string());
+
+        assert_eq!(said(&lock), Err(LOCK_FILE_MOVE_REFUSAL.to_string()));
+        for above in [state.clone(), root.join("home"), root.clone()] {
+            assert_eq!(
+                said(&above),
+                Err(LOCK_FOLDER_MOVE_REFUSAL.to_string()),
+                "{}",
+                above.display()
+            );
+        }
+        assert_eq!(said(&state.join("config.json")), Ok(()), "a file beside it");
+        assert_eq!(
+            said(&root.join("home").join("beside")),
+            Ok(()),
+            "a directory beside its own"
+        );
+        let absent = refuse_lock_move(&root.join("absent")).expect_err("nothing there");
+        assert_eq!(absent.kind(), std::io::ErrorKind::NotFound, "{absent}");
+
+        drop(held);
+        assert_eq!(
+            (said(&lock), said(&state)),
+            (Ok(()), Ok(())),
+            "nobody holds it"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Of a folder that holds both — the open database and the lock file, as a state directory
+    /// does — the database is what is named: the wording the manual has for such a folder. With
+    /// no connection open the folder is refused all the same, for the lock file in it.
+    #[test]
+    fn a_folder_that_holds_the_database_and_the_lock_file_is_refused_for_either() {
+        let _role = crate::state::store::role_guard();
+        let root = temp_dir("rename_both");
+        let state = root.join("state");
+        fs::create_dir(&state).unwrap();
+        let held = match crate::lock::try_acquire(&state).unwrap() {
+            crate::lock::Acquire::Operator(lock) => lock,
+            crate::lock::Acquire::Busy(_) => panic!("a fresh directory's lock is free"),
+        };
+        let store =
+            crate::state::store::ScanStore::open_writable(&state.join("dedcom.db")).unwrap();
+        let away = root.join("away");
+        let said = || rename_noreplace(&state, &away).map_err(|err| err.to_string());
+
+        assert_eq!(
+            said(),
+            Err(OPEN_DATABASE_FOLDER_MOVE_REFUSAL.to_string()),
+            "the database open and the lock held"
+        );
+        drop(store);
+        assert_eq!(
+            said(),
+            Err(LOCK_FOLDER_MOVE_REFUSAL.to_string()),
+            "the lock held alone"
+        );
+        drop(held);
+        assert_eq!(said(), Ok(()), "neither");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Both refusals of a lock file's move are what `dedcom.log` shows an operator, so the
+    /// manual carries them word for word where the state directory is described — each a line
+    /// of its own, beside the database's two. (Where an operator looks a message up, the manual
+    /// shows the whole line of the log: `move_batch` holds it to that.)
+    #[test]
+    fn the_manual_quotes_both_refusals_of_a_move_of_the_lock_file() {
+        let chapter = crate::testfixtures::manual("12-maintenance.md");
+        for words in [LOCK_FILE_MOVE_REFUSAL, LOCK_FOLDER_MOVE_REFUSAL] {
+            assert!(
+                chapter.lines().any(|line| line == words),
+                "12-maintenance.md must quote, as a line: {words}"
+            );
+        }
     }
 
     /// A refusal of this program's own is told in its own words alone, wherever it is met; what

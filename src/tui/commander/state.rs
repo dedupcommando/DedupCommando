@@ -175,6 +175,12 @@ pub struct Panel {
     /// Navigation counter: a background result with a stale `generation`
     /// is discarded (the user has already moved to another directory).
     pub generation: u64,
+    /// The load, by its `generation`, that puts the cursor past an entry that has left by the
+    /// time the directory is read: the re-read a move's answer asks for (`reload_after_move`).
+    /// The cursor returns to the entry it was on — one that was not moved is still under it —
+    /// and goes to that entry's nearest neighbour once it is not listed. `None`, or any other
+    /// load: the cursor goes to the top when its entry is not listed.
+    pub past_what_left: Option<u64>,
     /// Sort key for panel entries.
     pub sort: SortKey,
     /// Panel view mode — what it shows.
@@ -213,6 +219,7 @@ impl Panel {
             marks: HashMap::new(),
             loading: true,
             generation: 0,
+            past_what_left: None,
             sort: SortKey::Name,
             view: PanelView::Files,
             group_files_list: None,
@@ -417,19 +424,24 @@ pub struct PanelLoadRequest {
 /// `dest_dir`. The worker processes requests ONE AT A TIME (serialization — parallel
 /// copies don't hammer the disk, no races between batches). `reload`/`label` — for
 /// applying the result to the UI after completion; `scan_id` — for the journal.
+///
+/// `reload` names panels and nothing else. Where the cursor of each goes is settled when the
+/// panel is re-read, from what its directory then holds ([`Panel::past_what_left`]) — not here,
+/// before the batch, as if it could only succeed.
 #[derive(Debug, Clone)]
 pub struct MoveRequest {
     pub sources: Vec<PathBuf>,
     pub dest_dir: PathBuf,
     pub scan_id: Option<i64>,
-    pub reload: Vec<(LoadTarget, Option<PathBuf>)>,
+    pub reload: Vec<LoadTarget>,
     pub label: String,
 }
 
 /// Applies the result of a background directory load to panel `p`: checks
 /// `generation` (a stale response is discarded), the DirsOnly mode filter,
-/// sorting, and restoring the cursor to `previous`. Shared code for commander
-/// and Board panels.
+/// sorting, and restoring the cursor to `previous`. The one load that goes by the neighbours of
+/// `previous` once it has left is the re-read after a move ([`Panel::past_what_left`],
+/// [`row_to_return_to`]). Shared code for commander and Board panels.
 pub fn apply_panel_load(
     p: &mut Panel,
     generation: u64,
@@ -439,16 +451,48 @@ pub fn apply_panel_load(
     if p.generation != generation {
         return;
     }
-    p.entries = entries;
+    let shown = std::mem::replace(&mut p.entries, entries);
+    // Every other load opens at the top when the entry to return to is not listed, as it did.
+    let before: &[PanelEntry] = if p.past_what_left == Some(generation) {
+        &shown
+    } else {
+        &[]
+    };
     if p.view == PanelView::DirsOnly {
         p.entries.retain(|entry| entry.is_dir());
     }
     sort_entries(&mut p.entries, p.sort);
     p.loading = false;
     let index = previous
-        .and_then(|prev| p.entries.iter().position(|entry| entry.path == prev))
+        .and_then(|prev| row_to_return_to(before, &p.entries, &prev))
         .unwrap_or(0);
     p.select(index);
+}
+
+/// The row among `now` for a cursor that is to return to `previous`: `previous` itself while it
+/// is listed; once it has left, the nearest entry that stood below it in `before` and is still
+/// listed, otherwise the nearest above it. `before` is what the panel showed until this load,
+/// handed over by the one load that goes by it — the re-read after a move — and empty for every
+/// other.
+///
+/// What left is told by the directory as it is read, not by the batch: an entry the batch
+/// moved is gone from it, one it refused is still there, and so is a folder a merge left
+/// standing. And an entry can leave after the answer of its own batch: the next batch in the
+/// queue has taken it by the time the directory is read. Either way the cursor goes past what
+/// left, and not to the top of the list, from where the same keys would reach for another item
+/// altogether.
+fn row_to_return_to(before: &[PanelEntry], now: &[PanelEntry], previous: &Path) -> Option<usize> {
+    let row = |path: &Path| now.iter().position(|entry| entry.path == path);
+    if let Some(index) = row(previous) {
+        return Some(index);
+    }
+    let was = before.iter().position(|entry| entry.path == previous)?;
+    let listed: HashSet<&Path> = now.iter().map(|entry| entry.path.as_path()).collect();
+    before[was + 1..]
+        .iter()
+        .chain(before[..was].iter().rev())
+        .find(|entry| listed.contains(entry.path.as_path()))
+        .and_then(|entry| row(&entry.path))
 }
 
 /// What the F11 confirmation seat holds.
@@ -1031,6 +1075,113 @@ mod tests {
         sort_entries(&mut entries, SortKey::Size);
         let order: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(order, ["..", "big.txt", "mid.txt", "small.txt"]);
+    }
+
+    /// What a panel shows for `names`, as a load hands it over: `..` the way up, the rest files.
+    fn listing(names: &[&str]) -> Vec<PanelEntry> {
+        names
+            .iter()
+            .map(|name| {
+                let kind = if *name == ".." {
+                    EntryKind::Parent
+                } else {
+                    EntryKind::File
+                };
+                entry(name, kind, 0, 0)
+            })
+            .collect()
+    }
+
+    /// The name under the cursor of a panel that showed `before`, with the cursor on `under`,
+    /// once it is re-read as `now` and told to return to `previous` — by the re-read after a
+    /// move (`after_a_move`), or by any other load.
+    fn reread(
+        before: &[&str],
+        under: &str,
+        now: &[&str],
+        previous: &str,
+        after_a_move: bool,
+    ) -> String {
+        let mut panel = Panel::empty(PathBuf::from("/nonexistent/panel"));
+        panel.entries = listing(before);
+        panel.select(
+            before
+                .iter()
+                .position(|name| *name == under)
+                .expect("shown"),
+        );
+        panel.generation = 7;
+        panel.past_what_left = after_a_move.then_some(7);
+        apply_panel_load(&mut panel, 7, listing(now), Some(PathBuf::from(previous)));
+        panel
+            .selected()
+            .map(|entry| entry.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// Where the re-read after a move puts the cursor: back on its entry while that is listed —
+    /// an item that was not moved is still under it; once the entry has left, on the nearest
+    /// one that stood below it and still is, otherwise on the nearest above it; and at the top
+    /// when nothing it stood among is left.
+    #[test]
+    fn the_reread_after_a_move_puts_the_cursor_past_an_entry_that_has_left() {
+        let before = ["..", "a", "b", "c", "d"];
+        for (under, now, lands) in [
+            ("b", vec!["..", "a", "b", "c", "d"], "b"),
+            ("b", vec!["..", "a", "c", "d"], "c"),
+            // Two moves in a queue: both the file before it and the file itself are gone.
+            ("b", vec!["..", "c", "d"], "c"),
+            ("b", vec!["..", "a", "d"], "d"),
+            // Nothing below it is left: the nearest above, not the first.
+            ("c", vec!["..", "a", "b"], "b"),
+            ("d", vec!["..", "a", "b", "c"], "c"),
+            ("b", vec![".."], ".."),
+            ("..", vec!["..", "c"], ".."),
+        ] {
+            assert_eq!(
+                reread(&before, under, &now, under, true),
+                lands,
+                "the cursor on {under}, re-read as {now:?}"
+            );
+        }
+        assert_eq!(
+            reread(&before, "b", &["..", "a"], "never-shown", true),
+            "..",
+            "told to return to an entry the panel never showed"
+        );
+    }
+
+    /// Every other load leaves the cursor where it always went: on the entry it is told to
+    /// return to while that is listed, and at the top once it is not — a re-read no move asked
+    /// for, a load asked for after the re-read a move asked for, a directory that is entered.
+    #[test]
+    fn any_other_load_opens_at_the_top_when_its_entry_is_not_listed() {
+        let before = ["..", "a", "b", "c", "d"];
+        assert_eq!(reread(&before, "b", &before, "b", false), "b");
+        assert_eq!(
+            reread(&before, "b", &["..", "a", "c", "d"], "b", false),
+            ".."
+        );
+
+        // The re-read after a move was asked for, and then another load of the panel: the
+        // answer that comes is the later one's, and it goes by no neighbours.
+        let mut panel = Panel::empty(PathBuf::from("/nonexistent/panel"));
+        panel.entries = listing(&before);
+        panel.select(2);
+        panel.past_what_left = Some(7);
+        panel.generation = 8;
+        let previous = Some(PathBuf::from("b"));
+        apply_panel_load(&mut panel, 8, listing(&["..", "a", "c", "d"]), previous);
+        assert_eq!(
+            panel.cursor(),
+            0,
+            "a later load than the one after the move"
+        );
+
+        let mut entered = Panel::empty(PathBuf::from("/nonexistent/panel"));
+        let came_from = Some(PathBuf::from("/nonexistent"));
+        apply_panel_load(&mut entered, 0, listing(&["..", "x", "y"]), came_from);
+        assert_eq!(entered.cursor(), 0, "entered, where it came from not in it");
     }
 
     #[test]

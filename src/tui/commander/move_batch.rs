@@ -27,8 +27,8 @@ pub struct MoveBatchOutcome {
     pub failed: usize,
     /// How many were moved as duplicates (name `name.dupN`).
     pub dups: usize,
-    /// Which panels to re-read and where to put the cursor (filled in by `spawn_move`).
-    pub reload: Vec<(LoadTarget, Option<PathBuf>)>,
+    /// Which panels to re-read (filled in by the worker from the request).
+    pub reload: Vec<LoadTarget>,
     /// Label for the status line (e.g. «receiver 2» / «panel 2»).
     pub label: String,
     /// The batch died instead of returning — a panic in the worker. Nothing was reported item by
@@ -63,23 +63,23 @@ fn move_item(
     dest_dir: &Path,
     out: &mut MoveBatchOutcome,
 ) {
-    let meta = match std::fs::symlink_metadata(src) {
+    let meta = match looked_at(src) {
         Ok(meta) => meta,
-        Err(_) => {
-            out.failed += 1;
+        Err(err) => {
+            fail(out, src, &err);
             return;
         }
     };
-    if meta.file_type().is_symlink() {
-        out.failed += 1;
-        return;
-    }
     // A file of the database this process has open, or a directory that database lies in, is
     // not moved. The rename would refuse it by itself; it is refused here first, before anything
     // else is asked about it. Whether a file duplicates something at the destination takes a
     // read of it, and that read is refused in words of its own, which say nothing of a move. And
     // a directory that is merged is taken apart child by child: the three files would be refused
     // one by one, and everything else in the state directory would be gone from it.
+    //
+    // The lock file of the state directory, and a directory it lies in, are not moved either,
+    // and are refused here for the second of those reasons: no database need be open for a
+    // merge to take the state directory apart around its lock file.
     if let Some(refusal) = refused_at_once(src) {
         fail(out, src, &refusal);
         return;
@@ -91,9 +91,26 @@ fn move_item(
     }
 }
 
+/// The look a batch takes at `src` first — what is there, or why it is nothing a batch moves:
+/// a name that cannot be looked at, or a symbolic link.
+///
+/// The reason is handed back, to be written to `dedcom.log`, and not just counted: the status
+/// line sends the operator there for it, and a link that was not moved is still under the
+/// cursor, to be asked about again.
+fn looked_at(src: &Path) -> crate::error::Result<std::fs::Metadata> {
+    let meta = std::fs::symlink_metadata(src)?;
+    if meta.file_type().is_symlink() {
+        return Err(crate::error::AppError::msg(
+            crate::actions::move_file::SYMLINK_MOVE_REFUSAL,
+        ));
+    }
+    Ok(meta)
+}
+
 /// What stops `src` before anything else is asked about it, as the batch reports it.
 fn refused_at_once(src: &Path) -> Option<crate::error::AppError> {
     crate::actions::move_file::refuse_open_database_move(src)
+        .and_then(|()| crate::actions::move_file::refuse_lock_move(src))
         .err()
         .map(crate::actions::move_file::rename_failure)
 }
@@ -1466,6 +1483,325 @@ mod tests {
             (1, 0, true),
             "nobody holds it: moved, failed, the database at the destination"
         );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A state directory under a fresh root with the lock in it taken — as an operator keeps it
+    /// for the whole run — and NO database open: the settings and a log beside the lock file,
+    /// and a directory beside the state directory to move things to. This batch keeps its own
+    /// journal elsewhere. Returns the root (to remove), the state directory, the destination,
+    /// the batch's journal and the lock.
+    fn an_operator_with_no_database_open(
+        tag: &str,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        crate::lock::InstanceLock,
+    ) {
+        let root = temp_dir(tag);
+        let state = root.join("state");
+        let dest = root.join("dest");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        let held = match crate::lock::try_acquire(&state).unwrap() {
+            crate::lock::Acquire::Operator(lock) => lock,
+            crate::lock::Acquire::Busy(_) => panic!("a fresh directory's lock is free"),
+        };
+        write(&state.join("config.json"), b"{}");
+        write(&state.join("dedcom.log"), b"a line\n");
+        (root.clone(), state, dest, root.join("batch.db"), held)
+    }
+
+    /// What another dedcom that asks for the lock in `state` gets.
+    fn another_dedcom(state: &Path) -> &'static str {
+        match crate::lock::try_acquire(state) {
+            Ok(crate::lock::Acquire::Operator(_)) => "becomes an operator",
+            Ok(crate::lock::Acquire::Busy(_)) => "is turned away",
+            Err(_) => "finds no state directory to ask in",
+        }
+    }
+
+    /// Everything in the state directory selected at once: the lock file stays, and what was
+    /// selected beside it goes, as it did.
+    ///
+    /// Red on the parent: the lock file went with the rest, still locked, and the name it left
+    /// was free — another dedcom took a lock of its own and ran as a second operator.
+    #[test]
+    fn the_lock_file_stays_when_everything_beside_it_is_moved() {
+        let _role = crate::state::store::role_guard();
+        let (root, state, dest, journal, held) =
+            an_operator_with_no_database_open("own_lock_selection");
+        let lock = crate::lock::lock_path(&state);
+        let selected = [
+            state.join("config.json"),
+            lock.clone(),
+            state.join("dedcom.log"),
+        ];
+
+        let out = run_batch(&journal, &selected, &dest, None);
+
+        assert_eq!(
+            (
+                out.moved.len(),
+                out.failed,
+                lock.is_file(),
+                dest.join("dedcom.lock").exists(),
+                another_dedcom(&state)
+            ),
+            (2, 1, true, false, "is turned away"),
+            "moved, failed, the lock file at its name, at the destination, another dedcom"
+        );
+        drop(held);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A folder the lock file lies in is not moved, nor one further up — with no database open:
+    /// the lock is held for the whole run, a connection only now and then.
+    ///
+    /// Red on the parent: the folder went whole, the held lock file in it, and another dedcom
+    /// started an empty state directory where the old one was and ran as an operator.
+    #[test]
+    fn a_folder_that_holds_the_lock_file_is_not_moved() {
+        let _role = crate::state::store::role_guard();
+        let (root, state, dest, journal, held) =
+            an_operator_with_no_database_open("own_lock_folder");
+
+        let out = run_batch(&journal, std::slice::from_ref(&state), &dest, None);
+
+        assert_eq!(
+            (
+                out.moved.len(),
+                out.failed,
+                state.is_dir(),
+                dest.join("state").exists(),
+                another_dedcom(&state)
+            ),
+            (0, 1, true, false, "is turned away"),
+            "moved, failed, still there, at the destination, another dedcom"
+        );
+        drop(held);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A merge does not go into such a folder either: taken apart file by file, the state
+    /// directory would lose everything but the lock file.
+    ///
+    /// Red on the parent: all three went, the lock file among them.
+    #[test]
+    fn a_merge_stays_out_of_the_folder_of_the_lock_file() {
+        let _role = crate::state::store::role_guard();
+        let (root, state, dest, journal, held) =
+            an_operator_with_no_database_open("own_lock_merge");
+        fs::create_dir_all(dest.join("state")).unwrap();
+
+        let out = run_batch(&journal, std::slice::from_ref(&state), &dest, None);
+
+        assert_eq!(
+            (
+                out.moved.len(),
+                out.failed,
+                crate::testfixtures::names_in(&dest.join("state")).len(),
+                state.join("config.json").is_file(),
+                crate::lock::lock_path(&state).is_file(),
+                another_dedcom(&state)
+            ),
+            (0, 1, 0, true, true, "is turned away"),
+            "moved, failed, entries poured into the destination, the settings and the lock file \
+             where they were, another dedcom"
+        );
+        drop(held);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// What is refused is a lock file whose lock is HELD: once the operator has let go of it,
+    /// the file and its folder are a file and a folder like any other.
+    #[test]
+    fn the_lock_file_and_its_folder_move_once_the_lock_is_let_go_of() {
+        let _role = crate::state::store::role_guard();
+        let (root, state, dest, journal, held) =
+            an_operator_with_no_database_open("own_lock_let_go");
+        let lock = crate::lock::lock_path(&state);
+        drop(held);
+
+        let out = run_batch(&journal, std::slice::from_ref(&lock), &dest, None);
+        assert_eq!(
+            (
+                out.moved.len(),
+                out.failed,
+                dest.join("dedcom.lock").is_file()
+            ),
+            (1, 0, true),
+            "the file: moved, failed, at the destination"
+        );
+        let out = run_batch(&journal, std::slice::from_ref(&state), &dest, None);
+        assert_eq!(
+            (out.moved.len(), out.failed, dest.join("state").is_dir()),
+            (1, 0, true),
+            "the folder: moved, failed, at the destination"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// What `dedcom.log` is given for a refused lock file, and for a folder it lies in: the
+    /// path, then the refusal in its own words with nothing in front of them — the two lines the
+    /// manual shows an operator.
+    #[test]
+    fn the_log_line_of_a_refused_lock_file_is_the_one_the_manual_shows() {
+        use crate::actions::move_file::{LOCK_FILE_MOVE_REFUSAL, LOCK_FOLDER_MOVE_REFUSAL};
+        let (root, state, _dest, _journal, held) =
+            an_operator_with_no_database_open("own_lock_line");
+        let lock = crate::lock::lock_path(&state);
+        // What the batch itself says of the item, and the line it would write of it.
+        let line = |src: &Path| {
+            let refusal = refused_at_once(src).expect("part of the lock file's place");
+            failure_line(src, &refusal)
+        };
+
+        assert_eq!(
+            line(&lock),
+            format!("move failed: {} — {LOCK_FILE_MOVE_REFUSAL}", lock.display())
+        );
+        assert_eq!(
+            line(&state),
+            format!(
+                "move failed: {} — {LOCK_FOLDER_MOVE_REFUSAL}",
+                state.display()
+            )
+        );
+        let chapter = crate::testfixtures::manual("13-troubleshooting.md");
+        for words in [LOCK_FILE_MOVE_REFUSAL, LOCK_FOLDER_MOVE_REFUSAL] {
+            let shown = format!("move failed: <path> — {words}");
+            assert!(
+                chapter.lines().any(|line| line == shown),
+                "13-troubleshooting.md must show, as a line: {shown}"
+            );
+        }
+        drop(held);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A symbolic link, and a name that cannot be looked at, are not moved, and `dedcom.log`
+    /// says why — of the link, in the line the manual shows. The status line sends the operator
+    /// to the log for the reason.
+    ///
+    /// On the parent the batch counted both and wrote of neither.
+    #[test]
+    fn the_log_says_why_a_symbolic_link_or_a_name_it_cannot_look_at_is_not_moved() {
+        use crate::actions::move_file::SYMLINK_MOVE_REFUSAL;
+        let root = temp_dir("not_moved_line");
+        let missing = root.join("nowhere");
+        let link = root.join("a.link");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+
+        // What the batch itself says of the item, and the line it would write of it.
+        let of_the_link = looked_at(&link).expect_err("a link is nothing a batch moves");
+        assert_eq!(
+            failure_line(&link, &of_the_link),
+            format!("move failed: {} — {SYMLINK_MOVE_REFUSAL}", link.display())
+        );
+        let unseen = looked_at(&missing).expect_err("there is nothing to look at");
+        assert!(
+            matches!(&unseen, crate::error::AppError::Io(err)
+                if err.kind() == std::io::ErrorKind::NotFound),
+            "what the system said stays what it said: {unseen}"
+        );
+        assert!(
+            failure_line(&missing, &unseen)
+                .starts_with(&format!("move failed: {} — I/O: ", missing.display())),
+            "and is written after the path like any other reason"
+        );
+        assert!(
+            looked_at(&root).is_ok_and(|meta| meta.is_dir()),
+            "while a folder is looked at and handed on"
+        );
+        let shown = format!("move failed: <path> — {SYMLINK_MOVE_REFUSAL}");
+        assert!(
+            crate::testfixtures::manual("13-troubleshooting.md")
+                .lines()
+                .any(|line| line == shown),
+            "13-troubleshooting.md must show, as a line: {shown}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// What a batch leaves at its names: a file that moved and a folder a merge emptied and
+    /// removed are gone from theirs; a symbolic link is not moved, and a folder with one inside
+    /// is left standing by the merge, the link in it — as the manual says of both. A panel that
+    /// is re-read afterwards lists exactly this, whatever the batch counted, and its cursor goes
+    /// by that list: the tests of a merged folder in the commander and on the Board show it.
+    #[test]
+    fn a_batch_leaves_a_link_and_a_folder_with_one_inside_at_their_names() {
+        let _role = crate::state::store::role_guard();
+        let root = temp_dir("left_at_names");
+        let src = root.join("src");
+        let dest = root.join("dest");
+        for dir in [
+            src.join("emptied"),
+            src.join("standing"),
+            dest.join("emptied"),
+            dest.join("standing"),
+        ] {
+            fs::create_dir_all(&dir).unwrap();
+        }
+        write(&src.join("moved.bin"), b"moved");
+        write(&src.join("emptied").join("child.bin"), b"child");
+        write(&src.join("standing").join("child.bin"), b"another child");
+        // A symbolic link is not moved: as a source it stays, and as a child it keeps its
+        // folder standing after the merge.
+        std::os::unix::fs::symlink(src.join("moved.bin"), src.join("stays.link")).unwrap();
+        std::os::unix::fs::symlink(src.join("moved.bin"), src.join("standing").join("a.link"))
+            .unwrap();
+        let names = ["moved.bin", "stays.link", "emptied", "standing"];
+        let sources = names.map(|name| src.join(name));
+
+        let out = run_batch(&root.join("batch.db"), &sources, &dest, None);
+
+        let at_its_name = |path: PathBuf| fs::symlink_metadata(path).is_ok();
+        let left: Vec<&str> = names
+            .into_iter()
+            .filter(|name| at_its_name(src.join(name)))
+            .collect();
+        assert_eq!(
+            (out.moved.len(), out.failed, left),
+            (3, 2, vec!["stays.link", "standing"]),
+            "moved, failed, and what is still at its name"
+        );
+        assert!(
+            at_its_name(src.join("standing").join("a.link")),
+            "the link inside the folder the merge left standing"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Of a folder that holds both — the open database and the lock file, as the state
+    /// directory of a running operator does — the batch names the database, in the wording the
+    /// manual has for such a folder; with no connection open it names the lock file.
+    #[test]
+    fn of_a_folder_that_holds_both_the_batch_names_the_database_while_it_is_open() {
+        use crate::actions::move_file::{
+            LOCK_FOLDER_MOVE_REFUSAL, OPEN_DATABASE_FOLDER_MOVE_REFUSAL,
+        };
+        let _role = crate::state::store::role_guard();
+        let (root, state, _dest, _journal, held) =
+            an_operator_with_no_database_open("own_lock_and_db");
+        let said = || {
+            refused_at_once(&state)
+                .expect("a folder that is not moved")
+                .to_string()
+        };
+
+        let store = ScanStore::open_writable(&state.join("dedcom.db")).unwrap();
+        let with_the_database_open = said();
+        drop(store);
+
+        assert_eq!(
+            (with_the_database_open.as_str(), said().as_str()),
+            (OPEN_DATABASE_FOLDER_MOVE_REFUSAL, LOCK_FOLDER_MOVE_REFUSAL),
+            "the database open, and closed again"
+        );
+        drop(held);
         fs::remove_dir_all(&root).ok();
     }
 }

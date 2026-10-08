@@ -16,6 +16,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+use crate::paths::PathIdentity;
 
 const LOCK_FILE: &str = "dedcom.lock";
 
@@ -31,14 +35,208 @@ pub struct Holder {
 /// for clarity.
 pub struct InstanceLock {
     file: File,
+    /// Its entry in [`LOCK_FILES`].
+    entry: u64,
 }
 
 impl Drop for InstanceLock {
     fn drop(&mut self) {
+        // The entry goes while the descriptor is still open: the number of a file is not kept
+        // past the hold on the file, or in time it would refuse somebody else's. And it goes in
+        // one step with the lock, the list held, so nothing is renamed between the two.
+        let mut listed = lock_files_mut();
+        listed.retain(|kept| kept.entry != self.entry);
         unsafe {
             libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
     }
+}
+
+/// The lock files this process leaves at their names: one entry for each [`InstanceLock`] and
+/// each [`LockName`] alive.
+///
+/// The lock is on an open FILE, and the next dedcom looks for that file by its NAME. A lock
+/// file that is renamed stays locked and leaves the name free: the next dedcom makes a new file
+/// there, locks that one, and runs as a second operator beside the first — the very thing the
+/// lock is there to prevent. So the one rename this program makes of what an operator points at
+/// (`actions::move_file::rename_noreplace`) asks this list before it renames — about a file, and
+/// about a directory a lock file lies in ([`unless_part_of_lock`]).
+///
+/// A read-write lock, like the list of open databases (`paths::OpenDatabase`) and for the same
+/// reason: the question and the rename are made with the list held to read, and a lock is taken
+/// with it held to write — from before its file is opened until its entry stands
+/// ([`try_acquire`]). So nothing is renamed between «the lock is taken» and «its file is
+/// listed». The price is the same as there: a look or a rename that waits holds up whoever
+/// takes or lets go of a lock meanwhile.
+static LOCK_FILES: RwLock<Vec<Listed>> = RwLock::new(Vec::new());
+
+/// Tells one entry of [`LOCK_FILES`] from another.
+static NEXT_ENTRY: AtomicU64 = AtomicU64::new(0);
+
+/// One lock file.
+struct Listed {
+    entry: u64,
+    /// Where the lock file is looked for, absolute: a relative path has to go on naming the
+    /// same place whatever the working directory is when it is next looked at.
+    name: PathBuf,
+    /// The file the lock is on, read from the descriptor that holds it — so the number cannot
+    /// pass to another file while the entry stands. `None` for a name this process holds no
+    /// lock at ([`LockName`]): whatever lies at the name answers for it.
+    file: Option<PathIdentity>,
+}
+
+// A panic elsewhere while the list was held leaves it as true as it was, so a poisoned lock is
+// taken all the same.
+fn lock_files() -> RwLockReadGuard<'static, Vec<Listed>> {
+    LOCK_FILES.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn lock_files_mut() -> RwLockWriteGuard<'static, Vec<Listed>> {
+    LOCK_FILES.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Enters the lock file at `name` in `listed`, which the caller holds to write, and returns the
+/// number of the entry.
+fn enter(listed: &mut Vec<Listed>, name: &Path, file: Option<PathIdentity>) -> u64 {
+    let entry = NEXT_ENTRY.fetch_add(1, Ordering::Relaxed);
+    listed.push(Listed {
+        entry,
+        name: std::path::absolute(name).unwrap_or_else(|_| name.to_path_buf()),
+        file,
+    });
+    entry
+}
+
+/// Test-only: whether the list is held right now — by anybody, this thread included; it cannot
+/// tell whose hold it is. What an act handed to [`unless_part_of_lock`] can ask from inside. A
+/// test that asks takes `paths::alone_with_the_list` first, as for the list of open databases.
+#[cfg(test)]
+pub(crate) fn lock_files_are_held() -> bool {
+    matches!(
+        LOCK_FILES.try_write(),
+        Err(std::sync::TryLockError::WouldBlock)
+    )
+}
+
+/// The name of the lock file in a state directory, kept in [`LOCK_FILES`] for as long as this
+/// value lives, whoever holds the lock. A window keeps one for the state directory it works in.
+///
+/// An operator let in past a live holder (`--force`, the `allow` policy, `F` in the start-up
+/// overlay) holds no lock, but the lock file of its state directory is somebody's all the same:
+/// renamed, it would let the NEXT dedcom in with a lock of its own and no question asked. There
+/// is no descriptor to know a file by, so what is kept is the name: whatever non-directory lies
+/// at it, and every directory on the way to it.
+#[derive(Debug)]
+pub struct LockName(u64);
+
+impl LockName {
+    pub fn in_dir(state_dir: &Path) -> Self {
+        Self(enter(&mut lock_files_mut(), &lock_path(state_dir), None))
+    }
+}
+
+impl Drop for LockName {
+    fn drop(&mut self) {
+        lock_files_mut().retain(|kept| kept.entry != self.0);
+    }
+}
+
+/// Which part of a lock file's place a name holds — asked of a name that is about to be renamed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockPart {
+    /// The file a lock of this process is on, a hard link to it, or a non-directory at the name
+    /// of a listed lock file.
+    File,
+    /// A directory a listed lock file lies in, at whatever depth: the file would keep its name
+    /// inside it, but the next dedcom looks for it by the path it is given, and finds none.
+    Directory,
+}
+
+/// What the name `path` holds of the lock files in [`LOCK_FILES`], if anything — the question
+/// for a name that is about to be renamed, asked without renaming. A name that cannot be looked
+/// at is an error.
+pub fn part_of_lock(path: &Path) -> std::io::Result<Option<LockPart>> {
+    part_listed(&lock_files(), path)
+}
+
+/// Does `act` unless the name `path` holds part of a listed lock file's place, and says which
+/// part stopped it — the look, the question and the act as one step, for the act that must not
+/// happen to either part: a rename. No lock can be taken between the answer and the act (see
+/// [`LOCK_FILES`]).
+///
+/// `act` runs with the list held: it must not take or let go of a lock, nor ask about a name.
+pub fn unless_part_of_lock(path: &Path, act: impl FnOnce()) -> std::io::Result<Option<LockPart>> {
+    let listed = lock_files();
+    let part = part_listed(&listed, path)?;
+    if part.is_none() {
+        act();
+    }
+    Ok(part)
+}
+
+/// The question itself, after a look of its own that follows no link: a symbolic link answers
+/// for itself. A directory is asked about as a directory, anything else as a file — by what the
+/// look found, and by the name it was found under.
+fn part_listed(listed: &[Listed], path: &Path) -> std::io::Result<Option<LockPart>> {
+    use std::os::unix::fs::MetadataExt;
+    let looked = std::fs::symlink_metadata(path)?;
+    let thing = PathIdentity {
+        device: looked.dev(),
+        inode: looked.ino(),
+    };
+    Ok(if looked.is_dir() {
+        lies_above(listed, thing).then_some(LockPart::Directory)
+    } else {
+        (holds(listed, thing) || names(listed, path)).then_some(LockPart::File)
+    })
+}
+
+/// Whether `file` is a file a listed lock is on.
+fn holds(listed: &[Listed], file: PathIdentity) -> bool {
+    listed.iter().any(|kept| kept.file == Some(file))
+}
+
+/// Whether `path` is the name of a listed lock file: that name in that directory, by whatever
+/// way the directory is reached.
+///
+/// Asked beside the file itself, because the name is what the next dedcom opens: whatever lies
+/// at it — the file the lock is on, or one that took its place behind this process's back — is
+/// what stands between that dedcom and a lock of its own. And for a [`LockName`] the name is
+/// all there is.
+///
+/// The name is compared as its bytes, the spelling a panel hands on. Another spelling that a
+/// dataset without case sensitivity would take for the same name is left to the file itself.
+fn names(listed: &[Listed], path: &Path) -> bool {
+    let (Some(name), Some(dir)) = (path.file_name(), path.parent()) else {
+        return false;
+    };
+    // A directory is looked at through its `.`, so that a link at the end of the way to it is
+    // followed, as the rename itself will follow it.
+    let directory = |dir: &Path| crate::paths::identity_at(&dir.join(".")).ok();
+    // This one once, and only if some lock file has this name.
+    let mut ours = None;
+    listed.iter().any(|kept| {
+        kept.name.file_name() == Some(name)
+            && kept.name.parent().is_some_and(|their_dir| {
+                let ours = *ours.get_or_insert_with(|| directory(dir));
+                ours.is_some() && ours == directory(their_dir)
+            })
+    })
+}
+
+/// Whether a listed lock file lies in the directory `dir`, at whatever depth.
+///
+/// Asked of the directories on the way to each lock file's name, each looked at now and by
+/// `lstat`: nothing holds a directory open, so there is no number of one worth keeping. The way
+/// to a state directory a mode that writes was started in has neither a link nor a `..` in it
+/// (`paths::establish_state_dir`), so every name on it is a directory the lock file does lie in.
+fn lies_above(listed: &[Listed], dir: PathIdentity) -> bool {
+    listed.iter().any(|kept| {
+        kept.name
+            .ancestors()
+            .skip(1)
+            .any(|above| crate::paths::identity_at(above).is_ok_and(|theirs| theirs == dir))
+    })
 }
 
 /// The outcome of an attempt to acquire the lock.
@@ -157,9 +355,15 @@ pub fn is_not_our_lock_file(err: &std::io::Error) -> bool {
 /// refused by name, and the operator is told which file it is. The state directory is 0700 and
 /// normally nobody else can put anything there — but `--state-dir` takes any pathname the
 /// operator types, and being wrong about this costs someone their data.
+///
+/// A lock that is taken is entered in [`LOCK_FILES`] before this returns, with the file it is
+/// on as that same `fstat` found it. The list is held to write from before the file is opened:
+/// a rename made by this process falls either before the open — and then the lock is taken on
+/// whatever the name holds afterwards — or after the entry, which refuses it.
 pub fn try_acquire(state_dir: &Path) -> std::io::Result<Acquire> {
     use std::os::unix::fs::OpenOptionsExt;
     let path = lock_path(state_dir);
+    let mut listed = lock_files_mut();
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -182,13 +386,18 @@ pub fn try_acquire(state_dir: &Path) -> std::io::Result<Acquire> {
                 _ => err,
             }
         })?;
-    require_plain_lock_file(&file, &path)?;
+    let identity = require_plain_lock_file(&file, &path)?;
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
+        #[cfg(test)]
+        take_once_the_lock_is_taken();
+        let entry = enter(&mut listed, &path, Some(identity));
+        drop(listed);
         write_holder(&file);
-        Ok(Acquire::Operator(InstanceLock { file }))
+        Ok(Acquire::Operator(InstanceLock { file, entry }))
     } else {
         let err = std::io::Error::last_os_error();
+        drop(listed);
         // On Linux EWOULDBLOCK == EAGAIN — a busy flock(LOCK_NB) yields this code.
         let busy = err.raw_os_error() == Some(libc::EWOULDBLOCK);
         if busy {
@@ -199,12 +408,29 @@ pub fn try_acquire(state_dir: &Path) -> std::io::Result<Acquire> {
     }
 }
 
-/// Refuses a lock fd that is not a regular file with exactly one name.
+// Test-only one-shot seam between the lock and its entry: the instant by which the list has to
+// be held already. Thread-local, so it cannot fire in a parallel test; absent from every
+// non-test build.
+#[cfg(test)]
+thread_local! {
+    static ONCE_THE_LOCK_IS_TAKEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn take_once_the_lock_is_taken() {
+    if let Some(seen) = ONCE_THE_LOCK_IS_TAKEN.with(|slot| slot.borrow_mut().take()) {
+        seen();
+    }
+}
+
+/// Refuses a lock fd that is not a regular file with exactly one name, and says which file the
+/// fd is on.
 ///
 /// `InvalidInput` and no errno, so [`is_planted_symlink`] can recognise it alongside the ELOOP a
 /// symbolic link produces: from the operator's side all three are the same answer — the file
 /// under that name is not one this program may truncate.
-fn require_plain_lock_file(file: &File, path: &Path) -> std::io::Result<()> {
+fn require_plain_lock_file(file: &File, path: &Path) -> std::io::Result<PathIdentity> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `file` owns a valid fd for the whole call, and `st` is a repr(C) aggregate of
     // integers for which an all-zero value is valid.
@@ -220,7 +446,10 @@ fn require_plain_lock_file(file: &File, path: &Path) -> std::io::Result<()> {
             &format!("has {} names, not one", st.st_nlink),
         ));
     }
-    Ok(())
+    Ok(PathIdentity {
+        device: st.st_dev as u64,
+        inode: st.st_ino as u64,
+    })
 }
 
 /// One shape for every "the name holds something else" refusal: `InvalidInput` with no errno, so
@@ -547,6 +776,255 @@ mod tests {
         drop(first);
         // After release one can become the operator again.
         assert!(matches!(try_acquire(&dir).unwrap(), Acquire::Operator(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn the_lock_in(dir: &Path) -> InstanceLock {
+        match try_acquire(dir).unwrap() {
+            Acquire::Operator(lock) => lock,
+            Acquire::Busy(_) => panic!("a fresh directory's lock is free"),
+        }
+    }
+
+    /// What is asked of a name that is about to be renamed, an error as its kind.
+    fn part(path: &Path) -> Result<Option<LockPart>, std::io::ErrorKind> {
+        part_of_lock(path).map_err(|err| err.kind())
+    }
+
+    /// Every entry of the list is asked about, not the first alone: the file of a lock taken
+    /// after another, a name kept after both, and the directory of each.
+    #[test]
+    fn every_lock_file_of_the_list_is_asked_about() {
+        use LockPart::{Directory, File};
+        let (first, second, third) = (temp_state_dir(), temp_state_dir(), temp_state_dir());
+        let held_first = the_lock_in(&first);
+        let held_second = the_lock_in(&second);
+        std::fs::write(lock_path(&third), b"").unwrap();
+        let kept_third = LockName::in_dir(&third);
+        // Known by the file alone: another name of the second lock file, elsewhere.
+        let link = third.join("another-name-of-the-second");
+        std::fs::hard_link(lock_path(&second), &link).unwrap();
+
+        assert_eq!(
+            [
+                part(&link),
+                part(&lock_path(&third)),
+                part(&second),
+                part(&third)
+            ],
+            [
+                Ok(Some(File)),
+                Ok(Some(File)),
+                Ok(Some(Directory)),
+                Ok(Some(Directory))
+            ],
+            "the second lock's file under another name, the third's name, and their directories"
+        );
+        drop((held_first, held_second, kept_third));
+        for dir in [first, second, third] {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// While the lock is held, its file is known by the file itself — under whatever name — and
+    /// every directory on the way to it as one it lies in. Nothing beside them is, and nothing
+    /// at all once the lock is let go of.
+    #[test]
+    fn the_lock_file_and_the_directories_above_it_are_listed_while_the_lock_is_held() {
+        use LockPart::{Directory, File};
+        let root = temp_state_dir();
+        let state = root.join("home").join("state");
+        let beside = root.join("home").join("beside");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&beside).unwrap();
+        let settings = state.join("config.json");
+        std::fs::write(&settings, b"{}").unwrap();
+        let held = the_lock_in(&state);
+        let lock = lock_path(&state);
+        let link = beside.join("another-name");
+        std::fs::hard_link(&lock, &link).unwrap();
+        let symlink = beside.join("a-link-to-it");
+        std::os::unix::fs::symlink(&lock, &symlink).unwrap();
+        let home = root.join("home");
+        let asked = || {
+            [
+                &lock, &link, &symlink, &settings, &state, &home, &root, &beside,
+            ]
+            .map(|path| part(path))
+        };
+
+        assert_eq!(
+            asked(),
+            [
+                Ok(Some(File)),
+                Ok(Some(File)),
+                Ok(None),
+                Ok(None),
+                Ok(Some(Directory)),
+                Ok(Some(Directory)),
+                Ok(Some(Directory)),
+                Ok(None),
+            ],
+            "the lock file, a hard link to it, a symbolic link to it, a file beside it, its \
+             directory, the two above that, a directory beside its own"
+        );
+        assert_eq!(
+            part(&root.join("absent")),
+            Err(std::io::ErrorKind::NotFound),
+            "what cannot be looked at is not passed"
+        );
+
+        drop(held);
+        assert_eq!(asked(), [Ok(None); 8], "the lock is let go of");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The name is what the next dedcom opens, so whatever lies at it stays there: a file that
+    /// took the lock file's place behind this process's back is known by the name, and the file
+    /// the lock is on by itself, wherever it has been carried.
+    #[test]
+    fn a_file_that_took_the_place_of_the_lock_file_is_listed_by_the_name() {
+        let state = temp_state_dir();
+        let held = the_lock_in(&state);
+        let lock = lock_path(&state);
+        let carried_off = state.join("carried-off");
+        std::fs::rename(&lock, &carried_off).unwrap();
+        std::fs::write(&lock, b"somebody else's\n").unwrap();
+
+        assert_eq!(
+            (part(&lock), part(&carried_off)),
+            (Ok(Some(LockPart::File)), Ok(Some(LockPart::File))),
+            "the newcomer at the name, and the file the lock is on"
+        );
+        drop(held);
+        assert_eq!((part(&lock), part(&carried_off)), (Ok(None), Ok(None)));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A process that works in a state directory without the lock keeps the NAME: whatever lies
+    /// at it, by whatever way its directory is reached, and the directories above it. It knows
+    /// no file — a hard link elsewhere is nobody's, and so is the same name in another directory.
+    #[test]
+    fn a_lock_name_keeps_what_lies_at_the_name_and_knows_no_file() {
+        use LockPart::{Directory, File};
+        let root = temp_state_dir();
+        let state = root.join("state");
+        let other = root.join("other");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&state, &alias).unwrap();
+        let lock = lock_path(&state);
+        std::fs::write(&lock, b"another instance's\n").unwrap();
+        let through_the_alias = lock_path(&alias);
+        let namesake = lock_path(&other);
+        std::fs::write(&namesake, b"of another state\n").unwrap();
+        let link = other.join("another-name");
+        std::fs::hard_link(&lock, &link).unwrap();
+        let asked = || {
+            [
+                &lock,
+                &through_the_alias,
+                &link,
+                &namesake,
+                &state,
+                &root,
+                &other,
+            ]
+            .map(|path| part(path))
+        };
+        assert_eq!(asked(), [Ok(None); 7], "nothing is kept yet");
+
+        let kept = LockName::in_dir(&state);
+        assert_eq!(
+            asked(),
+            [
+                Ok(Some(File)),
+                Ok(Some(File)),
+                Ok(None),
+                Ok(None),
+                Ok(Some(Directory)),
+                Ok(Some(Directory)),
+                Ok(None),
+            ],
+            "the name, the name through a link to its directory, a hard link elsewhere, the \
+             same name in another directory, the directory, the one above, a directory beside"
+        );
+
+        drop(kept);
+        assert_eq!(asked(), [Ok(None); 7], "the name is let go of");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One lock is one entry: letting go of one leaves another's file listed.
+    #[test]
+    fn letting_go_of_one_lock_leaves_another_listed() {
+        let (first, second) = (temp_state_dir(), temp_state_dir());
+        let (held_first, held_second) = (the_lock_in(&first), the_lock_in(&second));
+
+        drop(held_first);
+        assert_eq!(
+            (part(&lock_path(&first)), part(&lock_path(&second))),
+            (Ok(None), Ok(Some(LockPart::File))),
+            "the one let go of, the one still held"
+        );
+        drop(held_second);
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+    }
+
+    /// A file and a directory are told by device and number together: the same number on
+    /// another device is somebody else's.
+    #[test]
+    fn the_same_number_on_another_device_is_not_the_lock_file() {
+        let state = temp_state_dir();
+        let held = the_lock_in(&state);
+        let own = |path: &Path| crate::paths::identity_at(path).unwrap();
+        let on_another_device = |path: &Path| PathIdentity {
+            device: own(path).device.wrapping_add(1),
+            inode: own(path).inode,
+        };
+        let lock = lock_path(&state);
+
+        let listed = lock_files();
+        let told = (
+            holds(&listed, own(&lock)),
+            holds(&listed, on_another_device(&lock)),
+            lies_above(&listed, own(&state)),
+            lies_above(&listed, on_another_device(&state)),
+        );
+        drop(listed);
+
+        assert_eq!(
+            told,
+            (true, false, true, false),
+            "the lock file, its number on another device, its directory, that number on another"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The list is held from before a lock is taken until its file is entered: at the instant
+    /// the lock is this process's and the entry is not there yet, nothing can be renamed. Were
+    /// the list taken only for the entry, a rename could fall in between and carry the locked
+    /// file from its name.
+    #[test]
+    fn the_list_is_held_from_the_taking_of_a_lock_to_its_entry() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let _alone = crate::paths::alone_with_the_list();
+        let dir = temp_state_dir();
+        // More than once: «held» can be another test's for an instant, and must not pass for ours.
+        for round in 0..8 {
+            let held = Rc::new(Cell::new(None));
+            ONCE_THE_LOCK_IS_TAKEN.with(|slot| {
+                let held = Rc::clone(&held);
+                *slot.borrow_mut() = Some(Box::new(move || held.set(Some(lock_files_are_held()))));
+            });
+            let lock = the_lock_in(&dir);
+            assert_eq!(held.get(), Some(true), "round {round}");
+            drop(lock);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

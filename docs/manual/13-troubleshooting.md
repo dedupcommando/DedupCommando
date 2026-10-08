@@ -282,6 +282,39 @@ move failed: <path> — a folder that holds dedcom's open database — it is not
 above it — quit `dedcom`, move the folder, and from then on start `dedcom` with
 `--state-dir` naming the state directory's new place.
 
+### "… dedcom's own lock file … it is not moved" (a move of dedcom's lock file)
+
+**Cause:** the item is `dedcom.lock` of the state directory this `dedcom` works in, a hard
+link to it, or a folder it lies in, at whatever depth. The lock is held on the file, not on
+its name: moved, the file would stay locked while the name it left was free, and the next
+`dedcom` would lock a new file there and run as a second operator beside this one
+([§12](12-maintenance.md#state-directory)). The status line counts the item —
+`moved 0, errors 1 (reasons in dedcom.log)` — and the line in `dedcom.log` is one of:
+
+```text
+move failed: <path> — dedcom's own lock file, or a hard link to it — it is not moved
+move failed: <path> — a folder that holds dedcom's own lock file — it is not moved
+```
+
+**Fix:** leave them where they are. A folder above the state directory is moved the way
+the entry above says: with `dedcom` quit.
+
+### "… source is a symbolic link, skipping" (a move of a symbolic link)
+
+**Cause:** the item under the cursor, or one of the selected ones, is a symbolic link. The
+commander and the Triage Board move files and folders; a link is left where it is, and the
+cursor that was on it stays on it. The status line counts it —
+`moved 0, errors 1 (reasons in dedcom.log)` — and the line in `dedcom.log` is:
+
+```text
+move failed: <path> — source is a symbolic link, skipping
+```
+
+A folder that moves whole takes the links inside it along. A folder that is merged into one
+of the same name does not: each link in it gets this line and stays, and so does the folder.
+
+**Fix:** move the link with `mv`, or move what it points to.
+
 ### "dedcom: N of M actions not carried out — each is named above" (a saved script)
 
 **Cause:** a script saved with `S` in the `F11` overlay went on past the actions it could
@@ -342,9 +375,10 @@ kill <PID>
 dedcom                                          # start again
 ```
 
-Never delete `dedcom.lock` to get past the message: the running process keeps its
-lock on the deleted file, the next `dedcom` locks a new one, and two writers then
-work on the same state.
+Never delete `dedcom.lock` to get past the message, and never move or rename it: the
+running process keeps its lock on the file that is gone from the name, the next `dedcom`
+locks a new one, and two writers then work on the same state. A `dedcom` open on this state
+directory does not move it ([§12](12-maintenance.md#state-directory)); `rm` and `mv` will.
 
 To only observe the running instance without touching the lock, start with
 `dedcom --read-only`. An alternative is the `--force` flag, but it neither stops

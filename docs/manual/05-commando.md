@@ -601,6 +601,9 @@ Details — [§09 Triage Board](09-triage-board.md).
 | **u** / **U** | Undo the last layout move (Undo)                                   |
 | **q** / **Q** | Exit                                                               |
 
+An item that **m** + a digit did not move — the status line counts it among the errors, and
+`dedcom.log` gives the reason — is still under the cursor ([§09](09-triage-board.md)).
+
 ## What's next
 
 - [§06 Classic wizard](06-classic.md) — the step-by-step equivalent for those who

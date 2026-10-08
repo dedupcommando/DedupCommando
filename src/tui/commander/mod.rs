@@ -1583,7 +1583,7 @@ fn navigate_panel(app: &mut App, index: usize, target: PathBuf) {
 /// cursor landing on `cursor_file` after loading. Differs from `navigate_panel` only in
 /// that it puts the passed file path into `PanelLoadRequest.previous`
 /// (not «where we came from»). `apply_panel_load` already knows how to find `previous`
-/// among the new `entries` and place the cursor on it (`state.rs:437-440`) — no new
+/// among the new `entries` and place the cursor on it (`state::row_to_return_to`) — no new
 /// load handlers are needed.
 fn navigate_panel_with_cursor(
     app: &mut App,
@@ -2231,13 +2231,9 @@ fn perform_triage_move(app: &mut App, target: usize) {
         app.commander.panels[pending.source_panel].marks.remove(src);
     }
     let dest_dir = app.commander.panels[target].cwd.clone();
-    let keep = next_survivor(
-        &app.commander.panels[pending.source_panel],
-        &pending.sources,
-    );
     let reload = vec![
-        (state::LoadTarget::Commander(pending.source_panel), keep),
-        (state::LoadTarget::Commander(target), None),
+        state::LoadTarget::Commander(pending.source_panel),
+        state::LoadTarget::Commander(target),
     ];
     spawn_move(
         app,
@@ -2252,13 +2248,13 @@ fn perform_triage_move(app: &mut App, target: usize) {
 /// IMPORTANT: the snapshot safeguard is done by the CALLER via
 /// `ensure_source_snapshots` BEFORE clearing marks/triage and BEFORE this call; on a
 /// snapshot failure the caller cancels the move and does not enter here. `spawn_move` only
-/// queues the task to the background worker. `reload` — which panels to re-read and where
-/// to put the cursor after completion; `label` — for the status line.
+/// queues the task to the background worker. `reload` — which panels to re-read after
+/// completion; `label` — for the status line.
 pub(crate) fn spawn_move(
     app: &mut App,
     sources: Vec<PathBuf>,
     dest_dir: PathBuf,
-    reload: Vec<(state::LoadTarget, Option<PathBuf>)>,
+    reload: Vec<state::LoadTarget>,
     label: String,
 ) {
     if app.deny_if_read_only("moving files") {
@@ -2375,11 +2371,12 @@ pub(crate) fn apply_move_outcome(app: &mut App, outcome: move_batch::MoveBatchOu
             outcome.label, outcome.failed
         )
     };
-    // Explicit re-reads (source + receiver-target) — carry the cursor hint.
-    let explicit: Vec<state::LoadTarget> =
-        outcome.reload.iter().map(|(target, _)| *target).collect();
-    for (target, keep) in outcome.reload {
-        reload_target(app, target, keep);
+    // Explicit re-reads (source + receiver-target). Each cursor returns to the entry it is on
+    // now, and goes past it only if the directory no longer lists it: an item that was refused
+    // is still under the cursor, and the same keys again ask about the same item.
+    let explicit = outcome.reload;
+    for target in &explicit {
+        reload_after_move(app, *target);
     }
     // Bug 9.11: any OTHER open panel showing a directory touched by the move
     // (e.g. a second receiver in the same folder) did not see the files that appeared
@@ -2426,7 +2423,7 @@ fn reload_touched_panels(
     }
     for target in targets {
         if !already.contains(&target) {
-            reload_target(app, target, None);
+            reload_after_move(app, target);
         }
     }
 }
@@ -2461,9 +2458,23 @@ fn refresh_affected_dir_sizes(app: &mut App, affected: &[PathBuf]) {
     }
 }
 
-/// Re-reads a panel (commander or Board) by its target in the background, placing the cursor on
-/// `keep` (if found), otherwise preserving the current position.
-pub(crate) fn reload_target(app: &mut App, target: state::LoadTarget, keep: Option<PathBuf>) {
+/// Re-reads a panel (commander or Board) by its target in the background. The cursor returns to
+/// the entry it is on, and goes to the top of the list if that entry is not listed any more.
+pub(crate) fn reload_target(app: &mut App, target: state::LoadTarget) {
+    reread(app, target, false);
+}
+
+/// The re-read a move's answer asks for: of the panel the items were taken from, of the one they
+/// were sent to, and of any other panel that shows a directory the move touched. The cursor
+/// returns to the entry it is on, and an entry that is gone by the time the directory is read
+/// hands it to its nearest neighbour (`Panel::past_what_left`). Whether an entry left is told by
+/// the directory as it is read then, not by the batch: this batch may have moved it, and so may
+/// the next one in the queue.
+fn reload_after_move(app: &mut App, target: state::LoadTarget) {
+    reread(app, target, true);
+}
+
+fn reread(app: &mut App, target: state::LoadTarget, after_a_move: bool) {
     ensure_panel_loader(app);
     let panel: &mut Panel = match target {
         state::LoadTarget::Commander(i) => match app.commander.panels.get_mut(i) {
@@ -2486,9 +2497,10 @@ pub(crate) fn reload_target(app: &mut App, target: state::LoadTarget, keep: Opti
             }
         }
     };
-    let previous = keep.or_else(|| panel.selected().map(|entry| entry.path.clone()));
+    let previous = panel.selected().map(|entry| entry.path.clone());
     panel.loading = true;
     panel.generation += 1;
+    panel.past_what_left = after_a_move.then_some(panel.generation);
     let request = state::PanelLoadRequest {
         target,
         generation: panel.generation,
@@ -2546,25 +2558,6 @@ pub(crate) fn fetch_panel_dedup(app: &mut App, target: state::LoadTarget) {
     // statements as a panel of 1. The signature algorithm is the one cached at `Open`, so it
     // cannot diverge from the persisted `dir_dedup` of this scan.
     app.request_panel_data(target, cwd, files, dirs);
-}
-
-/// The path of the entry the `panel` cursor will land on after moving `moved`: the first
-/// surviving item (file or directory) from the cursor downward, otherwise upward; otherwise None.
-pub(crate) fn next_survivor(panel: &Panel, moved: &[PathBuf]) -> Option<PathBuf> {
-    let entries = &panel.entries;
-    let cursor = panel.cursor().min(entries.len());
-    let moved_set: HashSet<&PathBuf> = moved.iter().collect();
-    let survives = |entry: &PanelEntry| {
-        !matches!(entry.kind, EntryKind::Parent) && !moved_set.contains(&entry.path)
-    };
-    if let Some(entry) = entries.iter().skip(cursor).find(|e| survives(e)) {
-        return Some(entry.path.clone());
-    }
-    entries[..cursor]
-        .iter()
-        .rev()
-        .find(|e| survives(e))
-        .map(|entry| entry.path.clone())
 }
 
 /// Returns a moved item from the path `to` back to `from` (for Undo):
@@ -4463,6 +4456,612 @@ mod triage_tests {
         );
         assert!(state.is_dir() && !folder_back.exists(), "and stays");
         drop(store);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Nor does undo take the lock file this process holds the lock on, or a folder it lies in.
+    ///
+    /// Red on the parent: `restore_one` renamed both.
+    #[test]
+    fn undo_does_not_move_the_lock_file_or_its_folder() {
+        let root = temp_dir("undo_own_lock");
+        let state = root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let held = match crate::lock::try_acquire(&state).unwrap() {
+            crate::lock::Acquire::Operator(lock) => lock,
+            crate::lock::Acquire::Busy(_) => panic!("a fresh directory's lock is free"),
+        };
+        let lock = crate::lock::lock_path(&state);
+
+        let file_back = root.join("elsewhere").join("dedcom.lock");
+        let file = restore_one(&lock, &file_back).map_err(|err| err.to_string());
+        let folder_back = root.join("before").join("state");
+        let folder = restore_one(&state, &folder_back).map_err(|err| err.to_string());
+
+        assert_eq!(
+            file,
+            Err(crate::actions::move_file::LOCK_FILE_MOVE_REFUSAL.to_string()),
+            "the file is refused, and for this reason"
+        );
+        assert!(lock.is_file() && !file_back.exists(), "and stays");
+        assert_eq!(
+            folder,
+            Err(crate::actions::move_file::LOCK_FOLDER_MOVE_REFUSAL.to_string()),
+            "the folder is refused, and for this reason"
+        );
+        assert!(state.is_dir() && !folder_back.exists(), "and stays");
+        drop(held);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A commander over the database `db`, its first panel on `source` and its second on `dest`,
+    /// both read.
+    fn commander_over(
+        db: &Path,
+        startup: crate::lock::Startup,
+        source: &Path,
+        dest: &Path,
+    ) -> (App, crossbeam_channel::Receiver<AppEvent>) {
+        let (mut app, rx) = crate::app::test_app_with_startup(db.to_path_buf(), startup);
+        for (index, dir) in [source, dest].into_iter().enumerate() {
+            app.commander.panels[index].cwd = dir.to_path_buf();
+            reload_panel(&mut app, index);
+        }
+        settle_move(&mut app, &rx);
+        (app, rx)
+    }
+
+    /// An operator's start: not an observer, nothing to ask.
+    fn as_operator(lock: Option<crate::lock::InstanceLock>) -> crate::lock::Startup {
+        crate::lock::Startup {
+            lock,
+            read_only: false,
+            read_only_asked: false,
+            prompt: None,
+        }
+    }
+
+    /// Carries the batch's answer and the re-reads it asks for back into the commander.
+    fn settle_move(app: &mut App, rx: &crossbeam_channel::Receiver<AppEvent>) {
+        crate::app::pump_until(app, rx, "the move and the re-read of the panels", |app| {
+            app.commander.move_pending == 0 && app.commander.panels.iter().all(|p| !p.loading)
+        });
+    }
+
+    /// Puts the cursor of the first panel on the entry `name`.
+    fn cursor_on(app: &mut App, name: &str) {
+        cursor_in(app, 0, name);
+    }
+
+    /// The name the cursor of the first panel is on.
+    fn under_the_cursor(app: &App) -> String {
+        under_the_cursor_in(app, 0)
+    }
+
+    /// `m`, then the digit of the second panel, and the answer.
+    fn move_to_the_second_panel(app: &mut App, rx: &crossbeam_channel::Receiver<AppEvent>) {
+        for key in ['m', '2'] {
+            on_key(app, KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        }
+        settle_move(app, rx);
+    }
+
+    /// A state directory under a fresh root with a store open on its database — the connection
+    /// a running dedcom keeps — two ordinary files beside the database, and a directory to move
+    /// things to. Returns the root (to remove), the state directory, the destination and the
+    /// store.
+    fn a_state_directory_in_a_panel(
+        tag: &str,
+    ) -> (PathBuf, PathBuf, PathBuf, crate::state::store::ScanStore) {
+        let root = temp_dir(tag);
+        let state = root.join("state");
+        let dest = root.join("dest");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        let mut store = crate::state::store::ScanStore::open_writable(&state.join("dedcom.db"))
+            .expect("the session opens its database");
+        store
+            .begin_scan(&crate::model::scan::ScanConfig::new(vec![root.clone()]))
+            .expect("and records a scan");
+        fs::write(state.join("a-first.bin"), b"first").unwrap();
+        fs::write(state.join("z-last.bin"), b"last").unwrap();
+        (root, state, dest, store)
+    }
+
+    /// A file that was not moved is still what the cursor is on: the same keys again ask about
+    /// the same file, not about the one below it.
+    ///
+    /// Red on the parent: where the cursor goes was settled before the move, as if it could
+    /// only succeed, and after the refusal the cursor stood on `dedcom.db-shm`.
+    #[test]
+    fn the_cursor_stays_on_a_file_that_was_not_moved() {
+        let _role = crate::state::store::role_guard();
+        let (root, state, dest, store) = a_state_directory_in_a_panel("cursor_refused");
+        let (mut app, rx) =
+            commander_over(&state.join("dedcom.db"), as_operator(None), &state, &dest);
+        cursor_on(&mut app, "dedcom.db");
+
+        move_to_the_second_panel(&mut app, &rx);
+
+        assert_eq!(
+            (
+                app.commander.status.as_str(),
+                under_the_cursor(&app).as_str()
+            ),
+            (
+                "→ panel 2: moved 0, errors 1 (reasons in dedcom.log)",
+                "dedcom.db"
+            ),
+            "the status line, and the entry under the cursor"
+        );
+        drop(store);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The control: a file that did move leaves the cursor on the next one, as it always did.
+    #[test]
+    fn the_cursor_steps_to_the_next_file_after_one_that_moved() {
+        let _role = crate::state::store::role_guard();
+        let (root, state, dest, store) = a_state_directory_in_a_panel("cursor_moved");
+        let (mut app, rx) =
+            commander_over(&state.join("dedcom.db"), as_operator(None), &state, &dest);
+        cursor_on(&mut app, "a-first.bin");
+
+        move_to_the_second_panel(&mut app, &rx);
+
+        assert_eq!(
+            (
+                app.commander.status.as_str(),
+                under_the_cursor(&app).as_str(),
+                dest.join("a-first.bin").is_file()
+            ),
+            ("→ panel 2: moved 1", "dedcom.db", true),
+            "the status line, the entry under the cursor, the file at the destination"
+        );
+        drop(store);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Of a selection, the cursor goes by what left: it was on a file that moved, and the next
+    /// entry down is one that was refused — that is where it stands.
+    ///
+    /// Red on the parent: both selected files were taken for gone, and the cursor stood past
+    /// the one that stayed.
+    #[test]
+    fn the_cursor_stops_at_the_first_entry_a_selection_left_behind() {
+        let _role = crate::state::store::role_guard();
+        let (root, state, dest, store) = a_state_directory_in_a_panel("cursor_selection");
+        let (mut app, rx) =
+            commander_over(&state.join("dedcom.db"), as_operator(None), &state, &dest);
+        for name in ["a-first.bin", "dedcom.db"] {
+            app.commander.panels[0]
+                .marks
+                .insert(state.join(name), Mark::Selected);
+        }
+        cursor_on(&mut app, "a-first.bin");
+
+        move_to_the_second_panel(&mut app, &rx);
+
+        assert_eq!(
+            (
+                app.commander.status.as_str(),
+                under_the_cursor(&app).as_str()
+            ),
+            (
+                "→ panel 2: moved 1, errors 1 (reasons in dedcom.log)",
+                "dedcom.db"
+            ),
+            "the status line, and the entry under the cursor"
+        );
+        drop(store);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The road the two faults made together, from the first key to the last: the same two
+    /// keys, pressed again and again from the database, never reach the lock file; and pointed
+    /// at directly, the lock file stays as well — the next dedcom is still turned away.
+    ///
+    /// Red on the parent: each refusal moved the cursor one entry down, the fourth press took
+    /// `dedcom.lock` to the other panel, and a second attempt on the lock made an operator.
+    #[test]
+    fn the_same_keys_from_the_database_never_take_the_lock_file() {
+        let _role = crate::state::store::role_guard();
+        let (root, state, dest, store) = a_state_directory_in_a_panel("keys_to_the_lock");
+        let held = match crate::lock::try_acquire(&state).unwrap() {
+            crate::lock::Acquire::Operator(lock) => lock,
+            crate::lock::Acquire::Busy(_) => panic!("a fresh directory's lock is free"),
+        };
+        let (mut app, rx) = commander_over(
+            &state.join("dedcom.db"),
+            as_operator(Some(held)),
+            &state,
+            &dest,
+        );
+        let lock = crate::lock::lock_path(&state);
+        let another_dedcom = || match crate::lock::try_acquire(&state).unwrap() {
+            crate::lock::Acquire::Operator(_) => "becomes an operator",
+            crate::lock::Acquire::Busy(_) => "is turned away",
+        };
+
+        cursor_on(&mut app, "dedcom.db");
+        for press in 1..=4 {
+            move_to_the_second_panel(&mut app, &rx);
+            assert_eq!(under_the_cursor(&app), "dedcom.db", "after press {press}");
+        }
+        assert_eq!(
+            (lock.is_file(), another_dedcom()),
+            (true, "is turned away"),
+            "after four presses: the lock file at its name, and what another dedcom gets"
+        );
+
+        cursor_on(&mut app, "dedcom.lock");
+        move_to_the_second_panel(&mut app, &rx);
+        assert_eq!(
+            (
+                app.commander.status.as_str(),
+                under_the_cursor(&app).as_str(),
+                lock.is_file(),
+                dest.join("dedcom.lock").exists(),
+                another_dedcom()
+            ),
+            (
+                "→ panel 2: moved 0, errors 1 (reasons in dedcom.log)",
+                "dedcom.lock",
+                true,
+                false,
+                "is turned away"
+            ),
+            "pointed at: the status line, the cursor, the lock file at its name, at the \
+             destination, and what another dedcom gets"
+        );
+        drop(store);
+        drop(app);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A window that holds no lock — an operator let in beside a live one — leaves the lock file
+    /// of its state directory at its name all the same: it is the other instance's, and with it
+    /// gone the next dedcom would get a lock of its own and no question.
+    #[test]
+    fn a_window_that_holds_no_lock_leaves_the_lock_file_too() {
+        let _role = crate::state::store::role_guard();
+        let (root, state, dest, store) = a_state_directory_in_a_panel("keys_no_lock");
+        let lock = crate::lock::lock_path(&state);
+        fs::write(&lock, b"4242\n2026-01-01 00:00:00\n").unwrap();
+        let (mut app, rx) =
+            commander_over(&state.join("dedcom.db"), as_operator(None), &state, &dest);
+
+        cursor_on(&mut app, "dedcom.lock");
+        move_to_the_second_panel(&mut app, &rx);
+
+        assert_eq!(
+            (
+                app.commander.status.as_str(),
+                lock.is_file(),
+                dest.join("dedcom.lock").exists()
+            ),
+            (
+                "→ panel 2: moved 0, errors 1 (reasons in dedcom.log)",
+                true,
+                false
+            ),
+            "the status line, the lock file at its name, at the destination"
+        );
+        drop(store);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The panel the items are taken from can be any: here the second, sending to the first.
+    /// Its cursor steps past the file that left, as the first panel's does.
+    #[test]
+    fn the_cursor_is_settled_in_the_panel_the_items_were_taken_from() {
+        let _role = crate::state::store::role_guard();
+        let (root, state, dest, store) = a_state_directory_in_a_panel("cursor_second_panel");
+        let (mut app, rx) =
+            commander_over(&state.join("dedcom.db"), as_operator(None), &dest, &state);
+        app.commander.active = 1;
+        cursor_in(&mut app, 1, "a-first.bin");
+
+        for key in ['m', '1'] {
+            on_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+            );
+        }
+        settle_move(&mut app, &rx);
+
+        assert_eq!(
+            (
+                app.commander.status.as_str(),
+                under_the_cursor_in(&app, 1).as_str()
+            ),
+            ("→ panel 1: moved 1", "dedcom.db"),
+            "the status line, and the entry under the cursor of the second panel"
+        );
+        drop(store);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Two folders under a fresh root, `first` holding the files `in_first` and `second` the
+    /// files `in_second`, and a commander with its first panel on the one and its second on the
+    /// other, both read. Returns the root (to remove), the two folders and the window.
+    fn two_folders_in_two_panels(
+        tag: &str,
+        in_first: &[&str],
+        in_second: &[&str],
+    ) -> (
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        App,
+        crossbeam_channel::Receiver<AppEvent>,
+    ) {
+        let root = temp_dir(tag);
+        let (first, second, state) = (root.join("first"), root.join("second"), root.join("state"));
+        for dir in [&first, &second, &state] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        for (dir, names) in [(&first, in_first), (&second, in_second)] {
+            for name in names {
+                fs::write(dir.join(name), name.as_bytes()).unwrap();
+            }
+        }
+        let (app, rx) =
+            commander_over(&state.join("dedcom.db"), as_operator(None), &first, &second);
+        (root, first, second, app, rx)
+    }
+
+    /// Puts the cursor of panel `index` on the entry `name`.
+    fn cursor_in(app: &mut App, index: usize, name: &str) {
+        let panel = &mut app.commander.panels[index];
+        let row = panel
+            .entries
+            .iter()
+            .position(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("{name} is not in panel {index}"));
+        panel.select(row);
+    }
+
+    /// The name the cursor of panel `index` is on.
+    fn under_the_cursor_in(app: &App, index: usize) -> String {
+        app.commander.panels[index]
+            .selected()
+            .map(|entry| entry.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// The answer of a batch that moved the one file `name` from the folder of panel
+    /// `taken_from` to that of panel `sent_to`, as the worker sends it.
+    fn it_moved(
+        app: &App,
+        name: &str,
+        taken_from: usize,
+        sent_to: usize,
+    ) -> super::move_batch::MoveBatchOutcome {
+        let folder = |index: usize| app.commander.panels[index].cwd.clone();
+        super::move_batch::MoveBatchOutcome {
+            moved: vec![(folder(taken_from).join(name), folder(sent_to).join(name))],
+            reload: vec![
+                super::state::LoadTarget::Commander(taken_from),
+                super::state::LoadTarget::Commander(sent_to),
+            ],
+            label: format!("panel {}", sent_to + 1),
+            ..Default::default()
+        }
+    }
+
+    /// Lets the re-reads an answer asked for land, while the next answer is still on its way.
+    fn the_rereads_land(app: &mut App, rx: &crossbeam_channel::Receiver<AppEvent>) {
+        crate::app::pump_until(app, rx, "the re-reads an answer asked for", |app| {
+            app.commander.panels.iter().all(|p| !p.loading)
+        });
+    }
+
+    /// Two moves in the queue, the cursor resting on the file of the second. The re-read the
+    /// first answer asks for can find that file gone already — the second batch has renamed it
+    /// and is still writing its journal. The cursor then stands past what left, and the second
+    /// answer finds it there.
+    ///
+    /// A re-read that opened at the top instead would leave the cursor on `..` for good: the
+    /// second answer finds `..` in its place.
+    #[test]
+    fn the_cursor_goes_past_a_file_the_next_batch_in_the_queue_took() {
+        let _role = crate::state::store::role_guard();
+        let (root, first, second, mut app, rx) = two_folders_in_two_panels(
+            "cursor_two_in_queue",
+            &["a.bin", "b.bin", "c.bin", "d.bin"],
+            &[],
+        );
+        // The operator has sent `a.bin`, stepped down to `b.bin` and sent it too. Both files
+        // are renamed; neither answer has been applied.
+        cursor_in(&mut app, 0, "b.bin");
+        for name in ["a.bin", "b.bin"] {
+            fs::rename(first.join(name), second.join(name)).unwrap();
+        }
+        app.commander.move_pending = 2;
+
+        let answer = it_moved(&app, "a.bin", 0, 1);
+        apply_move_outcome(&mut app, answer);
+        the_rereads_land(&mut app, &rx);
+        let between = under_the_cursor_in(&app, 0);
+        let answer = it_moved(&app, "b.bin", 0, 1);
+        apply_move_outcome(&mut app, answer);
+        settle_move(&mut app, &rx);
+
+        assert_eq!(
+            (between.as_str(), under_the_cursor_in(&app, 0).as_str()),
+            ("c.bin", "c.bin"),
+            "under the cursor between the two answers, and after the second"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The same when the second move takes its file from the panel the first one sent its items
+    /// to. That panel is re-read for the first answer as the one the items went to, and its
+    /// cursor rests on a file the second batch has renamed already.
+    #[test]
+    fn so_does_the_cursor_of_the_panel_the_first_move_sent_its_items_to() {
+        let _role = crate::state::store::role_guard();
+        let (root, first, second, mut app, rx) = two_folders_in_two_panels(
+            "cursor_receiver_in_queue",
+            &["a.bin"],
+            &["x.bin", "y.bin", "z.bin"],
+        );
+        // `a.bin` was sent to the second panel; then, from the second, `x.bin` to the first.
+        cursor_in(&mut app, 1, "x.bin");
+        fs::rename(first.join("a.bin"), second.join("a.bin")).unwrap();
+        fs::rename(second.join("x.bin"), first.join("x.bin")).unwrap();
+        app.commander.move_pending = 2;
+
+        let answer = it_moved(&app, "a.bin", 0, 1);
+        apply_move_outcome(&mut app, answer);
+        the_rereads_land(&mut app, &rx);
+        let between = under_the_cursor_in(&app, 1);
+        let answer = it_moved(&app, "x.bin", 1, 0);
+        apply_move_outcome(&mut app, answer);
+        settle_move(&mut app, &rx);
+
+        assert_eq!(
+            (between.as_str(), under_the_cursor_in(&app, 1).as_str()),
+            ("y.bin", "y.bin"),
+            "under the cursor of the second panel between the two answers, and after the second"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// And when it takes its file from a third panel that shows the folder the first move took
+    /// its items from: that panel is neither of the two the first answer names, and is re-read
+    /// for it as one that shows a folder the move touched.
+    #[test]
+    fn and_the_cursor_of_another_panel_on_a_folder_the_move_touched() {
+        let _role = crate::state::store::role_guard();
+        let (root, first, second, mut app, rx) =
+            two_folders_in_two_panels("cursor_touched_in_queue", &["a.bin", "b.bin", "c.bin"], &[]);
+        app.commander.panels.push(Panel::empty(first.clone()));
+        reload_panel(&mut app, 2);
+        settle_move(&mut app, &rx);
+        // `a.bin` was sent from the first panel; then `b.bin`, from the third.
+        cursor_in(&mut app, 2, "b.bin");
+        for name in ["a.bin", "b.bin"] {
+            fs::rename(first.join(name), second.join(name)).unwrap();
+        }
+        app.commander.move_pending = 2;
+
+        let answer = it_moved(&app, "a.bin", 0, 1);
+        apply_move_outcome(&mut app, answer);
+        the_rereads_land(&mut app, &rx);
+        let between = under_the_cursor_in(&app, 2);
+        let answer = it_moved(&app, "b.bin", 2, 1);
+        apply_move_outcome(&mut app, answer);
+        settle_move(&mut app, &rx);
+
+        assert_eq!(
+            (between.as_str(), under_the_cursor_in(&app, 2).as_str()),
+            ("c.bin", "c.bin"),
+            "under the cursor of the third panel between the two answers, and after the second"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The neighbour is for the re-read a move's answer asks for. A re-read nothing was moved
+    /// before — the Board reading its panels again after an undo — opens at the top once the
+    /// entry under the cursor is gone, as the parent has it.
+    #[test]
+    fn a_reread_no_move_asked_for_opens_at_the_top_once_its_entry_is_gone() {
+        let _role = crate::state::store::role_guard();
+        let (root, first, _second, mut app, rx) =
+            two_folders_in_two_panels("cursor_plain_reread", &["a.bin", "b.bin", "c.bin"], &[]);
+        cursor_in(&mut app, 0, "b.bin");
+        fs::remove_file(first.join("b.bin")).unwrap();
+
+        reload_target(&mut app, super::state::LoadTarget::Commander(0));
+        settle_move(&mut app, &rx);
+
+        assert_eq!(under_the_cursor_in(&app, 0), "..");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A folder sent to a panel that has a folder of its name is merged into it. What a merge
+    /// moves are the folder's children, so neither panel shows a directory the move touched:
+    /// the two are re-read only because the request names them. The cursor then goes by what
+    /// the merge left of the folder under it. Emptied and removed, the folder hands the cursor
+    /// to the next entry; left standing by a link inside it, it keeps the cursor.
+    #[test]
+    fn the_cursor_goes_by_what_a_merge_left_of_the_folder_under_it() {
+        let _role = crate::state::store::role_guard();
+        let (root, first, second, mut app, rx) =
+            two_folders_in_two_panels("cursor_merge", &["z.bin"], &[]);
+        for dir in [&first, &second] {
+            for name in ["emptied", "standing"] {
+                fs::create_dir_all(dir.join(name)).unwrap();
+            }
+        }
+        fs::write(first.join("emptied").join("child.bin"), b"child").unwrap();
+        fs::write(first.join("standing").join("child.bin"), b"another child").unwrap();
+        // A symbolic link is not moved, and keeps the folder it is in standing after the merge.
+        std::os::unix::fs::symlink(first.join("z.bin"), first.join("standing").join("a.link"))
+            .unwrap();
+        for index in 0..2 {
+            reload_panel(&mut app, index);
+        }
+        settle_move(&mut app, &rx);
+
+        cursor_in(&mut app, 0, "emptied");
+        move_to_the_second_panel(&mut app, &rx);
+        let status_of_the_emptied = app.commander.status.clone();
+        let after_the_emptied = under_the_cursor_in(&app, 0);
+        move_to_the_second_panel(&mut app, &rx);
+
+        assert_eq!(
+            (
+                status_of_the_emptied.as_str(),
+                after_the_emptied.as_str(),
+                app.commander.status.as_str(),
+                under_the_cursor_in(&app, 0).as_str()
+            ),
+            (
+                "→ panel 2: moved 1",
+                "standing",
+                "→ panel 2: moved 1, errors 1 (reasons in dedcom.log)",
+                "standing"
+            ),
+            "the folder the merge removed: the status line and the cursor; the folder it left \
+             standing: the status line and the cursor"
+        );
+        assert_eq!(
+            (
+                first.join("emptied").exists(),
+                second.join("emptied").join("child.bin").is_file(),
+                first.join("standing").join("a.link").is_symlink(),
+                second.join("standing").join("child.bin").is_file()
+            ),
+            (false, true, true, true),
+            "on disk: the emptied folder, its child at the destination, the link that stayed, \
+             the other child at the destination"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The name is kept for as long as the window lives, and let go of with it.
+    #[test]
+    fn a_window_keeps_the_name_of_its_lock_file_while_it_lives() {
+        use crate::lock::{part_of_lock, LockPart};
+        let root = temp_dir("window_lock_name");
+        let state = root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let lock = crate::lock::lock_path(&state);
+        fs::write(&lock, b"").unwrap();
+        let asked = || [&lock, &state].map(|path| part_of_lock(path).expect("it is there"));
+        assert_eq!(asked(), [None, None], "before the window");
+
+        let (app, _events) = crate::app::test_app_with_db(state.join("dedcom.db"));
+        assert_eq!(
+            asked(),
+            [Some(LockPart::File), Some(LockPart::Directory)],
+            "the lock file and its directory, while the window lives"
+        );
+        drop(app);
+        assert_eq!(asked(), [None, None], "after it");
         fs::remove_dir_all(&root).ok();
     }
 

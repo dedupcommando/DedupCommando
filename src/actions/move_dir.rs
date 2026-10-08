@@ -195,6 +195,50 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// A directory is not moved while the lock file this process holds the lock on lies in it,
+    /// at whatever depth — with no database open at all: the lock is held for the whole run. A
+    /// directory beside it is moved, and so is the same directory once the lock is let go of.
+    ///
+    /// Red on the parent: the directory was renamed with the held lock file inside, and the
+    /// next dedcom found no lock at the path it knows.
+    #[test]
+    fn a_directory_that_holds_the_lock_file_is_not_moved() {
+        let root = temp_dir("own_lock_inside");
+        let home = root.join("home");
+        let state = home.join("state");
+        let beside = home.join("beside");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&beside).unwrap();
+        let held = match crate::lock::try_acquire(&state).unwrap() {
+            crate::lock::Acquire::Operator(lock) => lock,
+            crate::lock::Acquire::Busy(_) => panic!("a fresh directory's lock is free"),
+        };
+        let lock = crate::lock::lock_path(&state);
+
+        for above in [&state, &home] {
+            let away = root.join("away");
+            let said = move_dir_to(above, &away)
+                .expect_err("the lock file lies in it")
+                .to_string();
+            assert_eq!(
+                said,
+                crate::actions::move_file::LOCK_FOLDER_MOVE_REFUSAL,
+                "{}",
+                above.display()
+            );
+            assert!(
+                lock.is_file() && !away.exists(),
+                "{} stays where it is",
+                above.display()
+            );
+        }
+        move_dir_to(&beside, &root.join("moved-beside")).expect("no lock file lies in it");
+
+        drop(held);
+        move_dir_to(&state, &root.join("moved-state")).expect("nobody holds the lock");
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// Cross-dataset refusal: for a directory — `rm -rf`, an rsync command with
     /// trailing slashes (moves the directory's content).
     #[test]
